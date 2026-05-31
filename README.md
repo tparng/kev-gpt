@@ -47,9 +47,13 @@ data tool and the model) for that project.
   "do". Parallel (`--nproc`) for the full corpus.
 - **Proof-of-life model**: a 3.16M-param char-level GPT trained on the Kevinised
   validation set climbs from random characters to coherent telegraphic Kevin in
-  ~35 min on an M1 (see `data/evolution.md` after a run).
+  ~35 min on an M1, ~4 min on an RTX 3050 Ti (see `data/evolution.md` after a run).
+- **Brevitas INT4 QAT path** (`model/qgpt.py`): the same architecture with every
+  `nn.Linear` swapped for INT4-weight / INT8-activation `QuantLinear`. Warm-starts
+  from an FP checkpoint via `--init-from`; inherits FP val loss within ~0.01 nats
+  on the smoke test, which is the bit-honesty signal that the remap is faithful.
 
-Not yet built: INT4 QAT, goformer validation, the HLS/RTL fabric engine.
+Not yet built: goformer cosine validation, the HLS/RTL fabric engine.
 
 ## Quickstart
 
@@ -66,8 +70,12 @@ python -m keviniser.harness samples/canonical.txt
 python -m keviniser.fetch_tinystories                       # validation split (~20 MB)
 python -m keviniser.harness data/TinyStories-valid.txt \
     -o data/TinyStories-valid.kevin.txt --marker "<|endoftext|>"
-python -m model.train --max-iters 4000                      # ~37 min on M1
+python -m model.train --max-iters 4000                      # ~37 min M1, ~4 min RTX 3050 Ti
 python -m model.sample data/ckpt.pt --prompt "once upon time"
+
+# Optional: INT4 QAT fine-tune off the FP checkpoint (requires `pip install brevitas`)
+python -m model.train --qat --init-from data/ckpt.pt --max-iters 2000 \
+    --out data/ckpt.qat.pt
 ```
 
 Training the **full** corpus belongs on a CUDA GPU — see
