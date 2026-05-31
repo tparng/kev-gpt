@@ -32,3 +32,9 @@ fabric/stage1/synth/
 # Stage 0 build artifacts
 fabric/stage0/a53_gemv_bench
 fabric/stage0/_*.log
+
+# Vivado batch run artifacts (repo root)
+vivado*.jou
+vivado*.log
+dfx_runtime.txt
+.Xil/

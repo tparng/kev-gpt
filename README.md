@@ -53,7 +53,19 @@ data tool and the model) for that project.
   from an FP checkpoint via `--init-from`; inherits FP val loss within ~0.01 nats
   on the smoke test, which is the bit-honesty signal that the remap is faithful.
 
-Not yet built: goformer cosine validation, the HLS/RTL fabric engine.
+- **Fabric path (PL prep, no board needed)**: a roofline/crossover model (3.15M
+  model = 1.5 MB INT4, fits the ~3 MB budget; crossover ~6.3M params); INT4
+  weight export to `$readmemh` images + per-channel scales; a numpy integer
+  golden ("goformer"); a **Stage 1 SystemVerilog systolic GEMV** verified
+  bit-exact (`maxabserr=0`) against the golden on all 17 layers in iverilog and
+  synthesised in Vivado for the KV260 part; a cosine validator showing the
+  exported integer datapath reconstructs the Brevitas QAT forward to **cosine
+  1.000** (gate > 0.9999); and a **Stage 0** A53 weight-streaming baseline (the
+  bandwidth-wall proof).
+
+Not yet built: Stage 2 (heterogeneous ping-pong tax) and Stage 3 (fabric-native
+softmax/RMSNorm + the zero-DRAM headline); the per-lane banked, fully-pipelined
+GEMV for peak throughput; on-board bring-up. All need the Kria connected.
 
 ## Quickstart
 
