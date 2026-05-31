@@ -114,6 +114,14 @@ def main(argv=None):
     p.add_argument("--compile", action="store_true", help="torch.compile (CUDA).")
     p.add_argument("--smoke", type=int, default=0,
                    help="run N iters, report tokens/sec and a time estimate, exit.")
+    p.add_argument("--qat", action="store_true",
+                   help="train the Brevitas INT4-weight / INT8-activation QAT model "
+                        "(model.qgpt.QGPT) instead of the FP GPT. Warm-start from an FP "
+                        "checkpoint with --init-from for the standard recipe.")
+    p.add_argument("--init-from", default=None, metavar="CKPT",
+                   help="load weights from this checkpoint before training. With --qat, "
+                        "FP weights are remapped into the QAT module and Brevitas's scale "
+                        "params initialise fresh (load is strict=False).")
     args = p.parse_args(argv)
 
     device = pick_device(args.device)
@@ -131,8 +139,34 @@ def main(argv=None):
         n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
         dropout=args.dropout,
     )
-    model = GPT(cfg).to(device)
-    print(f"params={model.num_params() / 1e6:.2f}M")
+    if args.qat:
+        from .qgpt import QGPT, load_fp_into_qat
+        # Build on CPU, warm-start, run one dry forward to materialise
+        # Brevitas's lazy scale buffers, THEN move to device. .to() picks up
+        # everything (params + buffers, lazy or not) only after they exist.
+        model = QGPT(cfg)
+        print(f"params={model.num_params() / 1e6:.2f}M  (QAT: INT4 weights, INT8 acts)")
+        if args.init_from:
+            ck = torch.load(args.init_from, map_location="cpu", weights_only=False)
+            missing, unexpected = load_fp_into_qat(model, ck["model"])
+            n_scale_missing = sum(1 for k in missing if "input_quant" in k)
+            n_real_missing = len(missing) - n_scale_missing
+            print(f"warm-start from {args.init_from} (iter {ck.get('iter')}): "
+                  f"transferred OK, {n_scale_missing} fresh quant-scale params, "
+                  f"{n_real_missing} unmatched, {len(unexpected)} unexpected")
+            if n_real_missing or unexpected:
+                print(f"  unmatched: {[k for k in missing if 'input_quant' not in k]}")
+                print(f"  unexpected: {unexpected}")
+        with torch.no_grad():
+            model(torch.zeros((1, 1), dtype=torch.long))
+        model.to(device)
+    else:
+        model = GPT(cfg).to(device)
+        print(f"params={model.num_params() / 1e6:.2f}M")
+        if args.init_from:
+            ck = torch.load(args.init_from, map_location=device, weights_only=False)
+            model.load_state_dict(ck["model"])
+            print(f"warm-start from {args.init_from} (iter {ck.get('iter')})")
     if args.compile and device == "cuda":
         model = torch.compile(model)
 
@@ -186,7 +220,7 @@ def main(argv=None):
 
     def save_ckpt(path, it, val):
         torch.save({"model": model.state_dict(), "cfg": cfg.__dict__,
-                    "meta": meta, "iter": it, "val": val}, path)
+                    "meta": meta, "iter": it, "val": val, "qat": args.qat}, path)
 
     best_val = float("inf")
     t0 = time.perf_counter()
