@@ -28,3 +28,7 @@ fabric/stage1/sim/_*.log
 fabric/stage1/sim/probe.sv
 fabric/stage1/sim/micro_tb.sv
 fabric/stage1/synth/
+
+# Stage 0 build artifacts
+fabric/stage0/a53_gemv_bench
+fabric/stage0/_*.log
