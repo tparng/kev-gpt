@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Kevinised corpus outputs and run stats (regenerable)
+*.kevin.txt
+*.stats.json
+stats.json
+
+# Large corpora (download locally, don't commit)
+data/
+*.tinystories*
+
+# macOS
+.DS_Store

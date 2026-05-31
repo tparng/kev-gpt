@@ -1,0 +1,11 @@
+# Core: part-of-speech tagging and lemmatisation.
+spacy>=3.7
+# The small English model is loaded by name; install it after pip install:
+#   python -m spacy download en_core_web_sm
+
+# Optional: GPT-2 BPE proxy for token-count compression in the harness.
+# The harness runs without it and reports word counts only.
+tiktoken>=0.5
+
+# Dev/test only.
+pytest>=7.0
