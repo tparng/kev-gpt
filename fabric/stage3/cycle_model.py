@@ -72,7 +72,10 @@ def table():
             else "PROJECTED with throughput-optimized parallel non-linears"
         print(f"== {mode.upper()}: {tag} ==")
         print(f"{'PE':>5} {'Fmax':>6} {'T':>4} {'GEMV':>7} {'attn':>6} {'nonlin':>7} {'cyc/tok':>8} {'tok/s':>9}")
-        for PE, fmax in ((256, 293), (512, 300), (1024, 300)):
+        # Fmax MEASURED by OOC synth on xck26-2LV (constant ~1.5 MB footprint, 0 DSP):
+        # PE=256 -> 293 MHz (22.7% LUT), 512 -> 292 (45% LUT), 1024 -> 239 (90% LUT, the
+        # LUT wall — pure-LUT INT4 MACs; going wider needs the 1248 idle DSPs).
+        for PE, fmax in ((256, 293), (512, 292), (1024, 239)):
             for T in (64, 128, 256):
                 g, a, n = gemv_cycles(PE), attn_cycles(PE, T), nonlinear_cycles(T, mode)
                 cyc, tps = tok_per_s(PE, T, fmax, mode)
