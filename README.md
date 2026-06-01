@@ -42,9 +42,12 @@ data tool and the model) for that project.
 
 ## What works today
 
-- **Keviniser**: runs on TinyStories, ~70% word / ~61% token compression (the
-  headline metric), POS-based so it keeps main-verb "do" and drops auxiliary
-  "do". Parallel (`--nproc`) for the full corpus.
+- **Keviniser**: POS-based so it keeps main-verb "do" and drops auxiliary "do".
+  The **full TinyStories train split is processed**: 2,119,718 stories,
+  371.7M → 260.5M words (**70.1%**), ~67% tokens (gpt2 proxy) — the headline
+  compression metric, holding constant from the validation slice to the full
+  corpus. ~2.9 h on the M1 with `--nproc 7`. Output is the ~1.3 GB Kevin training
+  corpus the GPU run consumes.
 - **Proof-of-life model**: a 3.16M-param char-level GPT trained on the Kevinised
   validation set climbs from random characters to coherent telegraphic Kevin in
   ~35 min on an M1, ~4 min on an RTX 3050 Ti (see `data/evolution.md` after a run).
