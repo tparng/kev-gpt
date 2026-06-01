@@ -96,6 +96,44 @@ python -m model.train --qat --init-from data/ckpt.pt --max-iters 2000 \
 Training the **full** corpus belongs on a CUDA GPU — see
 [`model/SETUP-DELL.md`](model/SETUP-DELL.md).
 
+## Data & checkpoints (GitHub as Dropbox)
+
+This project spans two machines — the **M1** runs the Keviniser (CPU/spaCy) and
+the **XPS 15 / RTX 3050 Ti** does the training (CUDA). The handoff is a single
+~1.3 GB corpus file, and the big artifacts (corpora, checkpoints) are gitignored
+and *not* in the repo. So we abuse **GitHub Releases as an artifact store** — a
+free Dropbox that lives next to the code:
+
+- A direct `git commit` is the wrong tool: GitHub **hard-rejects files > 100 MB**,
+  and a committed binary bloats clone history *forever*.
+- A **Release asset** allows **up to 2 GB per file**, lives *outside* git history
+  (zero repo bloat), and is one command each way.
+
+**Current artifacts:**
+
+| release | asset | what |
+|---|---|---|
+| [`corpus-v1`](https://github.com/michaelayles/kev-gpt/releases/tag/corpus-v1) | `TinyStories-train.kevin.txt.gz` (394 MB) | the full Kevinised train corpus, gzipped |
+
+**Pull an artifact (e.g. on the Dell):**
+
+```
+gh release download corpus-v1 -R michaelayles/kev-gpt -D data/
+# verify against the sha256 in the release notes, then gunzip
+```
+
+**Publish a new artifact (e.g. a trained checkpoint):**
+
+```
+gzip -k data/ckpt.pt
+shasum -a 256 data/ckpt.pt.gz          # put the hash in the notes
+gh release create ckpt-v1 data/ckpt.pt.gz --title "..." --notes "sha256: ..."
+```
+
+The repo is **private**, so release assets are private too — `gh` auth (or a
+token) is required to download. Code and docs travel through normal git; only the
+multi-hundred-MB blobs go through Releases.
+
 ## Conventions (project rules, honored in the docs)
 
 - **Mischief in the title, dry in the body.** The output prose is deliberately
