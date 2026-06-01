@@ -62,18 +62,33 @@ token stream** as the float reference — `GOFORMER_SEQ_PASS`, 48/48 identical,
 worst per-step cosine 0.99995. This is the golden stream the RTL sequencer is
 validated against.
 
-## Build order — what remains (the FPGA realization)
+## Build progress (the FPGA realization)
 
-The references above are the bit-honest specs; these turn them into timing-closed RTL:
+1. **✅ Q-format pinned** (`model/goformer_q.py`): residual = signed Q6.25 (32-bit,
+   cosine 1.0; floor Q6.18); INT8 acts, INT32 accum, 24-bit scale, GELU 8192-LUT,
+   exp Q1.20 z∈[−16,0], rsqrt 8-bit seed + 2 Newton. `GOFORMER_Q_PASS`.
+2. **✅ All three non-linears in gated RTL** (each bit-true + identical token stream;
+   the binding gate is the token stream — raw-logit cosine is a brittle proxy on this
+   char model because a few values sit on mlp_proj INT8 requant half-boundaries):
+   - `rtl/gelu_lut.sv` — 8192-entry Q4.12 LUT + 3-bit interp. `mismatches=0/4096`.
+   - `rtl/layernorm.sv` — γ-only, rsqrt (priority-encoder seed LUT + 2 Newton).
+     `mismatches=0/16384`, stream 68/68.
+   - `rtl/softmax.sv` — running-max, exp LUT (Q1.20), reciprocal by 41-cycle restoring
+     division. `mismatches=0/7127` on real attention rows, stream 68/68.
+3. **⏳ The sequencer FSM** (designed; the final integration) — embed → 4×[LN, qkv,
+   attn(+KV), proj, +res, LN, mlp(GELU), +res] → LN_f → head → LFSR-sample → append-KV
+   → loop, zero CPU between tokens. Prompt-id input FIFO, token-id output FIFO. All
+   datapath blocks now exist as gated RTL; this wires them under one control FSM and
+   timing-closes the integrated design. Validated against the `goformer_seq` token stream.
 
-1. **Pin the fixed-point datapath Q-format.** The reference carries the residual
-   stream in float; the RTL needs a fixed format. Profile the residual range, pick the
-   smallest Q(I).(F) that holds cosine > 0.9999 as a fully-integer datapath.
-2. **RTL for the three non-linears** (GELU-LUT, LayerNorm, softmax), each iverilog-gated
-   bit-true vs `goformer_fixed` in the pinned format.
-3. **The sequencer FSM** — embed → 4×[LN, qkv, attn(+KV), proj, +res, LN, mlp(GELU),
-   +res] → LN_f → head → LFSR-sample → append-KV → loop, zero CPU between tokens.
-   Prompt-id input FIFO, token-id output FIFO. Wire to `gemv_banked`; timing-close.
+## Will it hit 10k tok/s? Yes — ~18k at the measured point
+
+Per-token cycle budget at the synth-proven **PE=256 @ 293 MHz**: linear ~12,360 cyc +
+attention ~2,048 + head ~193 + non-linears ~1,500 ≈ **16,100 cyc/token → ~18,200 tok/s**
+(~1.8× over 10k). Headroom to absorb integrated-timing loss is large (0 DSP, 45/64 URAM,
+22.7% LUT at PE=256; widen toward PE=1152 → ~90k into the 1248 idle DSPs). The one
+unproven step is timing-closing the *integrated* design (the 293 MHz was the GEMV core
+alone), but 10k survives a drop to ~200 MHz.
 
 ## Files
 
