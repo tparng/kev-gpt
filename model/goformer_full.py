@@ -57,6 +57,14 @@ class GoformerFull:
         self.matmul = matmul
         self.n_head = params["n_head"]
 
+    # op hooks — float by default; FixedGoformer overrides with fabric-precision
+    # versions, so a KV decoder can run either backend through the same path.
+    def _ln(self, x, gamma):
+        return layernorm(x, gamma)
+
+    def _smax(self, s):
+        return softmax(s, axis=-1)
+
     def qlin(self, x, layer):
         """x (T, K) float -> y (T, M) float, GEMV on the pluggable backend."""
         int_w, w_scale, s_act = layer

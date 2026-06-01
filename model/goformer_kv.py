@@ -26,10 +26,10 @@ class KVDecoder:
     new position, maintaining per-layer K/V caches. Reuses GoformerFull's exact
     qlin/layernorm/gelu/softmax so the arithmetic matches the full forward."""
 
-    def __init__(self, params, matmul=numpy_matmul):
-        self.gf = GoformerFull(params, matmul)
-        self.p = params
-        self.n_head = params["n_head"]
+    def __init__(self, params=None, matmul=numpy_matmul, engine=None):
+        self.gf = engine if engine is not None else GoformerFull(params, matmul)
+        self.p = self.gf.p
+        self.n_head = self.p["n_head"]
         self.reset()
 
     def reset(self):
@@ -54,7 +54,7 @@ class KVDecoder:
         kh = kc.reshape(T, nh, hd).transpose(1, 0, 2)            # (nh, T, hd)
         vh = vc.reshape(T, nh, hd).transpose(1, 0, 2)            # (nh, T, hd)
         scores = (qh @ kh.transpose(0, 2, 1)) / np.sqrt(hd)      # (nh, 1, T) — no mask: all causal
-        attn = softmax(scores, axis=-1) @ vh                     # (nh, 1, hd)
+        attn = self.gf._smax(scores) @ vh                        # (nh, 1, hd)
         y = attn.transpose(1, 0, 2).reshape(C)                   # (C,)
         return self.gf.qlin(y[None, :], blk["proj"])[0]
 
@@ -63,9 +63,9 @@ class KVDecoder:
         p = self.p
         x = p["tok_emb"][idx_t] + p["pos_emb"][self.t]           # (C,)
         for bi, blk in enumerate(p["blocks"]):
-            x = x + self._attn_step(layernorm(x, blk["ln1"]), blk, bi)
-            x = x + self.gf._mlp(layernorm(x, blk["ln2"])[None, :], blk)[0]
-        x = layernorm(x, p["ln_f"])
+            x = x + self._attn_step(self.gf._ln(x, blk["ln1"]), blk, bi)
+            x = x + self.gf._mlp(self.gf._ln(x, blk["ln2"])[None, :], blk)[0]
+        x = self.gf._ln(x, p["ln_f"])
         self.t += 1
         return self.gf.qlin(x[None, :], p["head"])[0]
 
