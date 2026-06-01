@@ -42,9 +42,12 @@ data tool and the model) for that project.
 
 ## What works today
 
-- **Keviniser**: runs on TinyStories, ~70% word / ~61% token compression (the
-  headline metric), POS-based so it keeps main-verb "do" and drops auxiliary
-  "do". Parallel (`--nproc`) for the full corpus.
+- **Keviniser**: POS-based so it keeps main-verb "do" and drops auxiliary "do".
+  The **full TinyStories train split is processed**: 2,119,718 stories,
+  371.7M → 260.5M words (**70.1%**), ~67% tokens (gpt2 proxy) — the headline
+  compression metric, holding constant from the validation slice to the full
+  corpus. ~2.9 h on the M1 with `--nproc 7`. Output is the ~1.3 GB Kevin training
+  corpus the GPU run consumes.
 - **Proof-of-life model**: a 3.16M-param char-level GPT trained on the Kevinised
   validation set climbs from random characters to coherent telegraphic Kevin in
   ~35 min on an M1, ~4 min on an RTX 3050 Ti (see `data/evolution.md` after a run).
@@ -92,6 +95,44 @@ python -m model.train --qat --init-from data/ckpt.pt --max-iters 2000 \
 
 Training the **full** corpus belongs on a CUDA GPU — see
 [`model/SETUP-DELL.md`](model/SETUP-DELL.md).
+
+## Data & checkpoints (GitHub as Dropbox)
+
+This project spans two machines — the **M1** runs the Keviniser (CPU/spaCy) and
+the **XPS 15 / RTX 3050 Ti** does the training (CUDA). The handoff is a single
+~1.3 GB corpus file, and the big artifacts (corpora, checkpoints) are gitignored
+and *not* in the repo. So we abuse **GitHub Releases as an artifact store** — a
+free Dropbox that lives next to the code:
+
+- A direct `git commit` is the wrong tool: GitHub **hard-rejects files > 100 MB**,
+  and a committed binary bloats clone history *forever*.
+- A **Release asset** allows **up to 2 GB per file**, lives *outside* git history
+  (zero repo bloat), and is one command each way.
+
+**Current artifacts:**
+
+| release | asset | what |
+|---|---|---|
+| [`corpus-v1`](https://github.com/michaelayles/kev-gpt/releases/tag/corpus-v1) | `TinyStories-train.kevin.txt.gz` (394 MB) | the full Kevinised train corpus, gzipped |
+
+**Pull an artifact (e.g. on the Dell):**
+
+```
+gh release download corpus-v1 -R michaelayles/kev-gpt -D data/
+# verify against the sha256 in the release notes, then gunzip
+```
+
+**Publish a new artifact (e.g. a trained checkpoint):**
+
+```
+gzip -k data/ckpt.pt
+shasum -a 256 data/ckpt.pt.gz          # put the hash in the notes
+gh release create ckpt-v1 data/ckpt.pt.gz --title "..." --notes "sha256: ..."
+```
+
+The repo is **private**, so release assets are private too — `gh` auth (or a
+token) is required to download. Code and docs travel through normal git; only the
+multi-hundred-MB blobs go through Releases.
 
 ## Conventions (project rules, honored in the docs)
 
