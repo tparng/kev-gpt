@@ -23,10 +23,27 @@ file mkdir $outdir
 puts "synth gemv_int4  part=$part  M=$M K=$K PE_LANES=$PE"
 read_verilog -sv "$root/fabric/stage1/rtl/gemv_int4.sv"
 
-# OOC synth: weights/activation ROMs left uninitialised (WFILE/XFILE empty) so
-# this measures the datapath + memory resources, not a specific weight image.
-synth_design -top gemv_int4 -part $part -mode out_of_context \
-    -generic M=$M -generic K=$K -generic PE_LANES=$PE
+# Initialise the weight/activation ROMs from a real exported image. Without this
+# the ROMs are all-zero, the multiplies fold to 0 and synthesis prunes the whole
+# datapath (which is what made the first run report 0 DSP/0 URAM). Defaults to
+# the blocks_0_proj (256x256) layer; override via tclargs 4/5.
+set wfile "$root/fabric/export/blocks_0_proj.w.mem"
+set xfile "$root/fabric/export/tb/blocks_0_proj.x.mem"
+if {$argc >= 4} { set wfile [lindex $argv 3] }
+if {$argc >= 5} { set xfile [lindex $argv 4] }
+
+set gen [list "M=$M" "K=$K" "PE_LANES=$PE"]
+if {[file exists $wfile] && [file exists $xfile]} {
+    lappend gen "WFILE=$wfile" "XFILE=$xfile"
+    puts "weights: $wfile"
+} else {
+    puts "WARNING: $wfile / $xfile not found -- run 'python -m model.export_fabric"
+    puts "         data/ckpt.qat.pt' and 'python -m fabric.golden --all' first."
+    puts "         synthesising with empty ROMs (utilisation will be degenerate)."
+}
+set gargs {}
+foreach g $gen { lappend gargs -generic $g }
+synth_design -top gemv_int4 -part $part -mode out_of_context {*}$gargs
 
 # 300 MHz target (3.333 ns). Tighten to find the real Fmax once it closes.
 create_clock -name clk -period 3.333 [get_ports clk]

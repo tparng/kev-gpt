@@ -32,7 +32,13 @@ module gemv_int4 #(
     input  wire        clk,
     input  wire        rst,     // synchronous, active high
     input  wire        start,   // pulse to begin a GEMV
-    output reg         done
+    output reg         done,
+    // Result read-out. Exposing y through a port keeps the whole accumulation
+    // datapath + weight memory observable, so out-of-context synthesis reports
+    // real utilisation/timing instead of pruning it all away. In a real system
+    // this is the tap point for the AXI-stream reader / next stage.
+    input  wire [$clog2(M)-1:0] rd_addr,
+    output reg  signed [31:0]   y_out
 );
     localparam integer KB     = K / 2;                       // packed bytes/row
     localparam integer GROUPS = (M + PE_LANES - 1) / PE_LANES;
@@ -102,4 +108,7 @@ module gemv_int4 #(
             endcase
         end
     end
+
+    // Registered read of the result array — the observability tap (see ports).
+    always @(posedge clk) y_out <= y[rd_addr];
 endmodule

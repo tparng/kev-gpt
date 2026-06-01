@@ -5,8 +5,19 @@ resident on-chip, microbenchmarked in isolation. This is the "satisfying
 checkpoint" — raw on-chip matmul throughput, before the fiddly non-linearities.
 
 **Status: bit-exact in simulation against the numpy golden, all 17 model layers
-(`maxabserr=0`).** Synthesis script is ready; running it needs Vivado (installed)
-but no board.
+(`maxabserr=0`), and synthesised for the KV260 part.** Vivado OOC synth (256×256,
+PE=16, `xck26-sfvc784-2LV-c`): **closes 300 MHz (WNS +0.133 ns)**, **12.2k LUT
+(10.4%) / 8.9k FF (3.8%) / 0 DSP / 0 URAM / 0 BRAM**. No board needed for any of
+this.
+
+The 0 DSP/URAM is a real finding, not an error: INT4×INT8 multiplies are small
+enough that Vivado maps them to LUTs (no DSP), and this correctness-first core
+uses a **single shared weight ROM read by all `PE_LANES` lanes at once** — a
+16-read-port memory can't map to dual-port URAM/BRAM, so it lands in distributed
+logic. That's fine for one 32 KB layer but **won't scale to the full 1.5 MB
+model**, which is exactly why the throughput follow-up banks the weights per lane
+(one read port each → URAM-resident). This synth result is the concrete
+motivation for that next step.
 
 ## What it computes
 
@@ -62,8 +73,11 @@ vivado -mode batch -source fabric/stage1/tcl/synth.tcl -tclargs 256 256 16
 # reports -> fabric/stage1/synth/{util,timing}_*.rpt
 ```
 
-Out-of-context, weights left uninitialised (this measures the datapath + memory
-resources and Fmax, not a specific weight image). Part is the KV260 SOM
+Out-of-context. The script initialises the weight/activation ROMs from the real
+`blocks_0_proj` export (`-tclargs 256 256 16 [wfile] [xfile]` to override) — this
+is required, or the all-zero ROMs constant-fold and synthesis prunes the whole
+datapath to nothing (0 DSP/0 URAM). Run `model.export_fabric` + `fabric.golden
+--all` first so the `.mem` files exist. Part is the KV260 SOM
 `xck26-sfvc784-2LV-c`.
 
 ## Honest scope / next

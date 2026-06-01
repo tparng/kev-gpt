@@ -28,10 +28,12 @@ All on `main`, pushed. Built and checked **without the board**:
 **Caveats to fix tomorrow (known, not hidden):**
 1. Current checkpoints (`data/ckpt.fp.pt`, `data/ckpt.qat.pt`) were trained on the
    **2 MB smoke corpus** — placeholders. Replace with the full-corpus model.
-2. Vivado OOC synth closes timing at 300 MHz but **utilization is degenerate
-   (56 LUT / 0 DSP / 0 URAM)** — the datapath was pruned because `y` is an
-   internal reg with no observable output. **Real numbers need the output
-   exposed** (see §B2).
+2. ~~Vivado OOC synth utilization is degenerate~~ **FIXED.** The GEMV now has an
+   observable read-out port and the synth inits the ROMs from a real export, so
+   it reports real numbers: **300 MHz closes (WNS +0.133 ns), 12.2k LUT / 8.9k FF
+   / 0 DSP / 0 URAM**. The 0 URAM is expected for this correctness-first core
+   (single weight ROM, 16 read ports → distributed logic); landing weights in
+   URAM needs the per-lane banked design (see §B2/§B3).
 
 ---
 
@@ -117,30 +119,29 @@ wall), *not* near the core's MAC ceiling. Compare to the roofline prediction
 (~12k tok/s ceiling at 1.5 MB). This is the honest "before" number everything is
 measured against; capture **board power** alongside it for tok/joule.
 
-### B2. Real synth numbers — fix the output pruning first
-The GEMV is functionally proven; we just need a meaningful utilization/Fmax. The
-OOC synth pruned the datapath because `y` is unobservable. **Smallest fix:**
+### B2. Synth numbers — DONE, and what they tell us
+The output-pruning fix is already in (`rd_addr`/`y_out` read-out port + the synth
+inits ROMs from a real export). Re-run any time:
+```
+vivado -mode batch -source fabric/stage1/tcl/synth.tcl -tclargs 256 256 16
+# reports -> fabric/stage1/synth/{util,timing}_256x256_pe16.rpt
+```
+Current result (256×256, PE=16, `xck26-sfvc784-2LV-c`): **300 MHz closes (WNS
++0.133 ns), 12.2k LUT (10.4%) / 8.9k FF (3.8%) / 0 DSP / 0 URAM / 0 BRAM**.
 
-- In `fabric/stage1/rtl/gemv_int4.sv`, add a read-out port so the result array is
-  observable (forces synthesis to keep the datapath + infer the URAM/DSP):
-  ```systemverilog
-  input  wire [$clog2(M)-1:0] rd_addr,
-  output reg  signed [31:0]   y_out
-  // ... in the always block:
-  y_out <= y[rd_addr];
-  ```
-- Point the synth at a **real weight image** so the ROM infers as URAM rather than
-  being optimised to constants — pass `WFILE` to a `.w.mem` in `tcl/synth.tcl`
-  (`-generic WFILE=...`) or add `(* dont_touch = "true" *)` to `wmem`/`y`.
-- Re-run:
-  ```
-  vivado -mode batch -source fabric/stage1/tcl/synth.tcl -tclargs 256 256 16
-  # reports -> fabric/stage1/synth/{util,timing}_256x256_pe16.rpt
-  ```
-**Gate B2:** util report shows real **DSP / URAM / LUT / FF**, timing closes at
-300 MHz (stretch: push the clock to find Fmax). Feed measured on-chip
-bandwidth (URAM width × Fmax) back into `fabric/roofline.py` to replace the
-assumed 200–1000 GB/s band with a measured number.
+The takeaway that shapes the real build:
+- **0 DSP** — INT4×INT8 mults fit in LUTs; DSPs are free for later use (wider
+  accumulation, or batching in stage 4).
+- **0 URAM** — the single shared weight ROM is read by all 16 lanes at once
+  (16 ports), so it can't map to dual-port URAM and lands in LUTs. Fine for one
+  32 KB layer, **impossible for the full 1.5 MB model**. So the real throughput
+  build (§B3) must **bank the weights per lane** (each lane its own single-port
+  ROM → URAM-resident). That's the change that makes the on-chip story literally
+  fit, and it's the headline of stage 1's throughput follow-up.
+
+**Gate B2:** ✅ already met (real util, 300 MHz). Stretch: push the clock to find
+Fmax; then feed measured on-chip bandwidth (URAM width × Fmax) into
+`fabric/roofline.py` to replace the assumed 200–1000 GB/s band.
 
 > Note: iverilog rejected the unpacked-array output port, which is why `y` was
 > made internal. Keep the iverilog sim using the hierarchical `dut.y[m]` read;
