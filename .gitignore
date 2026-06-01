@@ -29,6 +29,12 @@ fabric/stage1/sim/probe.sv
 fabric/stage1/sim/micro_tb.sv
 fabric/stage1/synth/
 
+# Stage 2 build + sim scratch (regenerable; bitstreams build to C:/kevbuild, not here)
+fabric/stage2/build/
+fabric/stage2/sim/*.vvp
+fabric/stage2/sim/*.mem
+fabric/stage2/sim/config.svh
+
 # Stage 0 build artifacts
 fabric/stage0/a53_gemv_bench
 fabric/stage0/_*.log
