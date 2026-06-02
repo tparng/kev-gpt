@@ -62,7 +62,7 @@ set_property -dict [list \
 
 set g [create_bd_cell -type module -reference gemv_axi_seq seq]
 set_property -dict [list CONFIG.NLAYER {4} CONFIG.LANES {16} CONFIG.KVMAX {32} \
-    CONFIG.PROMPT_LEN {8} CONFIG.NGEN {8} CONFIG.WWORDS {262144} \
+    CONFIG.PROMPT_LEN {8} CONFIG.NGEN {8} CONFIG.WWORDS {204800} \
     CONFIG.C_S_AXI_ADDR_WIDTH {8}] [get_bd_cells seq]
 
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list \
