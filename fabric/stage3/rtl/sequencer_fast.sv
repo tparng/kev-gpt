@@ -284,6 +284,12 @@ module sequencer_fast #(
     reg [11:0] rb_a0, rb_a1, rb_a2;
     reg        rb_v0, rb_v1, rb_v2;
     reg [11:0] rbcap;
+    // streaming-GELU address+valid pipeline (4-cycle gelu_lut latency). Drive gl_x every
+    // cycle and capture gl_y for the element driven 4 cycles earlier — same x->y mapping as
+    // the old drive-then-wait-4 loop (BIT-EXACT), but ~1 cyc/elem instead of ~5+. Mirrors
+    // the GEMV readback shift (rb_*).
+    reg [11:0] ga0, ga1, ga2, ga3;
+    reg        gv0, gv1, gv2, gv3;
     // full-forward block loop + argmax
     reg [3:0]  blk;                 // current transformer block 0..NLAYER-1
     reg [19:0] wblk;                // weight ROM base for current block = blk*GW_BLK
@@ -614,25 +620,36 @@ module sequencer_fast #(
             if (dq_shv>=0) dq_val = dq_prod <<< dq_shv;
             else           dq_val = rsh_round(dq_prod, -dq_shv);
             mlpbuf[gi] <= {{32{dq_val[31]}}, sat16_32(dq_val)};  // Q4.12 sign-extended to 64b
-            if (gi==D_MLP-1) begin gi<=0; st<=S_GELU; end else gi<=gi+1'b1;
+            if (gi==D_MLP-1) begin
+                gi<=0; gv0<=0; gv1<=0; gv2<=0; gv3<=0; st<=S_GELU;  // clean GELU-pipe entry
+            end else gi<=gi+1'b1;
         end
-        // GELU pipeline (elementwise, 3-cycle latency): drive gl_x with mlpbuf[gi]
-        // (Q4.12), capture gl_y 3 cycles later as Q.LN_OUT_FRAC back into mlpbuf.
+        // STREAMING GELU. gelu_lut has a fixed 3-cycle latency; we drive gl_x every cycle
+        // and capture gl_y for the element driven 4 cycles earlier (a 4-deep addr/valid
+        // shift — same 4-cycle drive->capture separation the old drive-then-wait-4 loop
+        // used, so the y written is BIT-IDENTICAL). ~1 cyc/elem instead of ~5+.
         S_GELU: begin
-            lntmp = mlpbuf[gi];          // plain-vector copy before the part-select (iverilog-safe)
-            gl_x <= lntmp[15:0];
-            st   <= S_GELU_W; ki<=0;
-        end
-        S_GELU_W: begin
-            if (ki==3'd3) begin          // 4-cycle wait: 3-stage gelu pipeline + 1 margin
-                // gl_y is Q4.12; shift to Q.LN_OUT_FRAC (<<10) for mlp_proj act-quant
-                mlpbuf[gi] <= $signed({{48{gl_y[15]}}, gl_y}) <<< (LN_OUT_FRAC-GELU_FRAC);
-                if (gi==D_MLP-1) begin
+            // drive the next element until all D_MLP are issued
+            if (gi < D_MLP) begin
+                lntmp = mlpbuf[gi];      // plain-vector copy before the part-select (iverilog-safe)
+                gl_x <= lntmp[15:0];
+                ga0  <= gi[11:0]; gv0 <= 1'b1;
+                gi   <= gi + 1'b1;
+            end else begin
+                gv0 <= 1'b0;
+            end
+            // 4-deep address/valid shift tracking the in-flight gelu_lut reads
+            ga1 <= ga0; ga2 <= ga1; ga3 <= ga2;
+            gv1 <= gv0; gv2 <= gv1; gv3 <= gv2;
+            // capture gl_y (Q4.12 -> Q.LN_OUT_FRAC) for the element driven 4 cycles ago
+            if (gv3) begin
+                mlpbuf[ga3] <= $signed({{48{gl_y[15]}}, gl_y}) <<< (LN_OUT_FRAC-GELU_FRAC);
+                if (ga3 == D_MLP-1) begin    // last element captured -> set up mlp_proj GEMV
                     gi<=0; ci<=0; wcnt<=0; gM<=D; gK<=D_MLP;
                     wbase<=wblk + GW_QKV+GW_PROJ+GW_FC; dqbase<=dqblk + D3+D+D_MLP;
                     actsel<=sablk + 6'd3; act_wide<=1'b1; gret<=S_MP_DEQ; st<=G_LDRST;
-                end else begin gi<=gi+1'b1; st<=S_GELU; end
-            end else ki<=ki+1'b1;
+                end
+            end
         end
         S_MP_DEQ: begin
             mant_v = dq_mant[dqbase + ci]; exp_v = dq_exp[dqbase + ci];
