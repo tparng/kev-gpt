@@ -28,7 +28,15 @@ module gemv_banked #(
     parameter integer LANES = 16,        // PE lanes = nibbles per wide word (pow2)
     parameter integer MMAX  = 1024,      // max output rows
     parameter integer KMAX  = 1024,      // max reduction length
-    parameter integer RLAT  = 2          // read->mac pipeline depth (cycles)
+    parameter integer RLAT  = 2,         // read->mac pipeline depth (cycles)
+    // wmem (working weight buffer) DEPTH in wide words. Decoupled from MMAX*KMAX so the
+    // physical URAM can be sized to the LARGEST single matmul actually streamed in, not
+    // the worst-case MMAX*KMAX product (which over-allocates URAM). Defaults to exactly
+    // the old GROUPS*KMAX value so every existing instantiation stays byte-identical; the
+    // GEMV math/addressing is unchanged — for any valid layer (m<=MMAX,k<=KMAX) the word
+    // address grp_base+kc stays < WWORDS. Pass a smaller WWORDS (>= max ceil(M/LANES)*K
+    // over the layers a caller streams) to shrink the buffer.
+    parameter integer WWORDS = ((MMAX + LANES - 1) / LANES) * KMAX
 ) (
     input  wire                          clk,
     input  wire                          rst,
@@ -51,11 +59,11 @@ module gemv_banked #(
     localparam integer YBITS  = LANES*32;
     localparam integer LSH    = $clog2(LANES);                  // LANES is pow2
     localparam integer GROUPS = (MMAX + LANES - 1) / LANES;
-    localparam integer GWORDS = GROUPS * KMAX;
-    localparam integer WAW    = $clog2(GWORDS);
+    localparam integer GWORDS = GROUPS * KMAX;     // worst-case MMAX*KMAX product (logical)
+    localparam integer WAW    = $clog2(WWORDS);    // word-address width sized to the PHYSICAL buffer
     localparam integer XAW    = $clog2(KMAX);
 
-    (* ram_style = "ultra" *) reg [WBITS-1:0] wmem [0:GWORDS-1];
+    (* ram_style = "ultra" *) reg [WBITS-1:0] wmem [0:WWORDS-1];
     reg signed [7:0]                          xmem [0:KMAX-1];
     reg [YBITS-1:0]                           ymem [0:GROUPS-1];
 

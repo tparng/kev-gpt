@@ -182,8 +182,23 @@ module sequencer #(
     reg signed [63:0] mlpbuf[0:D_MLP-1];    // MLP hidden: Q4.12 (gelu in) then Q.22 (gelu out)
     reg signed [31:0] qvec  [0:D-1];        // q dequantized, stored Q.VFRAC
     // PER-BLOCK persistent K/V caches (Q.VFRAC), indexed [blk*KVMAX*D + tpos*D + d].
-    reg signed [31:0] kcache[0:NLAYER*KVMAX*D-1];
-    reg signed [31:0] vcache[0:NLAYER*KVMAX*D-1];
+    // 1 Mbit each — must map to BRAM, so single WRITE port + REGISTERED single READ port
+    // (combinational array reads aren't BRAM-inferable in Vivado; iverilog tolerated them
+    // but synth couldn't dissolve a 1 Mbit memory into FFs -> [Synth 8-3391]). The reads in
+    // the score (K) and context (V) phases stream one element per cycle through these
+    // registered ports, bit-identical to the old single-cycle dot-products — exactly the
+    // wmem URAM address->data pattern. The radr is itself a register and the data read is a
+    // second register stage, so kcache_q reflects the address issued TWO cycles earlier; the
+    // attention FSM runs the address 2 ahead of the consume (see S_SCORE_*/S_CTX_*).
+    (* ram_style = "block" *) reg signed [31:0] kcache[0:NLAYER*KVMAX*D-1];
+    (* ram_style = "block" *) reg signed [31:0] vcache[0:NLAYER*KVMAX*D-1];
+    localparam integer KVAW = $clog2(NLAYER*KVMAX*D);   // KV cache address width
+    reg signed [31:0] kcache_q, vcache_q;               // registered read data (2-cyc latency)
+    reg [KVAW-1:0]    kcache_radr, vcache_radr;          // read addresses (registers, run 2 ahead)
+    always @(posedge clk) begin
+        kcache_q <= kcache[kcache_radr];
+        vcache_q <= vcache[vcache_radr];
+    end
     reg signed [31:0] ctxv  [0:D-1];        // attention context, Q6.25
     reg [20:0]        probbuf[0:TMAX-1];    // current head probs Q1.20
     reg signed [31:0] gemvy [0:D_MLP-1];    // GEMV INT32 outputs
@@ -197,7 +212,15 @@ module sequencer #(
     wire               gv_done;
     reg [9:0]          gv_rdaddr;
     wire signed [31:0] gv_yout;
-    gemv_banked #(.LANES(LANES), .MMAX(D_MLP), .KMAX(D_MLP), .RLAT(2)) u_gemv (
+    // MMAX/KMAX stay D_MLP (they bound the per-call m_count<=1024, k_count<=1024). But the
+    // inner working buffer only ever holds ONE layer at a time (the sequencer reloads it per
+    // matmul), so WWORDS is sized to the BIGGEST single layer, not MMAX*KMAX. Biggest single
+    // layer = max over {qkv 768x256, proj 256x256, mlp_fc 1024x256, mlp_proj 256x1024,
+    // head 193x256} of ceil(M/LANES)*K = ceil(1024/16)*256 = 16384 words = 4 URAM (vs the old
+    // ceil(1024/16)*1024 = 65536 words = 16 URAM). This stops the 50+16>64 URAM spill.
+    localparam integer GV_WWORDS = 16384;   // ceil(1024/16)*256, the largest single matmul
+    gemv_banked #(.LANES(LANES), .MMAX(D_MLP), .KMAX(D_MLP), .RLAT(2),
+                  .WWORDS(GV_WWORDS)) u_gemv (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k),
         .ld_rst(gv_ldrst), .w_we(gv_wwe), .w_data(gv_wdata),
         .x_we(gv_xwe), .x_data(gv_xdata),
@@ -248,7 +271,12 @@ module sequencer #(
       S_HEAD_DEQ=33, S_ARGMAX=34, S_EMIT=35,
       // GEMV micro-sequence (callable): enter at G_LDRST
       G_LDRST=39, G_LDW=40, G_ACT=41, G_RUN=42, G_WAIT=43, G_RB0=44, G_RB1=45, G_RB2=46,
-      G_LDADDR=47;   // issue weight-URAM read address (registered read -> 1-cycle latency)
+      G_LDADDR=47,   // issue weight-URAM read address (registered read -> 1-cycle latency)
+      // attention K/V streaming reads (registered BRAM port, addr issued 1 cycle ahead):
+      S_SCORE_PRE=48,  // warm-up: issue K addr for element 0 of key ji
+      S_SCORE_ACC=49,  // stream K[ji,*] out of kcache_q, accumulate q.k, emit score
+      S_CTX_PRE  =50,  // warm-up: issue V addr for position 0 of output dim ci
+      S_CTX_ACC  =51;  // stream V[*,ci] out of vcache_q, accumulate prob.v
     reg [6:0] st, gret;          // st = master, gret = return state after GEMV
 
     integer ii;
@@ -274,6 +302,19 @@ module sequencer #(
     reg signed [31:0] best_val;     // argmax running best logit (real, via dequant)
     reg [8:0]  best_idx;
     reg [8:0]  tpos, ji;
+    // attention K/V streaming-read pipeline. The KV read has 2-cycle latency: kcache_radr/
+    //   vcache_radr are REGISTERS, and kcache_q/vcache_q <= kcache[radr] is a second register
+    //   stage, so kcache_q reflects the address issued TWO cycles earlier — exactly like the
+    //   weight URAM's wmem_radr->wmem_q path (G_LDRST warm-up + 2-ahead address). Each *_ACC
+    //   cycle issues the next element's address (index kvi) and consumes the element whose
+    //   address was issued 2 cycles ago (valid flag + paired operand flow down a 2-deep
+    //   pipeline kv_p1->kv_p0). The accumulation order/operands are byte-identical to the old
+    //   in-line for-loops; only the timing changes (registered BRAM reads instead of async).
+    reg [8:0]  kvi;                 // address-issue element index (K: 0..HEAD_DIM-1 ; V: 0..tpos-1)
+    // 2-deep operand/valid pipeline tracking the in-flight reads (newest=*_p1, lands next=*_p0)
+    reg        kv_v1, kv_v0;        // valid: a real read is in flight at this pipeline stage
+    reg        kv_last1, kv_last0;  // this in-flight read is the LAST element of the reduction
+    reg signed [31:0] kv_op1, kv_op0;  // paired operand: q[e] (score) or sign-ext prob[e] (ctx)
     // autoregressive multi-token loop state
     reg [8:0]  tcur;                // current decode position (0-based); pos_emb + KV slot
     reg [7:0]  cur_tok;            // input token id for this forward
@@ -281,9 +322,8 @@ module sequencer #(
 
     // plain-vector temporaries
     reg signed [63:0] lntmp;
-    reg signed [31:0] mant_v, kv_v, qv_v, vv_v;
+    reg signed [31:0] mant_v, vv_v;
     reg signed [7:0]  exp_v;
-    reg [20:0]        prob_v;
 
     // requant (INT8) temporaries
     reg signed [95:0] aq_prod, aq_sh;
@@ -440,40 +480,96 @@ module sequencer #(
         // ---------------- attention per head ----------------
         // pulse softmax start with this head's key count (tpos), then feed scores.
         S_HEAD: begin
-            ji<=0; ci<=0; sm_tcount<=tpos; sm_start<=1; st<=S_SMFEED;
+            ji<=0; ci<=0; sm_tcount<=tpos; sm_start<=1; st<=S_SCORE_PRE;
         end
-        // Feed one score per key while in_ready: score = (q.k_j)/sqrt(hd) -> Q8.8.
-        S_SMFEED: begin
+        // Score for key ji = (q.k_ji)/sqrt(hd) -> Q8.8. The HEAD_DIM K elements stream out
+        // of the registered kcache port one per cycle (address issued 2 cycles ahead of
+        // data — registered addr + registered q); score_acc accumulates q[e]*K[ji,e] as each
+        // K[ji,e] arrives. score_acc and the round/sat are bit-identical to the old dot-product.
+        S_SCORE_PRE: begin
+            // gate on softmax ready (it stays ready through PASS1; advances only on in_valid).
+            // Prime the read pipeline with K element 0 (its data lands 2 cycles later).
             if (sm_inready) begin
-                score_acc = 64'sd0;
-                for (ii=0; ii<HEAD_DIM; ii=ii+1) begin
-                    qv_v = qvec[head_i*HEAD_DIM + ii];
-                    kv_v = kcache[kvblk + ji*D + head_i*HEAD_DIM + ii];   // block-blk key j
-                    score_acc = score_acc + $signed(qv_v) * $signed(kv_v);  // Q.(2*VFRAC)
-                end
+                score_acc   = 64'sd0;
+                kcache_radr <= kvblk[KVAW-1:0] + ji*D + head_i*HEAD_DIM;   // issue K element 0
+                kv_v1       <= 1'b1;
+                kv_op1      <= qvec[head_i*HEAD_DIM];                      // q[0]
+                kv_last1    <= (HEAD_DIM == 1);
+                kv_v0       <= 1'b0;          // nothing landing yet
+                kvi         <= 9'd1;          // next element to issue
+                st          <= S_SCORE_ACC;
+            end
+        end
+        S_SCORE_ACC: begin
+            // CONSUME: data issued 2 cycles ago lands now on kcache_q (== K[ji, op0's element])
+            if (kv_v0) begin
+                score_acc = score_acc + $signed(kv_op0) * $signed(kcache_q);  // Q.(2*VFRAC)
+            end
+            // SHIFT the 2-deep in-flight pipeline (p1 -> p0)
+            kv_v0 <= kv_v1; kv_op0 <= kv_op1; kv_last0 <= kv_last1;
+            // ISSUE the next element's address into p1 (1 per cycle until HEAD_DIM)
+            if (kvi < HEAD_DIM) begin
+                kcache_radr <= kvblk[KVAW-1:0] + ji*D + head_i*HEAD_DIM + kvi;
+                kv_v1       <= 1'b1;
+                kv_op1      <= qvec[head_i*HEAD_DIM + kvi];
+                kv_last1    <= (kvi == HEAD_DIM-1);
+                kvi         <= kvi + 9'd1;
+            end else begin
+                kv_v1 <= 1'b0;
+            end
+            // last element consumed this cycle -> emit score, advance to next key
+            if (kv_v0 && kv_last0) begin
                 // /sqrt(64)=>>3, to Q8.8: round(acc / 2^(2*VFRAC+3-8))
                 score_q88 = rsh_round(score_acc, (2*VFRAC) + ISQRT - SCORE_FRAC);
                 sm_invalid<=1; sm_score<=sat16(score_q88);
                 if (ji==tpos-1) begin ji<=0; ci<=0; st<=S_SMCOLL; end
-                else ji<=ji+1'b1;
+                else begin ji<=ji+1'b1; st<=S_SCORE_PRE; end
             end
         end
         S_SMCOLL: begin
             if (sm_outvalid) begin probbuf[ci]<=sm_prob; ci<=ci+1'b1; end
-            if (sm_done) begin ci<=0; st<=S_CTX; end
+            if (sm_done) begin ci<=0; st<=S_CTX_PRE; end
         end
-        // ctx[d] = sum_j prob[j] * v_j[d]  (Q.(20+VFRAC)) -> Q6.25
-        S_CTX: begin
-            ctx_acc = 96'sd0;
-            for (ii=0; ii<TMAX; ii=ii+1) begin
-                if (ii < tpos) begin
-                    prob_v = probbuf[ii];
-                    vv_v   = vcache[kvblk + ii*D + head_i*HEAD_DIM + ci];   // block-blk value j, Q.VFRAC
-                    ctx_acc = ctx_acc + $signed({75'd0, prob_v}) * $signed({{64{vv_v[31]}}, vv_v});
-                end
+        // ctx[d] = sum_j prob[j] * v_j[d]  (Q.(20+VFRAC)) -> Q6.25. For each output dim ci
+        // the V elements V[ji,head_i*HEAD_DIM+ci] for ji=0..tpos-1 stream out of the
+        // registered vcache port (address 2 cycles ahead); ctx_acc accumulates prob[ji]*V[ji].
+        // ctx_acc and the final round are bit-identical to the old single-cycle sum.
+        S_CTX_PRE: begin
+            // Prime the read pipeline with V at position 0 (data lands 2 cycles later).
+            ctx_acc     = 96'sd0;
+            vcache_radr <= kvblk[KVAW-1:0] + head_i*HEAD_DIM + ci;   // issue V at position 0
+            kv_v1       <= 1'b1;
+            kv_op1      <= $signed({11'd0, probbuf[0]});             // prob[0], zero-ext (unsigned)
+            kv_last1    <= (tpos == 1);
+            kv_v0       <= 1'b0;
+            kvi         <= 9'd1;          // next position to issue
+            st          <= S_CTX_ACC;
+        end
+        S_CTX_ACC: begin
+            // CONSUME: V issued 2 cycles ago lands now on vcache_q (== V[op0's position, ci])
+            if (kv_v0) begin
+                vv_v    = vcache_q;
+                ctx_acc = ctx_acc + $signed({75'd0, kv_op0[20:0]})
+                                    * $signed({{64{vv_v[31]}}, vv_v});
             end
-            ctxv[head_i*HEAD_DIM + ci] <= rsh_round(ctx_acc, PROB_FRAC + VFRAC - RESID_FRAC);
-            if (ci==HEAD_DIM-1) st<=S_CTXST; else ci<=ci+1'b1;
+            // SHIFT the 2-deep in-flight pipeline (p1 -> p0)
+            kv_v0 <= kv_v1; kv_op0 <= kv_op1; kv_last0 <= kv_last1;
+            // ISSUE the next position's address into p1 (1 per cycle until tpos)
+            if (kvi < tpos) begin
+                vcache_radr <= kvblk[KVAW-1:0] + kvi*D + head_i*HEAD_DIM + ci;
+                kv_v1       <= 1'b1;
+                kv_op1      <= $signed({11'd0, probbuf[kvi[7:0]]});
+                kv_last1    <= (kvi == tpos-1);
+                kvi         <= kvi + 9'd1;
+            end else begin
+                kv_v1 <= 1'b0;
+            end
+            // last position consumed this cycle -> store ctx[ci], advance output dim
+            if (kv_v0 && kv_last0) begin
+                ctxv[head_i*HEAD_DIM + ci] <= rsh_round(ctx_acc, PROB_FRAC + VFRAC - RESID_FRAC);
+                if (ci==HEAD_DIM-1) st<=S_CTXST;
+                else begin ci<=ci+1'b1; st<=S_CTX_PRE; end
+            end
         end
         S_CTXST: begin
             if (head_i==NHEAD-1) begin ci<=0; st<=S_PROJ_PRE; end
