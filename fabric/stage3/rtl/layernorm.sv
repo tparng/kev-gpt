@@ -86,9 +86,11 @@ module layernorm (
         S_MSB    = 4'd5,   // priority-encode MSB(A)
         S_SEED   = 4'd6,   // seed LUT read + exponent shift -> Y0
         S_SEED2  = 4'd7,   // apply seed ROM value (registered read) -> Y0
-        S_NEWT   = 4'd8,   // 2 Newton iterations
+        S_NEWT   = 4'd8,   // Newton stage A:  yy  = Yr*Yr
         S_OUT    = 4'd9,   // stream 256 outputs
-        S_DONE   = 4'd10;
+        S_DONE   = 4'd10,
+        S_NEWTB  = 4'd11,  // Newton stage B:  ayy = (A*yy)>>>A_FRAC
+        S_NEWTC  = 4'd12;  // Newton stage C:  Yr <- (Yr*term)>>>(2*Y_FRAC)
     reg [3:0] state;
 
     // combinational MSB index of A (A is positive, <2^31 or so)
@@ -208,18 +210,26 @@ module layernorm (
                     state <= S_NEWT;
                 end
                 // -------------------------------------------------------------
-                S_NEWT: begin
-                    // y <- y*(1.5 - 0.5*a*y*y)
-                    yy   = Yr * Yr;                              // Q(2*Y_FRAC)
-                    ayy  = (A * yy) >>> A_FRAC;                  // Q(2*Y_FRAC)
-                    term = ONE_P5 - (ayy >>> 1);                 // 1.5 - 0.5*a*y*y
-                    ynew = (Yr * term) >>> (2*Y_FRAC);          // back to Q.Y_FRAC
+                // Newton iteration y <- y*(1.5 - 0.5*a*y*y), PIPELINED into 3 single-
+                // multiply stages so the old triple-chained-multiply (the 54-level DSP
+                // cascade that capped Fmax ~50 MHz) becomes one multiply per stage. Yr is
+                // not updated until stage C, so yy/ayy use the same old Yr and A -> the
+                // computed value is BIT-IDENTICAL to the 1-cycle version; only +2 cyc/iter.
+                S_NEWT: begin                                   // stage A
+                    yy <= Yr * Yr;                              // Q(2*Y_FRAC)
+                    state <= S_NEWTB;
+                end
+                S_NEWTB: begin                                  // stage B
+                    ayy <= (A * yy) >>> A_FRAC;                 // Q(2*Y_FRAC)
+                    state <= S_NEWTC;
+                end
+                S_NEWTC: begin                                  // stage C
+                    term = ONE_P5 - (ayy >>> 1);                // 1.5 - 0.5*a*y*y
+                    ynew = (Yr * term) >>> (2*Y_FRAC);         // back to Q.Y_FRAC
                     Yr   <= ynew[63:0];
                     newt <= newt + 1'b1;
-                    if (newt == 2'd1) begin
-                        idx <= 0;
-                        state <= S_OUT;
-                    end
+                    if (newt == 2'd1) begin idx <= 0; state <= S_OUT; end
+                    else state <= S_NEWT;
                 end
                 // -------------------------------------------------------------
                 S_OUT: begin
