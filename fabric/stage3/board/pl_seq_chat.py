@@ -51,9 +51,45 @@ NLAYER = 4
 LANES = 16
 PROMPT_LEN = 8
 NGEN = 8
-FCLK = 40e6                      # timing-closed @ 40 MHz
+FCLK = 40e6                      # timing-closed @ 40 MHz (WNS +0.686 ns)
 IDCODE_EXPECTED = 0x53455152     # "SEQR"
 BASE = 0xA0000000
+
+# PL clock control. A FLAT fpgautil bitstream load does NOT apply the block design's
+# PL0_REF_CTRL FREQMHZ setting (that only happens through the xmutil/device-tree app
+# flow), so pl0_ref stays at the system default (~100 MHz). Running this 40 MHz-closed
+# design at 100 MHz violates setup on the wide arithmetic -> NON-DETERMINISTIC garbage
+# (the cycle counter + AXI/MMIO survive because their paths are short, which is exactly
+# why CYCLES matched sim while the compute was random). So we MUST force fclk0 to 40 MHz
+# and VERIFY it before trusting any output or tok/s number. This is the bit-honest gate:
+# the measurement is only valid if the silicon clock is actually FCLK.
+FCLK_SET = "/sys/devices/platform/fclk0/set_rate"
+FCLK_SUMMARY = "/sys/kernel/debug/clk/clk_summary"
+
+
+def set_and_verify_fclk(target_hz=FCLK, tol_hz=1e5):
+    """Force the PL clock (fclk0 / pl0_ref) to target_hz and read it back. Returns the
+    actual rate in Hz. Raises if it cannot be set within tol_hz (running at the wrong
+    clock makes every speed number a lie and the data path non-deterministic)."""
+    try:
+        with open(FCLK_SET, "w") as f:
+            f.write(str(int(target_hz)))
+    except (PermissionError, FileNotFoundError) as e:
+        print(f"[clk ] WARNING: could not write {FCLK_SET} ({e}); clock NOT forced")
+    actual = None
+    try:
+        with open(FCLK_SET) as f:
+            actual = int(f.read().strip())
+    except Exception:
+        pass
+    if actual is None or abs(actual - target_hz) > tol_hz:
+        raise SystemExit(
+            f"[clk ] FATAL: PL clock is {actual} Hz, expected ~{int(target_hz)} Hz. "
+            f"A 40 MHz-closed design at the wrong clock gives non-deterministic output "
+            f"and a meaningless tok/s. Set it: echo {int(target_hz)} | "
+            f"sudo tee {FCLK_SET}")
+    print(f"[clk ] PL clock forced + verified = {actual/1e6:.3f} MHz (target {target_hz/1e6:.0f})")
+    return actual
 
 # register byte offsets
 R_CTRL, R_STATUS = 0x00, 0x04
@@ -135,6 +171,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     enc, dec, vocab = load_meta(args.meta)
+
+    # ---- force + verify the PL clock BEFORE anything else (see set_and_verify_fclk) --
+    fclk_hz = set_and_verify_fclk(FCLK)
 
     # ---- reference (the gate): integer sequencer greedy stream ----------------------
     p, cfg = seq_ref.build(args.npz)
@@ -232,10 +271,10 @@ def main(argv=None):
 
         if cycles > 0 and tokens_match:
             per_tok = cycles / ng
-            tok_s = ng * FCLK / cycles
+            tok_s = ng * fclk_hz / cycles
             print(f"[meas] per-token cycles = {per_tok:.0f}  (NGEN={ng})")
             print(f"[meas] MEASURED tok/s   = {tok_s:.2f}  "
-                  f"(= {ng}*{FCLK:.0f}/{cycles} @ {FCLK/1e6:.0f} MHz)")
+                  f"(= {ng}*{fclk_hz:.0f}/{cycles} @ {fclk_hz/1e6:.0f} MHz)")
             print(f"PL_SEQ_VERDICT tokens_match=True ngen={ng} cycles={cycles} "
                   f"tok_s={tok_s:.2f} idcode=0x{idcode:08X}")
         elif not tokens_match:

@@ -67,6 +67,43 @@ per-token loop (the sequencer), not a wider matmul behind the same driver.
 
 ---
 
+## Test C — the SEQUENCER bitstream (on silicon, MEASURED ✅)
+The capstone: the **whole single-stream autoregressive transformer in fabric, CPU out of
+the loop**. Host streams the INT4 weight image into URAM once, writes the prompt, pulses
+GO; the fabric does embed → 4 blocks → ln_f → head → argmax for NGEN tokens on-chip.
+Bitstream `~/kevbit/gemv_seq.bit.bin` (7.8 MB), IDCODE `0x53455152` ("SEQR"),
+40 MHz timing-closed (WNS +0.686 ns), 54/64 URAM.
+
+```
+# load the flat bitstream (no dtbo/app overlay needed):
+sudo xmutil unloadapp ; sudo fpgautil -b ~/kevbit/gemv_seq.bit.bin
+# run the gated driver (it FORCES + VERIFIES the PL clock itself — see the gotcha below):
+cd ~/kevpl/plchat
+sudo ~/kevweb/venv/bin/python -m fabric.stage3.board.pl_seq_chat \
+     --npz goformer.npz --meta goformer_meta.json --prompt "once upo"
+```
+**MEASURED:** `tokens_match=True (8/8)`, hw stream `[47,1,53,42,46,38,1,53]` = `"n time t"`,
+CYCLES=7,220,220 → **44.32 tok/s @ 40 MHz**, deterministic across 5/5 runs. This is the
+first VALID on-silicon single-stream number — token-stream bit-exact to `seq_ref`, ~200×
+the 0.22 cold baseline and ~4× the A53-optimised ~11 tok/s wall, with the CPU idle.
+
+### ⚠️ THE CLOCK GOTCHA (cost a whole debug session — do not forget)
+A **flat `fpgautil` bitstream load does NOT apply the block design's `PL0_REF_CTRL
+FREQMHZ` setting** — that only happens through the xmutil/device-tree *app* flow. So
+`pl0_ref` stays at the system default (**~100 MHz**). Running this 40 MHz-closed design
+at 100 MHz violates setup on the wide arithmetic (the 64×64 / 96-bit dequant clouds) →
+the data path emits **non-deterministic garbage**, while the cycle counter + AXI/MMIO
+keep working (short paths). That asymmetry — CYCLES bit-identical to sim but tokens
+random run-to-run — is the fingerprint. Fix, no resynthesis:
+```
+echo 40000000 | sudo tee /sys/devices/platform/fclk0/set_rate   # force pl0_ref to 40 MHz
+grep pl0_ref /sys/kernel/debug/clk/clk_summary                  # verify == 40000000
+```
+`pl_seq_chat.py` / `pl_seq_diag.py` now do this automatically (`set_and_verify_fclk`) and
+ABORT if the clock is wrong — a tok/s number measured at the wrong clock is a lie.
+`pl_seq_diag.py` is the localiser that nailed it: MMIO-stability + load-vs-compute
+(GO ×N with no reload) + reload-determinism probes.
+
 ## What this session will and won't show
 - **Will:** the fabric path goes from 0.22 → ~5–126 tok/s (finally beating the A53),
   measured, bit-identical Kevin output. The resident-banked design validated on silicon.
@@ -76,8 +113,9 @@ per-token loop (the sequencer), not a wider matmul behind the same driver.
 ## tok/s ladder (where each rung comes from)
 | Rung | tok/s | What it needs | Status |
 |---|---|---|---|
-| today | 0.22 | — | MEASURED |
+| today (PE=1 Python) | 0.22 | — | MEASURED |
 | Python + KV cache | ~5 | board pull + run | staged, gated |
-| C + KV cache | ~40–126 | gcc build on board | staged, gated |
-| single-stream dataflow | ~7–13k | sequencer FSM → bitstream → silicon | FSM in progress |
+| C + KV cache | ~10 | gcc build on board | MEASURED (10.35; A53-orchestration-bound) |
+| **single-stream dataflow (sequencer)** | **44.32** | sequencer bitstream @ 40 MHz, CPU out of loop | **MEASURED, bit-exact** |
+| + PE=256 / resident / pipelined | ~2k (target) | the LEAP — wide lanes, no per-GEMV reload, >40 MHz | RTL next |
 | batched serving | ~30–124k | + parallel non-linears + 3–4 GEMV engines | model proven; RTL TBD |
