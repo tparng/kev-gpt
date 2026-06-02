@@ -45,13 +45,18 @@ first MEASURED number. The wall here is the A53 doing ~26k AXI transactions/toke
 
 ---
 
-## Test B — the new wide-GEMV bitstream (if the build completed)
-Output (if the laptop Vivado build finished): `C:/kevbuild/stage3_bit/*.bit.bin`,
-AXI slave @ 0xA000_0000, IDCODE `0x47454D42` ("GEMB").
+## Test B — the new wide-GEMV bitstream (BUILT ✅, timing-closed)
+**Built on the laptop, placed+routed+timing-closed on `xck26-2LV`:**
+`C:/kevbuild/stage3_bit/gemv_banked.bit.bin` (7.8 MB), 60/64 URAM (94%), 100 MHz,
+*all timing constraints met*. AXI slave @ 0xA000_0000, IDCODE `0x47454D42` ("GEMB").
 ```
-# copy the bitstream to the board, then:
-sudo xmutil unloadapp && sudo fpgautil -b gemv_banked.bit.bin
-# point the driver at the GEMB engine and re-run pl_kv_chat / the bench.
+# copy the bitstream to the board (from laptop, once re-authed):
+scp C:/kevbuild/stage3_bit/gemv_banked.bit.bin ubuntu@kria-kev:~/kevpl/
+# load it:
+sudo xmutil unloadapp && sudo fpgautil -b ~/kevpl/gemv_banked.bit.bin
+# confirm IDCODE = 0x47454D42 (GEMB), then point the driver at it (PLBankedResident
+# in fabric/pl_gemv.py preloads transposed weights + per-layer W_BASE) and re-run
+# pl_kv_chat / the bench.
 ```
 **Honest expectation:** via the AXI driver this is **still ~100 tok/s** — the PE=256
 matmul is *hidden behind the AXI transaction overhead*. Its value is (a) silicon-
