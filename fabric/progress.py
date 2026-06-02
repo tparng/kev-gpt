@@ -16,6 +16,10 @@ from __future__ import annotations
 import argparse
 
 # (label, tok/s, tag, removed-by-this-step) — ordered; multiplier is vs the prior rung.
+# Tiers: MEASURED (real silicon, token-stream bit-exact), SIM (RTL bit-exact in iverilog
+# vs seq_ref, bitstream pending), PROJECTED (modelled — the scoped path beyond).
+# Rungs 1-4 are the CPU-IN-LOOP path (PE=1): it asymptotes to the A53 (~11). Rung 5 is the
+# architectural jump — the sequencer takes the CPU OUT of the loop. 6-7 widen the sequencer.
 LADDER = [
     ("PL: re-stream weights / forward\n(Python AXI, O(T^2))", 0.07, "MEASURED",
      "first on-fabric generation"),
@@ -25,8 +29,14 @@ LADDER = [
      "the O(T^2) full-context recompute"),
     ("+ C MMIO driver\n(compiled AXI inner loop)", 10.35, "MEASURED",
      "Python per-poke overhead -> matmul off the critical path"),
-    ("HW sequencer\n(CPU out of the loop)", 10000.0, "PROJECTED",
-     "the A53 doing the non-matmul forward (the wall above)"),
+    ("HW sequencer @40MHz\n(CPU out of the loop)", 44.32, "MEASURED",
+     "the A53 doing the non-matmul forward (the ~11 wall)"),
+    ("+ resident-read GEMV\n(no per-matmul reload)", 75.8, "SIM",
+     "re-streaming each matmul's weights (~42% of cycles)"),
+    ("+ PE=256 wide lanes\n(256 MACs/cycle)", 231.0, "SIM",
+     "the GEMV run phase (16x fewer group passes)"),
+    ("+ pipelined LN / wide datapath\n(>40MHz, parallel serial loops)", 2000.0, "PROJECTED",
+     "the LayerNorm DSP cascade (Fmax ~50->200MHz) + serial per-element loops"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]
@@ -48,7 +58,9 @@ def print_table():
     print(f"\nreference: A53 char chat = {A53_CHAT:.0f} tok/s, A53 INT4 GEMV bench = "
           f"{A53_BENCH:.0f} tok/s (both MEASURED).")
     print("note: the C-driver rung (10.35) ~= the A53 chat (11) — CPU-in-loop asymptotes "
-          "to the A53; the sequencer is the leap that beats it.")
+          "to the A53; the HW sequencer (44.32, MEASURED, CPU OUT of the loop) is the leap "
+          "that beats it. Resident-read + PE=256 (75.8 / 231) are RTL bit-exact in sim; the "
+          "PE=256 bitstream is building. >40 MHz + wide serial datapath is the path to ~2k.")
 
 
 def plot(path):
@@ -61,13 +73,16 @@ def plot(path):
     vals = [v for _, v, _, _ in LADDER]
     tags = [t for _, _, t, _ in LADDER]
     x = np.arange(len(LADDER))
-    meas = "#27ae60"
-    proj = "#b0b7bd"
-    colors = [meas if t == "MEASURED" else proj for t in tags]
+    meas = "#27ae60"        # MEASURED on silicon
+    sim = "#5dade2"         # SIM: RTL bit-exact vs seq_ref, bitstream pending
+    proj = "#b0b7bd"        # PROJECTED: modelled
+    cmap = {"MEASURED": meas, "SIM": sim, "PROJECTED": proj}
+    hmap = {"MEASURED": "", "SIM": "..", "PROJECTED": "//"}
+    colors = [cmap[t] for t in tags]
 
-    fig, ax = plt.subplots(figsize=(11, 6.2))
+    fig, ax = plt.subplots(figsize=(12.5, 6.4))
     bars = ax.bar(x, vals, color=colors, edgecolor="#2c3e50", width=0.62,
-                  hatch=["" if t == "MEASURED" else "//" for t in tags])
+                  hatch=[hmap[t] for t in tags])
     ax.set_yscale("log")
     ax.set_ylim(0.04, 300000)
 
@@ -96,6 +111,8 @@ def plot(path):
 
     from matplotlib.patches import Patch
     ax.legend(handles=[Patch(facecolor=meas, edgecolor="#2c3e50", label="MEASURED on silicon"),
+                       Patch(facecolor=sim, edgecolor="#2c3e50", hatch="..",
+                             label="SIM (RTL bit-exact vs seq_ref; bitstream pending)"),
                        Patch(facecolor=proj, edgecolor="#2c3e50", hatch="//", label="PROJECTED")],
               loc="upper left", fontsize=9)
     fig.tight_layout()
