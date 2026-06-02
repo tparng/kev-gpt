@@ -58,7 +58,11 @@ apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e \
 set_property -dict [list \
     CONFIG.PSU__USE__M_AXI_GP0 {1} CONFIG.PSU__USE__M_AXI_GP1 {0} \
     CONFIG.PSU__USE__M_AXI_GP2 {0} CONFIG.PSU__FPGA_PL0_ENABLE {1} \
-    CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {100}] [get_bd_cells ps]
+    CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {40}] [get_bd_cells ps]
+# NOTE: the integrated sequencer (FSM + 4 non-linear blocks + GEMV + KV) has a long
+# combinational critical path -> Fmax ~46 MHz (100 MHz gave WNS -11.685 ns). 40 MHz closes
+# with margin (~160 tok/s at PE=16, still ~14x the A53). Raising it needs the critical
+# path pipelined (a later optimization); 40 MHz gets a VALID bitstream + a real number now.
 
 set g [create_bd_cell -type module -reference gemv_axi_seq seq]
 set_property -dict [list CONFIG.NLAYER {4} CONFIG.LANES {16} CONFIG.KVMAX {32} \
