@@ -104,6 +104,24 @@ ABORT if the clock is wrong — a tok/s number measured at the wrong clock is a 
 `pl_seq_diag.py` is the localiser that nailed it: MMIO-stability + load-vs-compute
 (GO ×N with no reload) + reload-determinism probes.
 
+## Test D — the LEAP bitstream: resident-read + PE=256 (on silicon, MEASURED ✅)
+`sequencer_fast` (whole INT4 image resident in the GEMV core's URAM, no per-matmul reload)
+widened to 256 MACs/cycle. Bitstream `~/kevbit/gemv_seqfast.bit.bin`, IDCODE `SQRF`
+(0x53515246), 40 MHz, **URAM 60/64, LUT 87.4%, WNS +0.010 ns** (closed razor-thin — the
+one thing to watch; if a future rebuild congests worse, drop the forced clock a few MHz).
+```
+sudo xmutil unloadapp ; sudo fpgautil -b ~/kevbit/gemv_seqfast.bit.bin
+cd ~/kevpl/plchat
+sudo ~/kevweb/venv/bin/python -m fabric.stage3.board.pl_seq_chat --lanes 256 \
+     --npz goformer.npz --meta goformer_meta.json --prompt "once upo"
+```
+The driver auto-detects via `--lanes 256`: streams SUBW=32 32-bit W_DATA chunks per
+1024-bit word, accepts the SQRF IDCODE, forces fclk0=40 MHz. **MEASURED:** stream
+`[47,1,53,42,46,38,1,53]` = `"n time t"`, CYCLES=1,385,205 → **231.01 tok/s @ 40 MHz**,
+`tokens_match=True`, **deterministic 5/5 runs** (the +10 ps margin held). 5.2× the 44.32
+baseline, ~21× the A53 ~11 wall, CPU fully out of the loop. The weight load is ~400k MMIO
+pokes (~3 s); a C/DMA loader would shrink that but it is one-time, not per-token.
+
 ## What this session will and won't show
 - **Will:** the fabric path goes from 0.22 → ~5–126 tok/s (finally beating the A53),
   measured, bit-identical Kevin output. The resident-banked design validated on silicon.
@@ -118,6 +136,6 @@ ABORT if the clock is wrong — a tok/s number measured at the wrong clock is a 
 | C + KV cache | ~10 | gcc build on board | MEASURED (10.35; A53-orchestration-bound) |
 | **single-stream dataflow (sequencer)** | **44.32** | sequencer bitstream @ 40 MHz, CPU out of loop | **MEASURED, bit-exact** |
 | + resident-read (sequencer_fast, PE=16) | ~76 | drop per-matmul weight reload | SIM bit-exact (527,616 cyc/tok) |
-| + PE=256 (sequencer_fast, LANES=256) | ~231 | 16-wide lanes on top of resident | SIM bit-exact (173,151 cyc/tok); OOC fit/Fmax pending |
-| + pipelined arith (>40 MHz) | ~2k (target) | pipeline 96-bit dequant / 64×64 act-quant; parallel serial datapath | RTL next |
+| **+ PE=256 (sequencer_fast, LANES=256)** | **231.01** | 16-wide lanes on top of resident | **MEASURED, bit-exact, 5/5 deterministic** (1,385,205 cyc; SQRF) |
+| + pipelined arith (>40 MHz) | ~2k (target) | pipeline the LayerNorm DSP cascade (Fmax ~50→200 MHz) + parallel serial datapath | RTL next |
 | batched serving | ~30–124k | + parallel non-linears + 3–4 GEMV engines | model proven; RTL TBD |

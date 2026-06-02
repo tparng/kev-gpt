@@ -33,7 +33,7 @@ LADDER = [
      "the A53 doing the non-matmul forward (the ~11 wall)"),
     ("+ resident-read GEMV\n(no per-matmul reload)", 75.8, "SIM",
      "re-streaming each matmul's weights (~42% of cycles)"),
-    ("+ PE=256 wide lanes\n(256 MACs/cycle)", 231.0, "SIM",
+    ("+ PE=256 wide lanes\n(256 MACs/cycle)", 231.0, "MEASURED",
      "the GEMV run phase (16x fewer group passes)"),
     ("+ pipelined LN / wide datapath\n(>40MHz, parallel serial loops)", 2000.0, "PROJECTED",
      "the LayerNorm DSP cascade (Fmax ~50->200MHz) + serial per-element loops"),
@@ -58,9 +58,10 @@ def print_table():
     print(f"\nreference: A53 char chat = {A53_CHAT:.0f} tok/s, A53 INT4 GEMV bench = "
           f"{A53_BENCH:.0f} tok/s (both MEASURED).")
     print("note: the C-driver rung (10.35) ~= the A53 chat (11) — CPU-in-loop asymptotes "
-          "to the A53; the HW sequencer (44.32, MEASURED, CPU OUT of the loop) is the leap "
-          "that beats it. Resident-read + PE=256 (75.8 / 231) are RTL bit-exact in sim; the "
-          "PE=256 bitstream is building. >40 MHz + wide serial datapath is the path to ~2k.")
+          "to the A53; the HW sequencer (CPU OUT of the loop) is the leap that beats it. "
+          "MEASURED on silicon, token-stream bit-exact, deterministic: 44.32 (baseline PE16) "
+          "-> 231.01 (resident-read + PE=256, 5/5 runs). >40 MHz (pipeline the LayerNorm DSP "
+          "cascade) + wide serial datapath is the scoped path to ~2k.")
 
 
 def plot(path):
