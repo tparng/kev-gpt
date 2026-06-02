@@ -35,6 +35,13 @@
 `ifndef PWLOAD
  `define PWLOAD 1
 `endif
+// DUT selection: SEQ_FAST -> sequencer_fast (resident-read GEMV); else baseline sequencer.
+// Both present the SAME port list, so only the module name changes.
+`ifdef SEQ_FAST
+ `define DUTMOD sequencer_fast
+`else
+ `define DUTMOD sequencer
+`endif
 
 module tb;
     localparam integer D     = 256;
@@ -76,7 +83,7 @@ module tb;
     reg               pl_we;
     reg  [8:0]        pl_addr, pl_data;
 
-    sequencer #(.LANES(LANES), .NLAYER(NLAYER),
+    `DUTMOD #(.LANES(LANES), .NLAYER(NLAYER),
                 .PROMPT_LEN(`PPROMPT), .NGEN(`PNGEN), .KVMAX(`PKVMAX),
                 .WWORDS(WWORDS)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_id(tok_id), .pos(pos),
@@ -87,6 +94,13 @@ module tb;
     );
 
     integer i, f, ng, s;
+    // free-running cycle counter over the whole decode (go..done) for A/B cycle compare
+    reg [31:0] cyc_run = 0; reg counting = 1'b0;
+    always @(posedge clk) begin
+        if (go) counting <= 1'b1;
+        if (counting && !rst) cyc_run <= cyc_run + 1;
+        if (done) counting <= 1'b0;
+    end
     // tb-local image of the transposed weights (loaded from wrom.mem, NOT into the DUT)
     reg [WBITS-1:0] wimg [0:WROM_N-1];
     // the resident prompt ids (from prompt.mem) to push over the pl_* port
@@ -155,7 +169,8 @@ module tb;
         end
         $fclose(f);
 
-        $display("TB_DONE tok=%0d pos=%0d tok_out=%0d ngen=%0d", `TOKID, `POS, tok_out, ng);
+        $display("TB_DONE tok=%0d pos=%0d tok_out=%0d ngen=%0d cycles=%0d",
+                 `TOKID, `POS, tok_out, ng, cyc_run);
         $finish;
     end
 

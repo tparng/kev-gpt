@@ -109,18 +109,24 @@ def write_mems(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlayer: int,
     _w(os.path.join(sim_dir, "gelu_lut.mem"), gelu_table(), 4)
 
 
-def _compile_run(sim_dir, tok, pos, lanes, nlayer, prompt_len=1, ngen=1, kvmax=32):
+def _compile_run(sim_dir, tok, pos, lanes, nlayer, prompt_len=1, ngen=1, kvmax=32,
+                 fast=False):
+    # fast=True gates sequencer_fast (resident-read GEMV: weights preloaded once into the
+    # core's URAM, no per-matmul reload). Both DUTs share the tb (DUTMOD macro) and the
+    # same wl_* weight stream + token-stream contract, so the gate is apples-to-apples.
     srcs = [TB,
-            os.path.join(RTL, "sequencer.sv"),
-            os.path.join(RTL, "gemv_banked.sv"),
+            os.path.join(RTL, "sequencer_fast.sv" if fast else "sequencer.sv"),
+            os.path.join(RTL, "gemv_banked_resident.sv" if fast else "gemv_banked.sv"),
             os.path.join(RTL, "layernorm.sv"),
             os.path.join(RTL, "softmax.sv"),
             os.path.join(RTL, "gelu_lut.sv")]
+    defs = [f"-DTOKID={tok}", f"-DPOS={pos}", f"-DLANES={lanes}",
+            f"-DPNLAYER={nlayer}", f"-DPPROMPT={prompt_len}",
+            f"-DPNGEN={ngen}", f"-DPKVMAX={kvmax}"]
+    if fast:
+        defs.append("-DSEQ_FAST")
     vvp = os.path.join(sim_dir, "sim.vvp")
-    cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
-                         f"-DTOKID={tok}", f"-DPOS={pos}", f"-DLANES={lanes}",
-                         f"-DPNLAYER={nlayer}", f"-DPPROMPT={prompt_len}",
-                         f"-DPNGEN={ngen}", f"-DPKVMAX={kvmax}", *srcs],
+    cp = subprocess.run(["iverilog", "-g2012", "-o", vvp, *defs, *srcs],
                         capture_output=True, text=True)
     if cp.returncode != 0:
         print("IVERILOG_COMPILE_FAIL")
@@ -206,7 +212,7 @@ def run(sim_dir, tok, pos, lanes, nlayer, npz="fabric/export/goformer.npz"):
 
 
 def run_multitoken(sim_dir, lanes, nlayer, prompt_len, ngen, seed=0,
-                   npz="fabric/export/goformer.npz"):
+                   npz="fabric/export/goformer.npz", fast=False):
     """MULTI-TOKEN gate: the FSM autoregressively decodes `ngen` tokens from a resident
     `prompt_len`-token prompt, with PER-BLOCK persistent KV caches. The RTL's emitted
     greedy stream must be IDENTICAL to seq_ref.IntSequencer.generate_greedy. The binding
@@ -229,9 +235,15 @@ def run_multitoken(sim_dir, lanes, nlayer, prompt_len, ngen, seed=0,
     ref_gen = [int(t) for t in ref_full[prompt_len:]]
 
     write_mems(sim_dir, intseq, lanes, nlayer, prompt=prompt)
-    if not _compile_run(sim_dir, prompt[0], 0, lanes, nlayer,
-                        prompt_len=prompt_len, ngen=ngen, kvmax=kvmax):
+    out = _compile_run(sim_dir, prompt[0], 0, lanes, nlayer,
+                       prompt_len=prompt_len, ngen=ngen, kvmax=kvmax, fast=fast)
+    if not out:
         return False
+    # pull the tb cycle count (TB_DONE ... cycles=N) for the A/B speed compare
+    cyc = None
+    for line in out.splitlines():
+        if "TB_DONE" in line and "cycles=" in line:
+            cyc = int(line.split("cycles=")[1].split()[0])
 
     with open(os.path.join(sim_dir, "tokstream.out")) as f:
         got = [int(l.strip()) for l in f if l.strip()]
@@ -243,9 +255,10 @@ def run_multitoken(sim_dir, lanes, nlayer, prompt_len, ngen, seed=0,
     print(f"prompt={prompt}")
     print(f"ref_gen ={ref_gen}")
     print(f"rtl_gen ={got}")
-    print(f"SEQ_VERDICT multitoken tokens_identical={identical} stream={n_match}/{ngen} "
-          f"NLAYER={nlayer} LANES={lanes} PROMPT_LEN={prompt_len} NGEN={ngen} KVMAX={kvmax} "
-          f"pass={ok}")
+    cyc_s = f" cycles={cyc} ({cyc/ngen:.0f}/tok)" if cyc else ""
+    print(f"SEQ_VERDICT{' FAST' if fast else ''} multitoken tokens_identical={identical} "
+          f"stream={n_match}/{ngen} NLAYER={nlayer} LANES={lanes} PROMPT_LEN={prompt_len} "
+          f"NGEN={ngen} KVMAX={kvmax} pass={ok}{cyc_s}")
     return ok
 
 
@@ -296,6 +309,8 @@ def main(argv=None):
     ap.add_argument("--nlayer", type=int, default=None, choices=[1, 4])
     ap.add_argument("--multitoken", action="store_true",
                     help="run the autoregressive multi-token stream gate")
+    ap.add_argument("--fast", action="store_true",
+                    help="gate sequencer_fast (resident-read GEMV) instead of sequencer")
     ap.add_argument("--axi", action="store_true",
                     help="run the AXI-wrapped capstone gate (gemv_axi_seq over AXI4-Lite)")
     ap.add_argument("--prompt-len", type=int, default=4)
@@ -316,7 +331,8 @@ def main(argv=None):
     elif a.multitoken:
         if nlayer != 4:
             raise SystemExit("multi-token gate requires --nlayer 4 (the real model)")
-        ok = run_multitoken(a.dir, a.lanes, nlayer, a.prompt_len, a.ngen, a.seed)
+        ok = run_multitoken(a.dir, a.lanes, nlayer, a.prompt_len, a.ngen, a.seed,
+                            fast=a.fast)
     else:
         ok = run(a.dir, a.tok, a.pos, a.lanes, nlayer)
     raise SystemExit(0 if ok else 1)
