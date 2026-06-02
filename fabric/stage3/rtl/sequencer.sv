@@ -36,11 +36,26 @@
 //   softmax      scores Q8.8, probs Q1.20  gelu Q4.12 in/out
 //
 // One shared gemv_banked instance runs all four GEMVs (weights streamed from a resident
-// weight ROM each use) — correctness-first; a per-GEMV resident array is the throughput
-// follow-up. All tables/weights are host-preloaded via $readmemh ROMs (the testbench
-// writes the .mem files). Once `go` pulses, the FSM runs the block with zero host I/O.
+// weight memory each use) — correctness-first; a per-GEMV resident array is the throughput
+// follow-up. Once `go` pulses, the FSM runs the block with zero host I/O.
 //
-// iverilog -g2012 safe: single-write memories, registered ROM reads, copy unpacked
+// SYNTHESIZABLE WEIGHT MEMORY (the synth-blocker fix). The 1.5 MB INT4 weight image
+// lives in `wmem` — a RUNTIME-LOADABLE URAM (`ram_style="ultra"`), NOT a $readmemh ROM.
+// UltraScale+ URAM CANNOT be bitstream-initialized, and a multi-port combinational
+// $readmemh ROM gets PRUNED to zero by synth (sim-correct, synth-wrong — the first-
+// silicon all-zero bug). So the host streams the image in at boot through a load port
+// (wl_rst/wl_we/wl_data: 32-bit chunks assembled into LANES*4-bit wide words, low chunk
+// first — the proven gemv_banked_resident assembler), exactly mirroring how the inner
+// gemv_banked.wmem is loaded. The FSM's G_LDW read of wmem[wbase+wcnt] is a single-port
+// REGISTERED read (URAM-safe), byte-identical to the old wrom[] read.
+//
+// The SMALL tables stay $readmemh-initialized — but only as SINGLE-PORT REGISTERED reads
+// (BRAM/LUTRAM ROMs, init preserved by synth): tok_emb/pos_emb (Q6.25), gamma (Q4.20),
+// dq_mant/dq_exp (24-bit per-channel), inv_sact, prompt_rom. The prompt also has a write
+// port so the AXI host can overwrite the resident prompt at runtime (init from .mem in
+// sim; host-written on the board).
+//
+// iverilog -g2012 safe: single-write memories, registered ROM/URAM reads, copy unpacked
 // element to a plain vector before any variable index op, procedural always-FSM.
 // All glue arithmetic (requant, dequant, score, ctx) mirrors seq_ref exactly.
 // -----------------------------------------------------------------------------
@@ -65,7 +80,9 @@ module sequencer #(
     parameter integer SCORE_FRAC  = 8,
     parameter integer PROB_FRAC   = 20,
     parameter integer VFRAC       = 16,   // K/V stored Q.16
-    parameter integer ISH         = 40    // inv_sact fixed-point shift
+    parameter integer ISH         = 40,   // inv_sact fixed-point shift
+    parameter integer WWORDS      = 262144// resident weight URAM capacity (wide words);
+                                          // 4-layer model uses 199936 (WROM_N), 2^18 covers it
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -80,7 +97,17 @@ module sequencer #(
     // multi-token stream readout: tok_stream[0..ngen_out-1] is the greedy stream
     input  wire [8:0]  ts_addr,
     output reg  [8:0]  ts_out,
-    output reg  [8:0]  ngen_out          // number of generated tokens written to tok_stream
+    output reg  [8:0]  ngen_out,         // number of generated tokens written to tok_stream
+    // ---- runtime weight load port (URAM, NOT $readmemh) --------------------------
+    // Stream the whole transposed INT4 image in ONCE at boot: pulse wl_rst, then assert
+    // wl_we with successive 32-bit chunks (low chunk of each LANES*4-bit word first).
+    input  wire        wl_rst,
+    input  wire        wl_we,
+    input  wire [31:0] wl_data,
+    // ---- runtime prompt write port (host overrides the resident prompt) ----------
+    input  wire        pl_we,
+    input  wire [8:0]  pl_addr,
+    input  wire [8:0]  pl_data
 );
     localparam integer WBITS   = LANES*4;
     localparam integer GW_QKV  = ((D3   + LANES-1)/LANES) * D;
@@ -89,31 +116,64 @@ module sequencer #(
     localparam integer GW_MP   = ((D    + LANES-1)/LANES) * D_MLP;
     localparam integer GW_BLK  = GW_QKV + GW_PROJ + GW_FC + GW_MP;   // words / block
     localparam integer GW_HEAD = ((VOCAB + LANES-1)/LANES) * D;
-    localparam integer WROM_N  = GW_BLK * NLAYER + GW_HEAD;
+    localparam integer WROM_N  = GW_BLK * NLAYER + GW_HEAD;          // weight words actually used
+    localparam integer SUBW    = (WBITS > 32) ? (WBITS/32) : 1;      // 32-bit chunks / wide word
+    localparam integer SSW     = (SUBW > 1) ? $clog2(SUBW) : 1;
+    localparam integer WAW     = $clog2(WWORDS);                     // weight URAM addr width
+    localparam integer PAW     = (PROMPT_LEN > 1) ? $clog2(PROMPT_LEN) : 1; // prompt addr width
     localparam integer DQ_BLK  = D3 + D + D_MLP + D;                 // dequant / block
     localparam integer DQ_N    = DQ_BLK * NLAYER + VOCAB;            // + head channels
     localparam integer GAMMA_N = 2*NLAYER + 1;                       // ln1|ln2 /blk + ln_f
     localparam integer NSACT   = 4*NLAYER + 1;                       // 4 GEMV/blk + head
 
-    // ------------------------------------------------------------------- ROMs --
+    // ---- SMALL TABLES: synth-safe BRAM ROMs ($readmemh init, registered single read) --
     (* rom_style = "block" *) reg signed [31:0] tok_emb   [0:VOCAB*D-1];
     (* rom_style = "block" *) reg signed [31:0] pos_emb   [0:TMAX*D-1];
     (* rom_style = "block" *) reg signed [31:0] gamma_rom [0:GAMMA_N*D-1]; // (ln1|ln2)*L | ln_f
-    (* rom_style = "block" *) reg [WBITS-1:0]   wrom      [0:WROM_N-1];
     (* rom_style = "block" *) reg signed [31:0] dq_mant   [0:DQ_N-1];
     (* rom_style = "block" *) reg signed [7:0]  dq_exp    [0:DQ_N-1];
     (* rom_style = "block" *) reg signed [63:0] inv_sact  [0:NSACT-1];
-    (* rom_style = "block" *) reg [8:0]          prompt_rom[0:PROMPT_LEN-1];   // resident prompt
+    // prompt: init from .mem (sim) AND host-writable over pl_* (board) -> BRAM, not pruned
+    (* ram_style = "block" *) reg [8:0]          prompt_rom[0:PROMPT_LEN-1];   // resident prompt
     initial begin
         $readmemh("tok_emb.mem", tok_emb);
         $readmemh("pos_emb.mem", pos_emb);
         $readmemh("gamma.mem",   gamma_rom);
-        $readmemh("wrom.mem",    wrom);
         $readmemh("dq_mant.mem", dq_mant);
         $readmemh("dq_exp.mem",  dq_exp);
         $readmemh("inv_sact.mem",inv_sact);
         $readmemh("prompt.mem",  prompt_rom);
     end
+
+    // ---- WEIGHT IMAGE: RUNTIME-LOADABLE URAM (no $readmemh — URAM can't be init'd) -----
+    // The host streams the whole transposed INT4 image in once via wl_*; SUBW 32-bit
+    // chunks assemble into one LANES*4-bit wide word (low chunk first), exactly like
+    // gemv_banked_resident. The FSM later reads wmem[wbase+wcnt] single-port + registered.
+    (* ram_style = "ultra" *) reg [WBITS-1:0] wmem [0:WWORDS-1];
+    reg [WAW-1:0]   wlword;        // current wide-word index being assembled
+    reg [SSW-1:0]   wlsub;         // which 32-bit chunk within the wide word
+    reg [WBITS-1:0] wlbuf;         // partial wide word
+    // insert the incoming 32-bit chunk at position wlsub (low chunk first)
+    wire [WBITS-1:0] wlnext = wlbuf | ({{(WBITS-32){1'b0}}, wl_data} << (wlsub*32));
+    always @(posedge clk) begin
+        if (wl_rst) begin
+            wlword <= 0; wlsub <= 0; wlbuf <= {WBITS{1'b0}};
+        end else if (wl_we) begin
+            wmem[wlword] <= wlnext;                 // commit partial word every chunk
+            if (wlsub == SUBW-1) begin
+                wlword <= wlword + 1'b1; wlsub <= 0; wlbuf <= {WBITS{1'b0}};
+            end else begin
+                wlbuf <= wlnext; wlsub <= wlsub + 1'b1;
+            end
+        end
+    end
+    // host prompt override (registered write; init-from-.mem preserved for sim gates)
+    always @(posedge clk) if (pl_we) prompt_rom[pl_addr[PAW-1:0]] <= pl_data;
+
+    // registered single-port read of the weight URAM (URAM-safe; replaces wrom[] read)
+    reg [WBITS-1:0] wmem_q;
+    reg [WAW-1:0]   wmem_radr;
+    always @(posedge clk) wmem_q <= wmem[wmem_radr];
 
     // --------------------------------------------------------------- scratch ---
     reg signed [31:0] xres  [0:D-1];        // residual Q6.25
@@ -187,7 +247,8 @@ module sequencer #(
       S_LNF_SNAP=30, S_LNF_FEED=31, S_LNF_COLL=32,
       S_HEAD_DEQ=33, S_ARGMAX=34, S_EMIT=35,
       // GEMV micro-sequence (callable): enter at G_LDRST
-      G_LDRST=39, G_LDW=40, G_ACT=41, G_RUN=42, G_WAIT=43, G_RB0=44, G_RB1=45, G_RB2=46;
+      G_LDRST=39, G_LDW=40, G_ACT=41, G_RUN=42, G_WAIT=43, G_RB0=44, G_RB1=45, G_RB2=46,
+      G_LDADDR=47;   // issue weight-URAM read address (registered read -> 1-cycle latency)
     reg [6:0] st, gret;          // st = master, gret = return state after GEMV
 
     integer ii;
@@ -314,9 +375,17 @@ module sequencer #(
         //     from a real-Q source: handled by S_PROJ_PRE / S_MP_PRE / S_GELU
         //     which write lnout[] with the to-be-quantized value in Q.22-equivalent.
         // =========================================================
-        G_LDRST: begin gv_ldrst<=1; wcnt<=0; st<=G_LDW; end
+        // Weight load from the runtime-loaded URAM. The read is REGISTERED (wmem_q ==
+        // wmem[wmem_radr] one cycle later), so the address runs TWO ahead of the consume:
+        //   G_LDRST  issues read of word 0   (wmem_radr<=wbase)        -> wmem_q=word0 @ G_LDW
+        //   G_LDADDR issues read of word 1   (wmem_radr<=wbase+1)      (1-cycle warm-up bubble)
+        //   G_LDW    consumes wmem_q (== wmem[wbase+wcnt]) -> gv_wdata, pre-issues word wcnt+2.
+        // The stream into gemv_banked is byte-identical to the old wrom[wbase+wcnt] read.
+        G_LDRST:  begin gv_ldrst<=1; wcnt<=0; wmem_radr<=wbase[WAW-1:0]; st<=G_LDADDR; end
+        G_LDADDR: begin wmem_radr<=wbase[WAW-1:0] + 1'b1; st<=G_LDW; end
         G_LDW: begin
-            gv_wwe<=1; gv_wdata<=wrom[wbase + wcnt];
+            gv_wwe<=1; gv_wdata<=wmem_q;                        // wmem_q == wmem[wbase+wcnt]
+            wmem_radr <= wbase[WAW-1:0] + wcnt + 16'd2;         // pre-issue word wcnt+2
             if (wcnt==gM_words(gM,gK)-1) begin wcnt<=0; ci<=0; st<=G_ACT; end
             else wcnt<=wcnt+1'b1;
         end

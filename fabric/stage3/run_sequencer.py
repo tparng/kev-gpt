@@ -46,6 +46,7 @@ from fabric.stage3.seq_ref import RESID_FRAC, VFRAC
 HERE = os.path.dirname(os.path.abspath(__file__))
 RTL = os.path.join(HERE, "rtl")
 TB = os.path.join(HERE, "tb", "tb_sequencer.sv")
+TB_AXI = os.path.join(HERE, "tb", "tb_seq_axi.sv")
 D, D3, D_MLP, VOCAB = 256, 768, 1024, 193
 
 
@@ -126,6 +127,35 @@ def _compile_run(sim_dir, tok, pos, lanes, nlayer, prompt_len=1, ngen=1, kvmax=3
         print(cp.stdout); print(cp.stderr)
         return None
     rp = subprocess.run(["vvp", "sim.vvp"], cwd=sim_dir, capture_output=True, text=True)
+    sys.stdout.write(rp.stdout[-1500:])
+    if "TB_DONE" not in rp.stdout:
+        print("VVP_RUN_FAIL"); print(rp.stderr[-2000:])
+        return None
+    return rp.stdout
+
+
+def _compile_run_axi(sim_dir, lanes, nlayer, prompt_len, ngen, kvmax):
+    """Compile + run the AXI-LEVEL tb (tb_seq_axi.sv) driving gemv_axi_seq over AXI4-Lite:
+    weights streamed in via W_DATA (the URAM LOAD PORT, not $readmemh), prompt over PL_*,
+    GO, poll DONE, drain TS_*. Returns vvp stdout (tokstream.out is dumped in sim_dir)."""
+    srcs = [TB_AXI,
+            os.path.join(RTL, "gemv_axi_seq.v"),
+            os.path.join(RTL, "sequencer.sv"),
+            os.path.join(RTL, "gemv_banked.sv"),
+            os.path.join(RTL, "layernorm.sv"),
+            os.path.join(RTL, "softmax.sv"),
+            os.path.join(RTL, "gelu_lut.sv")]
+    vvp = os.path.join(sim_dir, "sim_axi.vvp")
+    cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
+                         f"-DLANES={lanes}", f"-DPNLAYER={nlayer}",
+                         f"-DPPROMPT={prompt_len}", f"-DPNGEN={ngen}",
+                         f"-DPKVMAX={kvmax}", *srcs],
+                        capture_output=True, text=True)
+    if cp.returncode != 0:
+        print("IVERILOG_COMPILE_FAIL")
+        print(cp.stdout); print(cp.stderr)
+        return None
+    rp = subprocess.run(["vvp", "sim_axi.vvp"], cwd=sim_dir, capture_output=True, text=True)
     sys.stdout.write(rp.stdout[-1500:])
     if "TB_DONE" not in rp.stdout:
         print("VVP_RUN_FAIL"); print(rp.stderr[-2000:])
@@ -219,6 +249,45 @@ def run_multitoken(sim_dir, lanes, nlayer, prompt_len, ngen, seed=0,
     return ok
 
 
+def run_axi(sim_dir, lanes, nlayer, prompt_len, ngen, seed=0,
+            npz="fabric/export/goformer.npz"):
+    """AXI GATE (the capstone, binding): drive gemv_axi_seq over the AXI4-Lite bus —
+    stream the weight image in through W_DATA (the URAM LOAD PORT, not $readmemh), write
+    the prompt over PL_*, pulse GO, poll DONE, drain the token stream over TS_*. The
+    emitted NGEN-token stream must be IDENTICAL to seq_ref.generate_greedy. This proves
+    the synth-safe weight path AND the full register interface end to end."""
+    p, cfg = seq_ref.build(npz)
+    intseq = seq_ref.IntSequencer(p, cfg)
+
+    rng = np.random.default_rng(seed)
+    prompt = [int(t) for t in rng.integers(0, p["tok_emb"].shape[0], size=prompt_len)]
+    kvmax = 1
+    while kvmax < prompt_len + ngen:
+        kvmax <<= 1
+
+    ref_full = intseq.generate_greedy(prompt, ngen)
+    ref_gen = [int(t) for t in ref_full[prompt_len:]]
+
+    write_mems(sim_dir, intseq, lanes, nlayer, prompt=prompt)
+    if not _compile_run_axi(sim_dir, lanes, nlayer, prompt_len, ngen, kvmax):
+        return False
+
+    with open(os.path.join(sim_dir, "tokstream.out")) as f:
+        got = [int(l.strip()) for l in f if l.strip()]
+
+    n = min(len(got), len(ref_gen))
+    n_match = sum(1 for i in range(n) if got[i] == ref_gen[i])
+    identical = (got == ref_gen)
+    ok = identical and (len(got) == ngen)
+    print(f"prompt={prompt}")
+    print(f"ref_gen ={ref_gen}")
+    print(f"axi_gen ={got}")
+    print(f"SEQ_AXI_VERDICT tokens_identical={identical} stream={n_match}/{ngen} "
+          f"NLAYER={nlayer} LANES={lanes} PROMPT_LEN={prompt_len} NGEN={ngen} KVMAX={kvmax} "
+          f"pass={ok}")
+    return ok
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="fabric.stage3.run_sequencer")
     ap.add_argument("--tok", type=int, default=0)
@@ -227,16 +296,24 @@ def main(argv=None):
     ap.add_argument("--nlayer", type=int, default=None, choices=[1, 4])
     ap.add_argument("--multitoken", action="store_true",
                     help="run the autoregressive multi-token stream gate")
+    ap.add_argument("--axi", action="store_true",
+                    help="run the AXI-wrapped capstone gate (gemv_axi_seq over AXI4-Lite)")
     ap.add_argument("--prompt-len", type=int, default=4)
     ap.add_argument("--ngen", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_seqmt"))
     a = ap.parse_args(argv)
-    # default layer count: the multi-token gate is for the REAL 4-layer model (nlayer=1
-    # multitoken is a non-physical single-layer config and is not supported); the
-    # single-token default is the block-0 bit-exact gate (nlayer=1).
-    nlayer = a.nlayer if a.nlayer is not None else (4 if a.multitoken else 1)
-    if a.multitoken:
+    # default layer count: the multi-token / AXI gates are for the REAL 4-layer model
+    # (nlayer=1 multitoken is a non-physical single-layer config and is not supported);
+    # the single-token default is the block-0 bit-exact gate (nlayer=1).
+    nlayer = a.nlayer if a.nlayer is not None else (4 if (a.multitoken or a.axi) else 1)
+    if a.axi:
+        if nlayer != 4:
+            raise SystemExit("AXI gate requires --nlayer 4 (the real model)")
+        ok = run_axi(a.dir if a.dir != os.path.join("C:\\kevbuild", "stage3_seqmt")
+                     else os.path.join("C:\\kevbuild", "stage3_seqaxi"),
+                     a.lanes, nlayer, a.prompt_len, a.ngen, a.seed)
+    elif a.multitoken:
         if nlayer != 4:
             raise SystemExit("multi-token gate requires --nlayer 4 (the real model)")
         ok = run_multitoken(a.dir, a.lanes, nlayer, a.prompt_len, a.ngen, a.seed)
