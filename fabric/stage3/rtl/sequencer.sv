@@ -1,23 +1,33 @@
 // -----------------------------------------------------------------------------
 // sequencer — Tier-3 single-stream transformer control FSM (CPU out of the loop).
 //
-// Runs the per-token KV-cached decode dataflow as hardware, wiring the four GATED
-// datapath blocks (gemv_banked, layernorm, softmax, gelu_lut) under one control FSM
-// with ZERO CPU between the `go` pulse and the emitted token. The full per-token
-// forward (NLAYER blocks + final LN + head + argmax):
+// Runs the MULTI-TOKEN KV-cached autoregressive decode dataflow as hardware, wiring
+// the four GATED datapath blocks (gemv_banked, layernorm, softmax, gelu_lut) under one
+// control FSM with ZERO host I/O between the `go` pulse and the N-token stream. The
+// per-token forward (NLAYER blocks + final LN + head + argmax):
 //
 //   embed -> NLAYER x [ LN1 -> qkv GEMV -> attn(softmax+KV) -> proj GEMV -> +res
 //                       -> LN2 -> mlp_fc GEMV -> GELU -> mlp_proj GEMV -> +res ]
 //         -> LN_f -> head GEMV -> argmax -> tok_out
 //
-// Two gates (fabric/stage3/run_sequencer.py), both vs fabric/stage3/seq_ref:
+// is wrapped in an autoregressive loop. A prompt of PROMPT_LEN tokens (resident in
+// prompt_rom) primes positions 0..PROMPT_LEN-1; the token predicted at position t is
+// fed back as the input at position t+1, advancing tcur. The emitted greedy stream
+// (the NGEN tokens predicted from position PROMPT_LEN-1 onward) is written to an
+// on-chip tok_stream buffer the host drains after `done`.
+//
+// PER-BLOCK PERSISTENT KV: each of the NLAYER blocks has its own INT8/Q.VFRAC K and V
+// cache, indexed [blk][position]. At position t, block b appends its k,v at slot t and
+// attends over slots 0..t; the caches survive between tokens. This is the fix that
+// makes the multi-block, multi-position attention correct (the old single shared KV
+// buffer was correct only for one token at pos=0).
+//
+// Gates (fabric/stage3/run_sequencer.py), all vs fabric/stage3/seq_ref:
 //   NLAYER=1 : one transformer block, residual x_out BIT-EXACT (mismatches=0/256)
 //              vs seq_ref.IntSequencer.block0_signals.
-//   NLAYER=4 : full forward, emitted tok_out IDENTICAL to seq_ref.step's argmax
-//              (which is itself token-identical to the float goformer golden).
-// The single GEMV instance + shared KV cache make the multi-block path correct for
-// one token at pos (pos=0 = T=1, the gated configuration); per-block resident KV is
-// the multi-token throughput follow-up.
+//   NLAYER=4 single-token : full forward, emitted tok_out IDENTICAL to seq_ref.step.
+//   NLAYER=4 multitoken   : the full NGEN-token greedy stream IDENTICAL to
+//              seq_ref.IntSequencer.generate_greedy (the binding token-stream gate).
 //
 // Pinned formats (bit-true to seq_ref / the committed blocks):
 //   residual x   signed Q6.25 (32-bit)     gamma  signed Q4.20   LN out  signed Q.22
@@ -46,6 +56,9 @@ module sequencer #(
     parameter integer VOCAB    = 193,
     parameter integer LANES    = 16,
     parameter integer TMAX     = 256,
+    parameter integer KVMAX      = 32,    // max cached positions (prompt+gen); KV mem depth
+    parameter integer PROMPT_LEN = 8,     // resident prompt tokens (prime the cache)
+    parameter integer NGEN       = 8,     // tokens to greedily generate after the prompt
     parameter integer RESID_FRAC  = 25,
     parameter integer LN_OUT_FRAC = 22,
     parameter integer GELU_FRAC   = 12,
@@ -57,13 +70,17 @@ module sequencer #(
     input  wire        clk,
     input  wire        rst,
     input  wire        go,
-    input  wire [7:0]  tok_id,
-    input  wire [8:0]  pos,
+    input  wire [7:0]  tok_id,           // legacy single-token input (pos=0 path); prompt[0]
+    input  wire [8:0]  pos,              // legacy single-token start position
     output reg         busy,
     output reg         done,
     input  wire [8:0]  rd_addr,
     output reg signed [31:0] x_out,
-    output reg  [8:0]  tok_out         // argmax of logits (the emitted token id)
+    output reg  [8:0]  tok_out,          // argmax of logits (the most-recent emitted token id)
+    // multi-token stream readout: tok_stream[0..ngen_out-1] is the greedy stream
+    input  wire [8:0]  ts_addr,
+    output reg  [8:0]  ts_out,
+    output reg  [8:0]  ngen_out          // number of generated tokens written to tok_stream
 );
     localparam integer WBITS   = LANES*4;
     localparam integer GW_QKV  = ((D3   + LANES-1)/LANES) * D;
@@ -86,6 +103,7 @@ module sequencer #(
     (* rom_style = "block" *) reg signed [31:0] dq_mant   [0:DQ_N-1];
     (* rom_style = "block" *) reg signed [7:0]  dq_exp    [0:DQ_N-1];
     (* rom_style = "block" *) reg signed [63:0] inv_sact  [0:NSACT-1];
+    (* rom_style = "block" *) reg [8:0]          prompt_rom[0:PROMPT_LEN-1];   // resident prompt
     initial begin
         $readmemh("tok_emb.mem", tok_emb);
         $readmemh("pos_emb.mem", pos_emb);
@@ -94,6 +112,7 @@ module sequencer #(
         $readmemh("dq_mant.mem", dq_mant);
         $readmemh("dq_exp.mem",  dq_exp);
         $readmemh("inv_sact.mem",inv_sact);
+        $readmemh("prompt.mem",  prompt_rom);
     end
 
     // --------------------------------------------------------------- scratch ---
@@ -102,11 +121,13 @@ module sequencer #(
     reg signed [63:0] lnout [0:D-1];        // LN out Q.22 (GEMV act source, K<=D)
     reg signed [63:0] mlpbuf[0:D_MLP-1];    // MLP hidden: Q4.12 (gelu in) then Q.22 (gelu out)
     reg signed [31:0] qvec  [0:D-1];        // q dequantized, stored Q.VFRAC
-    reg signed [31:0] kcache[0:TMAX*D-1];   // K cache Q.VFRAC
-    reg signed [31:0] vcache[0:TMAX*D-1];   // V cache Q.VFRAC
+    // PER-BLOCK persistent K/V caches (Q.VFRAC), indexed [blk*KVMAX*D + tpos*D + d].
+    reg signed [31:0] kcache[0:NLAYER*KVMAX*D-1];
+    reg signed [31:0] vcache[0:NLAYER*KVMAX*D-1];
     reg signed [31:0] ctxv  [0:D-1];        // attention context, Q6.25
     reg [20:0]        probbuf[0:TMAX-1];    // current head probs Q1.20
     reg signed [31:0] gemvy [0:D_MLP-1];    // GEMV INT32 outputs
+    reg [8:0]         tok_stream[0:KVMAX-1];// emitted greedy stream (host drains)
 
     // ----------------------------------------------------- block instances -----
     reg                gv_ldrst, gv_wwe, gv_xwe, gv_start;
@@ -188,9 +209,14 @@ module sequencer #(
     reg [19:0] wblk;                // weight ROM base for current block = blk*GW_BLK
     reg [15:0] dqblk;               // dequant ROM base for current block = blk*DQ_BLK
     reg [5:0]  sablk;               // inv_sact base for current block = blk*4
+    reg [19:0] kvblk;               // KV cache base for current block = blk*KVMAX*D
     reg signed [31:0] best_val;     // argmax running best logit (real, via dequant)
     reg [8:0]  best_idx;
     reg [8:0]  tpos, ji;
+    // autoregressive multi-token loop state
+    reg [8:0]  tcur;                // current decode position (0-based); pos_emb + KV slot
+    reg [7:0]  cur_tok;            // input token id for this forward
+    reg [8:0]  gcnt;               // number of generated tokens emitted so far
 
     // plain-vector temporaries
     reg signed [63:0] lntmp;
@@ -228,6 +254,7 @@ module sequencer #(
         if (rst) begin
             st <= S_IDLE; busy <= 0;
             ci<=0; gi<=0; wcnt<=0; ji<=0; head_i<=0; ki<=0;
+            tcur<=0; gcnt<=0; ngen_out<=0;
         end else begin
         case (st)
         // ----------------------------------------------------------------
@@ -235,13 +262,23 @@ module sequencer #(
             busy<=0;
             if (go) begin
                 busy<=1; ci<=0; gi<=0;
-                blk<=0; wblk<=0; dqblk<=0; sablk<=0;     // start at block 0
+                blk<=0; wblk<=0; dqblk<=0; sablk<=0; kvblk<=0; // start at block 0
+                gcnt<=0; ngen_out<=0;
+                // Multi-token (PROMPT_LEN>1): prime from prompt_rom starting at position 0,
+                //   input token at position t = prompt_rom[t]; then autoregress.
+                // Single-token (PROMPT_LEN<=1): legacy path — feed tok_id at position `pos`.
+                if (PROMPT_LEN > 1) begin
+                    tcur<=0; cur_tok <= prompt_rom[0][7:0];
+                end else begin
+                    tcur<=pos; cur_tok <= tok_id;
+                end
                 st<=S_EMBED;
             end
         end
 
         S_EMBED: begin
-            xres[ci] <= tok_emb[tok_id*D + ci] + pos_emb[pos*D + ci];
+            // embed the current token at the current position: x = tok_emb[t] + pos_emb[tcur]
+            xres[ci] <= tok_emb[cur_tok*D + ci] + pos_emb[tcur*D + ci];
             if (ci==D-1) begin ci<=0; st<=S_LN_SNAP; end else ci<=ci+1'b1;
         end
 
@@ -323,10 +360,11 @@ module sequencer #(
             if (dq_shv >= 0) dq_val = dq_prod <<< dq_shv;
             else             dq_val = rsh_round(dq_prod, -dq_shv);
             // route: 0..D-1 -> q ; D..2D-1 -> k ; 2D..3D-1 -> v
-            if (ci < D)            qvec[ci]            <= dq_val[31:0];
-            else if (ci < 2*D)     kcache[pos*D + (ci-D)]   <= dq_val[31:0];
-            else                   vcache[pos*D + (ci-2*D)] <= dq_val[31:0];
-            if (ci==D3-1) begin head_i<=0; tpos<=pos+1'b1; st<=S_HEAD; end
+            // K/V append at this block's slot tcur:  kvblk + tcur*D + offset
+            if (ci < D)            qvec[ci]                          <= dq_val[31:0];
+            else if (ci < 2*D)     kcache[kvblk + tcur*D + (ci-D)]   <= dq_val[31:0];
+            else                   vcache[kvblk + tcur*D + (ci-2*D)] <= dq_val[31:0];
+            if (ci==D3-1) begin head_i<=0; tpos<=tcur+1'b1; st<=S_HEAD; end
             else ci<=ci+1'b1;
         end
 
@@ -341,7 +379,7 @@ module sequencer #(
                 score_acc = 64'sd0;
                 for (ii=0; ii<HEAD_DIM; ii=ii+1) begin
                     qv_v = qvec[head_i*HEAD_DIM + ii];
-                    kv_v = kcache[ji*D + head_i*HEAD_DIM + ii];
+                    kv_v = kcache[kvblk + ji*D + head_i*HEAD_DIM + ii];   // block-blk key j
                     score_acc = score_acc + $signed(qv_v) * $signed(kv_v);  // Q.(2*VFRAC)
                 end
                 // /sqrt(64)=>>3, to Q8.8: round(acc / 2^(2*VFRAC+3-8))
@@ -361,7 +399,7 @@ module sequencer #(
             for (ii=0; ii<TMAX; ii=ii+1) begin
                 if (ii < tpos) begin
                     prob_v = probbuf[ii];
-                    vv_v   = vcache[ii*D + head_i*HEAD_DIM + ci];   // Q.VFRAC
+                    vv_v   = vcache[kvblk + ii*D + head_i*HEAD_DIM + ci];   // block-blk value j, Q.VFRAC
                     ctx_acc = ctx_acc + $signed({75'd0, prob_v}) * $signed({{64{vv_v[31]}}, vv_v});
                 end
             end
@@ -463,9 +501,10 @@ module sequencer #(
                 ci<=0;
                 if (blk == NLAYER-1) st<=S_LNF_SNAP;        // last block -> final LN + head
                 else begin
-                    // advance to next block: bump all ROM bases
+                    // advance to next block: bump all ROM bases + per-block KV base
                     blk<=blk+1'b1;
                     wblk<=wblk+GW_BLK; dqblk<=dqblk+DQ_BLK; sablk<=sablk+4'd4;
+                    kvblk<=kvblk+KVMAX*D;
                     st<=S_LN_SNAP;
                 end
             end else ci<=ci+1'b1;
@@ -505,12 +544,33 @@ module sequencer #(
             end
             if (ci==VOCAB-1) st<=S_EMIT; else ci<=ci+1'b1;
         end
+        // ---------------- emit + autoregressive loop ----------------
+        // best_idx = argmax at position tcur. Record it into the output stream iff this
+        // position is in the generation window (tcur >= PROMPT_LEN-1). Then either feed
+        // the next token (prompt token if still priming, else the just-emitted token) and
+        // advance to tcur+1, or finish once NGEN tokens have been emitted.
         S_EMIT: begin
             tok_out <= best_idx;
-            done<=1; busy<=0; st<=S_IDLE;
+            // is this position emitting a generated token? (predictions at PROMPT_LEN-1..)
+            if (tcur >= PROMPT_LEN-1) begin
+                tok_stream[gcnt] <= best_idx;
+                gcnt    <= gcnt + 1'b1;
+                ngen_out<= gcnt + 1'b1;
+            end
 `ifdef DBG_SEQ
-            $display("EMIT tok_out=%0d best_val=%0d xres[0]=%0d", best_idx, best_val, xres[0]);
+            $display("EMIT pos=%0d tok_out=%0d gcnt=%0d best_val=%0d",
+                     tcur, best_idx, gcnt, best_val);
 `endif
+            // stop after NGEN emitted tokens (or if the KV cache is full)
+            if (((tcur >= PROMPT_LEN-1) && (gcnt + 1'b1 >= NGEN)) || (tcur+1'b1 >= KVMAX)) begin
+                done<=1; busy<=0; st<=S_IDLE;
+            end else begin
+                // advance one position: choose next input token, reset per-forward state
+                cur_tok <= (tcur+1'b1 < PROMPT_LEN) ? prompt_rom[tcur+1'b1][7:0] : best_idx[7:0];
+                tcur <= tcur + 1'b1;
+                ci<=0; gi<=0; blk<=0; wblk<=0; dqblk<=0; sablk<=0; kvblk<=0;
+                st<=S_EMBED;
+            end
         end
         default: st<=S_IDLE;
         endcase
@@ -522,6 +582,13 @@ module sequencer #(
     always @(posedge clk) begin
         xrb   <= xres[rd_addr[7:0]];
         x_out <= xrb;
+    end
+
+    // readback of the emitted token stream (2-cycle registered, like x_out)
+    reg [8:0] tsrb;
+    always @(posedge clk) begin
+        tsrb   <= tok_stream[ts_addr[($clog2(KVMAX))-1:0]];
+        ts_out <= tsrb;
     end
 
     // -------- functions (combinational, iverilog-safe) -----------------------
@@ -546,8 +613,10 @@ module sequencer #(
 
     function signed [15:0] sat16(input signed [63:0] v);
         begin
-            if (v >  16'sh7FFF) sat16 = 16'sh7FFF;
-            else if (v < -16'sh8000) sat16 = -16'sh8000;
+            // NOTE: 16'sh8000 already equals -32768; the bound must be written as a
+            // wide signed literal. (-16'sh8000 wrongly evaluates to +32768.)
+            if (v >  64'sd32767)  sat16 = 16'sd32767;
+            else if (v < -64'sd32768) sat16 = -16'sd32768;
             else sat16 = v[15:0];
         end
     endfunction
