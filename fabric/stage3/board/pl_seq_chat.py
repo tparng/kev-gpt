@@ -72,10 +72,13 @@ FCLK_SET = "/sys/devices/platform/fclk0/set_rate"
 FCLK_SUMMARY = "/sys/kernel/debug/clk/clk_summary"
 
 
-def set_and_verify_fclk(target_hz=FCLK, tol_hz=1e5):
+def set_and_verify_fclk(target_hz=FCLK, tol_hz=2e6):
     """Force the PL clock (fclk0 / pl0_ref) to target_hz and read it back. Returns the
-    actual rate in Hz. Raises if it cannot be set within tol_hz (running at the wrong
-    clock makes every speed number a lie and the data path non-deterministic)."""
+    ACTUAL rate in Hz (the PLL quantises to discrete divisors, so the readback is what
+    tok/s must be computed from — bit-honest). Raises only if the clock is wildly off
+    (>tol_hz), which would mean the set failed entirely. Used both to pin 40 MHz and to
+    SWEEP the clock up on silicon to find the true Fmax (the highest rate still
+    deterministic + token-bit-exact)."""
     try:
         with open(FCLK_SET, "w") as f:
             f.write(str(int(target_hz)))
@@ -173,6 +176,9 @@ def main(argv=None):
                     help="PE width the LOADED bitstream was built with (16=SEQR baseline, "
                          "256=SQRF resident-read). Sets the W_DATA chunks/word and the pack.")
     ap.add_argument("--base", type=lambda s: int(s, 0), default=BASE)
+    ap.add_argument("--fclk", type=float, default=FCLK,
+                    help="PL clock to force (Hz). Default 40e6. Raise it to SWEEP the silicon "
+                         "Fmax: the highest value still tokens_match=True is the real ceiling.")
     ap.add_argument("--poll-timeout", type=float, default=30.0)
     ap.add_argument("--dump-resid", type=int, default=0,
                     help="if tokens mismatch, dump this many residual-x words for diagnosis")
@@ -181,7 +187,7 @@ def main(argv=None):
     enc, dec, vocab = load_meta(args.meta)
 
     # ---- force + verify the PL clock BEFORE anything else (see set_and_verify_fclk) --
-    fclk_hz = set_and_verify_fclk(FCLK)
+    fclk_hz = set_and_verify_fclk(args.fclk)
 
     # ---- reference (the gate): integer sequencer greedy stream ----------------------
     p, cfg = seq_ref.build(args.npz)
