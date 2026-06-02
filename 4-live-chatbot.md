@@ -99,6 +99,51 @@ The model is, helpfully, too dumb to be dangerous. It is a TinyStories-grade tel
 
 No change to the fabric engine from doc 2 except the one real addition, batched decode with per-session KV caches held on-chip. The model being served is the Keviniser-trained one from doc 3, so the dumbness is on public display, which is exactly the point, the crowd is meant to see the telegraphic output and the speed at the same time. This is stage 4, and only after stages 0 to 3 work.
 
+## Making the latency disappear, the single-refresh trick (a design note for later)
+
+A future-feature idea, only viable once the single-stream engine is fast, but worth
+writing down because it turns the speed from a number into a feeling. The goal: the
+answer should appear the instant you press Enter, fully formed, in a single monitor
+refresh. No spinner, no typewriter streaming, just *bang*, the reply is there.
+
+The trick rests on one property of autoregressive decode: typing a prompt forward is
+*appending* tokens, and a KV cache is append-only. So as the user types, letter by
+letter, the front end speculatively runs the prompt-so-far through the model — but each
+keystroke is only **one new token to append** to the cache, not a fresh re-read of the
+whole prompt. The cache stays caught up to the cursor for the cost of a single forward
+step per keystroke, which at the target speed is well under the gap between keystrokes.
+By the time the user hits Enter, the expensive part — prefill, the thing that is
+normally the time-to-first-token — is already done. TTFT was spent during typing, for
+free, and the user never saw it.
+
+Two flavours, depending on how aggressive I want to be:
+
+- **Warm cache.** Only the prefill runs while typing; the reply is generated on Enter.
+  Because the model is so fast and Kevin is so terse, a whole reply generates in a few
+  milliseconds — under one 60 Hz frame — so it still lands in a single refresh. Simple
+  and robust, and probably enough.
+- **Speculative generate.** Also generate the reply for the current prompt-so-far
+  continuously, so on Enter the answer is *already computed* and the keypress is pure
+  rendering, zero compute. It costs more fabric time — you are answering prompts that
+  may still change — and the last keystroke leaves the speculation one character stale,
+  so you re-run the delta. At these speeds that is cheap enough to redo per keystroke.
+
+The "single refresh" part is then just a rendering choice: buffer the whole reply and
+write it in one frame, do not stream it. The effect is the visceral version of the
+speed claim — most fast-LLM demos still stream token by token; this one would just have
+the answer appear, whole, the moment you commit the prompt.
+
+The honest caveats, because this only works in a narrow regime. It needs the fast path
+— at the current single-digit tok/s a reply takes tens of seconds, so this is a stage-4
+feature gated on the sequencer, not something the driver-bound prototype can do.
+Backspace and mid-prompt edits break the append-only assumption: invalidate the cache
+from the edit point and recompute the tail, cheap but not free, so keep a per-position
+cache and only redo the suffix. And under a crowd it fights the batch scheduler —
+speculating for every half-typed prompt multiplies the load, so cap speculation to the
+focused session or let it use only spare batch slots. It is, once again, the same fact
+from two sides: the thing is only fast enough to pre-answer your prompt *because* it is
+small, on-chip, and dumb.
+
 ## What I would report
 
 - the two ceilings, inference versus serving, with the bottleneck named
