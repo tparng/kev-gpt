@@ -35,6 +35,10 @@ fabric/stage2/sim/*.vvp
 fabric/stage2/sim/*.mem
 fabric/stage2/sim/config.svh
 
+# Stage 3 .mem init files (regenerable from goformer.npz via run_sequencer write_mems;
+# wrom.mem alone is ~3.6 MB; bitstreams build to C:/kevbuild)
+fabric/stage3/mems/
+
 # Stage 0 build artifacts
 fabric/stage0/a53_gemv_bench
 fabric/stage0/_*.log
