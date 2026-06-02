@@ -775,4 +775,34 @@ module sequencer_fast #(
             else sat16_32 = v[31:0];
         end
     endfunction
+
+`ifdef DBG_PHASE
+    // ---- per-phase cycle accounting (sim-only; -DDBG_PHASE) --------------------
+    // buckets every busy cycle by FSM state into a phase, dumps totals at the final
+    // `done`. Totals are over the whole NGEN run; divide by NGEN for per-token.
+    localparam integer NPH = 9;
+    integer phc [0:NPH-1];
+    integer pp_i;
+    function integer phase_of(input [6:0] s);
+        case (s)
+            S_EMBED: phase_of = 0;
+            S_LN_SNAP, S_LN_FEED, S_LN_COLL, S_LN2_SNAP, S_LN2_FEED, S_LN2_COLL,
+            S_LNF_SNAP, S_LNF_FEED, S_LNF_COLL:                         phase_of = 1; // layernorm
+            G_LDRST, G_ACT, G_RUN, G_WAIT, G_RB0:                       phase_of = 2; // gemv
+            S_QKV_DEQ, S_PROJ_DEQ, S_FC_DEQ, S_MP_DEQ:                  phase_of = 3; // dequant
+            S_HEAD, S_SCORE_PRE, S_SCORE_ACC, S_SMFEED, S_SMCOLL,
+            S_CTX_PRE, S_CTX_ACC, S_CTXST:                              phase_of = 4; // attention
+            S_GELU, S_GELU_W:                                           phase_of = 5; // gelu
+            S_RES1, S_RES2, S_PROJ_PRE, S_MP_PRE:                       phase_of = 6; // resid/quant-pre
+            S_HEAD_DEQ, S_ARGMAX, S_EMIT:                               phase_of = 7; // head+argmax+emit
+            default:                                                    phase_of = 8; // idle/finish/other
+        endcase
+    endfunction
+    initial for (pp_i = 0; pp_i < NPH; pp_i = pp_i + 1) phc[pp_i] = 0;
+    always @(posedge clk) if (busy && !rst) phc[phase_of(st)] = phc[phase_of(st)] + 1;
+    always @(posedge clk) if (done) begin
+        $display("PHASE_BREAKDOWN embed=%0d layernorm=%0d gemv=%0d dequant=%0d attn=%0d gelu=%0d residpre=%0d emitarg=%0d other=%0d",
+                 phc[0], phc[1], phc[2], phc[3], phc[4], phc[5], phc[6], phc[7], phc[8]);
+    end
+`endif
 endmodule

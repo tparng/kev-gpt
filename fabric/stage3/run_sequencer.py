@@ -110,7 +110,7 @@ def write_mems(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlayer: int,
 
 
 def _compile_run(sim_dir, tok, pos, lanes, nlayer, prompt_len=1, ngen=1, kvmax=32,
-                 fast=False):
+                 fast=False, dbg_phase=False):
     # fast=True gates sequencer_fast (resident-read GEMV: weights preloaded once into the
     # core's URAM, no per-matmul reload). Both DUTs share the tb (DUTMOD macro) and the
     # same wl_* weight stream + token-stream contract, so the gate is apples-to-apples.
@@ -125,6 +125,8 @@ def _compile_run(sim_dir, tok, pos, lanes, nlayer, prompt_len=1, ngen=1, kvmax=3
             f"-DPNGEN={ngen}", f"-DPKVMAX={kvmax}"]
     if fast:
         defs.append("-DSEQ_FAST")
+    if dbg_phase:
+        defs.append("-DDBG_PHASE")
     vvp = os.path.join(sim_dir, "sim.vvp")
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp, *defs, *srcs],
                         capture_output=True, text=True)
@@ -212,7 +214,7 @@ def run(sim_dir, tok, pos, lanes, nlayer, npz="fabric/export/goformer.npz"):
 
 
 def run_multitoken(sim_dir, lanes, nlayer, prompt_len, ngen, seed=0,
-                   npz="fabric/export/goformer.npz", fast=False):
+                   npz="fabric/export/goformer.npz", fast=False, dbg_phase=False):
     """MULTI-TOKEN gate: the FSM autoregressively decodes `ngen` tokens from a resident
     `prompt_len`-token prompt, with PER-BLOCK persistent KV caches. The RTL's emitted
     greedy stream must be IDENTICAL to seq_ref.IntSequencer.generate_greedy. The binding
@@ -236,7 +238,8 @@ def run_multitoken(sim_dir, lanes, nlayer, prompt_len, ngen, seed=0,
 
     write_mems(sim_dir, intseq, lanes, nlayer, prompt=prompt)
     out = _compile_run(sim_dir, prompt[0], 0, lanes, nlayer,
-                       prompt_len=prompt_len, ngen=ngen, kvmax=kvmax, fast=fast)
+                       prompt_len=prompt_len, ngen=ngen, kvmax=kvmax, fast=fast,
+                       dbg_phase=dbg_phase)
     if not out:
         return False
     # pull the tb cycle count (TB_DONE ... cycles=N) for the A/B speed compare
@@ -244,6 +247,15 @@ def run_multitoken(sim_dir, lanes, nlayer, prompt_len, ngen, seed=0,
     for line in out.splitlines():
         if "TB_DONE" in line and "cycles=" in line:
             cyc = int(line.split("cycles=")[1].split()[0])
+    # per-phase cycle breakdown (PHASE_BREAKDOWN ...), if -DDBG_PHASE was set
+    for line in out.splitlines():
+        if "PHASE_BREAKDOWN" in line:
+            kv = dict(tok.split("=") for tok in line.split()[1:])
+            tot = sum(int(v) for v in kv.values())
+            print(f"--- per-phase cycles (total {tot}, /{ngen}tok = {tot//ngen}/tok) ---")
+            for k, v in sorted(kv.items(), key=lambda x: -int(x[1])):
+                v = int(v)
+                print(f"  {k:10s} {v:>10d}  {v//ngen:>8d}/tok  {100*v/max(tot,1):5.1f}%")
 
     with open(os.path.join(sim_dir, "tokstream.out")) as f:
         got = [int(l.strip()) for l in f if l.strip()]
@@ -311,6 +323,8 @@ def main(argv=None):
                     help="run the autoregressive multi-token stream gate")
     ap.add_argument("--fast", action="store_true",
                     help="gate sequencer_fast (resident-read GEMV) instead of sequencer")
+    ap.add_argument("--dbg-phase", action="store_true",
+                    help="dump per-phase cycle breakdown (LN/GEMV/dequant/attn/GELU/...)")
     ap.add_argument("--axi", action="store_true",
                     help="run the AXI-wrapped capstone gate (gemv_axi_seq over AXI4-Lite)")
     ap.add_argument("--prompt-len", type=int, default=4)
@@ -332,7 +346,7 @@ def main(argv=None):
         if nlayer != 4:
             raise SystemExit("multi-token gate requires --nlayer 4 (the real model)")
         ok = run_multitoken(a.dir, a.lanes, nlayer, a.prompt_len, a.ngen, a.seed,
-                            fast=a.fast)
+                            fast=a.fast, dbg_phase=a.dbg_phase)
     else:
         ok = run(a.dir, a.tok, a.pos, a.lanes, nlayer)
     raise SystemExit(0 if ok else 1)
