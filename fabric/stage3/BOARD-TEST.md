@@ -117,5 +117,7 @@ ABORT if the clock is wrong — a tok/s number measured at the wrong clock is a 
 | Python + KV cache | ~5 | board pull + run | staged, gated |
 | C + KV cache | ~10 | gcc build on board | MEASURED (10.35; A53-orchestration-bound) |
 | **single-stream dataflow (sequencer)** | **44.32** | sequencer bitstream @ 40 MHz, CPU out of loop | **MEASURED, bit-exact** |
-| + PE=256 / resident / pipelined | ~2k (target) | the LEAP — wide lanes, no per-GEMV reload, >40 MHz | RTL next |
+| + resident-read (sequencer_fast, PE=16) | ~76 | drop per-matmul weight reload | SIM bit-exact (527,616 cyc/tok) |
+| + PE=256 (sequencer_fast, LANES=256) | ~231 | 16-wide lanes on top of resident | SIM bit-exact (173,151 cyc/tok); OOC fit/Fmax pending |
+| + pipelined arith (>40 MHz) | ~2k (target) | pipeline 96-bit dequant / 64×64 act-quant; parallel serial datapath | RTL next |
 | batched serving | ~30–124k | + parallel non-linears + 3–4 GEMV engines | model proven; RTL TBD |

@@ -48,11 +48,16 @@ from fabric.stage3 import pack_banked, seq_ref  # noqa: E402
 
 # ---- baked-in bitstream config (must match the synthesized gemv_seq.bit.bin) -------
 NLAYER = 4
-LANES = 16
+LANES = 16                       # default PE width (baseline bitstream); --lanes overrides
 PROMPT_LEN = 8
 NGEN = 8
 FCLK = 40e6                      # timing-closed @ 40 MHz (WNS +0.686 ns)
-IDCODE_EXPECTED = 0x53455152     # "SEQR"
+# IDCODE depends on the bitstream: SEQR = baseline (per-matmul reload, PE=16); SQRF =
+# resident-read sequencer_fast (any PE width). Accept either.
+IDCODE_SEQR = 0x53455152         # "SEQR" — gemv_axi_seq
+IDCODE_SQRF = 0x53515246         # "SQRF" — gemv_axi_seq_fast (resident-read)
+IDCODE_OK = {IDCODE_SEQR, IDCODE_SQRF}
+IDCODE_EXPECTED = IDCODE_SEQR    # default; overridden by --lanes>16 / actual readback
 BASE = 0xA0000000
 
 # PL clock control. A FLAT fpgautil bitstream load does NOT apply the block design's
@@ -164,6 +169,9 @@ def main(argv=None):
     ap.add_argument("--wrom", default=os.path.join(_REPO, "fabric", "stage3", "mems", "wrom.mem"),
                     help="committed wrom.mem to self-check the rebuilt image against")
     ap.add_argument("--prompt", default="once upo", help="prompt text (encoded then padded to PROMPT_LEN)")
+    ap.add_argument("--lanes", type=int, default=LANES,
+                    help="PE width the LOADED bitstream was built with (16=SEQR baseline, "
+                         "256=SQRF resident-read). Sets the W_DATA chunks/word and the pack.")
     ap.add_argument("--base", type=lambda s: int(s, 0), default=BASE)
     ap.add_argument("--poll-timeout", type=float, default=30.0)
     ap.add_argument("--dump-resid", type=int, default=0,
@@ -190,26 +198,33 @@ def main(argv=None):
     print(f"[ref ] seq_ref decoded            = {dec(ref_gen)!r}")
 
     # ---- build + self-check the weight image ----------------------------------------
-    words = build_weight_image(intseq, LANES, NLAYER)
-    print(f"[wimg] {len(words)} x {LANES*4}-bit words ({len(words)*8} bytes -> "
-          f"{len(words)*2} 32-bit W_DATA chunks)")
-    chk = verify_against_wrom(words, args.wrom, LANES)
-    if chk is None:
-        print(f"[wimg] WARNING: {args.wrom} not present -> cannot self-check (using rebuilt)")
+    lanes = args.lanes
+    subw = (lanes * 4) // 32          # 32-bit W_DATA chunks per wide word (low-first)
+    words = build_weight_image(intseq, lanes, NLAYER)
+    print(f"[wimg] {len(words)} x {lanes*4}-bit words ({len(words)*lanes//2} bytes -> "
+          f"{len(words)*subw} 32-bit W_DATA chunks, SUBW={subw})")
+    # the committed wrom.mem is the LANES=16 pack; only self-check when packs match.
+    if lanes == 16:
+        chk = verify_against_wrom(words, args.wrom, lanes)
+        if chk is None:
+            print(f"[wimg] WARNING: {args.wrom} not present -> cannot self-check (using rebuilt)")
+        else:
+            ok, msg = chk
+            print(f"[wimg] vs wrom.mem: {'MATCH' if ok else 'MISMATCH'} ({msg})")
+            if not ok:
+                print("[wimg] FATAL: rebuilt image != committed wrom.mem; aborting (correctness risk)")
+                return 2
     else:
-        ok, msg = chk
-        print(f"[wimg] vs wrom.mem: {'MATCH' if ok else 'MISMATCH'} ({msg})")
-        if not ok:
-            print("[wimg] FATAL: rebuilt image != committed wrom.mem; aborting (correctness risk)")
-            return 2
+        print(f"[wimg] (lanes={lanes} != 16) skipping wrom.mem self-check — the binding gate is "
+              f"the token stream vs seq_ref below")
 
     # ---- open the AXI slave + verify IDCODE -----------------------------------------
     dev = Seqr(args.base)
     try:
         idcode = dev.rd(R_IDCODE)
-        print(f"[idc ] IDCODE = 0x{idcode:08X} (expected 0x{IDCODE_EXPECTED:08X}) "
-              f"-> {'OK' if idcode == IDCODE_EXPECTED else 'MISMATCH'}")
-        if idcode != IDCODE_EXPECTED:
+        kind = {IDCODE_SEQR: "SEQR", IDCODE_SQRF: "SQRF"}.get(idcode, "????")
+        print(f"[idc ] IDCODE = 0x{idcode:08X} ({kind}) -> {'OK' if idcode in IDCODE_OK else 'MISMATCH'}")
+        if idcode not in IDCODE_OK:
             print("[idc ] FATAL: wrong IDCODE -> bitstream not loaded / wrong base. Aborting.")
             return 3
 
@@ -222,15 +237,16 @@ def main(argv=None):
         # 1) reset the load pointer
         dev.wr(R_CTRL, 0x2)                          # wl_rst pulse
 
-        # 2) stream the whole transposed INT4 image: low32 then high32 per 64-bit word
+        # 2) stream the whole transposed INT4 image: SUBW 32-bit chunks per wide word,
+        #    LOW chunk first (the gemv_banked_resident / sequencer load-assembler order).
         t0 = time.time()
         for w in words:
             w = int(w)
-            dev.wr(R_WDATA, w & 0xFFFFFFFF)          # LOW chunk first
-            dev.wr(R_WDATA, (w >> 32) & 0xFFFFFFFF)  # then HIGH chunk
+            for s in range(subw):
+                dev.wr(R_WDATA, (w >> (32 * s)) & 0xFFFFFFFF)
         t_load = time.time() - t0
-        print(f"[load] streamed {len(words)*2} chunks in {t_load:.2f}s "
-              f"({len(words)*2/max(t_load,1e-9):.0f} chunks/s)")
+        print(f"[load] streamed {len(words)*subw} chunks in {t_load:.2f}s "
+              f"({len(words)*subw/max(t_load,1e-9):.0f} chunks/s)")
 
         # 3) write the prompt: PL_ADDR=i then PL_DATA=token_id, in order
         for i, tok in enumerate(prompt_ids):
