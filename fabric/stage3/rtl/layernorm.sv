@@ -117,9 +117,16 @@ module layernorm (
     reg signed [127:0] term;
     reg signed [191:0] ynew;
 
-    // Output temporaries (wide)
+    // Output temporaries (wide). prod is now a PIPELINE register (stage 1 -> stage 2):
+    // S_OUT splits the two chained multiplies (d*Yr, then *gamma) across two cycles to
+    // break the DSP_OUTPUT critical path (the limiter after the Newton fix). grow_r holds
+    // gamma alongside prod so stage 2 pairs the right element; s1v/oidx track the 1-deep
+    // stream pipeline. +1 cycle of LN output latency (negligible); value is BIT-IDENTICAL.
     reg signed [95:0]  prod;
     reg signed [127:0] prod2;
+    reg signed [31:0]  grow_r;
+    reg                s1v;
+    reg [8:0]          oidx;
 
     always @(posedge clk) begin
         if (rst) begin
@@ -228,23 +235,35 @@ module layernorm (
                     ynew = (Yr * term) >>> (2*Y_FRAC);         // back to Q.Y_FRAC
                     Yr   <= ynew[63:0];
                     newt <= newt + 1'b1;
-                    if (newt == 2'd1) begin idx <= 0; state <= S_OUT; end
-                    else state <= S_NEWT;
+                    if (newt == 2'd1) begin
+                        idx <= 0; oidx <= 0; s1v <= 1'b0;   // prime the S_OUT stream pipeline
+                        state <= S_OUT;
+                    end else state <= S_NEWT;
                 end
                 // -------------------------------------------------------------
+                // PIPELINED output stream (2 stages, 1 result/cycle):
+                //   stage 1: prod = (X-mean)*Yr   [register prod, latch gamma]
+                //   stage 2: prod2 = prod*gamma -> y_out   [uses stage-1 registers]
+                // breaks the d*Yr*gamma double-multiply that capped Fmax after the Newton
+                // fix. Same operands per element -> y_out is BIT-IDENTICAL, +1 cyc latency.
                 S_OUT: begin
-                    // copy array elements to plain vectors, then operate (iverilog-safe)
-                    xrow = xmem[idx];
-                    grow = gmem[idx];
-                    // d = X - mean (Q6.25)
-                    // prod  = d * Yr            -> Q(QX+Y_FRAC)
-                    prod  = ($signed({{8{xrow[31]}}, xrow}) - mean) * Yr;
-                    // prod2 = prod * gamma      -> Q(QX+Y_FRAC+G_FRAC)
-                    prod2 = prod * $signed({{96{grow[31]}}, grow});
-                    y_out   <= prod2 >>> OUT_SH;                 // Q.OUT_FRAC
-                    y_valid <= 1'b1;
-                    idx <= idx + 1'b1;
-                    if (idx == D-1) state <= S_DONE;
+                    // stage 1
+                    if (idx < D) begin
+                        xrow = xmem[idx];
+                        grow = gmem[idx];
+                        prod   <= ($signed({{8{xrow[31]}}, xrow}) - mean) * Yr;  // Q(QX+Y_FRAC)
+                        grow_r <= grow;
+                        idx <= idx + 1'b1;
+                        s1v <= 1'b1;
+                    end else s1v <= 1'b0;
+                    // stage 2 (consumes prod/grow_r registered by stage 1 last cycle)
+                    if (s1v) begin
+                        prod2 = prod * $signed({{96{grow_r[31]}}, grow_r});  // Q(QX+Y_FRAC+G_FRAC)
+                        y_out   <= prod2 >>> OUT_SH;                         // Q.OUT_FRAC
+                        y_valid <= 1'b1;
+                        if (oidx == D-1) state <= S_DONE;
+                        oidx <= oidx + 1'b1;
+                    end
                 end
                 // -------------------------------------------------------------
                 S_DONE: begin
