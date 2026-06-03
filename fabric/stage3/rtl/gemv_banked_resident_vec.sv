@@ -56,23 +56,34 @@ module gemv_banked_resident_vec #(
     localparam integer SUBW   = WBITS / 32;
     localparam integer SSW    = (SUBW > 1) ? $clog2(SUBW) : 1;
 
-    (* ram_style = "ultra" *) reg [WBITS-1:0] wmem [0:WWORDS-1];
-    reg [P*8-1:0]                             xmem [0:XROWS-1];   // P acts per row
-    reg [YBITS-1:0]                           ymem [0:GROUPS-1];
+    // Weight memory in <=512-bit URAM banks (generate: one real array per bank).
+    // A single LANES=256 (1024-bit) memory cascades to 16x4 = 64 URAM — the whole
+    // device — so Vivado silently falls back to LUTRAM (~400k LUT, 342%). Two
+    // 512-bit banks are the geometry already proven at LANES=128. Bank b holds
+    // bits [b*BW +: BW] of the wide word; the stream fills bank 0's chunks first.
+    localparam integer NB    = (WBITS + 511) / 512;   // banks
+    localparam integer BW    = WBITS / NB;            // bank width (<= 512)
+    localparam integer BSUBW = BW / 32;               // 32-bit chunks per bank word
+    localparam integer NBW   = (NB > 1) ? $clog2(NB) : 1;
 
-    // ---- one-time load: assemble SUBW 32-bit chunks into one wide word ----------
+    reg [P*8-1:0]    xmem [0:XROWS-1];   // P acts per row
+    reg [YBITS-1:0]  ymem [0:GROUPS-1];
+
+    // ---- one-time load: assemble BSUBW chunks per bank word, banks in turn ------
     reg [WAW-1:0]    wword;
-    reg [SSW-1:0]    wsub;
-    reg [WBITS-1:0]  wbuf;
+    reg [SSW-1:0]    wsub;                     // chunk within the bank word
+    reg [NBW-1:0]    wbank;                    // which bank
+    reg [BW-1:0]     wbuf;
     reg [XAW-1:0]    xptr;
-    wire [WBITS-1:0] wnext = wbuf | ({{(WBITS-32){1'b0}}, w_data} << (wsub*32));
+    wire [BW-1:0]    wnext = wbuf | ({{(BW-32){1'b0}}, w_data} << (wsub*32));
     always @(posedge clk) begin
-        if (ld_rst) begin wword <= 0; wsub <= 0; wbuf <= {WBITS{1'b0}}; xptr <= 0; end
+        if (ld_rst) begin wword <= 0; wsub <= 0; wbank <= 0; wbuf <= {BW{1'b0}}; xptr <= 0; end
         else begin
             if (w_we) begin
-                wmem[wword] <= wnext;
-                if (wsub == SUBW-1) begin
-                    wword <= wword + 1'b1; wsub <= 0; wbuf <= {WBITS{1'b0}};
+                if (wsub == BSUBW-1) begin
+                    wsub <= 0; wbuf <= {BW{1'b0}};
+                    if (wbank == NB-1) begin wbank <= 0; wword <= wword + 1'b1; end
+                    else wbank <= wbank + 1'b1;
                 end else begin
                     wbuf <= wnext; wsub <= wsub + 1'b1;
                 end
@@ -80,6 +91,22 @@ module gemv_banked_resident_vec #(
             if (x_we) begin xmem[xptr] <= x_data; xptr <= xptr + 1'b1; end
         end
     end
+
+    // ---- per-bank URAM arrays + registered read (= pipeline stage 0) ------------
+    wire [$clog2(WWORDS)-1:0] waddr;
+    wire [WBITS-1:0] wword_rd;
+    genvar gb;
+    generate
+        for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
+            (* ram_style = "ultra" *) reg [BW-1:0] mem [0:WWORDS-1];
+            reg [BW-1:0] rd;
+            always @(posedge clk) begin
+                if (w_we && wsub == BSUBW-1 && wbank == gb[NBW-1:0]) mem[wword] <= wnext;
+                rd <= mem[waddr];
+            end
+            assign wword_rd[gb*BW +: BW] = rd;
+        end
+    endgenerate
 
     // ---- run FSM + RLAT-deep read/mac pipeline -------------------------------
     localparam [1:0] IDLE = 2'd0, RUN = 2'd1, FIN = 2'd2;
@@ -91,10 +118,10 @@ module gemv_banked_resident_vec #(
 
     wire [$clog2(GROUPS):0] gcount = (m_count + LANES - 1) >> LSH;
     wire                 issue   = (kc < k_count);
-    wire [WAW-1:0]       waddr   = grp_base + kc;
+    assign               waddr   = grp_base + kc;
 
-    // pipeline: weight word + the P-wide act row + lane-in-row + valid
-    reg [WBITS-1:0]      word_p [0:RLAT-1];
+    // pipeline: weight word (stage 0 = the per-bank URAM read reg) + act + valid
+    reg [WBITS-1:0]      word_p [0:RLAT-2];
     reg [P*8-1:0]        xrow_p [0:RLAT-1];
     reg [LSHP-1:0]       xl_p   [0:RLAT-1];
     reg                  v_p    [0:RLAT-1];
@@ -107,12 +134,13 @@ module gemv_banked_resident_vec #(
     wire                 mac_v = v_p[RLAT-1];
 
     always @(posedge clk) begin
-        word_p[0] <= wmem[waddr];
+        word_p[0] <= wword_rd;
         xrow_p[0] <= xmem[kc[$clog2(KMAX)-1:0] >> LSHP];
         xl_p[0]   <= kc[LSHP-1:0];
         v_p[0]    <= (state == RUN) && issue;
-        for (i = 1; i < RLAT; i = i + 1) begin
+        for (i = 1; i < RLAT-1; i = i + 1)
             word_p[i] <= word_p[i-1];
+        for (i = 1; i < RLAT; i = i + 1) begin
             xrow_p[i] <= xrow_p[i-1];
             xl_p[i]   <= xl_p[i-1];
             v_p[i]    <= v_p[i-1];
@@ -136,7 +164,7 @@ module gemv_banked_resident_vec #(
                 RUN: begin
                     if (issue) kc <= kc + 1'b1;
                     if (mac_v) begin
-                        wsel = word_p[RLAT-1];
+                        wsel = word_p[RLAT-2];
                         xrow = xrow_p[RLAT-1];
                         xsel = xrow[xl_p[RLAT-1]*8 +: 8];
                         for (L = 0; L < LANES; L = L + 1) begin
