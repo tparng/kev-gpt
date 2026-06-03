@@ -109,6 +109,67 @@ def write_mems(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlayer: int,
     _w(os.path.join(sim_dir, "gelu_lut.mem"), gelu_table(), 4)
 
 
+def write_banked_mem(prefix, vals, P, nib, pad=True):
+    """Bank-interleave a length-L vector into P ROM files for the P-wide datapath.
+
+    Element e of `vals` goes to bank (e % P) at position (e // P) within that bank.
+    Equivalently bank b holds vals[b::P]. Writes files prefix.b0.mem .. prefix.b{P-1}.mem,
+    each value `nib` hex digits, masked (reuses the same per-value formatting as `_w`).
+
+    L must be divisible by P. When pad=True (default) a length that is not a multiple of
+    P is zero-padded up to the next multiple before interleaving, so each bank file has an
+    equal number of words (what the P-wide datapath expects: it reads P channels per beat
+    and the last partial beat is zero-filled). The padding tail is purely trailing zeros,
+    so de-interleaving the first L words reconstructs `vals` exactly. With pad=False the
+    divisibility is asserted instead.
+    """
+    vals = list(vals)
+    L = len(vals)
+    if L % P != 0:
+        assert pad, f"banked rom length {L} not divisible by P={P}"
+        vals = vals + [0] * (P - L % P)
+    for b in range(P):
+        _w(f"{prefix}.b{b}.mem", vals[b::P], nib)
+
+
+def write_mems_banked(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlayer: int,
+                      P: int, prompt=None):
+    """Same outputs as write_mems, but the per-channel/per-element ROMs the P-wide datapath
+    reads P-at-a-time (dq_mant, dq_exp, inv_sact, gamma) are ALSO emitted bank-interleaved
+    into P files each via write_banked_mem. The values + nibble widths are IDENTICAL to
+    write_mems; only the file layout differs. The remaining 1-wide ROMs (tok_emb/pos_emb/
+    prompt/wrom/seed/exp_lut/gelu_lut) are produced by calling write_mems unchanged.
+    """
+    # produce all the standard 1-wide ROMs (incl. the flat dq_mant/dq_exp/inv_sact/gamma)
+    write_mems(sim_dir, intseq, lanes, nlayer, prompt=prompt)
+    p = intseq.p
+
+    # gamma: (ln1|ln2) per block, then ln_f  (same construction + Q4.20 / 8-nib as write_mems)
+    gam = []
+    for bi in range(nlayer):
+        gam += list(np.round(p["blocks"][bi]["ln1"] * (1 << LN_GFRAC)).astype(np.int64))
+        gam += list(np.round(p["blocks"][bi]["ln2"] * (1 << LN_GFRAC)).astype(np.int64))
+    gam += list(np.round(p["ln_f"] * (1 << LN_GFRAC)).astype(np.int64))
+
+    # dq_mant / dq_exp / inv_sact: per block (qkv|proj|mlp_fc|mlp_proj), then head
+    mant_all, exp_all, inv = [], [], []
+    for bi in range(nlayer):
+        for nm in ("qkv", "proj", "mlp_fc", "mlp_proj"):
+            L = intseq.layers[(bi, nm)]
+            mant_all += [int(m) for m in L["mant"]]
+            exp_all += [int(e) for e in L["exp"]]
+            inv.append(intseq._inv_sact(L["s_act"]))
+    mant_all += [int(m) for m in intseq.head["mant"]]
+    exp_all += [int(e) for e in intseq.head["exp"]]
+    inv.append(intseq._inv_sact(intseq.head["s_act"]))
+
+    # bank-interleaved copies (same nibble widths as write_mems: mant 8, exp 2, inv 16, gamma 8)
+    write_banked_mem(os.path.join(sim_dir, "dq_mant"), mant_all, P, 8)
+    write_banked_mem(os.path.join(sim_dir, "dq_exp"), exp_all, P, 2)
+    write_banked_mem(os.path.join(sim_dir, "inv_sact"), inv, P, 16)
+    write_banked_mem(os.path.join(sim_dir, "gamma"), gam, P, 8)
+
+
 def _compile_run(sim_dir, tok, pos, lanes, nlayer, prompt_len=1, ngen=1, kvmax=32,
                  fast=False, dbg_phase=False):
     # fast=True gates sequencer_fast (resident-read GEMV: weights preloaded once into the
