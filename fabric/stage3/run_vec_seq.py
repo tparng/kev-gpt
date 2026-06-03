@@ -54,7 +54,7 @@ def run(sim_dir, tok, P, lanes=16, tmax=256, npz="fabric/export/goformer.npz"):
                          os.path.join(RTL, "vec_gelu.sv"),
                          os.path.join(RTL, "gelu_lut.sv"),
                          os.path.join(RTL, "softmax.sv"),
-                         os.path.join(RTL, "gemv_banked_resident.sv")],
+                         os.path.join(RTL, "gemv_banked_resident_vec.sv")],
                         capture_output=True, text=True)
     if cp.returncode != 0:
         print("IVERILOG_COMPILE_FAIL"); print(cp.stdout); print(cp.stderr); return False

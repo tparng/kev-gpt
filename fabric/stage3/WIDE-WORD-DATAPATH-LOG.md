@@ -358,3 +358,18 @@ KV 654 — launch-bound), ONNX Runtime KV ctx-256 748, ctx-64 best 1,273. The KV
 the laptop's best single-stream by 2.0× at ctx-64 (3.3× at ctx-256) — a 3M-param model is
 DDR/launch-bound on both CPU and GPU; on-chip residency wins on every machine, the laptop just
 has no fabric to be resident in.
+
+---
+
+## 10. The P-wide GEMV boundary — 35,597 cyc/token (SIM, gated bit-exact)
+
+The §8 lever, executed: `gemv_banked_resident_vec.sv` keeps the proven 128-lane MAC core but
+widens the boundary — the act port takes P INT8 lanes/write (acts banked P/row like the scratch),
+readback returns P INT32 per address (P-block of the LANES-wide group word). G_AQ quantizes P
+lanes/cycle straight from the wide bank read; G_RB writes one full gemvy row/cycle. The two
+1/cycle boundary loops (~7.4k + ~9.4k cycles) collapse by P.
+
+Gate green first run on tok 10/48/100: **35,597 cyc/token** (was 50,325; −29%). Cycle floor
+now ≈ GEMV MAC (~12k) + attention load (~4.3k) + LN/argmax (~7k) + dequant (~2.2k).
+@125 MHz → **3,512 tok/s PROJECTED**; OOC + bitstream pending. Bonus: 9 SLICE-heavy carry-chain
+adders fold into 8 DSP-friendly multipliers (act-quant is 64×34 → DSPs).

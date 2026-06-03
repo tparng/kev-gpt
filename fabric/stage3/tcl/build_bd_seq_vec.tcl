@@ -34,7 +34,7 @@ add_files -norecurse [list \
     "$root/fabric/stage3/rtl/vec_gelu.sv" \
     "$root/fabric/stage3/rtl/gelu_lut.sv" \
     "$root/fabric/stage3/rtl/softmax.sv" \
-    "$root/fabric/stage3/rtl/gemv_banked_resident.sv"]
+    "$root/fabric/stage3/rtl/gemv_banked_resident_vec.sv"]
 
 # wide-word BRAM-ROM init files (one P-packed word per line) + submodule LUTs
 set memfiles [list tok_emb_w.mem pos_emb_w.mem gamma_w.mem dqm_w.mem dqe_w.mem \

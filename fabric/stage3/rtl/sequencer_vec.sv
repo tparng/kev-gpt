@@ -131,20 +131,23 @@ module sequencer_vec #(
         .clk(clk), .rst(rst), .start(ln_start), .valid_in(ln_vin),
         .x_in(ln_x), .gamma_in(ln_g), .y_valid(ln_yv), .y_out(ln_y), .done(ln_done));
 
-    // ---- GEMV (resident) -------------------------------------------------------
+    // ---- GEMV (resident, P-wide boundary) ---------------------------------------
+    // act feed: P INT8 lanes/cycle; readback: P INT32 outputs/cycle (rd_addr is a
+    // P-group index). The MAC core is the proven gemv_banked_resident.
     reg                gv_ldrst, gv_xwe, gv_start;
-    reg signed [7:0]   gv_xdata;
+    reg  [P*8-1:0]     gv_xdata;
     reg [10:0]         gv_m, gv_k;
     reg [$clog2(WWORDS)-1:0] gv_wbase;
     wire               gv_done;
     reg [10:0]         gv_rdaddr;
-    wire signed [31:0] gv_yout;
-    gemv_banked_resident #(.LANES(LANES), .MMAX(1024), .KMAX(1024), .RLAT(2),
+    wire [P*32-1:0]    gv_yout;
+    gemv_banked_resident_vec #(.LANES(LANES), .P(P), .MMAX(1024), .KMAX(1024), .RLAT(2),
                   .WWORDS(WWORDS)) u_gemv (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
         .x_we(gv_xwe), .x_data(gv_xdata),
-        .start(gv_start), .done(gv_done), .rd_addr(gv_rdaddr[9:0]), .y_out(gv_yout));
+        .start(gv_start), .done(gv_done),
+        .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout));
 
     // ---- vec_dequant (P lanes, runtime frac) -----------------------------------
     reg               dq_vin;
@@ -209,6 +212,7 @@ module sequencer_vec #(
     reg signed [31:0]  aq_int;
     reg signed [31:0]  cb, dqv, hv;
     reg [P*32-1:0]  ww, sw, dword, gyr, hw, gyw, cw;
+    reg [P*8-1:0]   aqw;                     // P-wide act-quant word
     reg [P*64-1:0]  mword, gsw;
     reg [P*24-1:0]  mwr;
     reg [P*8-1:0]   ewr;
@@ -243,11 +247,12 @@ module sequencer_vec #(
     wire [10:0] rbr = rd_addr >> LSH;            // board readback row (idle only)
     wire [10:0] xres_ra   = (st==L_FEED) ? {{(11-$clog2(ROWSM+1)){1'b0}}, fr} :
                             (st==S_RES1 || st==S_RES2) ? ci : rbr;
-    wire [10:0] lnout1_ra = (st==G_AQ) ? (ci >> LSH) : rbr;
-    wire [10:0] lnout2_ra = (st==G_AQ) ? (ci >> LSH) : rbr;
-    wire [10:0] ctxv_ra   = (st==G_AQ) ? (ci >> LSH) : rbr;
+    // G_AQ counts P-rows directly (one wide word per cycle into the GEMV boundary)
+    wire [10:0] lnout1_ra = (st==G_AQ) ? ci : rbr;
+    wire [10:0] lnout2_ra = (st==G_AQ) ? ci : rbr;
+    wire [10:0] ctxv_ra   = (st==G_AQ) ? ci : rbr;
     wire [10:0] mlpbuf_ra = (st==S_GELU) ? {{(11-$clog2(ROWSM+1)){1'b0}}, gfr} :
-                            (st==G_AQ) ? (ci >> LSH) : rbr;
+                            (st==G_AQ) ? ci : rbr;
     wire [10:0] qkv_ra    = (st==S_ALD) ? (aw_src >> LSH) : rbr;
     wire [10:0] attn_ra   = (st==S_RES1) ? ci : rbr;
     wire [10:0] mlp_ra    = (st==S_RES2) ? ci : rbr;
@@ -321,32 +326,35 @@ module sequencer_vec #(
                     g_ret<=S_AST; ci<=0; civ<=0; hh<=2'd0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // ================= callable GEMV ==============================
-                G_AQ: begin            // act-quant from the selected source (sync read)
-                    cid <= ci; civ <= (ci != g_k);
-                    if (ci != g_k) ci <= ci + 1'b1;
+                G_AQ: begin    // act-quant: P lanes per cycle into the GEMV boundary
+                    cid <= ci; civ <= (ci != (g_k >> LSH));
+                    if (ci != (g_k >> LSH)) ci <= ci + 1'b1;
                     if (civ) begin
-                        case (g_asrc)
-                            2'd0: lntmp = $signed(lnout1_r[(cid[LSH-1:0])*64 +: 64]);
-                            2'd1: begin
-                                cb = ctxv_r[(cid[LSH-1:0])*32 +: 32];
-                                // ctx Q6.25 -> Q.22 rsh_round (matches _proj_after_attn)
-                                if ($signed({{32{cb[31]}}, cb}) >= 0)
-                                    lntmp = ($signed({{32{cb[31]}}, cb}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC);
-                                else
-                                    lntmp = -((-$signed({{32{cb[31]}}, cb}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC));
-                            end
-                            2'd2: lntmp = $signed(lnout2_r[(cid[LSH-1:0])*64 +: 64]);
-                            default: lntmp = $signed(mlpbuf_r[(cid[LSH-1:0])*64 +: 64]);
-                        endcase
-                        aq_prod = $signed(lntmp) * $signed(inv_sact[g_asel]);
-                        if (lntmp >= 0)
-                            aq_sh = (aq_prod + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH);
-                        else
-                            aq_sh = -(((-aq_prod) + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH));
-                        aq_int = aq_sh[31:0];
-                        if (aq_int>127) aq_int=127; if (aq_int<-128) aq_int=-128;
-                        gv_xwe<=1'b1; gv_xdata<=aq_int[7:0];
-                        if (cid==g_k-1) begin ci<=0; civ<=0; st<=G_RUN; end
+                        for (pp=0; pp<P; pp=pp+1) begin
+                            case (g_asrc)
+                                2'd0: lntmp = $signed(lnout1_r[pp*64 +: 64]);
+                                2'd1: begin
+                                    cb = ctxv_r[pp*32 +: 32];
+                                    // ctx Q6.25 -> Q.22 rsh_round (matches _proj_after_attn)
+                                    if ($signed({{32{cb[31]}}, cb}) >= 0)
+                                        lntmp = ($signed({{32{cb[31]}}, cb}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC);
+                                    else
+                                        lntmp = -((-$signed({{32{cb[31]}}, cb}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC));
+                                end
+                                2'd2: lntmp = $signed(lnout2_r[pp*64 +: 64]);
+                                default: lntmp = $signed(mlpbuf_r[pp*64 +: 64]);
+                            endcase
+                            aq_prod = $signed(lntmp) * $signed(inv_sact[g_asel]);
+                            if (lntmp >= 0)
+                                aq_sh = (aq_prod + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH);
+                            else
+                                aq_sh = -(((-aq_prod) + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH));
+                            aq_int = aq_sh[31:0];
+                            if (aq_int>127) aq_int=127; if (aq_int<-128) aq_int=-128;
+                            aqw[pp*8 +: 8] = aq_int[7:0];
+                        end
+                        gv_xwe<=1'b1; gv_xdata<=aqw;
+                        if (cid==(g_k >> LSH)-1) begin ci<=0; civ<=0; st<=G_RUN; end
                     end
                 end
                 G_RUN: begin
@@ -356,18 +364,15 @@ module sequencer_vec #(
                 G_WAIT: if (gv_done) begin
                     ci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0; gystage<=0; dq_rd_v<=0; st<=G_RB;
                 end
-                G_RB: begin                               // readback g_m outputs -> gemvy (staged)
-                    if (ci < g_m) begin gv_rdaddr<=ci; rb0<=ci; ci<=ci+1'b1; end
-                    else gv_rdaddr<=g_m-1'b1;
+                G_RB: begin              // readback ceil(g_m/P) wide words -> gemvy
+                    if (ci < ((g_m + P-1) >> LSH)) begin
+                        gv_rdaddr<=ci; rb0<=ci; ci<=ci+1'b1;
+                    end else gv_rdaddr <= ((g_m + P-1) >> LSH) - 1'b1;
                     rb1<=rb0; rb2<=rb1;
-                    rv0<=(ci<g_m); rv1<=rv0; rv2<=rv1;
+                    rv0<=(ci < ((g_m + P-1) >> LSH)); rv1<=rv0; rv2<=rv1;
                     if (rv2) begin
-                        gyw = gystage;
-                        gyw[(rb2[LSH-1:0])*32 +: 32] = gv_yout;
-                        if (rb2[LSH-1:0]==P-1 || rb2==g_m-1) begin
-                            gemvy_bank[rb2 >> LSH] <= gyw; gystage <= 0;
-                        end else gystage <= gyw;
-                        if (rb2==g_m-1) begin dr<=0; dor<=0; st<=G_DQ; end
+                        gemvy_bank[rb2] <= gv_yout;
+                        if (rb2==((g_m + P-1) >> LSH)-1) begin dr<=0; dor<=0; st<=G_DQ; end
                     end
                 end
                 G_DQ: begin                               // P-wide dequant -> selected dest

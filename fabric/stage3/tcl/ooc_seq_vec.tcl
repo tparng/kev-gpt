@@ -27,7 +27,7 @@ read_verilog -sv [list \
     "$rtl/vec_gelu.sv" \
     "$rtl/gelu_lut.sv" \
     "$rtl/softmax.sv" \
-    "$rtl/gemv_banked_resident.sv"]
+    "$rtl/gemv_banked_resident_vec.sv"]
 
 synth_design -top sequencer_vec -part $part -mode out_of_context \
     -generic P=$pp -generic LANES=$lanes -generic NLAYER=4 -generic WWORDS=$wwords \
