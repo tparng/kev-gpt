@@ -16,7 +16,7 @@ set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"
 set root  [file normalize [file dirname [info script]]/../../..]
 set bdir  "C:/kevbuild/stage3_seqvec_bit"
-set mems  "C:/kevbuild/stage3_seq_vec_ww128"      ;# wide-word ROMs (tok/pos/gamma_w + dqm/dqe_w)
+set mems  "C:/kevbuild/stage3_seq_vec_p$pp"       ;# wide-word ROMs — P-DEPENDENT (packed P/word)
 
 file mkdir $bdir
 create_project gemv_seqvec_pl "$bdir/gemv_seqvec_pl" -part $part -force

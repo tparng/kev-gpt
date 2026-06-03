@@ -8,6 +8,11 @@ wait_on_run synth_1
 if {[get_property PROGRESS [get_runs synth_1]] != "100%"} { puts "SYNTH_FAILED"; error "synth" }
 puts "SYNTH_OK"
 
+# the P-wide datapath is LUT/SLICEM-dense (distributed-RAM buffers); spread logic across the
+# whole device + a congestion-aware router so placement doesn't choke near the URAM/DSP columns.
+set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE AltSpreadLogic_high [get_runs impl_1]
+set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE AlternateCLBRouting [get_runs impl_1]
+
 launch_runs impl_1 -to_step write_bitstream -jobs 8
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { puts "IMPL_FAILED"; error "impl" }
