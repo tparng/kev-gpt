@@ -33,7 +33,7 @@ module tb;
     sequencer_vec #(.P(P), .LANES(LANES)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_id(tok), .pos(pos), .done(done),
         .tok_out(tok_out), .rd_sel(rsel), .rd_addr(raddr), .rd_data(rdata),
-        .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data));
+        .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data), .dbg_stop(1'b0));
 
     reg [WBITS-1:0] wimg [0:`WROMN-1];
     reg [WBITS-1:0] wword;

@@ -50,8 +50,35 @@ class Dev:
     def wr(self, off, val): self.reg[off >> 2] = np.uint32(val & 0xFFFFFFFF)
     def rd(self, off): return int(self.reg[off >> 2])
 
+    def read_bank(self, sel, n):
+        """Read n elements of bank `sel` via the rd_sel/rd_addr port (registered). Returns
+        unsigned 64-bit words (sign-extended in HW for the 32-bit banks)."""
+        out = []
+        self.wr(R_RDSEL, sel)
+        for a in range(n):
+            self.wr(R_RDADDR, a)
+            _ = self.rd(R_RDLO)               # dummy read to flush the 2-cyc registered pipe
+            lo = self.rd(R_RDLO); hi = self.rd(R_RDHI)
+            out.append(((hi & 0xFFFFFFFF) << 32) | (lo & 0xFFFFFFFF))
+        return out
+
     def close(self):
         self.reg = None; self.mm.close(); os.close(self.fd)
+
+
+M64 = (1 << 64) - 1
+
+
+def _cmp_phase(dev, sel, key, n, gold_sig):
+    got = dev.read_bank(sel, n)
+    gold = [int(v) & M64 for v in gold_sig[key][:n]]
+    mism = [i for i in range(n) if got[i] != gold[i]]
+    tag = f"{key}: {'OK' if not mism else f'{len(mism)}/{n} MISMATCH'}"
+    if mism:
+        i = mism[0]
+        tag += f" first@{i} got={got[i]:016x} gold={gold[i]:016x}"
+    print(f"[rdbk] {tag}")
+    return not mism
 
 
 def build_weight_image(intseq, lanes):
@@ -75,6 +102,14 @@ def main(argv=None):
     ap.add_argument("--fclk", type=float, default=40e6)
     ap.add_argument("--base", type=lambda s: int(s, 0), default=BASE)
     ap.add_argument("--poll-timeout", type=float, default=30.0)
+    ap.add_argument("--readback", action="store_true",
+                    help="after the forward, read back x4/lnf/head and compare to seq_ref "
+                         "(localises which phase first diverges)")
+    ap.add_argument("--stop-b0", action="store_true",
+                    help="halt after block 0 (CTRL b3 dbg_stop); banks hold block-0 phases")
+    ap.add_argument("--readback-b0", action="store_true",
+                    help="with --stop-b0: read ln1/qkv/ctx/attn/ln2/gelu/mlp/x and compare IN "
+                         "ORDER to seq_ref.block0_phase_signals — finds the first broken phase")
     args = ap.parse_args(argv)
 
     fclk_hz = set_and_verify_fclk(args.fclk)
@@ -104,7 +139,7 @@ def main(argv=None):
         print(f"[load] {len(words)*subw} chunks in {time.time()-t0:.2f}s")
         dev.wr(R_TOKID, int(args.tok) & 0x1FF)
         dev.wr(R_POS, int(args.pos) & 0x1FF)
-        dev.wr(R_CTRL, 0x1)                                  # go
+        dev.wr(R_CTRL, 0x9 if args.stop_b0 else 0x1)         # go (+ dbg_stop b3 if stop-b0)
         t0 = time.time(); done = False
         while time.time() - t0 < args.poll_timeout:
             if dev.rd(R_STATUS) & 0x1:
@@ -114,6 +149,23 @@ def main(argv=None):
         cyc = dev.rd(R_CYCLES); got_tok = dev.rd(R_TOKOUT) & 0x1FF
         match = (got_tok == gold_tok)
         print(f"[hw  ] tok_out={got_tok} gold={gold_tok} match={match}  CYCLES={cyc}")
+        if args.readback:
+            # after the forward: lnout1=LN_f out (sel0), xres=x4 (sel7), head logits (sel8)
+            _cmp_phase(dev, 7, "x4_q25", 256, gold)     # residual after the last block (blocks OK?)
+            _cmp_phase(dev, 0, "lnf_q22", 256, gold)    # final LayerNorm out (head input)
+            _cmp_phase(dev, 8, "head_q25", 193, gold)   # head logits (argmax input)
+        if args.readback_b0:
+            # block-0 phases left in the banks by --stop-b0, compared IN FORWARD ORDER:
+            # the FIRST mismatch pinpoints the broken operation.
+            b0 = intseq.block0_phase_signals(int(args.tok))
+            order = [(0, "ln1_out_q22", 256), (1, "qkv_q16", 768), (2, "ctx_q25", 256),
+                     (3, "attn_out_q25", 256), (4, "ln2_out_q22", 256), (5, "gelu_q22", 1024),
+                     (6, "mlp_out_q25", 256), (7, "x_out_q25", 256)]
+            for sel, key, n in order:
+                ok = _cmp_phase(dev, sel, key, n, b0)
+                if not ok:
+                    print(f"[b0  ] >>> FIRST DIVERGENCE at phase '{key}' (sel {sel}) <<<")
+                    break
         if match and cyc > 0:
             tok_s = fclk_hz / cyc
             print(f"[meas] cyc/token = {cyc}   MEASURED tok/s = {tok_s:.1f}  "

@@ -58,7 +58,10 @@ module sequencer_vec #(
     // runtime weight load (stream the whole transposed image once)
     input  wire        wl_rst,
     input  wire        wl_we,
-    input  wire [31:0] wl_data
+    input  wire [31:0] wl_data,
+    // DEBUG: when high, halt after block 0's residual (banks hold block-0 ln1/qkv/ctx/attn/
+    // ln2/gelu/mlp/x) so a board readback can be compared to seq_ref.block0_phase_signals.
+    input  wire        dbg_stop
 );
     localparam integer ROWS  = D    / P;
     localparam integer ROWS3 = D3   / P;
@@ -421,7 +424,8 @@ module sequencer_vec #(
                     xres_bank[ci] <= sw;
                     if (ci==ROWS-1) begin
                         ci<=0;
-                        if (blk == NLAYER-1) begin                 // -> final LN_f -> head
+                        if (dbg_stop && blk==4'd0) st<=S_FIN;      // DEBUG: stop after block 0
+                        else if (blk == NLAYER-1) begin            // -> final LN_f -> head
                             l_gbase<=NLAYER*2; l_dst<=1'b0; l_ret<=S_HEADSET; st<=L_GAM;
                         end else begin                             // -> next block LN1
                             blk<=blk+1'b1; l_gbase<=(blk+1'b1)*2; l_dst<=1'b0;

@@ -49,6 +49,7 @@ module gemv_axi_seq_vec #(
     wire wr_en = S_AXI_AWVALID & S_AXI_WVALID & ~S_AXI_BVALID;
 
     reg          go_pulse, wl_rst, soft_reset, wl_we;
+    reg          dbg_stop;                          // CTRL b3: halt after block 0 (debug)
     reg [31:0]   wl_data;
     reg [8:0]    tok_id, pos;
     reg [3:0]    rd_sel;
@@ -58,7 +59,7 @@ module gemv_axi_seq_vec #(
         if (!aresetn) begin
             S_AXI_AWREADY<=0; S_AXI_WREADY<=0; S_AXI_BVALID<=0; S_AXI_BRESP<=0; awaddr<=0;
             go_pulse<=0; wl_rst<=0; soft_reset<=0; wl_we<=0; wl_data<=0;
-            tok_id<=0; pos<=0; rd_sel<=0; rd_addr<=0;
+            tok_id<=0; pos<=0; rd_sel<=0; rd_addr<=0; dbg_stop<=0;
         end else begin
             go_pulse<=0; wl_rst<=0; wl_we<=0;
             if (wr_en && !S_AXI_AWREADY) begin
@@ -66,7 +67,7 @@ module gemv_axi_seq_vec #(
             end else begin S_AXI_AWREADY<=0; S_AXI_WREADY<=0; end
             if (S_AXI_AWREADY) begin
                 case (awaddr[7:2])
-                    6'h0: begin go_pulse<=S_AXI_WDATA[0]; wl_rst<=S_AXI_WDATA[1]; soft_reset<=S_AXI_WDATA[2]; end
+                    6'h0: begin go_pulse<=S_AXI_WDATA[0]; wl_rst<=S_AXI_WDATA[1]; soft_reset<=S_AXI_WDATA[2]; dbg_stop<=S_AXI_WDATA[3]; end
                     6'h2: tok_id  <= S_AXI_WDATA[8:0];
                     6'h3: pos     <= S_AXI_WDATA[8:0];
                     6'h4: begin wl_we<=1; wl_data<=S_AXI_WDATA; end
@@ -122,6 +123,6 @@ module gemv_axi_seq_vec #(
         .clk(clk), .rst(core_rst), .go(go_pulse),
         .tok_id(tok_id), .pos(pos), .done(core_done_w), .tok_out(core_tok_out),
         .rd_sel(rd_sel), .rd_addr(rd_addr), .rd_data(core_rd_data),
-        .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data)
+        .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data), .dbg_stop(dbg_stop)
     );
 endmodule
