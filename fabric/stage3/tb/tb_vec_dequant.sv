@@ -37,8 +37,8 @@ module tb;
     wire               out_valid;
     wire [P*32-1:0]    dq_out;
 
-    vec_dequant #(.P(P), .FRAC(FRAC)) dut (
-        .clk(clk), .rst(rst), .in_valid(in_valid),
+    vec_dequant #(.P(P)) dut (
+        .clk(clk), .rst(rst), .in_valid(in_valid), .frac(FRAC[6:0]),
         .gemvy(gemvy), .mant(mant), .exp(exp),
         .out_valid(out_valid), .dq_out(dq_out)
     );

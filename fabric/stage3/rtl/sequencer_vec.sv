@@ -113,13 +113,14 @@ module sequencer_vec #(
 
     // ---- vec_dequant (P lanes, FRAC = VFRAC for qkv) ---------------------------
     reg               dq_vin;
+    reg signed [6:0]  dq_frac;          // runtime dequant fraction (16 qkv / 25 proj-mp / 12 fc)
     reg  [P*32-1:0]   dq_gemvy;
     reg  [P*24-1:0]   dq_mant;
     reg  [P*8-1:0]    dq_exp;
     wire              dq_vout;
     wire [P*32-1:0]   dq_out;
-    vec_dequant #(.P(P), .FRAC(VFRAC)) u_dq (
-        .clk(clk), .rst(rst), .in_valid(dq_vin),
+    vec_dequant #(.P(P)) u_dq (
+        .clk(clk), .rst(rst), .in_valid(dq_vin), .frac(dq_frac),
         .gemvy(dq_gemvy), .mant(dq_mant), .exp(dq_exp),
         .out_valid(dq_vout), .dq_out(dq_out));
 
@@ -171,7 +172,7 @@ module sequencer_vec #(
             rv0 <= 0; rv1 <= 0; rv2 <= 0;
         end else begin
             case (st)
-                S_IDLE: if (go) begin ci <= 0; st <= S_EMB; end
+                S_IDLE: if (go) begin ci <= 0; dq_frac <= 7'd16; st <= S_EMB; end
                 // ---- embed -> banks --------------------------------------------
                 S_EMB: begin
                     e_tok = tok_emb[tok_id*D + ci];

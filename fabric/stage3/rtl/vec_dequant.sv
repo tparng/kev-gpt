@@ -25,12 +25,12 @@
 `timescale 1ns / 1ps
 
 module vec_dequant #(
-    parameter integer P    = 8,    // lanes processed per cycle
-    parameter integer FRAC = 16    // target fraction (16 qkv-kv / 25 residual / 12 gelu)
+    parameter integer P    = 8     // lanes processed per cycle
 ) (
     input  wire                  clk,
     input  wire                  rst,
     input  wire                  in_valid,
+    input  wire signed [6:0]     frac,    // target fraction, RUNTIME (16 qkv-kv / 25 resid / 12 gelu)
     // PACKED per-lane buses: lane k occupies the k-th fixed-width slot.
     input  wire [P*32-1:0]       gemvy,   // P x signed [31:0]
     input  wire [P*24-1:0]       mant,    // P x signed [23:0]
@@ -70,7 +70,7 @@ module vec_dequant #(
                 // zero-extend mant to a positive 25-bit signed before the signed product
                 // (values >= 2^23 would flip negative under a 24-bit signed read)
                 dq_prod = $signed(gemvy_v) * $signed({1'b0, mant_v});
-                dq_shv  = $signed(exp_v) + FRAC;                // signed sum
+                dq_shv  = $signed(exp_v) + $signed(frac);       // signed sum (runtime frac)
                 if (dq_shv >= 0) dq_val = dq_prod <<< dq_shv;
                 else             dq_val = rsh_round(dq_prod, -dq_shv);
             end
