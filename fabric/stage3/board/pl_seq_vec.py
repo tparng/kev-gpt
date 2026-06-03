@@ -105,11 +105,10 @@ def main(argv=None):
     ap.add_argument("--readback", action="store_true",
                     help="after the forward, read back x4/lnf/head and compare to seq_ref "
                          "(localises which phase first diverges)")
-    ap.add_argument("--stop-b0", action="store_true",
-                    help="halt after block 0 (CTRL b3 dbg_stop); banks hold block-0 phases")
-    ap.add_argument("--readback-b0", action="store_true",
-                    help="with --stop-b0: read ln1/qkv/ctx/attn/ln2/gelu/mlp/x and compare IN "
-                         "ORDER to seq_ref.block0_phase_signals — finds the first broken phase")
+    ap.add_argument("--stop-mode", type=int, default=0, choices=[0, 1, 2, 3],
+                    help="DEBUG halt (CTRL b4:3): 1=after embed (xres=x_in), 2=after LN2 "
+                         "(xres=x_res1, lnout2=ln2), 3=after block0 (full phase sweep). "
+                         "Banks are read back + compared to seq_ref.block0_phase_signals.")
     args = ap.parse_args(argv)
 
     fclk_hz = set_and_verify_fclk(args.fclk)
@@ -139,7 +138,7 @@ def main(argv=None):
         print(f"[load] {len(words)*subw} chunks in {time.time()-t0:.2f}s")
         dev.wr(R_TOKID, int(args.tok) & 0x1FF)
         dev.wr(R_POS, int(args.pos) & 0x1FF)
-        dev.wr(R_CTRL, 0x9 if args.stop_b0 else 0x1)         # go (+ dbg_stop b3 if stop-b0)
+        dev.wr(R_CTRL, 0x1 | (args.stop_mode << 3))          # go (+ dbg_stop b4:3)
         t0 = time.time(); done = False
         while time.time() - t0 < args.poll_timeout:
             if dev.rd(R_STATUS) & 0x1:
@@ -154,18 +153,21 @@ def main(argv=None):
             _cmp_phase(dev, 7, "x4_q25", 256, gold)     # residual after the last block (blocks OK?)
             _cmp_phase(dev, 0, "lnf_q22", 256, gold)    # final LayerNorm out (head input)
             _cmp_phase(dev, 8, "head_q25", 193, gold)   # head logits (argmax input)
-        if args.readback_b0:
-            # block-0 phases left in the banks by --stop-b0, compared IN FORWARD ORDER:
-            # the FIRST mismatch pinpoints the broken operation.
+        if args.stop_mode:
             b0 = intseq.block0_phase_signals(int(args.tok))
-            order = [(0, "ln1_out_q22", 256), (1, "qkv_q16", 768), (2, "ctx_q25", 256),
-                     (3, "attn_out_q25", 256), (4, "ln2_out_q22", 256), (5, "gelu_q22", 1024),
-                     (6, "mlp_out_q25", 256), (7, "x_out_q25", 256)]
-            for sel, key, n in order:
-                ok = _cmp_phase(dev, sel, key, n, b0)
-                if not ok:
-                    print(f"[b0  ] >>> FIRST DIVERGENCE at phase '{key}' (sel {sel}) <<<")
-                    break
+            if args.stop_mode == 1:        # after embed: xres = x_in (the embedding)
+                _cmp_phase(dev, 7, "x_in_q25", 256, b0)
+            elif args.stop_mode == 2:      # after LN2: xres = x_res1, lnout2 = ln2
+                _cmp_phase(dev, 7, "x_res1_q25", 256, b0)
+                _cmp_phase(dev, 4, "ln2_out_q22", 256, b0)
+            else:                          # after block0: full ordered phase sweep
+                order = [(0, "ln1_out_q22", 256), (1, "qkv_q16", 768), (2, "ctx_q25", 256),
+                         (3, "attn_out_q25", 256), (4, "ln2_out_q22", 256), (5, "gelu_q22", 1024),
+                         (6, "mlp_out_q25", 256), (7, "x_out_q25", 256)]
+                for sel, key, n in order:
+                    if not _cmp_phase(dev, sel, key, n, b0):
+                        print(f"[b0  ] >>> FIRST DIVERGENCE at phase '{key}' (sel {sel}) <<<")
+                        break
         if match and cyc > 0:
             tok_s = fclk_hz / cyc
             print(f"[meas] cyc/token = {cyc}   MEASURED tok/s = {tok_s:.1f}  "

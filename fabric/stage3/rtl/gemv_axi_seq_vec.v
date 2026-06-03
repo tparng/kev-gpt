@@ -49,7 +49,7 @@ module gemv_axi_seq_vec #(
     wire wr_en = S_AXI_AWVALID & S_AXI_WVALID & ~S_AXI_BVALID;
 
     reg          go_pulse, wl_rst, soft_reset, wl_we;
-    reg          dbg_stop;                          // CTRL b3: halt after block 0 (debug)
+    reg [1:0]    dbg_stop;                           // CTRL b4:3: debug halt point (1/2/3)
     reg [31:0]   wl_data;
     reg [8:0]    tok_id, pos;
     reg [3:0]    rd_sel;
@@ -67,7 +67,7 @@ module gemv_axi_seq_vec #(
             end else begin S_AXI_AWREADY<=0; S_AXI_WREADY<=0; end
             if (S_AXI_AWREADY) begin
                 case (awaddr[7:2])
-                    6'h0: begin go_pulse<=S_AXI_WDATA[0]; wl_rst<=S_AXI_WDATA[1]; soft_reset<=S_AXI_WDATA[2]; dbg_stop<=S_AXI_WDATA[3]; end
+                    6'h0: begin go_pulse<=S_AXI_WDATA[0]; wl_rst<=S_AXI_WDATA[1]; soft_reset<=S_AXI_WDATA[2]; dbg_stop<=S_AXI_WDATA[4:3]; end
                     6'h2: tok_id  <= S_AXI_WDATA[8:0];
                     6'h3: pos     <= S_AXI_WDATA[8:0];
                     6'h4: begin wl_we<=1; wl_data<=S_AXI_WDATA; end

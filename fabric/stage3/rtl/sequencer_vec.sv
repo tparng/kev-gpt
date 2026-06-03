@@ -59,9 +59,10 @@ module sequencer_vec #(
     input  wire        wl_rst,
     input  wire        wl_we,
     input  wire [31:0] wl_data,
-    // DEBUG: when high, halt after block 0's residual (banks hold block-0 ln1/qkv/ctx/attn/
-    // ln2/gelu/mlp/x) so a board readback can be compared to seq_ref.block0_phase_signals.
-    input  wire        dbg_stop
+    // DEBUG halt points (banks then hold a block-0 snapshot for board readback vs
+    // seq_ref.block0_phase_signals): 1=after embed (xres=x_in), 2=after LN2 (xres=x_res1,
+    // lnout2=ln2), 3=after block0 (xres=x_out). 0 = no stop (normal forward).
+    input  wire [1:0]  dbg_stop
 );
     localparam integer ROWS  = D    / P;
     localparam integer ROWS3 = D3   / P;
@@ -243,7 +244,9 @@ module sequencer_vec #(
                         ww[pp*32 +: 32] = $signed(tw[pp*32 +: 32]) + $signed(pw[pp*32 +: 32]);
                     xres_bank[fr] <= ww;
                     if (fr==ROWS-1) begin
-                        fr<=0; l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; st<=L_GAM;
+                        fr<=0;
+                        if (dbg_stop==2'd1) st<=S_FIN;         // DEBUG: stop after embed
+                        else begin l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; st<=L_GAM; end
                     end else fr<=fr+1'b1;
                 end
                 // ================= callable LayerNorm =========================
@@ -389,7 +392,8 @@ module sequencer_vec #(
                     end else ci<=ci+1'b1;
                 end
                 // mlp_fc GEMV setup (after LN2) --------------------------------
-                S_FCRET: begin
+                S_FCRET: if (dbg_stop==2'd2 && blk==4'd0) st<=S_FIN;  // DEBUG: stop after LN2
+                  else begin
                     g_wbase<=blk*GW_BLK + WB_FC; g_m<=D_MLP[10:0]; g_k<=D[10:0]; g_asrc<=2'd2;
                     g_asel<=blk*4 + 6'd2; g_frac<=7'd12; g_dqrow<=blk*DQB_P + DR_FC; g_dst<=3'd2;
                     g_ret<=S_GELU; ci<=0; gfr<=0; gor<=0; gv_ldrst<=1'b1; st<=G_AQ;
@@ -424,7 +428,7 @@ module sequencer_vec #(
                     xres_bank[ci] <= sw;
                     if (ci==ROWS-1) begin
                         ci<=0;
-                        if (dbg_stop && blk==4'd0) st<=S_FIN;      // DEBUG: stop after block 0
+                        if (dbg_stop==2'd3 && blk==4'd0) st<=S_FIN; // DEBUG: stop after block 0
                         else if (blk == NLAYER-1) begin            // -> final LN_f -> head
                             l_gbase<=NLAYER*2; l_dst<=1'b0; l_ret<=S_HEADSET; st<=L_GAM;
                         end else begin                             // -> next block LN1
