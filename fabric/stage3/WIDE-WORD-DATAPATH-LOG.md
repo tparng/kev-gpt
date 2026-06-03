@@ -314,3 +314,25 @@ silicon ceiling comes from the board `--fclk` sweep.
 URAM 56/64 · DSP 421.** LUT headroom is back (~38%); the binding resource is BRAM with 1.5
 tiles spare — anything new on-chip must displace the embed ROMs. The P=4 LUTRAM design used
 106k LUT (90.5%) — sync-read P=8 is both smaller AND ~3k cyc/token faster.
+
+**Full build @40 MHz (SYNTH):** placed + routed without strategies drama — setup slack
+**+4.092 ns** (crit ~20.9 ns vs P=4's 17.5 — the BRAM read mux is the slower path), 72,223 LUT
+(61.7%). Bitstream `gemv_seqvec.bit/.bin` (IDCODE `SQRV`).
+
+**On silicon (MEASURED, driver bit-honest):** bit-exact on first run, CYCLES = **50,324** —
+cycle-exact to sim. Clock sweep:
+
+| fclk | tok/s | match |
+|---|---|---|
+| 40 MHz | 794.8 | ✓ |
+| 76.9 MHz | 1,528.6 | ✓ 3/3 |
+| **83.3 MHz** | **1,655.9** | ✓ **3/3** |
+| 90.9 MHz | (1,806.5) | ✗ 1/3 — not claimed |
+| 100 MHz | (1,987.1) | ✗ 1/3 — first pass cold, then fails |
+
+**P=8 reliable = 1,655.9 tok/s; the P=4 record (1,882.7 @ 100 MHz) still stands.** The lesson:
+the BRAM datapath cost ~17 % silicon clock ceiling (~83 vs 100 MHz, the same ~2.0–2.5× STA
+factor over its 20.9 ns crit path) and bought only 5 % cycles back. The first 100 MHz run
+passed cold then failed warm — only multi-run sweeps count. Next: rebuild constrained at
+80 MHz so placement actually tightens the BRAM read paths — silicon @100 MHz × 50,324 cycles
+would be 1,987 tok/s.
