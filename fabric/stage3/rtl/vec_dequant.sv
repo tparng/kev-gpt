@@ -57,8 +57,8 @@ module vec_dequant #(
             // copy this lane's packed slice into plain vector regs BEFORE any arithmetic
             // (constant-index part-select from a packed bus is iverilog-safe).
             reg signed [31:0] gemvy_v;
-            reg signed [23:0] mant_v;
-            reg signed [7:0]  exp_v;
+            reg        [23:0] mant_v;                          // mant is UNSIGNED 24-bit (a
+            reg signed [7:0]  exp_v;                           // positive mantissa, up to 2^24)
             reg signed [95:0] dq_prod;
             reg signed [8:0]  dq_shv;
             reg signed [95:0] dq_val;
@@ -67,7 +67,9 @@ module vec_dequant #(
                 gemvy_v = gemvy[gi*32 +: 32];
                 mant_v  = mant [gi*24 +: 24];
                 exp_v   = exp  [gi*8  +: 8 ];
-                dq_prod = $signed(gemvy_v) * $signed(mant_v);   // signed product (~56b used, 96b carry)
+                // zero-extend mant to a positive 25-bit signed before the signed product
+                // (values >= 2^23 would flip negative under a 24-bit signed read)
+                dq_prod = $signed(gemvy_v) * $signed({1'b0, mant_v});
                 dq_shv  = $signed(exp_v) + FRAC;                // signed sum
                 if (dq_shv >= 0) dq_val = dq_prod <<< dq_shv;
                 else             dq_val = rsh_round(dq_prod, -dq_shv);

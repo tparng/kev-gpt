@@ -210,6 +210,8 @@ class IntSequencer:
         qkv_q16 = self._dequant_to_q(self.layers[(bi, "qkv")], y_int, VFRAC)
         if sink is not None:
             sink["ln1_out_q22"] = [int(v) for v in y_q22]
+            sink["qkv_ix"] = [int(v) for v in ix]            # INT8 acts into the qkv GEMV
+            sink["qkv_yint"] = [int(v) for v in y_int]       # raw INT32 GEMV output
             sink["qkv_q16"] = [int(v) for v in qkv_q16]
         C = 256
         q = [int(v) for v in qkv_q16[:C]]

@@ -68,12 +68,9 @@ def _gen_vectors(n, seed=0):
     mant = np.empty(n, dtype=object)
     exp = np.empty(n, dtype=object)
 
-    # plausible 24-bit mantissas: in [2^23, 2^24) magnitude (as quantize_scale_24 yields),
-    # both signs; clamp into signed 24-bit range.
-    m_mag = rng.integers(1 << 23, 1 << 24, size=n)
-    m_sgn = rng.choice([-1, 1], size=n)
-    m = (m_mag * m_sgn).astype(np.int64)
-    m = np.clip(m, -(1 << 23), (1 << 23) - 1)
+    # plausible 24-bit mantissas: UNSIGNED [1, 2^24) — the real model's folded scale
+    # mantissa is always POSITIVE and frequently >= 2^23 (so a signed-24 read would flip it).
+    m = rng.integers(1, 1 << 24, size=n).astype(np.int64)
 
     # exp: mostly negative (real model), span both shift branches around all three FRACs.
     e = rng.integers(-45, 16, size=n).astype(np.int64)
@@ -90,18 +87,18 @@ def _gen_vectors(n, seed=0):
         (0,            0,                   0),
         (1,            1,                   0),
         (-1,           1,                   0),
-        (2**31 - 1,    (1 << 23) - 1,       10),
-        (-(2**31),     -(1 << 23),          10),
-        (2**31 - 1,    -(1 << 23),         -30),
-        (-(2**31),     (1 << 23) - 1,      -30),
-        (123456,       1 << 23,             0),
+        (2**31 - 1,    (1 << 24) - 1,       10),     # max unsigned mant
+        (-(2**31),     (1 << 24) - 1,       10),
+        (2**31 - 1,    (1 << 23),          -30),     # mant exactly 2^23 (the sign-flip edge)
+        (-(2**31),     (1 << 23),          -30),
+        (123456,       (1 << 24) - 1,       0),
         (-123456,      1 << 23,             0),
         (3,            5,                  -1),      # round-half cases
         (-3,           5,                  -1),
         (1,            3,                  -2),
         (-1,           3,                  -2),
-        (7,            -7,                 -3),
-        (255,          (1 << 23) - 1,      15),      # large left shift
+        (7,            (1 << 23) + 7,      -3),
+        (255,          (1 << 24) - 1,      15),      # large left shift
         (1,            1,                  -40),     # shift all the way out
     ]
     for j, (gg, mm, ee) in enumerate(edges):

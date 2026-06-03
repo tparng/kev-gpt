@@ -1,9 +1,10 @@
 """Phase-gated bring-up of sequencer_vec (the P-wide datapath sequencer), milestone by
-milestone against seq_ref.block0_phase_signals.
+milestone vs seq_ref.block0_phase_signals.
 
-MILESTONE 1 (this gate): embed -> LN1. Runs sequencer_vec for token TOK at pos 0, reads back
-the 256 lnout (Q.22) values, compares to ln1_out_q22 from the reference. Pass:
-SEQ_VEC_VERDICT ln1 bitexact=True mismatches=0/256.
+  M1: embed -> LN1            -> lnout (Q.22)  vs ln1_out_q22
+  M2: + act-quant -> qkv GEMV -> P-wide dequant -> qkv (Q.16) vs qkv_q16
+
+Pass: SEQ_VEC_VERDICT ... ln1=True qkv=True.
 
     python -m fabric.stage3.run_vec_seq --tok 48 --p 8
 """
@@ -15,11 +16,22 @@ import os
 import subprocess
 
 from fabric.stage3 import seq_ref
-from fabric.stage3.run_sequencer import write_mems
+from fabric.stage3.run_sequencer import write_mems_banked
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RTL = os.path.join(HERE, "rtl")
 TB = os.path.join(HERE, "tb", "tb_seq_vec.sv")
+
+
+def _read_hex(path, mask):
+    with open(path) as fh:
+        out = []
+        for ln in fh:
+            s = ln.strip()
+            if not s:
+                continue
+            out.append(None if ("x" in s or "z" in s) else int(s, 16) & mask)
+    return out
 
 
 def run(sim_dir, tok, P, npz="fabric/export/goformer.npz"):
@@ -28,18 +40,21 @@ def run(sim_dir, tok, P, npz="fabric/export/goformer.npz"):
     iseq = seq_ref.IntSequencer(p, cfg)
     iseq.reset()
     sig = iseq.block0_phase_signals(int(tok))
-    gold = [int(v) & 0xFFFFFFFFFFFFFFFF for v in sig["ln1_out_q22"]]
+    gold_ln = [int(v) & 0xFFFFFFFFFFFFFFFF for v in sig["ln1_out_q22"]]
+    gold_qkv = [int(v) & 0xFFFFFFFF for v in sig["qkv_q16"]]
+    gold_gy = [int(v) & 0xFFFFFFFF for v in sig["qkv_yint"]]
 
-    # write_mems emits tok_emb/pos_emb/gamma/seed (+ others we don't use here); lanes only
-    # affects wrom which milestone 1 doesn't touch. gamma row 0 = block0 ln1 (GBASE=0).
     iseq.reset()
-    write_mems(sim_dir, iseq, 8, 4)
+    write_mems_banked(sim_dir, iseq, 16, 4, P)       # wrom@LANES16 + banked dq (P)
 
     vvp = os.path.join(sim_dir, "sim.vvp")
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
                          f"-DTOK={int(tok)}", f"-DPVAL={P}",
-                         TB, os.path.join(RTL, "sequencer_vec.sv"),
-                         os.path.join(RTL, "layernorm_vec.sv")],
+                         TB,
+                         os.path.join(RTL, "sequencer_vec.sv"),
+                         os.path.join(RTL, "layernorm_vec.sv"),
+                         os.path.join(RTL, "vec_dequant.sv"),
+                         os.path.join(RTL, "gemv_banked_resident.sv")],
                         capture_output=True, text=True)
     if cp.returncode != 0:
         print("IVERILOG_COMPILE_FAIL"); print(cp.stdout); print(cp.stderr); return False
@@ -47,25 +62,28 @@ def run(sim_dir, tok, P, npz="fabric/export/goformer.npz"):
     if "TB_DONE" not in rp.stdout:
         print("VVP_FAIL"); print(rp.stdout[-2000:]); print(rp.stderr[-1000:]); return False
 
-    with open(os.path.join(sim_dir, "lnout.out")) as fh:
-        lines = [ln.strip() for ln in fh if ln.strip()]
+    got_ln = _read_hex(os.path.join(sim_dir, "lnout.out"), 0xFFFFFFFFFFFFFFFF)
+    got_qkv = _read_hex(os.path.join(sim_dir, "qkv.out"), 0xFFFFFFFF)
+    got_gy = _read_hex(os.path.join(sim_dir, "gemvy.out"), 0xFFFFFFFF)
 
-    def _hx(s):
-        return None if ("x" in s or "z" in s) else int(s, 16) & 0xFFFFFFFFFFFFFFFF
+    def _cmp(got, gold):
+        n = min(len(got), len(gold))
+        mism = sum(1 for i in range(n) if got[i] != gold[i]) + abs(len(got) - len(gold))
+        return mism, len(gold), (mism == 0 and len(got) == len(gold))
 
-    got = [_hx(s) for s in lines]
-    n = min(len(got), len(gold))
-    mism = sum(1 for i in range(n) if got[i] != gold[i]) + abs(len(got) - len(gold))
-    nx = sum(1 for g in got if g is None)
-    ok = (mism == 0) and (len(got) == len(gold))
-    print(f"SEQ_VEC_VERDICT ln1 bitexact={ok} mismatches={mism}/{len(gold)} "
-          f"x_lines={nx} tok={tok} P={P} got={len(got)}")
-    if not ok and n:
-        for i in range(min(n, 256)):
+    m_ln, t_ln, ok_ln = _cmp(got_ln, gold_ln)
+    m_gy, t_gy, ok_gy = _cmp(got_gy, gold_gy)
+    m_qkv, t_qkv, ok_qkv = _cmp(got_qkv, gold_qkv)
+    print(f"SEQ_VEC_VERDICT tok={tok} P={P} "
+          f"ln1={ok_ln}({m_ln}/{t_ln}) gemvy={ok_gy}({m_gy}/{t_gy}) qkv={ok_qkv}({m_qkv}/{t_qkv})")
+    for nm, got, gold in (("gemvy", got_gy, gold_gy), ("qkv", got_qkv, gold_qkv)):
+        for i in range(min(len(got), len(gold))):
             if got[i] != gold[i]:
-                print(f"  first mismatch @ {i}: got={got[i]:016x} gold={gold[i]:016x}")
+                g = got[i]
+                print(f"  {nm} first mismatch @ {i}: got={g if g is None else format(g,'08x')} "
+                      f"gold={gold[i]:08x}")
                 break
-    return ok
+    return ok_ln and ok_qkv
 
 
 def main(argv=None):
