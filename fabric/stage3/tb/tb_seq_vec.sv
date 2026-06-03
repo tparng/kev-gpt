@@ -26,12 +26,12 @@ module tb;
     reg [10:0] rdaddr;
     wire done;
     wire signed [63:0] lnrd;
-    wire signed [31:0] qkvrd, gemvyrd;
+    wire signed [31:0] qkvrd, gemvyrd, ctxrd;
     reg wl_rst, wl_we; reg [31:0] wl_data;
 
     sequencer_vec #(.P(P), .LANES(LANES), .GBASE(0)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_id(tok), .pos(pos), .done(done),
-        .rd_addr(rdaddr), .ln_rd(lnrd), .qkv_rd(qkvrd), .gemvy_rd(gemvyrd),
+        .rd_addr(rdaddr), .ln_rd(lnrd), .qkv_rd(qkvrd), .gemvy_rd(gemvyrd), .ctx_rd(ctxrd),
         .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data));
 
     reg [WBITS-1:0] wimg [0:`GWQKV-1];
@@ -72,6 +72,12 @@ module tb;
         for (i = 0; i < D3; i = i + 1) begin
             rdaddr = i[10:0]; @(posedge clk); @(posedge clk); #1;
             $fwrite(f, "%08x\n", gemvyrd);
+        end
+        $fclose(f);
+        f = $fopen("ctx.out", "w");
+        for (i = 0; i < D; i = i + 1) begin
+            rdaddr = i[10:0]; @(posedge clk); @(posedge clk); #1;
+            $fwrite(f, "%08x\n", ctxrd);
         end
         $fclose(f);
         $display("TB_DONE");

@@ -45,6 +45,7 @@ module sequencer_vec #(
     output reg signed [63:0] ln_rd,
     output reg signed [31:0] qkv_rd,
     output reg signed [31:0] gemvy_rd,   // raw GEMV INT32 (debug: vs seq_ref qkv_yint)
+    output reg signed [31:0] ctx_rd,     // attention context Q6.25 (vs seq_ref ctx_q25)
     // runtime weight load (stream the transposed INT4 image once)
     input  wire        wl_rst,
     input  wire        wl_we,
@@ -122,6 +123,27 @@ module sequencer_vec #(
         .gemvy(dq_gemvy), .mant(dq_mant), .exp(dq_exp),
         .out_valid(dq_vout), .dq_out(dq_out));
 
+    // ---- vec_attn (one head at a time; T=1 for the single-token block0 gate) ----
+    localparam integer NHEAD = 4, HEAD_DIM = 64;
+    reg signed [31:0] ctxv_bank [0:P-1][0:ROWS-1];   // attention context Q6.25
+    reg               at_start, at_ldv;
+    reg [8:0]         at_tcount;
+    wire              at_ldready, at_ctxv, at_done;
+    wire [6:0]        at_ctxidx;
+    wire signed [31:0] at_ctxdata;
+    reg [1:0]  hh;          // head 0..3
+    reg [8:0]  wi;          // load word index 0..191 (q64|K64|V64 for T=1)
+    // combinational source of the current load word: q[0..63] | K0[0..63] | V0[0..63] for
+    // head hh, taken from qkv_bank (q=qkv[0:256], k=[256:512], v=[512:768]).
+    wire [10:0] aw_src = (wi < 64)  ? (hh*HEAD_DIM + wi) :
+                         (wi < 128) ? (11'd256 + hh*HEAD_DIM + (wi - 64)) :
+                                      (11'd512 + hh*HEAD_DIM + (wi - 128));
+    wire signed [31:0] aw_data = qkv_bank[aw_src[LSH-1:0]][aw_src >> LSH];
+    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(32)) u_attn (
+        .clk(clk), .rst(rst), .start(at_start), .tcount(at_tcount),
+        .ld_valid(at_ldv), .ld_data(aw_data), .ld_ready(at_ldready),
+        .ctx_valid(at_ctxv), .ctx_idx(at_ctxidx), .ctx_data(at_ctxdata), .done(at_done));
+
     // ---- act-quant temporaries (mirror sequencer_fast G_ACT) -------------------
     reg signed [63:0]  lntmp;
     reg signed [95:0]  aq_prod, aq_sh;
@@ -129,8 +151,10 @@ module sequencer_vec #(
 
     // ---- FSM -------------------------------------------------------------------
     localparam [3:0] S_IDLE=0, S_EMB=1, S_FEED=2, S_COLL=3,
-                     S_AQ=4, S_GRUN=5, S_GWAIT=6, S_RB=7, S_DQ=8, S_FIN=9;
+                     S_AQ=4, S_GRUN=5, S_GWAIT=6, S_RB=7, S_DQ=8,
+                     S_AST=9, S_ALD=10, S_ACL=11, S_FIN=12;
     reg [3:0] st;
+    reg [8:0] ce;                            // ctxv element index = hh*HEAD_DIM + ctx_idx
     reg [10:0] ci;                          // element counter (to D3-1)
     reg [$clog2(ROWS3+1)-1:0] fr, orow, dr, dor;
     integer pp;
@@ -141,7 +165,7 @@ module sequencer_vec #(
 
     always @(posedge clk) begin
         ln_start <= 1'b0; ln_vin <= 1'b0; gv_ldrst <= 1'b0; gv_xwe <= 1'b0;
-        gv_start <= 1'b0; dq_vin <= 1'b0; done <= 1'b0;
+        gv_start <= 1'b0; dq_vin <= 1'b0; done <= 1'b0; at_start <= 1'b0; at_ldv <= 1'b0;
         if (rst) begin
             st <= S_IDLE; ci <= 0; fr <= 0; orow <= 0; dr <= 0; dor <= 0;
             rv0 <= 0; rv1 <= 0; rv2 <= 0;
@@ -229,8 +253,29 @@ module sequencer_vec #(
                     if (dq_vout) begin
                         for (pp = 0; pp < P; pp = pp + 1)
                             qkv_bank[pp][dor] <= dq_out[pp*32 +: 32];
-                        if (dor == ROWS3-1) st <= S_FIN;
+                        if (dor == ROWS3-1) begin hh <= 2'd0; st <= S_AST; end
                         else dor <= dor + 1'b1;
+                    end
+                end
+                // ---- attention: one head at a time (T=1 single-token block0 gate) ---
+                S_AST: begin
+                    at_start <= 1'b1; at_tcount <= 9'd1; wi <= 9'd0; st <= S_ALD;
+                end
+                S_ALD: begin
+                    at_ldv <= 1'b1;                              // stream q|K0|V0 (192 words)
+                    if (at_ldready) begin
+                        if (wi == 9'd191) st <= S_ACL;
+                        else wi <= wi + 1'b1;
+                    end
+                end
+                S_ACL: begin
+                    if (at_ctxv) begin                          // ctx dim hh*HEAD_DIM+ctx_idx
+                        ce = {2'd0, hh} * HEAD_DIM + {2'd0, at_ctxidx};
+                        ctxv_bank[ce[LSH-1:0]][ce >> LSH] <= at_ctxdata;
+                    end
+                    if (at_done) begin
+                        if (hh == NHEAD-1) st <= S_FIN;
+                        else begin hh <= hh + 2'd1; st <= S_AST; end
                     end
                 end
                 S_FIN: begin done <= 1'b1; st <= S_IDLE; end
@@ -241,7 +286,7 @@ module sequencer_vec #(
 
     // ---- readback (2-cyc): lnout (Q.22) and qkv (Q.16), both indexed by rd_addr ---
     reg signed [63:0] ln_rd0;
-    reg signed [31:0] qkv_rd0, gemvy_rd0;
+    reg signed [31:0] qkv_rd0, gemvy_rd0, ctx_rd0;
     always @(posedge clk) begin
         ln_rd0    <= lnout_bank[rd_addr[LSH-1:0]][rd_addr >> LSH];
         ln_rd     <= ln_rd0;
@@ -249,5 +294,7 @@ module sequencer_vec #(
         qkv_rd    <= qkv_rd0;
         gemvy_rd0 <= gemvy_bank[rd_addr[LSH-1:0]][rd_addr >> LSH];
         gemvy_rd  <= gemvy_rd0;
+        ctx_rd0   <= ctxv_bank[rd_addr[LSH-1:0]][rd_addr >> LSH];
+        ctx_rd    <= ctx_rd0;
     end
 endmodule
