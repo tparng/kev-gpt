@@ -202,6 +202,7 @@ module sequencer_vec #(
     reg [P*8-1:0]   ewr;
     reg signed [63:0] gl_sh;
     reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
+    reg dq_rd_v;                             // G_DQ read-pipeline valid (BRAM 1-cyc latency)
     reg [$clog2(ROWSM+1)-1:0] gfr, gor;
     integer pp;
     reg [8:0] ce;
@@ -227,7 +228,7 @@ module sequencer_vec #(
         dq_vin<=1'b0; gl_vin<=1'b0; at_start<=1'b0; at_ldv<=1'b0; done<=1'b0;
         if (rst) begin
             st<=S_IDLE; ci<=0; fr<=0; orow<=0; dr<=0; dor<=0; gfr<=0; gor<=0;
-            rv0<=0; rv1<=0; rv2<=0; gystage<=0; cstage<=0;
+            rv0<=0; rv1<=0; rv2<=0; gystage<=0; cstage<=0; dq_rd_v<=0;
         end else begin
             case (st)
                 S_IDLE: if (go) begin fr<=0; blk<=4'd0; gystage<=0; cstage<=0; st<=S_EMB; end
@@ -296,7 +297,7 @@ module sequencer_vec #(
                     gv_start<=1'b1; st<=G_WAIT;
                 end
                 G_WAIT: if (gv_done) begin
-                    ci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0; gystage<=0; st<=G_RB;
+                    ci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0; gystage<=0; dq_rd_v<=0; st<=G_RB;
                 end
                 G_RB: begin                               // readback g_m outputs -> gemvy (staged)
                     if (ci < g_m) begin gv_rdaddr<=ci; rb0<=ci; ci<=ci+1'b1; end
@@ -313,18 +314,25 @@ module sequencer_vec #(
                     end
                 end
                 G_DQ: begin                               // P-wide dequant -> selected dest
+                    // gemvy/dqm_w/dqe_w map to BLOCK RAM (1-cyc registered read on silicon).
+                    // Stage 1: REGISTERED read (nonblocking) — iverilog + BRAM both latch the
+                    // address now, data valid next cycle, so sim == hardware. Stage 2: one cycle
+                    // later, the row's data is valid in gyr/mwr/ewr -> drive the dequant lanes.
                     if (dr < ((g_m + P-1) >> LSH)) begin   // ceil rows (head VOCAB not P-mult)
+                        gyr <= gemvy_bank[dr];
+                        mwr <= dqm_w[g_dqrow + dr];
+                        ewr <= dqe_w[g_dqrow + dr];
+                        dq_rd_v <= 1'b1;
+                        dr<=dr+1'b1;
+                    end else dq_rd_v <= 1'b0;
+                    if (dq_rd_v) begin                      // BRAM outputs now valid
                         dq_vin<=1'b1; dq_frac<=g_frac;
-                        gyr = gemvy_bank[dr];
-                        mwr = dqm_w[g_dqrow + dr];
-                        ewr = dqe_w[g_dqrow + dr];
                         for (pp=0; pp<P; pp=pp+1) begin
                             dq_gemvy[pp*32 +: 32] <= gyr[pp*32 +: 32];
                             dq_mant [pp*24 +: 24] <= mwr[pp*24 +: 24];
                             dq_exp  [pp*8  +: 8 ] <= ewr[pp*8  +: 8 ];
                         end
-                        dr<=dr+1'b1;
-                    end else dq_vin<=1'b0;
+                    end
                     if (dq_vout) begin
                         for (pp=0; pp<P; pp=pp+1) begin
                             dqv = dq_out[pp*32 +: 32];
