@@ -122,6 +122,27 @@ The driver auto-detects via `--lanes 256`: streams SUBW=32 32-bit W_DATA chunks 
 baseline, ~21× the A53 ~11 wall, CPU fully out of the loop. The weight load is ~400k MMIO
 pokes (~3 s); a C/DMA loader would shrink that but it is one-time, not per-token.
 
+## Test E — GELU+LN optimisations + on-silicon clock sweep (MEASURED ✅ 751.78 tok/s)
+`sequencer_fast` + streaming GELU (kills the per-element gelu_lut stall) + pipelined
+LayerNorm (Newton + S_OUT split into single-multiply stages, breaking the DSP cascade that
+capped Fmax). Built at **PE=128** (vs 256) to relieve LUT congestion (77.6% LUT, URAM 56/64).
+Bitstream `~/kevbit/gemv_seqfast_p128.bit.bin`, IDCODE `SQRF`, 166,273 cyc/token.
+```
+sudo fpgautil -b ~/kevbit/gemv_seqfast_p128.bit.bin
+cd ~/kevpl/plchat
+# sweep the PL clock to find the silicon Fmax (--fclk; driver uses the actual readback rate):
+sudo ~/kevweb/venv/bin/python -m fabric.stage3.board.pl_seq_chat --lanes 128 \
+     --fclk 125000000 --npz goformer.npz --meta goformer_meta.json --prompt "once upo"
+```
+**Clock sweep (bit-exact gated, --lanes 128):** 71→430, 91→547, 100→601, 111→668, all
+deterministic; **125 MHz → 751.78 tok/s, tokens_match=True, 3/3 deterministic** ("n time t").
+142 MHz → tokens_match=False (non-deterministic — past the silicon edge). So the measured
+ceiling is **125 MHz / 751.78 tok/s** (3.26× the PE=256 baseline, 17× the A53 ~11 wall).
+HONEST: STA closes the build at only ~71 MHz (430 tok/s, guaranteed-across-corners); the
+silicon overclocks clean to 125 (this chip, this temp) and breaks at 142 — the 751 is
+bit-exact-gated but chip/temperature-specific, not an STA spec. Lesson: STA on this -2LV
+part is very pessimistic; the bit-exact token-stream gate is what bounds the real Fmax.
+
 ## What this session will and won't show
 - **Will:** the fabric path goes from 0.22 → ~5–126 tok/s (finally beating the A53),
   measured, bit-identical Kevin output. The resident-banked design validated on silicon.
@@ -137,5 +158,6 @@ pokes (~3 s); a C/DMA loader would shrink that but it is one-time, not per-token
 | **single-stream dataflow (sequencer)** | **44.32** | sequencer bitstream @ 40 MHz, CPU out of loop | **MEASURED, bit-exact** |
 | + resident-read (sequencer_fast, PE=16) | ~76 | drop per-matmul weight reload | SIM bit-exact (527,616 cyc/tok) |
 | **+ PE=256 (sequencer_fast, LANES=256)** | **231.01** | 16-wide lanes on top of resident | **MEASURED, bit-exact, 5/5 deterministic** (1,385,205 cyc; SQRF) |
-| + pipelined arith (>40 MHz) | ~2k (target) | pipeline the LayerNorm DSP cascade (Fmax ~50→200 MHz) + parallel serial datapath | RTL next |
+| **+ streaming GELU + pipelined LN (PE=128)** | **751.78** | GELU stall + LN DSP cascade → Fmax 50→125 MHz | **MEASURED @125 MHz, bit-exact, 3/3** (STA-safe 71/430; breaks at 142) |
+| + P-wide serial datapath | ~2k–10k (target) | the remaining 1-elem/cyc loops (dequant/attn/act-feed) + ~200 MHz | `PLAN-10K-DATAPATH.md` |
 | batched serving | ~30–124k | + parallel non-linears + 3–4 GEMV engines | model proven; RTL TBD |

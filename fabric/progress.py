@@ -35,8 +35,10 @@ LADDER = [
      "re-streaming each matmul's weights (~42% of cycles)"),
     ("+ PE=256 wide lanes\n(256 MACs/cycle)", 231.0, "MEASURED",
      "the GEMV run phase (16x fewer group passes)"),
-    ("+ pipelined LN / wide datapath\n(>40MHz, parallel serial loops)", 2000.0, "PROJECTED",
-     "the LayerNorm DSP cascade (Fmax ~50->200MHz) + serial per-element loops"),
+    ("+ GELU stream + LN pipeline\n(PE=128 @125 MHz silicon)", 751.78, "MEASURED",
+     "GELU per-elem stall + LN DSP cascade -> Fmax 50->125 MHz (STA-safe 71/430)"),
+    ("+ wide serial datapath\n(P-lane LN/dequant/attn, ~200MHz)", 2000.0, "PROJECTED",
+     "the remaining 1-elem/cyc loops (dequant/attn/act-feed) — see PLAN-10K-DATAPATH"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]
@@ -60,8 +62,10 @@ def print_table():
     print("note: the C-driver rung (10.35) ~= the A53 chat (11) — CPU-in-loop asymptotes "
           "to the A53; the HW sequencer (CPU OUT of the loop) is the leap that beats it. "
           "MEASURED on silicon, token-stream bit-exact, deterministic: 44.32 (baseline PE16) "
-          "-> 231.01 (resident-read + PE=256, 5/5 runs). >40 MHz (pipeline the LayerNorm DSP "
-          "cascade) + wide serial datapath is the scoped path to ~2k.")
+          "-> 231 (resident-read + PE=256, @40MHz) -> 751.78 (+ streaming GELU + pipelined "
+          "LayerNorm, PE=128 @125 MHz, 3/3 runs). The 125 MHz is the silicon Fmax (STA closes "
+          "at 71 MHz=430 tok/s; it overclocks clean to 125, breaks at 142). Next: the P-wide "
+          "serial datapath (PLAN-10K-DATAPATH.md) for the order-of-magnitude to ~10k.")
 
 
 def plot(path):

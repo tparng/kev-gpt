@@ -72,7 +72,7 @@ FCLK_SET = "/sys/devices/platform/fclk0/set_rate"
 FCLK_SUMMARY = "/sys/kernel/debug/clk/clk_summary"
 
 
-def set_and_verify_fclk(target_hz=FCLK, tol_hz=2e6):
+def set_and_verify_fclk(target_hz=FCLK, tol_hz=6e6):
     """Force the PL clock (fclk0 / pl0_ref) to target_hz and read it back. Returns the
     ACTUAL rate in Hz (the PLL quantises to discrete divisors, so the readback is what
     tok/s must be computed from — bit-honest). Raises only if the clock is wildly off
