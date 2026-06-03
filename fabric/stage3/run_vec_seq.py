@@ -32,7 +32,7 @@ def _read_hex(path):
     return out
 
 
-def run(sim_dir, tok, P, lanes=16, npz="fabric/export/goformer.npz"):
+def run(sim_dir, tok, P, lanes=16, tmax=256, npz="fabric/export/goformer.npz"):
     os.makedirs(sim_dir, exist_ok=True)
     p, cfg = seq_ref.build(npz)
     iseq = seq_ref.IntSequencer(p, cfg)
@@ -45,7 +45,7 @@ def run(sim_dir, tok, P, lanes=16, npz="fabric/export/goformer.npz"):
     vvp = os.path.join(sim_dir, "sim.vvp")
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
                          f"-DTOK={int(tok)}", f"-DPVAL={P}",
-                         f"-DLVAL={lanes}", f"-DWROMN={wrom_n}",
+                         f"-DLVAL={lanes}", f"-DWROMN={wrom_n}", f"-DTMAXVAL={tmax}",
                          TB,
                          os.path.join(RTL, "sequencer_vec.sv"),
                          os.path.join(RTL, "layernorm_vec.sv"),
@@ -89,7 +89,7 @@ def run(sim_dir, tok, P, lanes=16, npz="fabric/export/goformer.npz"):
             cyc = int(fh.read().strip())
     except Exception:
         pass
-    print(f"SEQ_VEC_FULL tok={tok} P={P} L={lanes} " + " ".join(parts) +
+    print(f"SEQ_VEC_FULL tok={tok} P={P} L={lanes} TMAX={tmax} " + " ".join(parts) +
           f" ALL={all_ok} fwd_cyc={cyc}")
     return all_ok
 
@@ -99,9 +99,11 @@ def main(argv=None):
     ap.add_argument("--tok", type=int, default=48)
     ap.add_argument("--p", type=int, default=8)
     ap.add_argument("--lanes", type=int, default=16)
+    ap.add_argument("--tmax", type=int, default=256,
+                    help="pos table depth baked into the RTL (64 = BRAM-budget build)")
     ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_seq_vec"))
     a = ap.parse_args(argv)
-    ok = run(a.dir, a.tok, a.p, a.lanes)
+    ok = run(a.dir, a.tok, a.p, a.lanes, a.tmax)
     raise SystemExit(0 if ok else 1)
 
 

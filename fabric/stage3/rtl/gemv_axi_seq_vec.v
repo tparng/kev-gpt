@@ -18,6 +18,7 @@ module gemv_axi_seq_vec #(
     parameter integer LANES  = 128,
     parameter integer NLAYER = 4,
     parameter integer WWORDS = 262144,
+    parameter integer TMAX   = 64,    // pos-table depth; 64 fits the embed ROMs in BRAM
     parameter integer C_S_AXI_ADDR_WIDTH = 8
 ) (
     input  wire                          S_AXI_ACLK,
@@ -119,7 +120,7 @@ module gemv_axi_seq_vec #(
         end
     end
 
-    sequencer_vec #(.P(P), .LANES(LANES), .NLAYER(NLAYER), .WWORDS(WWORDS)) u_seq (
+    sequencer_vec #(.P(P), .LANES(LANES), .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX)) u_seq (
         .clk(clk), .rst(core_rst), .go(go_pulse),
         .tok_id(tok_id), .pos(pos), .done(core_done_w), .tok_out(core_tok_out),
         .rd_sel(rd_sel), .rd_addr(rd_addr), .rd_data(core_rd_data),

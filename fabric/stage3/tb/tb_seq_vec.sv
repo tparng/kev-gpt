@@ -14,9 +14,13 @@
 `ifndef LVAL
  `define LVAL 16
 `endif
+`ifndef TMAXVAL
+ `define TMAXVAL 256
+`endif
 module tb;
     localparam integer P     = `PVAL;
     localparam integer LANES = `LVAL;
+    localparam integer TMAXP = `TMAXVAL;
     localparam integer WBITS = LANES * 4;
     localparam integer SUBW  = WBITS / 32;
 
@@ -30,7 +34,7 @@ module tb;
     wire signed [63:0] rdata;
     reg wl_rst, wl_we; reg [31:0] wl_data;
 
-    sequencer_vec #(.P(P), .LANES(LANES)) dut (
+    sequencer_vec #(.P(P), .LANES(LANES), .TMAX(TMAXP)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_id(tok), .pos(pos), .done(done),
         .tok_out(tok_out), .rd_sel(rsel), .rd_addr(raddr), .rd_data(rdata),
         .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data), .dbg_stop(2'b0));

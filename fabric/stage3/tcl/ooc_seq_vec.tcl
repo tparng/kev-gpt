@@ -6,9 +6,12 @@ set pp     [lindex $argv 0]
 set lanes  [lindex $argv 1]
 set period [lindex $argv 2]
 set wwords [lindex $argv 3]
+set tmax   [lindex $argv 4]
 if {$pp     eq ""} { set pp 16 }
 if {$lanes  eq ""} { set lanes 128 }
 if {$period eq ""} { set period 8.0 }
+# TMAX=64 keeps both embed ROMs inside the 144-BRAM budget (256 needs 174 tiles).
+if {$tmax   eq ""} { set tmax 64 }
 # WWORDS = resident weight URAM depth (wide words). The image is ~12.6 Mbit fixed, so this
 # must scale INVERSELY with LANES (word = LANES*4 bits): L=16->262144, L=128->32768, L=256->16384.
 if {$wwords eq ""} { set wwords [expr {3276800 / $lanes}] }
@@ -27,7 +30,8 @@ read_verilog -sv [list \
     "$rtl/gemv_banked_resident.sv"]
 
 synth_design -top sequencer_vec -part $part -mode out_of_context \
-    -generic P=$pp -generic LANES=$lanes -generic NLAYER=4 -generic WWORDS=$wwords
+    -generic P=$pp -generic LANES=$lanes -generic NLAYER=4 -generic WWORDS=$wwords \
+    -generic TMAX=$tmax
 
 create_clock -name clk -period $period [get_ports clk]
 

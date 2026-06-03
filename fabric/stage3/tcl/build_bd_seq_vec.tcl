@@ -7,10 +7,13 @@ set pp     [lindex $argv 0]
 set lanes  [lindex $argv 1]
 set wwords [lindex $argv 2]
 set freq   [lindex $argv 3]
+set tmax   [lindex $argv 4]
 if {$pp     eq ""} { set pp 8 }
 if {$lanes  eq ""} { set lanes 128 }
 if {$wwords eq ""} { set wwords 25600 }
 if {$freq   eq ""} { set freq 40 }
+# TMAX=64 keeps both embed ROMs inside the 144-BRAM budget (256 needs 174 tiles).
+if {$tmax   eq ""} { set tmax 64 }
 
 set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"
@@ -54,7 +57,7 @@ set_property -dict [list \
 
 set g [create_bd_cell -type module -reference gemv_axi_seq_vec seq]
 set_property -dict [list CONFIG.P $pp CONFIG.LANES $lanes CONFIG.NLAYER {4} \
-    CONFIG.WWORDS $wwords CONFIG.C_S_AXI_ADDR_WIDTH {8}] [get_bd_cells seq]
+    CONFIG.WWORDS $wwords CONFIG.TMAX $tmax CONFIG.C_S_AXI_ADDR_WIDTH {8}] [get_bd_cells seq]
 
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list \
     Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
@@ -70,4 +73,4 @@ make_wrapper -files [get_files design_1.bd] -top -import
 set_property top design_1_wrapper [current_fileset]
 generate_target all [get_files design_1.bd]
 update_compile_order -fileset sources_1
-puts "BD_BUILD_VEC_OK p=$pp lanes=$lanes wwords=$wwords freq=$freq"
+puts "BD_BUILD_VEC_OK p=$pp lanes=$lanes wwords=$wwords freq=$freq tmax=$tmax"

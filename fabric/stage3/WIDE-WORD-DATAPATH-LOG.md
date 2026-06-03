@@ -277,3 +277,40 @@ consistent with the `sequencer_fast` 1.76×). The PLL snaps to 1000/N MHz (…10
 aggregate ~100–150k (B≈8–10 short-Kevin-context streams + DSP-packed INT4 MACs); hard roofline
 ~200–270k (URAM weight bandwidth). 100k is a *batched* number and needs the short Kevin context —
 the joke is still the thesis.
+
+---
+
+## 9. The BRAM sync-read rewrite — P=8 unlocked (SIM, gated bit-exact)
+
+The first "next lever" from §8, executed. Every scratch buffer and every wide ROM in
+`sequencer_vec` switched from asynchronous (distributed-RAM) reads to **registered 1-cycle
+reads**: one read register + small address mux per memory, FSM loops carry an address counter,
+a delayed address and a valid bit (the same stage-1/stage-2 pattern G_DQ already proved on
+silicon). Embeddings, gamma, dequant ROMs and all 10 banks now have BRAM semantics; `inv_sact`
+(17 deep) stays LUT. Attention load became a 1-deep prefetch (`qkv_r` and `at_ldv` both run one
+register behind the address counter, so they land in the same cycle at `vec_attn`).
+
+The gate caught the rewrite's only integration bug: an extra valid register in the attention
+prefetch (`at_ldv <= wiv`) lagged data by one cycle — LN1/QKV gated bit-exact while ctx and
+everything downstream diverged. The dbg_stop probe localised in ~3 sim runs, no silicon needed —
+the async-read sim/hardware divergence class is gone by design.
+
+**Cycles (sim, bit-exact at L=128):** P=4 53,157 (+41 vs LUTRAM 53,116 — the pipeline tax) ·
+**P=8 50,325** · P=16 48,909. The sweet spot stays P=8.
+
+Expected fit: P=8/L=128 was 127.7k LUT (109%); −31k distributed-RAM LUTs lands ~83% (PROJECTED,
+needs OOC). On silicon: 50,325 cyc/token @ 100 MHz → **~1,987 tok/s** (PROJECTED).
+
+**OOC, P=8/L=128 (SYNTH):** the LUT blow-up is *gone* — **74,165 LUT (63.3%)**, vs 127,681
+(109%) async. The squeeze moved to BRAM: both embed ROMs in block RAM hit **174/144 tiles
+(121%)**. URAM can't take them (no init support — URAM is why weights are streamed). Fix: the
+pos table doesn't need 256 positions for Kevin's short context → **TMAX=64**, ~15 tiles for
+pos_emb instead of 57. Re-gated bit-exact (the .mem truncation is benign). TMAX is now a
+generic on shell + OOC/BD scripts; gate's `--tmax 64`. WNS at 8.0 ns came out −4.285 → STA
+Fmax ≈ 81 MHz, same band as the LUTRAM build; 40 MHz build clock closes comfortably, the
+silicon ceiling comes from the board `--fclk` sweep.
+
+**OOC, P=8/L=128/TMAX=64 (SYNTH): FITS.** **72,017 LUT (61.5%) · BRAM 142.5/144 (99.0%) ·
+URAM 56/64 · DSP 421.** LUT headroom is back (~38%); the binding resource is BRAM with 1.5
+tiles spare — anything new on-chip must displace the embed ROMs. The P=4 LUTRAM design used
+106k LUT (90.5%) — sync-read P=8 is both smaller AND ~3k cyc/token faster.
