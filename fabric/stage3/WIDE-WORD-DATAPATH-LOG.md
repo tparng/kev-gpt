@@ -373,3 +373,12 @@ Gate green first run on tok 10/48/100: **35,597 cyc/token** (was 50,325; −29%)
 now ≈ GEMV MAC (~12k) + attention load (~4.3k) + LN/argmax (~7k) + dequant (~2.2k).
 @125 MHz → **3,512 tok/s PROJECTED**; OOC + bitstream pending. Bonus: 9 SLICE-heavy carry-chain
 adders fold into 8 DSP-friendly multipliers (act-quant is 64×34 → DSPs).
+
+**OOC (SYNTH):** 74,181 LUT (63.3%) · BRAM 143.5/144 (99.7%) · URAM 56/64 · **DSP 505** (+84,
+the eight act-quant multipliers). Fits with half a BRAM tile to spare.
+
+**On silicon (MEASURED): 3,511.6 tok/s @ 125 MHz, 3/3 bit-exact, CYCLES = 35,596 == sim.**
+The projection (3,512) landed within 0.4 tok/s. Sweep: 100 MHz 2,809.3 · 111.1 3,121.4 ·
+**125 3,511.6** · 142.9 marginal 1/3 (4,013.3 — not claimed). 80 MHz build WNS −0.371,
+silicon factor 1.57. 1.87× over yesterday's 1,882.7. Ladder: 752 → 1,883 → 2,484 → 3,512.
+Levers left: LANES=256 (~29k cyc), softmax overlap, then 200 MHz pipelining → 10k.

@@ -41,6 +41,8 @@ LADDER = [
      "the 1-elem/cyc serial loops -> P-wide (53,116 cyc/tok, 2.5x over 752)"),
     ("+ BRAM sync-read scratch\n(P=8 @125 MHz silicon)", 2483.9, "MEASURED",
      "LUTRAM datapath -> BRAM (50,324 cyc/tok; STA 79.5 MHz, clean to 125, breaks 142.9)"),
+    ("+ P-wide GEMV boundary\n(act-feed + readback P/cycle)", 3511.6, "MEASURED",
+     "the 1-elem/cyc GEMV act/readback loops (35,596 cyc/tok; 125 MHz 3/3)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]
