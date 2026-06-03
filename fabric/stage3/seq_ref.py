@@ -201,13 +201,16 @@ class IntSequencer:
         return out, y_int
 
     # ---- attention step (KV-cached) — EXACT INTEGER, matches rtl/sequencer.sv -
-    def _attn_step(self, x_q25, bi):
+    def _attn_step(self, x_q25, bi, sink=None):
         gamma = self.layers[(bi, "ln1")]
         y_q22 = self._ln(x_q25, gamma)
         ix = self._act_quant(y_q22, self.layers[(bi, "qkv")]["s_act"])
         y_int = self._gemv_int(self.layers[(bi, "qkv")], ix)
         # dequant q/k/v to Q.VFRAC integers (the RTL stores them this way)
         qkv_q16 = self._dequant_to_q(self.layers[(bi, "qkv")], y_int, VFRAC)
+        if sink is not None:
+            sink["ln1_out_q22"] = [int(v) for v in y_q22]
+            sink["qkv_q16"] = [int(v) for v in qkv_q16]
         C = 256
         q = [int(v) for v in qkv_q16[:C]]
         k = [int(v) for v in qkv_q16[C:2 * C]]
@@ -234,18 +237,23 @@ class IntSequencer:
                 for j in range(T):
                     acc += int(prob_q20[j]) * self.v_cache[bi][j][base + d]
                 ctx_q25[base + d] = rsh_round(acc, PROB_FRAC_A + VFRAC - RESID_FRAC)
-        return self._proj_after_attn(ctx_q25, bi)
+        if sink is not None:
+            sink["ctx_q25"] = [int(v) for v in ctx_q25]
+        return self._proj_after_attn(ctx_q25, bi, sink=sink)
 
-    def _proj_after_attn(self, ctx_q25, bi):
+    def _proj_after_attn(self, ctx_q25, bi, sink=None):
         """proj GEMV: act-quant ctx (Q6.25) by proj.act_scale exactly as the RTL.
         The RTL converts ctx Q6.25 -> Q.22 (>>3) then applies inv_sact; we mirror that."""
         layer = self.layers[(bi, "proj")]
         ctx_q22 = [rsh_round(int(c), RESID_FRAC - LN_OUTFRAC) for c in ctx_q25]
         ix = self._act_quant(ctx_q22, layer["s_act"])
-        return self._gemv_dequant_to_q25(layer, ix)      # Q6.25 (proj output)
+        proj = self._gemv_dequant_to_q25(layer, ix)      # Q6.25 (proj output)
+        if sink is not None:
+            sink["attn_out_q25"] = [int(v) for v in proj]
+        return proj
 
     # ---- MLP step — EXACT INTEGER, matches rtl/sequencer.sv --------------------
-    def _mlp_step(self, x_q25, bi):
+    def _mlp_step(self, x_q25, bi, sink=None):
         gamma = self.layers[(bi, "ln2")]
         y_q22 = self._ln(x_q25, gamma)
         ix = self._act_quant(y_q22, self.layers[(bi, "mlp_fc")]["s_act"])
@@ -258,7 +266,12 @@ class IntSequencer:
         g_q22 = [int(v) << (LN_OUTFRAC - GELU_FRAC) for v in g_q12]
         layer = self.layers[(bi, "mlp_proj")]
         ix2 = self._act_quant(g_q22, layer["s_act"])
-        return self._gemv_dequant_to_q25(layer, ix2)     # Q6.25 ints
+        mlp = self._gemv_dequant_to_q25(layer, ix2)      # Q6.25 ints
+        if sink is not None:
+            sink["ln2_out_q22"] = [int(v) for v in y_q22]
+            sink["gelu_q22"] = [int(v) for v in g_q22]
+            sink["mlp_out_q25"] = [int(v) for v in mlp]
+        return mlp
 
     # ---- one decode step -------------------------------------------------------
     def step(self, idx_t):
@@ -288,6 +301,23 @@ class IntSequencer:
         mlp_out = self._mlp_step(x, 0)
         x = x + np.asarray([int(v) for v in mlp_out], dtype=object)
         return {"x_in_q25": x0, "x_out_q25": x}
+
+    def block0_phase_signals(self, idx_t):
+        """Like block0_signals but captures EVERY phase intermediate (ln1_out, qkv, ctx,
+        attn_out, x_res1, ln2_out, gelu, mlp_out, x_out) so the P-wide datapath rewrite can
+        gate each phase against this reference, not only the final residual. Keys are Q-tagged.
+        """
+        s = {}
+        x = self.tok_emb_q[idx_t] + self.pos_emb_q[self.t]
+        x = np.asarray([int(v) for v in x], dtype=object)
+        s["x_in_q25"] = [int(v) for v in x]
+        attn_out = self._attn_step(x, 0, sink=s)
+        x = x + np.asarray([int(v) for v in attn_out], dtype=object)
+        s["x_res1_q25"] = [int(v) for v in x]
+        mlp_out = self._mlp_step(x, 0, sink=s)
+        x = x + np.asarray([int(v) for v in mlp_out], dtype=object)
+        s["x_out_q25"] = [int(v) for v in x]
+        return s
 
     def generate_greedy(self, prompt, n_gen):
         self.reset()

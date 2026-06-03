@@ -105,6 +105,64 @@ exercise, not a guess; **measure PE × P combinations OOC for LUT/DSP/URAM/Fmax 
 Expect this to land in the **5,000–12,000 tok/s** band depending on the PE×P×Fmax point the
 board actually closes — report it as the measured result, not the model.
 
+## v1 implementation (concrete) — `sequencer_vec.sv`
+
+The blocker that makes this a rewrite (not an increment): **banking a buffer propagates to
+every phase that touches it**, so there is no small gateable slice — until you add
+*intermediate* gates. Those now exist: `seq_ref.block0_phase_signals(idx_t)` returns every
+phase's reference value (`x_in_q25`, `ln1_out_q22`, `qkv_q16`, `ctx_q25`, `attn_out_q25`,
+`x_res1_q25`, `ln2_out_q22`, `gelu_q22`, `mlp_out_q25`, `x_out_q25`). So `sequencer_vec` is
+brought up phase-by-phase, each compared bit-exact to its key before moving on.
+
+### The banking scheme
+Parameter `P` (vector lanes, pow2; start P=8, scale to 16/32). A length-`L` vector `v[0..L-1]`
+is stored **bank-interleaved**: element `e` lives in bank `e mod P`, row `e div P`. A P-slice
+`{e=r*P .. r*P+P-1}` is then one row across all P banks → read/write in a single cycle.
+
+```systemverilog
+// P parallel single-port memories; one row-address feeds all P banks.
+genvar b;
+generate for (b=0;b<P;b=b+1) begin: bank
+  (* ram_style="block" *) reg [W-1:0] mem [0:(L/P)-1];
+  always @(posedge clk) begin
+    if (we) mem[row] <= wdata[b];          // wdata is a packed P*W bus
+    rdata[b] <= mem[row];                   // registered read (BRAM-safe)
+  end
+end endgenerate
+```
+
+Buffers to bank (P-wide): `xres`, `lnbuf`, `lnout`, `mlpbuf`, `qvec`, `ctxv` (all D or D_MLP),
+the per-block `kcache`/`vcache`, and `gemvy` (GEMV outputs the dequant reads). Small ROMs
+read P-at-a-time (`dq_mant`/`dq_exp`/`gamma`/`inv_sact`) are **P-banked at mem-gen time**
+(reshape the `.mem` writer in `run_sequencer.write_mems` to emit P interleaved files, or one
+file with P columns/row). `tok_emb`/`pos_emb` stay 1-wide (embed is only 0.3%).
+
+### GEMV at the bank boundary
+`gemv_banked_resident` keeps its 256-wide MAC array (the run is inherent: one column k/cycle).
+Two things widen around it: (1) **act-feed** — quantize P acts/cycle from banked `lnout`/`mlpbuf`
+into a P-write-port `xmem` (add P x-write ports to the core, or a small P→1 staging FIFO);
+(2) **readback** — expose a P-wide read of the core's grouped `ymem` into banked `gemvy`.
+The MAC run is unchanged and already wide.
+
+### Phase bring-up order (each gated bit-exact vs the named key)
+1. **embed + LN1** → gate `ln1_out_q22`. Bank `xres`/`lnbuf`/`lnout`; integrate `layernorm_par.sv`
+   (P-wide mean/var/normalize) re-pinned to the committed Q-format. *Proves banking + par-LN.*
+2. **qkv GEMV + P-wide dequant** → gate `qkv_q16`. P-wide dequant unit (P mult+shift), banked
+   `dq_mant`/`dq_exp`, write banked `qvec`/`kcache`/`vcache`. *Proves the dequant pattern + GEMV feed.*
+3. **attention** → gate `ctx_q25`. P-wide score (q·k adder tree over banked kcache) + P-wide
+   ctx (Σ p·v over banked vcache). The context-scaling win.
+4. **proj + residual** → gate `attn_out_q25`, `x_res1_q25`. (residual add already P-trivial once banked.)
+5. **LN2 + mlp_fc + GELU + mlp_proj** → gate `ln2_out_q22`, `gelu_q22`, `mlp_out_q25`, `x_out_q25`.
+   GELU already streams; make it P parallel `gelu_lut`. *Closes block 0.*
+6. Scale to 4 blocks + final-LN/head → the multitoken token-stream gate (the binding one).
+7. Pipeline the P-wide arith; OOC-sweep `P × PE` for LUT/DSP/URAM/Fmax; build; board fclk-sweep.
+
+### The resource knob
+`P` and the GEMV `PE` trade against the ~117k LUT / 64 URAM / 1248 DSP budget. The measured
+silicon-overclock headroom (build 71 → runs 125 MHz) means the *built* clock can be conservative;
+pick `P×PE` for fit first, then let the on-board fclk sweep find the real tok/s. Target band
+**5,000–12,000 tok/s** at the `P×PE×Fmax` point the board actually closes — reported as measured.
+
 ## Why 100k is not on this line
 
 100k single-stream is latency-bound: a 4-layer autoregressive forward cannot compress to the
