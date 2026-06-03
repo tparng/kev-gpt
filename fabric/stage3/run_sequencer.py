@@ -170,6 +170,64 @@ def write_mems_banked(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlayer:
     write_banked_mem(os.path.join(sim_dir, "gamma"), gam, P, 8)
 
 
+def write_wideword_mem(path, vals, P, bits):
+    """Pack a length-L vector into WIDE words of P elements each (lane 0 in the low bits),
+    one hex line per word — the layout the WIDE-WORD sequencer_vec reads. word w holds
+    vals[w*P + 0 .. w*P + P-1]; lane `l` occupies bits [l*bits +: bits]. A non-multiple tail
+    is zero-padded. Each line is ceil(P*bits/4) hex nibbles (e.g. P=8,bits=32 -> 64 nibbles).
+    This is the de-banked counterpart of write_banked_mem: the SAME element->(word,lane)
+    mapping, but emitted as one packed word/line instead of P separate bank files (so each
+    buffer maps to ONE row-addressed BRAM instead of P arrays that synth-dissolve to muxes)."""
+    vals = list(vals)
+    mask = (1 << bits) - 1
+    nwords = (len(vals) + P - 1) // P
+    nib = (P * bits + 3) // 4
+    lines = []
+    for w in range(nwords):
+        acc = 0
+        for lane in range(P):
+            idx = w * P + lane
+            v = int(vals[idx]) & mask if idx < len(vals) else 0
+            acc |= v << (lane * bits)
+        lines.append(f"{acc:0{nib}x}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_mems_wideword(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlayer: int,
+                        P: int, prompt=None):
+    """Outputs for the WIDE-WORD sequencer_vec: the standard 1-wide ROMs (wrom/seed/exp_lut/
+    gelu_lut/inv_sact/prompt via write_mems) PLUS the P-wide-read ROMs packed wide-word —
+    tok_emb_w / pos_emb_w / gamma_w (P x 32b/word) and dqm_w / dqe_w (P x 24b / P x 8b). The
+    values + element order are IDENTICAL to write_mems_banked; only the file layout differs
+    (one packed word/line vs P bank files)."""
+    write_mems(sim_dir, intseq, lanes, nlayer, prompt=prompt)
+    p = intseq.p
+
+    tok = np.round(p["tok_emb"] * (1 << RESID_FRAC)).astype(np.int64).reshape(-1)
+    pos = np.round(p["pos_emb"] * (1 << RESID_FRAC)).astype(np.int64).reshape(-1)
+    write_wideword_mem(os.path.join(sim_dir, "tok_emb_w.mem"), tok, P, 32)
+    write_wideword_mem(os.path.join(sim_dir, "pos_emb_w.mem"), pos, P, 32)
+
+    gam = []
+    for bi in range(nlayer):
+        gam += list(np.round(p["blocks"][bi]["ln1"] * (1 << LN_GFRAC)).astype(np.int64))
+        gam += list(np.round(p["blocks"][bi]["ln2"] * (1 << LN_GFRAC)).astype(np.int64))
+    gam += list(np.round(p["ln_f"] * (1 << LN_GFRAC)).astype(np.int64))
+    write_wideword_mem(os.path.join(sim_dir, "gamma_w.mem"), gam, P, 32)
+
+    mant_all, exp_all = [], []
+    for bi in range(nlayer):
+        for nm in ("qkv", "proj", "mlp_fc", "mlp_proj"):
+            L = intseq.layers[(bi, nm)]
+            mant_all += [int(m) for m in L["mant"]]
+            exp_all += [int(e) for e in L["exp"]]
+    mant_all += [int(m) for m in intseq.head["mant"]]
+    exp_all += [int(e) for e in intseq.head["exp"]]
+    write_wideword_mem(os.path.join(sim_dir, "dqm_w.mem"), mant_all, P, 24)
+    write_wideword_mem(os.path.join(sim_dir, "dqe_w.mem"), exp_all, P, 8)
+
+
 def _compile_run(sim_dir, tok, pos, lanes, nlayer, prompt_len=1, ngen=1, kvmax=32,
                  fast=False, dbg_phase=False):
     # fast=True gates sequencer_fast (resident-read GEMV: weights preloaded once into the

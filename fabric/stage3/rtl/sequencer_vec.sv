@@ -1,18 +1,24 @@
 // -----------------------------------------------------------------------------
 // sequencer_vec — the P-WIDE vector-datapath sequencer (the road to ~10k tok/s).
-// MILESTONE 4: the FULL block-0 forward, P-wide, each phase bit-exact vs
-// seq_ref.block0_phase_signals:
+// WIDE-WORD banking edition. Functionally identical (bit-exact) to the proven
+// [P][rows] version, but every scratch buffer + every P-wide-read ROM is ONE
+// row-addressed memory holding P elements per word (lane l in bits [l*W +: W]):
 //
-//   embed -> LN1 -> qkv GEMV -> attention(x4 heads) -> proj GEMV -> +res1
-//         -> LN2 -> mlp_fc GEMV -> GELU -> mlp_proj GEMV -> +res2 -> x_out
+//   reg [P*W-1:0] buf [0:ROWS-1]      instead of    reg [W] buf [0:P-1][0:ROWS-1]
 //
-// The GEMV and LN paths are CALLABLE micro-sequences (parameter registers + a return
-// state), reused for all 4 GEMVs / 2 LNs. Each gateable intermediate has its own banked
-// buffer so every phase key is readable at the end. The banking scheme (element e ->
-// bank e%P, row e/P) is the same one proven in M1.
+// WHY: the [P][rows] layout, read/written at a VARIABLE row, synthesises to giant
+// per-lane row-multiplexers (the 88k MUXF7 / 216k-LUT blow-up that overflowed the
+// KV260). With wide words the variable row is just a memory ADDRESS (free) and only
+// a small P:1 lane-select remains. P-wide accesses touch the whole word (constant
+// offsets, no mux); the two inherently-1/cycle producers (GEMV readback, attention
+// ctx) accumulate into a plain-reg staging word and write one wide word every P.
 //
-// iverilog-2012 safe: copy unpacked-array elements to plain vectors before any indexed
-// use; packed-vector +: part-selects only; flat ROMs for $readmemh (no 2D-row init).
+// Bonus cycle win: embeddings/gamma are wide ROMs, so embed is ROWS (not D) cycles
+// and the separate gamma-load phase disappears.
+//
+// iverilog-2012 safe: VARIABLE +: part-selects only ever index PLAIN REGS (never an
+// unpacked-array element); unpacked arrays are only ever read/written by element
+// index; flat/packed ROMs for $readmemh.
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
@@ -49,7 +55,7 @@ module sequencer_vec #(
     input  wire [3:0]  rd_sel,
     input  wire [10:0] rd_addr,
     output reg signed [63:0] rd_data,
-    // runtime weight load (stream the whole block-0 transposed image once)
+    // runtime weight load (stream the whole transposed image once)
     input  wire        wl_rst,
     input  wire        wl_we,
     input  wire [31:0] wl_data
@@ -74,40 +80,36 @@ module sequencer_vec #(
     localparam integer WB_HEAD = NLAYER*GW_BLK;                          // head weight base
     localparam integer DR_HEAD = (NLAYER*DQ_BLK)/P;                      // head dequant row base
     localparam integer ARROWS  = (VOCAB + P - 1)/P;                      // argmax rows
+    localparam integer EROWS   = D / P;                                  // emb/gamma rows per set
 
-    // ---- small ROMs ($readmemh) ------------------------------------------------
-    (* rom_style = "block" *) reg signed [31:0] tok_emb   [0:VOCAB*D-1];
-    (* rom_style = "block" *) reg signed [31:0] pos_emb   [0:TMAX*D-1];
-    (* rom_style = "block" *) reg signed [31:0] gamma_rom [0:GAMMA_N*D-1];
-    (* rom_style = "block" *) reg signed [63:0] inv_sact  [0:NSACT-1];
-    (* rom_style = "block" *) reg signed [31:0] dqm_flat [0:P*DQROWS-1];
-    (* rom_style = "block" *) reg signed [7:0]  dqe_flat [0:P*DQROWS-1];
+    // ---- wide-word ROMs ($readmemh: one P-packed word per line) -----------------
+    (* rom_style = "block" *) reg [P*32-1:0] tok_emb_w [0:VOCAB*EROWS-1];  // Q6.25
+    (* rom_style = "block" *) reg [P*32-1:0] pos_emb_w [0:TMAX*EROWS-1];   // Q6.25
+    (* rom_style = "block" *) reg [P*32-1:0] gamma_w   [0:GAMMA_N*EROWS-1];// Q4.20
+    (* rom_style = "block" *) reg signed [63:0] inv_sact [0:NSACT-1];
+    (* rom_style = "block" *) reg [P*24-1:0] dqm_w [0:DQROWS-1];           // P mant / word
+    (* rom_style = "block" *) reg [P*8-1:0]  dqe_w [0:DQROWS-1];           // P exp  / word
     initial begin
-        $readmemh("tok_emb.mem",  tok_emb);
-        $readmemh("pos_emb.mem",  pos_emb);
-        $readmemh("gamma.mem",    gamma_rom);
-        $readmemh("inv_sact.mem", inv_sact);
+        $readmemh("tok_emb_w.mem", tok_emb_w);
+        $readmemh("pos_emb_w.mem", pos_emb_w);
+        $readmemh("gamma_w.mem",   gamma_w);
+        $readmemh("inv_sact.mem",  inv_sact);
+        $readmemh("dqm_w.mem",     dqm_w);
+        $readmemh("dqe_w.mem",     dqe_w);
     end
-    genvar gb;
-    generate for (gb = 0; gb < P; gb = gb + 1) begin: dqload
-        initial begin
-            $readmemh($sformatf("dq_mant.b%0d.mem", gb), dqm_flat, gb*DQROWS, (gb+1)*DQROWS-1);
-            $readmemh($sformatf("dq_exp.b%0d.mem",  gb), dqe_flat, gb*DQROWS, (gb+1)*DQROWS-1);
-        end
-    end endgenerate
 
-    // ---- P-banked scratch (one bank per gateable intermediate) -----------------
-    reg signed [31:0] xres_bank  [0:P-1][0:ROWS-1];    // residual Q6.25
-    reg signed [31:0] gamma_bank [0:P-1][0:ROWS-1];    // current LN gamma Q4.20
-    reg signed [63:0] lnout1_bank[0:P-1][0:ROWS-1];    // LN1 out Q.22
-    reg signed [63:0] lnout2_bank[0:P-1][0:ROWS-1];    // LN2 out Q.22
-    reg signed [31:0] qkv_bank   [0:P-1][0:ROWS3-1];   // q|k|v Q.16
-    reg signed [31:0] ctxv_bank  [0:P-1][0:ROWS-1];    // attention ctx Q6.25
-    reg signed [31:0] attn_bank  [0:P-1][0:ROWS-1];    // proj out (attn_out) Q6.25
-    reg signed [63:0] mlpbuf_bank[0:P-1][0:ROWSM-1];   // mlp hidden Q4.12 then Q.22
-    reg signed [31:0] mlp_bank   [0:P-1][0:ROWS-1];    // mlp_proj out Q6.25
-    reg signed [31:0] gemvy_bank [0:P-1][0:ROWSM-1];   // GEMV INT32 (up to D_MLP wide)
-    reg signed [31:0] head_bank  [0:P-1][0:ARROWS-1];  // head logits (real, Q6.25)
+    // ---- wide-word scratch (one row-addressed memory per gateable intermediate) -
+    reg [P*32-1:0] xres_bank  [0:ROWS-1];    // residual Q6.25
+    reg [P*64-1:0] lnout1_bank[0:ROWS-1];    // LN1 / LN_f out Q.22
+    reg [P*64-1:0] lnout2_bank[0:ROWS-1];    // LN2 out Q.22
+    reg [P*32-1:0] qkv_bank   [0:ROWS3-1];   // q|k|v Q.16
+    reg [P*32-1:0] ctxv_bank  [0:ROWS-1];    // attention ctx Q6.25
+    reg [P*32-1:0] attn_bank  [0:ROWS-1];    // proj out (attn_out) Q6.25
+    reg [P*64-1:0] mlpbuf_bank[0:ROWSM-1];   // mlp hidden Q4.12 then Q.22
+    reg [P*32-1:0] mlp_bank   [0:ROWS-1];    // mlp_proj out Q6.25
+    reg [P*32-1:0] gemvy_bank [0:ROWSM-1];   // GEMV INT32 (up to D_MLP wide)
+    reg [P*32-1:0] head_bank  [0:ARROWS-1];  // head logits (real, Q6.25)
+    reg [P*32-1:0] gystage, cstage;          // P-deep staging words for 1/cyc producers
 
     // ---- layernorm_vec ---------------------------------------------------------
     reg                ln_start, ln_vin;
@@ -166,7 +168,10 @@ module sequencer_vec #(
     wire [10:0] aw_src = (wi < 64)  ? (hh*HEAD_DIM + wi) :
                          (wi < 128) ? (11'd256 + hh*HEAD_DIM + (wi - 64)) :
                                       (11'd512 + hh*HEAD_DIM + (wi - 128));
-    wire signed [31:0] aw_data = qkv_bank[aw_src[LSH-1:0]][aw_src >> LSH];
+    // wide-word qkv read: element-select the word (plain reg), then plain-reg lane part-sel
+    reg  [P*32-1:0] qw_r;
+    always @* qw_r = qkv_bank[aw_src >> LSH];
+    wire signed [31:0] aw_data = qw_r[(aw_src[LSH-1:0])*32 +: 32];
     vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(32)) u_attn (
         .clk(clk), .rst(rst), .start(at_start), .tcount(at_tcount),
         .ld_valid(at_ldv), .ld_data(aw_data), .ld_ready(at_ldready),
@@ -181,33 +186,33 @@ module sequencer_vec #(
     reg [11:0] g_dqrow;            // dequant channel-row base (up to NLAYER*DQ_BLK/P = 1152)
     reg [2:0]  g_dst;              // dest: 0 qkv,1 attn,2 mlpbuf(sat16),3 mlp,4 head
     reg [4:0]  g_ret;             // return state after the GEMV
-    reg [3:0]  l_gbase;            // LN gamma row
+    reg [3:0]  l_gbase;            // LN gamma set (0=ln1.0,1=ln2.0,...,2*NLAYER=ln_f)
     reg        l_dst;              // LN dest: 0 lnout1, 1 lnout2
     reg [4:0]  l_ret;             // return state after the LN
 
-    // ---- act-quant + dequant temporaries ---------------------------------------
+    // ---- temporaries (PLAIN regs — safe targets for variable part-selects) -----
     reg signed [63:0]  lntmp;
     reg signed [95:0]  aq_prod, aq_sh;
     reg signed [31:0]  aq_int;
-    reg signed [31:0]  cb;
-    reg signed [31:0]  e_tok, e_pos, xb, gb_, gy, om;
-    reg signed [63:0]  lo;
-    reg signed [31:0]  mant_v; reg signed [7:0] exp_v;
-    reg signed [31:0]  dqv;
-    reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
-    // gelu address pipeline (3-cyc latency)
-    reg [$clog2(ROWSM+1)-1:0] gfr, gor;
+    reg signed [31:0]  cb, dqv, gy_v, hv;
+    reg [P*32-1:0]  tw, pw, ww, xw, ow, sw, dword, gyr, hw, gyw, cw;
+    reg [P*64-1:0]  w64, mw64, mword, gsw;
+    reg [P*32-1:0]  w32;
+    reg [P*24-1:0]  mwr;
+    reg [P*8-1:0]   ewr;
     reg signed [63:0] gl_sh;
+    reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
+    reg [$clog2(ROWSM+1)-1:0] gfr, gor;
     integer pp;
     reg [8:0] ce;
     reg [3:0] blk;                           // transformer block 0..NLAYER-1
-    reg signed [31:0] best_val; reg [8:0] best_idx, hidx; reg signed [31:0] hv;
+    reg signed [31:0] best_val; reg [8:0] best_idx, hidx;
     reg [$clog2(ARROWS+1)-1:0] ar;           // argmax row counter
 
     // ---- FSM -------------------------------------------------------------------
     localparam [4:0]
       S_IDLE=0, S_EMB=1,
-      L_GAM=2, L_FEED=3, L_COLL=4,                  // callable LN
+      L_GAM=2, L_FEED=3, L_COLL=4,                  // callable LN (L_GAM now = start-only)
       G_AQ=5, G_RUN=6, G_WAIT=7, G_RB=8, G_DQ=9,    // callable GEMV
       S_QKVRET=10, S_AST=11, S_ALD=12, S_ACL=13,    // attention
       S_RES1=14, S_LN2=15, S_FCRET=16,              // proj/res1/LN2-call
@@ -222,39 +227,33 @@ module sequencer_vec #(
         dq_vin<=1'b0; gl_vin<=1'b0; at_start<=1'b0; at_ldv<=1'b0; done<=1'b0;
         if (rst) begin
             st<=S_IDLE; ci<=0; fr<=0; orow<=0; dr<=0; dor<=0; gfr<=0; gor<=0;
-            rv0<=0; rv1<=0; rv2<=0;
+            rv0<=0; rv1<=0; rv2<=0; gystage<=0; cstage<=0;
         end else begin
             case (st)
-                S_IDLE: if (go) begin ci<=0; blk<=4'd0; st<=S_EMB; end
-                // ---- embed -> xres banks; then call LN1 of block 0 -------------
+                S_IDLE: if (go) begin fr<=0; blk<=4'd0; gystage<=0; cstage<=0; st<=S_EMB; end
+                // ---- embed -> xres (wide ROM, P/cyc); then call LN1 of block 0 --
                 S_EMB: begin
-                    e_tok = tok_emb[tok_id*D + ci];
-                    e_pos = pos_emb[pos*D + ci];
-                    xres_bank[ci[LSH-1:0]][ci >> LSH] <= e_tok + e_pos;
-                    if (ci == D-1) begin
-                        ci<=0; l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; st<=L_GAM;
-                    end else ci<=ci+1'b1;
+                    tw = tok_emb_w[tok_id*EROWS + fr];
+                    pw = pos_emb_w[pos*EROWS + fr];
+                    for (pp=0; pp<P; pp=pp+1)
+                        ww[pp*32 +: 32] = $signed(tw[pp*32 +: 32]) + $signed(pw[pp*32 +: 32]);
+                    xres_bank[fr] <= ww;
+                    if (fr==ROWS-1) begin
+                        fr<=0; l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; st<=L_GAM;
+                    end else fr<=fr+1'b1;
                 end
                 // ================= callable LayerNorm =========================
-                L_GAM: begin                              // load gamma row -> gamma_bank
-                    gamma_bank[ci[LSH-1:0]][ci >> LSH] <= gamma_rom[l_gbase*D + ci];
-                    if (ci==D-1) begin ci<=0; fr<=0; ln_start<=1'b1; st<=L_FEED; end
-                    else ci<=ci+1'b1;
-                end
+                L_GAM: begin ln_start<=1'b1; fr<=0; st<=L_FEED; end   // gamma is a wide ROM now
                 L_FEED: begin
                     ln_vin<=1'b1;
-                    for (pp=0; pp<P; pp=pp+1) begin
-                        xb = xres_bank[pp][fr]; gb_ = gamma_bank[pp][fr];
-                        ln_x[pp*32 +: 32] <= xb; ln_g[pp*32 +: 32] <= gb_;
-                    end
+                    ln_x <= xres_bank[fr];
+                    ln_g <= gamma_w[l_gbase*EROWS + fr];
                     if (fr==ROWS-1) begin orow<=0; st<=L_COLL; end else fr<=fr+1'b1;
                 end
                 L_COLL: begin
                     if (ln_yv) begin
-                        for (pp=0; pp<P; pp=pp+1) begin
-                            if (l_dst==1'b0) lnout1_bank[pp][orow] <= ln_y[pp*64 +: 64];
-                            else             lnout2_bank[pp][orow] <= ln_y[pp*64 +: 64];
-                        end
+                        if (l_dst==1'b0) lnout1_bank[orow] <= ln_y;
+                        else             lnout2_bank[orow] <= ln_y;
                         if (orow==ROWS-1) st<=l_ret; else orow<=orow+1'b1;
                     end
                 end
@@ -262,22 +261,25 @@ module sequencer_vec #(
                 S_QKVRET: begin
                     g_wbase<=blk*GW_BLK + WB_QKV; g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
                     g_asel<=blk*4 + 6'd0; g_frac<=7'd16; g_dqrow<=blk*DQB_P + DR_QKV; g_dst<=3'd0;
-                    g_ret<=S_AST; ci<=0; hh<=2'd0; gv_ldrst<=1'b1; st<=G_AQ;  // init head counter
+                    g_ret<=S_AST; ci<=0; hh<=2'd0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // ================= callable GEMV ==============================
                 G_AQ: begin                               // act-quant from the selected source
                     case (g_asrc)
-                        2'd0: lntmp = lnout1_bank[ci[LSH-1:0]][ci >> LSH];
-                        2'd1: begin cb = ctxv_bank[ci[LSH-1:0]][ci >> LSH];
-                                    // ctx Q6.25 -> Q.22 with rsh_round (round-half-away-from-0,
-                                    // shift 3) — matches seq_ref._proj_after_attn exactly.
+                        2'd0: begin w64 = lnout1_bank[ci >> LSH];
+                                    lntmp = w64[(ci[LSH-1:0])*64 +: 64]; end
+                        2'd1: begin w32 = ctxv_bank[ci >> LSH];
+                                    cb = w32[(ci[LSH-1:0])*32 +: 32];
+                                    // ctx Q6.25 -> Q.22 rsh_round (matches _proj_after_attn)
                                     if ($signed({{32{cb[31]}}, cb}) >= 0)
                                         lntmp = ($signed({{32{cb[31]}}, cb}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC);
                                     else
                                         lntmp = -((-$signed({{32{cb[31]}}, cb}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC));
                               end
-                        2'd2: lntmp = lnout2_bank[ci[LSH-1:0]][ci >> LSH];
-                        default: lntmp = mlpbuf_bank[ci[LSH-1:0]][ci >> LSH];
+                        2'd2: begin w64 = lnout2_bank[ci >> LSH];
+                                    lntmp = w64[(ci[LSH-1:0])*64 +: 64]; end
+                        default: begin w64 = mlpbuf_bank[ci >> LSH];
+                                    lntmp = w64[(ci[LSH-1:0])*64 +: 64]; end
                     endcase
                     aq_prod = $signed(lntmp) * $signed(inv_sact[g_asel]);
                     if (lntmp >= 0)
@@ -294,46 +296,50 @@ module sequencer_vec #(
                     gv_start<=1'b1; st<=G_WAIT;
                 end
                 G_WAIT: if (gv_done) begin
-                    ci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0; st<=G_RB;
+                    ci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0; gystage<=0; st<=G_RB;
                 end
-                G_RB: begin                               // readback g_m outputs -> gemvy banks
+                G_RB: begin                               // readback g_m outputs -> gemvy (staged)
                     if (ci < g_m) begin gv_rdaddr<=ci; rb0<=ci; ci<=ci+1'b1; end
                     else gv_rdaddr<=g_m-1'b1;
                     rb1<=rb0; rb2<=rb1;
                     rv0<=(ci<g_m); rv1<=rv0; rv2<=rv1;
                     if (rv2) begin
-                        gemvy_bank[rb2[LSH-1:0]][rb2 >> LSH] <= gv_yout;
+                        gyw = gystage;
+                        gyw[(rb2[LSH-1:0])*32 +: 32] = gv_yout;
+                        if (rb2[LSH-1:0]==P-1 || rb2==g_m-1) begin
+                            gemvy_bank[rb2 >> LSH] <= gyw; gystage <= 0;
+                        end else gystage <= gyw;
                         if (rb2==g_m-1) begin dr<=0; dor<=0; st<=G_DQ; end
                     end
                 end
                 G_DQ: begin                               // P-wide dequant -> selected dest
                     if (dr < ((g_m + P-1) >> LSH)) begin   // ceil rows (head VOCAB not P-mult)
                         dq_vin<=1'b1; dq_frac<=g_frac;
+                        gyr = gemvy_bank[dr];
+                        mwr = dqm_w[g_dqrow + dr];
+                        ewr = dqe_w[g_dqrow + dr];
                         for (pp=0; pp<P; pp=pp+1) begin
-                            gy = gemvy_bank[pp][dr];
-                            mant_v = dqm_flat[pp*DQROWS + g_dqrow + dr];
-                            exp_v  = dqe_flat[pp*DQROWS + g_dqrow + dr];
-                            dq_gemvy[pp*32 +: 32] <= gy;
-                            dq_mant [pp*24 +: 24] <= mant_v[23:0];
-                            dq_exp  [pp*8  +: 8 ] <= exp_v;
+                            dq_gemvy[pp*32 +: 32] <= gyr[pp*32 +: 32];
+                            dq_mant [pp*24 +: 24] <= mwr[pp*24 +: 24];
+                            dq_exp  [pp*8  +: 8 ] <= ewr[pp*8  +: 8 ];
                         end
                         dr<=dr+1'b1;
                     end else dq_vin<=1'b0;
                     if (dq_vout) begin
                         for (pp=0; pp<P; pp=pp+1) begin
                             dqv = dq_out[pp*32 +: 32];
-                            case (g_dst)
-                                3'd0: qkv_bank [pp][dor] <= dqv;
-                                3'd1: attn_bank[pp][dor] <= dqv;
-                                3'd2: begin                       // mlpbuf: sat16 to Q4.12, sign-ext
-                                    if      ($signed(dqv) >  32'sd32767)  mlpbuf_bank[pp][dor] <= 64'sd32767;
-                                    else if ($signed(dqv) < -32'sd32768)  mlpbuf_bank[pp][dor] <= -64'sd32768;
-                                    else    mlpbuf_bank[pp][dor] <= {{32{dqv[31]}}, dqv};
-                                end
-                                3'd3: mlp_bank [pp][dor] <= dqv;
-                                default: head_bank[pp][dor] <= dqv;     // 4: head logits Q6.25
-                            endcase
+                            dword[pp*32 +: 32] = dqv;
+                            if      ($signed(dqv) >  32'sd32767)  mword[pp*64 +: 64] = 64'sd32767;
+                            else if ($signed(dqv) < -32'sd32768)  mword[pp*64 +: 64] = -64'sd32768;
+                            else    mword[pp*64 +: 64] = {{32{dqv[31]}}, dqv};
                         end
+                        case (g_dst)
+                            3'd0: qkv_bank [dor] <= dword;
+                            3'd1: attn_bank[dor] <= dword;
+                            3'd2: mlpbuf_bank[dor] <= mword;   // Q4.12 sat16, sign-ext
+                            3'd3: mlp_bank [dor] <= dword;
+                            default: head_bank[dor] <= dword;  // 4: head logits Q6.25
+                        endcase
                         if (dor==((g_m + P-1) >> LSH)-1) st<=g_ret; else dor<=dor+1'b1;
                     end
                 end
@@ -348,7 +354,10 @@ module sequencer_vec #(
                 S_ACL: begin
                     if (at_ctxv) begin
                         ce = {2'd0, hh}*HEAD_DIM + {2'd0, at_ctxidx};
-                        ctxv_bank[ce[LSH-1:0]][ce >> LSH] <= at_ctxdata;
+                        cw = cstage;
+                        cw[(ce[LSH-1:0])*32 +: 32] = at_ctxdata;
+                        if (ce[LSH-1:0]==P-1) begin ctxv_bank[ce >> LSH] <= cw; cstage <= 0; end
+                        else cstage <= cw;
                     end
                     if (at_done) begin
                         if (hh==NHEAD-1) begin                    // -> proj GEMV
@@ -360,10 +369,10 @@ module sequencer_vec #(
                 end
                 // ---- res1: xres += attn_out ; then LN2 -----------------------
                 S_RES1: begin
-                    for (pp=0; pp<P; pp=pp+1) begin
-                        xb = xres_bank[pp][ci]; om = attn_bank[pp][ci];
-                        xres_bank[pp][ci] <= xb + om;
-                    end
+                    xw = xres_bank[ci]; ow = attn_bank[ci];
+                    for (pp=0; pp<P; pp=pp+1)
+                        sw[pp*32 +: 32] = $signed(xw[pp*32 +: 32]) + $signed(ow[pp*32 +: 32]);
+                    xres_bank[ci] <= sw;
                     if (ci==ROWS-1) begin
                         ci<=0; l_gbase<=blk*2 + 4'd1; l_dst<=1'b1; l_ret<=S_FCRET; st<=L_GAM;
                     end else ci<=ci+1'b1;
@@ -376,21 +385,19 @@ module sequencer_vec #(
                 end
                 // ================= GELU (vec_gelu over mlpbuf) ================
                 S_GELU: begin                              // drive P Q4.12, capture P Q.22
-                    // feed
                     if (gfr < ROWSM) begin
                         gl_vin<=1'b1;
-                        for (pp=0; pp<P; pp=pp+1) begin
-                            lo = mlpbuf_bank[pp][gfr];
-                            gl_x[pp*16 +: 16] <= lo[15:0];
-                        end
+                        mw64 = mlpbuf_bank[gfr];
+                        for (pp=0; pp<P; pp=pp+1)
+                            gl_x[pp*16 +: 16] <= mw64[pp*64 +: 16];   // low 16 of each Q4.12 lane
                         gfr<=gfr+1'b1;
                     end else gl_vin<=1'b0;
-                    // capture: gl_y (Q4.12) << (LN_OUT_FRAC-GELU_FRAC) -> Q.22
                     if (gl_vout) begin
                         for (pp=0; pp<P; pp=pp+1) begin
                             gl_sh = $signed(gl_y[pp*16 +: 16]) <<< (LN_OUT_FRAC-GELU_FRAC);
-                            mlpbuf_bank[pp][gor] <= gl_sh;
+                            gsw[pp*64 +: 64] = gl_sh;
                         end
+                        mlpbuf_bank[gor] <= gsw;
                         if (gor==ROWSM-1) begin                   // -> mlp_proj GEMV
                             g_wbase<=blk*GW_BLK + WB_MP; g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
                             g_asel<=blk*4 + 6'd3; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_MP; g_dst<=3'd3;
@@ -400,10 +407,10 @@ module sequencer_vec #(
                 end
                 // ---- res2: xres += mlp_out ; next block or final LN_f --------
                 S_RES2: begin
-                    for (pp=0; pp<P; pp=pp+1) begin
-                        xb = xres_bank[pp][ci]; om = mlp_bank[pp][ci];
-                        xres_bank[pp][ci] <= xb + om;
-                    end
+                    xw = xres_bank[ci]; ow = mlp_bank[ci];
+                    for (pp=0; pp<P; pp=pp+1)
+                        sw[pp*32 +: 32] = $signed(xw[pp*32 +: 32]) + $signed(ow[pp*32 +: 32]);
+                    xres_bank[ci] <= sw;
                     if (ci==ROWS-1) begin
                         ci<=0;
                         if (blk == NLAYER-1) begin                 // -> final LN_f -> head
@@ -423,8 +430,9 @@ module sequencer_vec #(
                 end
                 // ---- P-wide argmax over the VOCAB logits (Q6.25) ------------
                 S_ARGMAX: begin
+                    hw = head_bank[ar];
                     for (pp=0; pp<P; pp=pp+1) begin
-                        hv   = head_bank[pp][ar];
+                        hv   = hw[pp*32 +: 32];
                         hidx = ar*P + pp;
                         if (hidx < VOCAB && $signed(hv) > best_val) begin
                             best_val = $signed(hv); best_idx = hidx;
@@ -439,23 +447,26 @@ module sequencer_vec #(
         end
     end
 
-    // ---- readback mux (2-cyc registered). 32-bit signed banks auto sign-extend to
-    //      the 64-bit signed rd0; 64-bit banks (ln1/ln2/gelu) pass through. ---------
+    // ---- readback mux (2-cyc registered): pick the bank word, extract the lane ----
     reg signed [63:0] rd0;
     reg [LSH-1:0] rba; reg [10:0] rbr;
+    reg [P*64-1:0] rw64; reg [P*32-1:0] rw32; reg is64;
     always @(posedge clk) begin
         rba = rd_addr[LSH-1:0]; rbr = rd_addr >> LSH;
+        is64 = 1'b0; rw64 = {(P*64){1'b0}}; rw32 = {(P*32){1'b0}};
         case (rd_sel)
-            4'd0: rd0 <= lnout1_bank[rba][rbr];   // ln1   (Q.22)
-            4'd1: rd0 <= qkv_bank   [rba][rbr];   // qkv   (Q.16, sign-ext)
-            4'd2: rd0 <= ctxv_bank  [rba][rbr];   // ctx   (Q6.25)
-            4'd3: rd0 <= attn_bank  [rba][rbr];   // attn_out (Q6.25)
-            4'd4: rd0 <= lnout2_bank[rba][rbr];   // ln2   (Q.22)
-            4'd5: rd0 <= mlpbuf_bank[rba][rbr];   // gelu  (Q.22)
-            4'd6: rd0 <= mlp_bank   [rba][rbr];   // mlp_out (Q6.25)
-            4'd7: rd0 <= xres_bank  [rba][rbr];   // x4 residual after the last block (Q6.25)
-            default: rd0 <= head_bank[rba][rbr];  // 8: head logits (Q6.25)
+            4'd0: begin rw64 = lnout1_bank[rbr]; is64 = 1'b1; end   // ln1   (Q.22)
+            4'd1: rw32 = qkv_bank   [rbr];                          // qkv   (Q.16)
+            4'd2: rw32 = ctxv_bank  [rbr];                          // ctx   (Q6.25)
+            4'd3: rw32 = attn_bank  [rbr];                          // attn_out (Q6.25)
+            4'd4: begin rw64 = lnout2_bank[rbr]; is64 = 1'b1; end   // ln2   (Q.22)
+            4'd5: begin rw64 = mlpbuf_bank[rbr]; is64 = 1'b1; end   // gelu  (Q.22)
+            4'd6: rw32 = mlp_bank   [rbr];                          // mlp_out (Q6.25)
+            4'd7: rw32 = xres_bank  [rbr];                          // x4 residual (Q6.25)
+            default: rw32 = head_bank[rbr];                         // 8: head logits (Q6.25)
         endcase
+        if (is64) rd0 <= $signed(rw64[rba*64 +: 64]);
+        else      rd0 <= {{32{rw32[rba*32 + 31]}}, rw32[rba*32 +: 32]};  // sign-ext 32->64
         rd_data <= rd0;
     end
 endmodule

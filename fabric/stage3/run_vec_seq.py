@@ -12,7 +12,7 @@ import os
 import subprocess
 
 from fabric.stage3 import seq_ref
-from fabric.stage3.run_sequencer import write_mems_banked
+from fabric.stage3.run_sequencer import write_mems_wideword
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RTL = os.path.join(HERE, "rtl")
@@ -38,7 +38,7 @@ def run(sim_dir, tok, P, lanes=16, npz="fabric/export/goformer.npz"):
     iseq = seq_ref.IntSequencer(p, cfg)
     sig = iseq.full_forward_signals(int(tok))
     iseq.reset()
-    write_mems_banked(sim_dir, iseq, lanes, 4, P)
+    write_mems_wideword(sim_dir, iseq, lanes, 4, P)
     with open(os.path.join(sim_dir, "wrom.mem")) as fh:
         wrom_n = sum(1 for ln in fh if ln.strip())
 
