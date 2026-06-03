@@ -118,18 +118,18 @@ def plot(path):
 
     # baselines — the references to beat (same model, B=1 greedy decode)
     refs = [
-        (A53_CHAT, f"A53 chat ({A53_CHAT:.0f})", "#2980b9"),
-        (XPS_CPU, f"XPS15 torch CPU ({XPS_CPU:.0f})", "#8e44ad"),
-        (XPS_GPU, f"XPS15 RTX 3050 Ti ({XPS_GPU:.0f})", "#d35400"),
-        (XPS_CPU_OPT, f"XPS15 ORT CPU ({XPS_CPU_OPT:,.0f})", "#7f1d3c"),
+        (A53_CHAT, f"A53 chat ({A53_CHAT:.0f})", "#2980b9", "bottom"),
+        (XPS_CPU, f"XPS15 torch CPU ({XPS_CPU:.0f})", "#8e44ad", "bottom"),
+        (XPS_GPU, f"XPS15 RTX 3050 Ti ({XPS_GPU:.0f})", "#d35400", "top"),
+        (XPS_CPU_OPT, f"XPS15 ORT CPU ({XPS_CPU_OPT:,.0f})", "#7f1d3c", "bottom"),
     ]
-    for yv, lbl, col in refs:
+    for yv, lbl, col, va in refs:
         ax.axhline(yv, color=col, ls=":", lw=1.4)
-        ax.text(len(LADDER) - 0.5, yv * 1.1, lbl,
-                color=col, fontsize=8, ha="right", va="bottom")
+        ax.text(-0.55, yv * (1.1 if va == "bottom" else 0.9), lbl,
+                color=col, fontsize=8, ha="left", va=va)
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=8.2)
+    ax.set_xticklabels(labels, fontsize=8.2, rotation=30, ha="right")
     ax.set_ylabel("tokens / second  (log scale)")
     ax.set_title("Kevin on Kria — the speed ladder: each step's contribution to the gains")
     ax.grid(True, axis="y", which="both", alpha=0.18)
