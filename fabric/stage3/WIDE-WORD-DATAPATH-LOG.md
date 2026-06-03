@@ -382,3 +382,13 @@ The projection (3,512) landed within 0.4 tok/s. Sweep: 100 MHz 2,809.3 · 111.1 
 **125 3,511.6** · 142.9 marginal 1/3 (4,013.3 — not claimed). 80 MHz build WNS −0.371,
 silicon factor 1.57. 1.87× over yesterday's 1,882.7. Ladder: 752 → 1,883 → 2,484 → 3,512.
 Levers left: LANES=256 (~29k cyc), softmax overlap, then 200 MHz pipelining → 10k.
+
+---
+
+## 11. LANES=256 — 22,942 cyc/token (SIM, gated bit-exact)
+
+Pure parameter push: L=128→256 (WWORDS scales inversely to 12,800; the image is fixed
+~12.6 Mbit). The GEMV halves twice — half the columns *and* half the group passes per matrix.
+Gate green tok 10/48/100: **22,942 cyc/token** (35,597 → −36%). @125 MHz → **5,449 tok/s
+PROJECTED**. The 1-cycle floor is now attention load + LN + softmax — the next cycle lever is
+qkv/attn restructuring, not LANES.
