@@ -56,34 +56,34 @@ module gemv_banked_resident_vec #(
     localparam integer SUBW   = WBITS / 32;
     localparam integer SSW    = (SUBW > 1) ? $clog2(SUBW) : 1;
 
-    // Weight memory in <=512-bit URAM banks (generate: one real array per bank).
-    // A single LANES=256 (1024-bit) memory cascades to 16x4 = 64 URAM — the whole
-    // device — so Vivado silently falls back to LUTRAM (~400k LUT, 342%). Two
-    // 512-bit banks are the geometry already proven at LANES=128. Bank b holds
-    // bits [b*BW +: BW] of the wide word; the stream fills bank 0's chunks first.
-    localparam integer NB    = (WBITS + 511) / 512;   // banks
-    localparam integer BW    = WBITS / NB;            // bank width (<= 512)
-    localparam integer BSUBW = BW / 32;               // 32-bit chunks per bank word
-    localparam integer NBW   = (NB > 1) ? $clog2(NB) : 1;
+    // Weight memory in URAM banks (generate: one real array per bank).
+    // GEOMETRY IS THE CONSTRAINT: a URAM is 4096 x 72b, and Vivado pads each
+    // memory up to a multiple of 72b x 4096. One 1024b x 12800 memory -> 16 URAM
+    // wide x 4 cascade = 64 = the whole device -> "infeasible" -> ~400k LUTRAM.
+    // Even two 512b banks pad to 2 x (8 wide x 4) = 64. The dense packing is
+    // 72b-wide banks: 15 banks x 4 cascade = 60 URAM for LANES=256.
+    // For LANES<=128 the proven single 512b x 25600 memory (56 URAM) is kept.
+    localparam integer BANKW = (WBITS > 512) ? 72 : WBITS;        // URAM-native width
+    localparam integer NB    = (WBITS + BANKW - 1) / BANKW;       // banks
+    localparam integer WPAD  = NB * BANKW;                        // padded word width
 
     reg [P*8-1:0]    xmem [0:XROWS-1];   // P acts per row
     reg [YBITS-1:0]  ymem [0:GROUPS-1];
 
-    // ---- one-time load: assemble BSUBW chunks per bank word, banks in turn ------
+    // ---- one-time load: assemble SUBW chunks -> commit all banks in one shot ----
     reg [WAW-1:0]    wword;
-    reg [SSW-1:0]    wsub;                     // chunk within the bank word
-    reg [NBW-1:0]    wbank;                    // which bank
-    reg [BW-1:0]     wbuf;
+    reg [SSW-1:0]    wsub;
+    reg [WBITS-1:0]  wbuf;
     reg [XAW-1:0]    xptr;
-    wire [BW-1:0]    wnext = wbuf | ({{(BW-32){1'b0}}, w_data} << (wsub*32));
+    wire [WBITS-1:0] wnext = wbuf | ({{(WBITS-32){1'b0}}, w_data} << (wsub*32));
+    wire [WPAD-1:0]  wnext_pad = {{(WPAD-WBITS){1'b0}}, wnext};
+    wire             wcommit = w_we && (wsub == SUBW-1);
     always @(posedge clk) begin
-        if (ld_rst) begin wword <= 0; wsub <= 0; wbank <= 0; wbuf <= {BW{1'b0}}; xptr <= 0; end
+        if (ld_rst) begin wword <= 0; wsub <= 0; wbuf <= {WBITS{1'b0}}; xptr <= 0; end
         else begin
             if (w_we) begin
-                if (wsub == BSUBW-1) begin
-                    wsub <= 0; wbuf <= {BW{1'b0}};
-                    if (wbank == NB-1) begin wbank <= 0; wword <= wword + 1'b1; end
-                    else wbank <= wbank + 1'b1;
+                if (wsub == SUBW-1) begin
+                    wword <= wword + 1'b1; wsub <= 0; wbuf <= {WBITS{1'b0}};
                 end else begin
                     wbuf <= wnext; wsub <= wsub + 1'b1;
                 end
@@ -94,17 +94,18 @@ module gemv_banked_resident_vec #(
 
     // ---- per-bank URAM arrays + registered read (= pipeline stage 0) ------------
     wire [$clog2(WWORDS)-1:0] waddr;
-    wire [WBITS-1:0] wword_rd;
+    wire [WPAD-1:0] wword_pad;
+    wire [WBITS-1:0] wword_rd = wword_pad[WBITS-1:0];
     genvar gb;
     generate
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
-            (* ram_style = "ultra" *) reg [BW-1:0] mem [0:WWORDS-1];
-            reg [BW-1:0] rd;
+            (* ram_style = "ultra" *) reg [BANKW-1:0] mem [0:WWORDS-1];
+            reg [BANKW-1:0] rd;
             always @(posedge clk) begin
-                if (w_we && wsub == BSUBW-1 && wbank == gb[NBW-1:0]) mem[wword] <= wnext;
+                if (wcommit) mem[wword] <= wnext_pad[gb*BANKW +: BANKW];
                 rd <= mem[waddr];
             end
-            assign wword_rd[gb*BW +: BW] = rd;
+            assign wword_pad[gb*BANKW +: BANKW] = rd;
         end
     endgenerate
 
