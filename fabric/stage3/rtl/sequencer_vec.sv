@@ -354,7 +354,13 @@ module sequencer_vec #(
                             3'd3: mlp_bank [dor] <= dword;
                             default: head_bank[dor] <= dword;  // 4: head logits Q6.25
                         endcase
-                        if (dor==((g_m + P-1) >> LSH)-1) st<=g_ret; else dor<=dor+1'b1;
+                        // ci is left at g_m by G_RB; reset it so the g_ret consumer (S_RES1/
+                        // S_RES2 stream ci=0..ROWS-1) starts clean. Without this, ci enters res
+                        // as 256: iverilog drops the out-of-range xres_bank[256] (gate passes by
+                        // luck) but on silicon the 6-bit address WRAPS and the residual adds attn
+                        // ~29x as ci counts 256..2047..63 -> x_res1 blows up. The real bug.
+                        if (dor==((g_m + P-1) >> LSH)-1) begin ci<=0; st<=g_ret; end
+                        else dor<=dor+1'b1;
                     end
                 end
                 // ================= attention ==================================
