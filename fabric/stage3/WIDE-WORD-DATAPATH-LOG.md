@@ -401,3 +401,10 @@ URAM-native width — 15 banks × 72 b × 4 cascades = **60 URAM**. **OOC L=256:
 BRAM 143.5/144, URAM 60/64, DSP 505 — FITS.** Re-gated bit-exact at L=128 (geometry unchanged)
 and 256. The 12.6 Mbit image needs ≥45.5 URAM, so 60 is within 1.32× of the floor — the next
 lever after this is the GEMV core, not weight banking.
+
+**On silicon (MEASURED): 5,448.8 tok/s @ 125 MHz, 3/3 bit-exact, CYCLES = 22,941 == sim.**
+Sweep: 100 MHz 4,359.0 · 111.1 4,843.3 · **125 5,448.8** · 142.9 fails 0/3 (clean edge).
+Projection 5,449 → measured 5,448.8. One day, four bit-honest rungs: **1,883 → 2,484 → 3,512
+→ 5,449** (2.9×). 10k now needs ~1.85×: pipeline the GEMV/non-linears to ~200 MHz, or cut the
+~23k cyc floor (softmax overlap, attention restructure). Both are pure clock-or-cycles work
+within the proven gate ladder.

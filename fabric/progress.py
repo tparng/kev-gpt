@@ -43,6 +43,8 @@ LADDER = [
      "LUTRAM datapath -> BRAM (50,324 cyc/tok; STA 79.5 MHz, clean to 125, breaks 142.9)"),
     ("+ P-wide GEMV boundary\n(act-feed + readback P/cycle)", 3511.6, "MEASURED",
      "the 1-elem/cyc GEMV act/readback loops (35,596 cyc/tok; 125 MHz 3/3)"),
+    ("+ LANES=256\n(72-bit URAM banks, 60/64)", 5448.8, "MEASURED",
+     "half the GEMV passes (22,941 cyc/tok; 125 MHz 3/3, breaks 142.9)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]
