@@ -145,8 +145,16 @@ into a P-write-port `xmem` (add P x-write ports to the core, or a small P→1 st
 The MAC run is unchanged and already wide.
 
 ### Phase bring-up order (each gated bit-exact vs the named key)
-1. **embed + LN1** → gate `ln1_out_q22`. Bank `xres`/`lnbuf`/`lnout`; integrate `layernorm_par.sv`
-   (P-wide mean/var/normalize) re-pinned to the committed Q-format. *Proves banking + par-LN.*
+1. **embed + LN1** → gate `ln1_out_q22`. Bank `xres`/`lnbuf`/`lnout`; needs a **NEW P-wide-I/O
+   LayerNorm** (`layernorm_vec.sv`). NOTE: the existing `layernorm_par.sv` is NOT P-wide I/O —
+   it still streams x/gamma in and y out at 1/cycle (256+256 cyc); it only folds the variance
+   pass into the load (~264 middle cyc saved) AND it still has the OLD single-cycle Newton +
+   S_OUT double-multiply (the Fmax limiters already fixed in `layernorm.sv`). So write
+   `layernorm_vec`: feed P (x,gamma)/cyc for D/P cyc (P-input adder tree builds sum/sum_xx),
+   algebraic var (the exact identity, like `layernorm_par`), the PIPELINED Newton + PIPELINED
+   P-wide output (reuse the `layernorm.sv` 3-stage Newton + 2-stage S_OUT) emitting P y/cyc.
+   Bit-exact (integer adds associative; same mean/var/rsqrt). Standalone gate first
+   (`run_layernorm`-style), then wire in. *Proves banking + the P-wide LN block.*
 2. **qkv GEMV + P-wide dequant** → gate `qkv_q16`. P-wide dequant unit (P mult+shift), banked
    `dq_mant`/`dq_exp`, write banked `qvec`/`kcache`/`vcache`. *Proves the dequant pattern + GEMV feed.*
 3. **attention** → gate `ctx_q25`. P-wide score (q·k adder tree over banked kcache) + P-wide
