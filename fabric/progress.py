@@ -39,13 +39,18 @@ LADDER = [
      "GELU per-elem stall + LN DSP cascade -> Fmax 50->125 MHz (STA-safe 71/430)"),
     ("+ wide P-lane datapath\n(P=4 LN/dequant/attn/GELU @100MHz)", 1882.7, "MEASURED",
      "the 1-elem/cyc serial loops -> P-wide (53,116 cyc/tok, 2.5x over 752)"),
+    ("+ BRAM sync-read scratch\n(P=8 @125 MHz silicon)", 2483.9, "MEASURED",
+     "LUTRAM datapath -> BRAM (50,324 cyc/tok; STA 79.5 MHz, clean to 125, breaks 142.9)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]
 
-# reference baselines (drawn as guide lines, not rungs)
+# reference baselines (drawn as guide lines, not rungs) — all the same model, B=1 greedy
 A53_CHAT = 11.0          # MEASURED: the pure-A53 char chat
 A53_BENCH = 177.8        # MEASURED: the A53 raw INT4 GEMV microbench
+XPS_CPU = 356.0          # MEASURED: XPS15 PyTorch KV decode (CPU, ctx 256)
+XPS_GPU = 719.0          # MEASURED: XPS15 RTX 3050 Ti, fastest torch mode (full recompute)
+XPS_CPU_OPT = 1273.0     # MEASURED: XPS15 ONNX Runtime KV, 4 threads, Kevin ctx 64
 
 
 def print_table():
@@ -58,7 +63,8 @@ def print_table():
         print(f"{one:52s} {tps:>10,.2f} {mult:>8s}  {tag}   (removes: {removed})")
         prev = tps
     print(f"\nreference: A53 char chat = {A53_CHAT:.0f} tok/s, A53 INT4 GEMV bench = "
-          f"{A53_BENCH:.0f} tok/s (both MEASURED).")
+          f"{A53_BENCH:.0f} tok/s, XPS15 laptop: torch CPU {XPS_CPU:.0f} / RTX 3050 Ti "
+          f"{XPS_GPU:.0f} / ONNX Runtime CPU best {XPS_CPU_OPT:.0f} (all MEASURED).")
     print("note: the C-driver rung (10.35) ~= the A53 chat (11) — CPU-in-loop asymptotes "
           "to the A53; the HW sequencer (CPU OUT of the loop) is the leap that beats it. "
           "MEASURED on silicon, token-stream bit-exact, deterministic: 44.32 (baseline PE16) "
@@ -67,8 +73,10 @@ def print_table():
           "at 71 MHz=430 tok/s; it overclocks clean to 125, breaks at 142). The P-wide serial "
           "datapath (sequencer_vec, P=4/L=128, wide-word banking) is now MEASURED too: 1,882.7 "
           "tok/s @100 MHz, 3/3 bit-exact (53,116 cyc/token; STA closes 40 MHz, overclocks clean "
-          "to 100, marginal at 111). Next: BRAM-buffer rewrite -> P=8 + widen the GEMV boundary "
-          "-> ~10k (see WIDE-WORD-DATAPATH-LOG.md).")
+          "to 100, marginal at 111). BRAM sync-read scratch (P=8/L=128, TMAX=64): MEASURED "
+          "2,483.9 tok/s @125 MHz 3/3 (50,324 cyc/token; STA 79.5 MHz, breaks at 142.9) — beats "
+          "an XPS15 laptop on the same model (ORT CPU 1,273 best, RTX 3050 Ti 719: launch-bound). "
+          "Next: widen the GEMV boundary -> ~10k (see WIDE-WORD-DATAPATH-LOG.md).")
 
 
 def plot(path):
@@ -106,10 +114,17 @@ def plot(path):
                         fontweight="bold")
         prev = v
 
-    # baselines
-    ax.axhline(A53_CHAT, color="#2980b9", ls=":", lw=1.4)
-    ax.text(len(LADDER) - 0.5, A53_CHAT * 1.1, f"A53 chat ({A53_CHAT:.0f})",
-            color="#2980b9", fontsize=8, ha="right", va="bottom")
+    # baselines — the references to beat (same model, B=1 greedy decode)
+    refs = [
+        (A53_CHAT, f"A53 chat ({A53_CHAT:.0f})", "#2980b9"),
+        (XPS_CPU, f"XPS15 torch CPU ({XPS_CPU:.0f})", "#8e44ad"),
+        (XPS_GPU, f"XPS15 RTX 3050 Ti ({XPS_GPU:.0f})", "#d35400"),
+        (XPS_CPU_OPT, f"XPS15 ORT CPU ({XPS_CPU_OPT:,.0f})", "#7f1d3c"),
+    ]
+    for yv, lbl, col in refs:
+        ax.axhline(yv, color=col, ls=":", lw=1.4)
+        ax.text(len(LADDER) - 0.5, yv * 1.1, lbl,
+                color=col, fontsize=8, ha="right", va="bottom")
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=8.2)

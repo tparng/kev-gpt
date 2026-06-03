@@ -336,3 +336,25 @@ factor over its 20.9 ns crit path) and bought only 5 % cycles back. The first 10
 passed cold then failed warm — only multi-run sweeps count. Next: rebuild constrained at
 80 MHz so placement actually tightens the BRAM read paths — silicon @100 MHz × 50,324 cycles
 would be 1,987 tok/s.
+
+### The 80 MHz rebuild — NEW RECORD (MEASURED)
+
+Same RTL, constraint 40 → 80 MHz: placement tightened the BRAM paths from 20.9 ns to ~12.6 ns
+(STA WNS −0.071, 9 endpoints — accepted; the gate is the board). Sweep, all 3/3 deterministic:
+
+| fclk | tok/s | match |
+|---|---|---|
+| 100 MHz | 1,987.1 | ✓ 3/3 |
+| 111.1 MHz | 2,207.9 | ✓ 3/3 |
+| **125 MHz** | **2,483.9** | ✓ **3/3** |
+| 142.9 MHz | (2,838.7) | ✗ 1/3 — not claimed |
+
+**Headline: 2,483.9 tok/s, bit-exact, CYCLES = 50,324 == sim, 3.3× over 752, 1.32× over the
+P=4 record.** Silicon/STA factor 1.57. The same constraint sweep on P=4 was never tried — the
+40 MHz constraint, not the LUTRAM datapath, was the previous ceiling.
+
+**Laptop reference (same model, MEASURED on XPS15):** PyTorch CPU 356, RTX 3050 Ti 719 (full;
+KV 654 — launch-bound), ONNX Runtime KV ctx-256 748, ctx-64 best 1,273. The KV260 at ~6 W beats
+the laptop's best single-stream by 2.0× at ctx-64 (3.3× at ctx-256) — a 3M-param model is
+DDR/launch-bound on both CPU and GPU; on-chip residency wins on every machine, the laptop just
+has no fabric to be resident in.
