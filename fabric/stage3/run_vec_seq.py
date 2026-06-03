@@ -1,10 +1,6 @@
-"""Phase-gated bring-up of sequencer_vec (the P-wide datapath sequencer).
-
-M4 = the FULL block-0 forward, P-wide, every phase bit-exact vs seq_ref.block0_phase_signals:
-  ln1 -> qkv -> ctx -> attn_out -> ln2 -> gelu -> mlp_out -> x_out.
-
-All banks are read back as 64-bit (32-bit signed banks sign-extended) and compared to the
-reference masked to 64-bit. Pass: SEQ_VEC_VERDICT ... all phases True, x_out the binding one.
+"""Full-forward gate for sequencer_vec (M5): single token through 4 blocks + LN_f + head +
+argmax, P-wide. Compares tok_out to seq_ref.full_forward_signals' argmax (the binding check),
+plus x4 (residual after the last block), lnf (LN_f out), and head logits for localisation.
 
     python -m fabric.stage3.run_vec_seq --tok 48 --p 8
 """
@@ -23,17 +19,7 @@ RTL = os.path.join(HERE, "rtl")
 TB = os.path.join(HERE, "tb", "tb_seq_vec.sv")
 M64 = (1 << 64) - 1
 
-# (file, seq_ref key, length)
-PHASES = [
-    ("ln1.out",  "ln1_out_q22", 256),
-    ("qkv.out",  "qkv_q16",     768),
-    ("ctx.out",  "ctx_q25",     256),
-    ("attn.out", "attn_out_q25",256),
-    ("ln2.out",  "ln2_out_q22", 256),
-    ("gelu.out", "gelu_q22",    1024),
-    ("mlp.out",  "mlp_out_q25", 256),
-    ("xout.out", "x_out_q25",   256),
-]
+PHASES = [("x4.out", "x4_q25", 256), ("lnf.out", "lnf_q22", 256), ("head.out", "head_q25", 193)]
 
 
 def _read_hex(path):
@@ -41,9 +27,8 @@ def _read_hex(path):
     with open(path) as fh:
         for ln in fh:
             s = ln.strip()
-            if not s:
-                continue
-            out.append(None if ("x" in s or "z" in s) else int(s, 16) & M64)
+            if s:
+                out.append(None if ("x" in s or "z" in s) else int(s, 16) & M64)
     return out
 
 
@@ -51,11 +36,9 @@ def run(sim_dir, tok, P, npz="fabric/export/goformer.npz"):
     os.makedirs(sim_dir, exist_ok=True)
     p, cfg = seq_ref.build(npz)
     iseq = seq_ref.IntSequencer(p, cfg)
+    sig = iseq.full_forward_signals(int(tok))
     iseq.reset()
-    sig = iseq.block0_phase_signals(int(tok))
-
-    iseq.reset()
-    write_mems_banked(sim_dir, iseq, 16, 4, P)       # wrom@LANES16 + banked dq (P)
+    write_mems_banked(sim_dir, iseq, 16, 4, P)
 
     vvp = os.path.join(sim_dir, "sim.vvp")
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
@@ -76,8 +59,12 @@ def run(sim_dir, tok, P, npz="fabric/export/goformer.npz"):
     if "TB_DONE" not in rp.stdout:
         print("VVP_FAIL"); print(rp.stdout[-2000:]); print(rp.stderr[-1500:]); return False
 
-    parts = []
-    all_ok = True
+    with open(os.path.join(sim_dir, "tok.out")) as fh:
+        got_tok = int(fh.read().strip())
+    tok_ok = (got_tok == sig["tok"])
+
+    parts = [f"tok={tok_ok}(got={got_tok},gold={sig['tok']})"]
+    all_ok = tok_ok
     for fname, key, n in PHASES:
         got = _read_hex(os.path.join(sim_dir, fname))
         gold = [int(v) & M64 for v in sig[key]]
@@ -85,16 +72,15 @@ def run(sim_dir, tok, P, npz="fabric/export/goformer.npz"):
         mism = sum(1 for i in range(m) if got[i] != gold[i]) + abs(len(got) - len(gold))
         ok = (mism == 0) and (len(got) == len(gold))
         all_ok = all_ok and ok
-        tag = fname.split(".")[0]
-        parts.append(f"{tag}={ok}({mism}/{len(gold)})")
+        parts.append(f"{key.split('_')[0]}={ok}({mism}/{len(gold)})")
         if not ok:
             for i in range(m):
                 if got[i] != gold[i]:
                     g = got[i]
-                    print(f"  {tag} first mismatch @ {i}: got="
-                          f"{'x' if g is None else format(g, '016x')} gold={gold[i]:016x}")
+                    print(f"  {key} first mismatch @ {i}: "
+                          f"got={'x' if g is None else format(g, '016x')} gold={gold[i]:016x}")
                     break
-    print(f"SEQ_VEC_VERDICT tok={tok} P={P} " + " ".join(parts) + f" ALL={all_ok}")
+    print(f"SEQ_VEC_FULL tok={tok} P={P} " + " ".join(parts) + f" ALL={all_ok}")
     return all_ok
 
 

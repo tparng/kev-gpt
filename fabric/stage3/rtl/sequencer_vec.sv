@@ -27,7 +27,8 @@ module sequencer_vec #(
     parameter integer GAMMA_N = 9,
     parameter integer DQ_N  = 9409,
     parameter integer NSACT = 17,
-    parameter integer WWORDS = 65536,
+    parameter integer WWORDS = 262144,
+    parameter integer NLAYER = 4,
     parameter integer NHEAD = 4,
     parameter integer HEAD_DIM = 64,
     parameter integer RESID_FRAC  = 25,
@@ -42,6 +43,7 @@ module sequencer_vec #(
     input  wire [8:0]  tok_id,
     input  wire [8:0]  pos,
     output reg         done,
+    output reg [8:0]   tok_out,     // argmax token id (after the full forward + head)
     // readback: rd_sel picks the bank, rd_addr the element (2-cyc registered). 64-bit so
     // the Q.22 LN/gelu values fit; 32-bit values are sign-extended in their bank.
     input  wire [3:0]  rd_sel,
@@ -64,6 +66,14 @@ module sequencer_vec #(
     localparam integer WB_QKV = 0, WB_PROJ = GW_QKV,
                        WB_FC = GW_QKV+GW_PROJ, WB_MP = GW_QKV+GW_PROJ+GW_FC;
     localparam integer DR_QKV = 0, DR_PROJ = D3/P, DR_FC = (D3+D)/P, DR_MP = (D3+D+D_MLP)/P;
+    localparam integer GW_MP   = ((D + LANES-1)/LANES) * D_MLP;          // 16384
+    localparam integer GW_HEAD = ((VOCAB + LANES-1)/LANES) * D;          // 3328
+    localparam integer GW_BLK  = GW_QKV+GW_PROJ+GW_FC+GW_MP;             // 49152 (words/block)
+    localparam integer DQ_BLK  = D3+D+D_MLP+D;                           // 2304 (channels/block)
+    localparam integer DQB_P   = DQ_BLK/P;                               // 288 (rows/block, /P)
+    localparam integer WB_HEAD = NLAYER*GW_BLK;                          // head weight base
+    localparam integer DR_HEAD = (NLAYER*DQ_BLK)/P;                      // head dequant row base
+    localparam integer ARROWS  = (VOCAB + P - 1)/P;                      // argmax rows
 
     // ---- small ROMs ($readmemh) ------------------------------------------------
     (* rom_style = "block" *) reg signed [31:0] tok_emb   [0:VOCAB*D-1];
@@ -97,6 +107,7 @@ module sequencer_vec #(
     reg signed [63:0] mlpbuf_bank[0:P-1][0:ROWSM-1];   // mlp hidden Q4.12 then Q.22
     reg signed [31:0] mlp_bank   [0:P-1][0:ROWS-1];    // mlp_proj out Q6.25
     reg signed [31:0] gemvy_bank [0:P-1][0:ROWSM-1];   // GEMV INT32 (up to D_MLP wide)
+    reg signed [31:0] head_bank  [0:P-1][0:ARROWS-1];  // head logits (real, Q6.25)
 
     // ---- layernorm_vec ---------------------------------------------------------
     reg                ln_start, ln_vin;
@@ -167,8 +178,8 @@ module sequencer_vec #(
     reg [1:0]  g_asrc;             // act source: 0 lnout1, 1 ctxv(>>3), 2 lnout2, 3 mlpbuf
     reg [5:0]  g_asel;             // inv_sact index
     reg signed [6:0] g_frac;       // dequant frac
-    reg [8:0]  g_dqrow;            // dequant channel-row base
-    reg [1:0]  g_dst;              // dequant dest: 0 qkv, 1 attn, 2 mlpbuf(sat16), 3 mlp
+    reg [11:0] g_dqrow;            // dequant channel-row base (up to NLAYER*DQ_BLK/P = 1152)
+    reg [2:0]  g_dst;              // dest: 0 qkv,1 attn,2 mlpbuf(sat16),3 mlp,4 head
     reg [4:0]  g_ret;             // return state after the GEMV
     reg [3:0]  l_gbase;            // LN gamma row
     reg        l_dst;              // LN dest: 0 lnout1, 1 lnout2
@@ -189,6 +200,9 @@ module sequencer_vec #(
     reg signed [63:0] gl_sh;
     integer pp;
     reg [8:0] ce;
+    reg [3:0] blk;                           // transformer block 0..NLAYER-1
+    reg signed [31:0] best_val; reg [8:0] best_idx, hidx; reg signed [31:0] hv;
+    reg [$clog2(ARROWS+1)-1:0] ar;           // argmax row counter
 
     // ---- FSM -------------------------------------------------------------------
     localparam [4:0]
@@ -198,7 +212,7 @@ module sequencer_vec #(
       S_QKVRET=10, S_AST=11, S_ALD=12, S_ACL=13,    // attention
       S_RES1=14, S_LN2=15, S_FCRET=16,              // proj/res1/LN2-call
       S_GELU=17, S_GELUC=18, S_MPRET=19, S_RES2=20, S_FIN=21,
-      S_LN1=22;                                     // entry to LN1 call
+      S_HEADSET=22, S_ARGMAX=23;                    // final LN_f -> head -> argmax
     reg [4:0] st;
     reg [10:0] ci;
     reg [$clog2(ROWSM+1)-1:0] fr, orow, dr, dor;
@@ -211,8 +225,8 @@ module sequencer_vec #(
             rv0<=0; rv1<=0; rv2<=0;
         end else begin
             case (st)
-                S_IDLE: if (go) begin ci<=0; st<=S_EMB; end
-                // ---- embed -> xres banks; then call LN1 ------------------------
+                S_IDLE: if (go) begin ci<=0; blk<=4'd0; st<=S_EMB; end
+                // ---- embed -> xres banks; then call LN1 of block 0 -------------
                 S_EMB: begin
                     e_tok = tok_emb[tok_id*D + ci];
                     e_pos = pos_emb[pos*D + ci];
@@ -246,8 +260,8 @@ module sequencer_vec #(
                 end
                 // qkv GEMV setup (after LN1) and the GEMV call ------------------
                 S_QKVRET: begin
-                    g_wbase<=WB_QKV[19:0]; g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
-                    g_asel<=6'd0; g_frac<=7'd16; g_dqrow<=DR_QKV[8:0]; g_dst<=2'd0;
+                    g_wbase<=blk*GW_BLK + WB_QKV; g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
+                    g_asel<=blk*4 + 6'd0; g_frac<=7'd16; g_dqrow<=blk*DQB_P + DR_QKV; g_dst<=3'd0;
                     g_ret<=S_AST; ci<=0; hh<=2'd0; gv_ldrst<=1'b1; st<=G_AQ;  // init head counter
                 end
                 // ================= callable GEMV ==============================
@@ -293,7 +307,7 @@ module sequencer_vec #(
                     end
                 end
                 G_DQ: begin                               // P-wide dequant -> selected dest
-                    if (dr < (g_m >> LSH)) begin
+                    if (dr < ((g_m + P-1) >> LSH)) begin   // ceil rows (head VOCAB not P-mult)
                         dq_vin<=1'b1; dq_frac<=g_frac;
                         for (pp=0; pp<P; pp=pp+1) begin
                             gy = gemvy_bank[pp][dr];
@@ -309,17 +323,18 @@ module sequencer_vec #(
                         for (pp=0; pp<P; pp=pp+1) begin
                             dqv = dq_out[pp*32 +: 32];
                             case (g_dst)
-                                2'd0: qkv_bank [pp][dor] <= dqv;
-                                2'd1: attn_bank[pp][dor] <= dqv;
-                                2'd2: begin                       // mlpbuf: sat16 to Q4.12, sign-ext
+                                3'd0: qkv_bank [pp][dor] <= dqv;
+                                3'd1: attn_bank[pp][dor] <= dqv;
+                                3'd2: begin                       // mlpbuf: sat16 to Q4.12, sign-ext
                                     if      ($signed(dqv) >  32'sd32767)  mlpbuf_bank[pp][dor] <= 64'sd32767;
                                     else if ($signed(dqv) < -32'sd32768)  mlpbuf_bank[pp][dor] <= -64'sd32768;
                                     else    mlpbuf_bank[pp][dor] <= {{32{dqv[31]}}, dqv};
                                 end
-                                default: mlp_bank[pp][dor] <= dqv;
+                                3'd3: mlp_bank [pp][dor] <= dqv;
+                                default: head_bank[pp][dor] <= dqv;     // 4: head logits Q6.25
                             endcase
                         end
-                        if (dor==(g_m >> LSH)-1) st<=g_ret; else dor<=dor+1'b1;
+                        if (dor==((g_m + P-1) >> LSH)-1) st<=g_ret; else dor<=dor+1'b1;
                     end
                 end
                 // ================= attention ==================================
@@ -337,8 +352,8 @@ module sequencer_vec #(
                     end
                     if (at_done) begin
                         if (hh==NHEAD-1) begin                    // -> proj GEMV
-                            g_wbase<=WB_PROJ[19:0]; g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
-                            g_asel<=6'd1; g_frac<=7'd25; g_dqrow<=DR_PROJ[8:0]; g_dst<=2'd1;
+                            g_wbase<=blk*GW_BLK + WB_PROJ; g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
+                            g_asel<=blk*4 + 6'd1; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_PROJ; g_dst<=3'd1;
                             g_ret<=S_RES1; ci<=0; gv_ldrst<=1'b1; st<=G_AQ;
                         end else begin hh<=hh+2'd1; st<=S_AST; end
                     end
@@ -350,13 +365,13 @@ module sequencer_vec #(
                         xres_bank[pp][ci] <= xb + om;
                     end
                     if (ci==ROWS-1) begin
-                        ci<=0; l_gbase<=4'd1; l_dst<=1'b1; l_ret<=S_FCRET; st<=L_GAM;
+                        ci<=0; l_gbase<=blk*2 + 4'd1; l_dst<=1'b1; l_ret<=S_FCRET; st<=L_GAM;
                     end else ci<=ci+1'b1;
                 end
                 // mlp_fc GEMV setup (after LN2) --------------------------------
                 S_FCRET: begin
-                    g_wbase<=WB_FC[19:0]; g_m<=D_MLP[10:0]; g_k<=D[10:0]; g_asrc<=2'd2;
-                    g_asel<=6'd2; g_frac<=7'd12; g_dqrow<=DR_FC[8:0]; g_dst<=2'd2;
+                    g_wbase<=blk*GW_BLK + WB_FC; g_m<=D_MLP[10:0]; g_k<=D[10:0]; g_asrc<=2'd2;
+                    g_asel<=blk*4 + 6'd2; g_frac<=7'd12; g_dqrow<=blk*DQB_P + DR_FC; g_dst<=3'd2;
                     g_ret<=S_GELU; ci<=0; gfr<=0; gor<=0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // ================= GELU (vec_gelu over mlpbuf) ================
@@ -377,19 +392,46 @@ module sequencer_vec #(
                             mlpbuf_bank[pp][gor] <= gl_sh;
                         end
                         if (gor==ROWSM-1) begin                   // -> mlp_proj GEMV
-                            g_wbase<=WB_MP[19:0]; g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
-                            g_asel<=6'd3; g_frac<=7'd25; g_dqrow<=DR_MP[8:0]; g_dst<=2'd3;
+                            g_wbase<=blk*GW_BLK + WB_MP; g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
+                            g_asel<=blk*4 + 6'd3; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_MP; g_dst<=3'd3;
                             g_ret<=S_RES2; ci<=0; gv_ldrst<=1'b1; st<=G_AQ;
                         end else gor<=gor+1'b1;
                     end
                 end
-                // ---- res2: xres += mlp_out -> x_out --------------------------
+                // ---- res2: xres += mlp_out ; next block or final LN_f --------
                 S_RES2: begin
                     for (pp=0; pp<P; pp=pp+1) begin
                         xb = xres_bank[pp][ci]; om = mlp_bank[pp][ci];
                         xres_bank[pp][ci] <= xb + om;
                     end
-                    if (ci==ROWS-1) st<=S_FIN; else ci<=ci+1'b1;
+                    if (ci==ROWS-1) begin
+                        ci<=0;
+                        if (blk == NLAYER-1) begin                 // -> final LN_f -> head
+                            l_gbase<=NLAYER*2; l_dst<=1'b0; l_ret<=S_HEADSET; st<=L_GAM;
+                        end else begin                             // -> next block LN1
+                            blk<=blk+1'b1; l_gbase<=(blk+1'b1)*2; l_dst<=1'b0;
+                            l_ret<=S_QKVRET; st<=L_GAM;
+                        end
+                    end else ci<=ci+1'b1;
+                end
+                // ---- head GEMV (act = LN_f out in lnout1) -> head_bank -------
+                S_HEADSET: begin
+                    g_wbase<=WB_HEAD; g_m<=VOCAB[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
+                    g_asel<=4*NLAYER; g_frac<=7'd25; g_dqrow<=DR_HEAD[11:0]; g_dst<=3'd4;
+                    g_ret<=S_ARGMAX; ci<=0; gv_ldrst<=1'b1;
+                    best_val<=32'sh80000000; best_idx<=9'd0; ar<=0; st<=G_AQ;
+                end
+                // ---- P-wide argmax over the VOCAB logits (Q6.25) ------------
+                S_ARGMAX: begin
+                    for (pp=0; pp<P; pp=pp+1) begin
+                        hv   = head_bank[pp][ar];
+                        hidx = ar*P + pp;
+                        if (hidx < VOCAB && $signed(hv) > best_val) begin
+                            best_val = $signed(hv); best_idx = hidx;
+                        end
+                    end
+                    if (ar==ARROWS-1) begin tok_out<=best_idx; st<=S_FIN; end
+                    else ar<=ar+1'b1;
                 end
                 S_FIN: begin done<=1'b1; st<=S_IDLE; end
                 default: st<=S_IDLE;
@@ -411,7 +453,8 @@ module sequencer_vec #(
             4'd4: rd0 <= lnout2_bank[rba][rbr];   // ln2   (Q.22)
             4'd5: rd0 <= mlpbuf_bank[rba][rbr];   // gelu  (Q.22)
             4'd6: rd0 <= mlp_bank   [rba][rbr];   // mlp_out (Q6.25)
-            default: rd0 <= xres_bank[rba][rbr];  // x_out (Q6.25)
+            4'd7: rd0 <= xres_bank  [rba][rbr];   // x4 residual after the last block (Q6.25)
+            default: rd0 <= head_bank[rba][rbr];  // 8: head logits (Q6.25)
         endcase
         rd_data <= rd0;
     end

@@ -321,6 +321,25 @@ class IntSequencer:
         s["x_out_q25"] = [int(v) for v in x]
         return s
 
+    def full_forward_signals(self, idx_t):
+        """Single-token full forward (4 blocks -> LN_f -> head -> argmax) with the phase
+        keys the P-wide sequencer_vec gates on: x4 (residual after the last block, Q6.25),
+        lnf (LN_f out, Q.22), head_logits (Q6.25 int = round(real*2^25), argmax-equivalent),
+        and tok (the emitted argmax). Resets KV/t first (single token at pos 0)."""
+        self.reset()
+        x = self.tok_emb_q[idx_t] + self.pos_emb_q[self.t]
+        x = np.asarray([int(v) for v in x], dtype=object)
+        for bi in range(self.nblocks):
+            x = x + np.asarray([int(v) for v in self._attn_step(x, bi)], dtype=object)
+            x = x + np.asarray([int(v) for v in self._mlp_step(x, bi)], dtype=object)
+        x4 = [int(v) for v in x]
+        y_q22 = self._ln(x, self.ln_f_q)
+        ix = self._act_quant(y_q22, self.head["s_act"])
+        h_int = self._dequant_to_q(self.head, self._gemv_int(self.head, ix), RESID_FRAC)
+        logits_real, _ = self._gemv_dequant_real(self.head, ix)
+        return {"x4_q25": x4, "lnf_q22": [int(v) for v in y_q22],
+                "head_q25": [int(v) for v in h_int], "tok": int(np.argmax(logits_real))}
+
     def generate_greedy(self, prompt, n_gen):
         self.reset()
         out = list(prompt)
