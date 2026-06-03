@@ -392,3 +392,12 @@ Pure parameter push: L=128→256 (WWORDS scales inversely to 12,800; the image i
 Gate green tok 10/48/100: **22,942 cyc/token** (35,597 → −36%). @125 MHz → **5,449 tok/s
 PROJECTED**. The 1-cycle floor is now attention load + LN + softmax — the next cycle lever is
 qkv/attn restructuring, not LANES.
+
+**URAM geometry is the constraint, not capacity.** First L=256 OOC: 400k LUT (342 %), URAM 0 —
+the single 1024-bit × 12,800 wmem pads to 16 URAM wide × 4 cascade = 64 = the whole device, so
+Vivado marks the `ultra` attribute INFEASIBLE and silently falls back to LUTRAM. Two 512-bit
+banks also fail: 512 b pads to 8 wide (512/72 = 7.1) → 64 total. Fix: bank the weight memory at
+URAM-native width — 15 banks × 72 b × 4 cascades = **60 URAM**. **OOC L=256: 87,761 LUT (74.9 %),
+BRAM 143.5/144, URAM 60/64, DSP 505 — FITS.** Re-gated bit-exact at L=128 (geometry unchanged)
+and 256. The 12.6 Mbit image needs ≥45.5 URAM, so 60 is within 1.32× of the floor — the next
+lever after this is the GEMV core, not weight banking.
