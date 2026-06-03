@@ -32,17 +32,20 @@ def _read_hex(path):
     return out
 
 
-def run(sim_dir, tok, P, npz="fabric/export/goformer.npz"):
+def run(sim_dir, tok, P, lanes=16, npz="fabric/export/goformer.npz"):
     os.makedirs(sim_dir, exist_ok=True)
     p, cfg = seq_ref.build(npz)
     iseq = seq_ref.IntSequencer(p, cfg)
     sig = iseq.full_forward_signals(int(tok))
     iseq.reset()
-    write_mems_banked(sim_dir, iseq, 16, 4, P)
+    write_mems_banked(sim_dir, iseq, lanes, 4, P)
+    with open(os.path.join(sim_dir, "wrom.mem")) as fh:
+        wrom_n = sum(1 for ln in fh if ln.strip())
 
     vvp = os.path.join(sim_dir, "sim.vvp")
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
                          f"-DTOK={int(tok)}", f"-DPVAL={P}",
+                         f"-DLVAL={lanes}", f"-DWROMN={wrom_n}",
                          TB,
                          os.path.join(RTL, "sequencer_vec.sv"),
                          os.path.join(RTL, "layernorm_vec.sv"),
@@ -80,7 +83,14 @@ def run(sim_dir, tok, P, npz="fabric/export/goformer.npz"):
                     print(f"  {key} first mismatch @ {i}: "
                           f"got={'x' if g is None else format(g, '016x')} gold={gold[i]:016x}")
                     break
-    print(f"SEQ_VEC_FULL tok={tok} P={P} " + " ".join(parts) + f" ALL={all_ok}")
+    cyc = None
+    try:
+        with open(os.path.join(sim_dir, "cyc.out")) as fh:
+            cyc = int(fh.read().strip())
+    except Exception:
+        pass
+    print(f"SEQ_VEC_FULL tok={tok} P={P} L={lanes} " + " ".join(parts) +
+          f" ALL={all_ok} fwd_cyc={cyc}")
     return all_ok
 
 
@@ -88,9 +98,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="fabric.stage3.run_vec_seq")
     ap.add_argument("--tok", type=int, default=48)
     ap.add_argument("--p", type=int, default=8)
+    ap.add_argument("--lanes", type=int, default=16)
     ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_seq_vec"))
     a = ap.parse_args(argv)
-    ok = run(a.dir, a.tok, a.p)
+    ok = run(a.dir, a.tok, a.p, a.lanes)
     raise SystemExit(0 if ok else 1)
 
 

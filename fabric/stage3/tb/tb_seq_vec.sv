@@ -11,9 +11,12 @@
 `ifndef WROMN
  `define WROMN 199936
 `endif
+`ifndef LVAL
+ `define LVAL 16
+`endif
 module tb;
     localparam integer P     = `PVAL;
-    localparam integer LANES = 16;
+    localparam integer LANES = `LVAL;
     localparam integer WBITS = LANES * 4;
     localparam integer SUBW  = WBITS / 32;
 
@@ -34,7 +37,7 @@ module tb;
 
     reg [WBITS-1:0] wimg [0:`WROMN-1];
     reg [WBITS-1:0] wword;
-    integer i, s, f;
+    integer i, s, f, cyc0, cyc1;
 
     task dump(input [3:0] sel, input integer n, input [127:0] fname);
         integer k, ff;
@@ -62,8 +65,11 @@ module tb;
             end
         end
         wl_we = 1'b0; @(posedge clk); #1;
+        cyc0 = dbgcyc;
         go = 1'b1; @(posedge clk); #1; go = 1'b0;
-        wait (done == 1'b1); @(posedge clk); #1;
+        wait (done == 1'b1); cyc1 = dbgcyc; @(posedge clk); #1;
+        $display("FWD_CYCLES=%0d", cyc1 - cyc0);
+        f = $fopen("cyc.out", "w"); $fwrite(f, "%0d\n", cyc1 - cyc0); $fclose(f);
         f = $fopen("tok.out", "w"); $fwrite(f, "%0d\n", tok_out); $fclose(f);
         dump(4'd7, 256, "x4.out");
         dump(4'd0, 256, "lnf.out");
