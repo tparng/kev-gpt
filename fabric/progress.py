@@ -37,8 +37,8 @@ LADDER = [
      "the GEMV run phase (16x fewer group passes)"),
     ("+ GELU stream + LN pipeline\n(PE=128 @125 MHz silicon)", 751.78, "MEASURED",
      "GELU per-elem stall + LN DSP cascade -> Fmax 50->125 MHz (STA-safe 71/430)"),
-    ("+ wide serial datapath\n(P-lane LN/dequant/attn, ~200MHz)", 2000.0, "PROJECTED",
-     "the remaining 1-elem/cyc loops (dequant/attn/act-feed) — see PLAN-10K-DATAPATH"),
+    ("+ wide P-lane datapath\n(P=4 LN/dequant/attn/GELU @100MHz)", 1882.7, "MEASURED",
+     "the 1-elem/cyc serial loops -> P-wide (53,116 cyc/tok, 2.5x over 752)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]
@@ -64,8 +64,11 @@ def print_table():
           "MEASURED on silicon, token-stream bit-exact, deterministic: 44.32 (baseline PE16) "
           "-> 231 (resident-read + PE=256, @40MHz) -> 751.78 (+ streaming GELU + pipelined "
           "LayerNorm, PE=128 @125 MHz, 3/3 runs). The 125 MHz is the silicon Fmax (STA closes "
-          "at 71 MHz=430 tok/s; it overclocks clean to 125, breaks at 142). Next: the P-wide "
-          "serial datapath (PLAN-10K-DATAPATH.md) for the order-of-magnitude to ~10k.")
+          "at 71 MHz=430 tok/s; it overclocks clean to 125, breaks at 142). The P-wide serial "
+          "datapath (sequencer_vec, P=4/L=128, wide-word banking) is now MEASURED too: 1,882.7 "
+          "tok/s @100 MHz, 3/3 bit-exact (53,116 cyc/token; STA closes 40 MHz, overclocks clean "
+          "to 100, marginal at 111). Next: BRAM-buffer rewrite -> P=8 + widen the GEMV boundary "
+          "-> ~10k (see WIDE-WORD-DATAPATH-LOG.md).")
 
 
 def plot(path):

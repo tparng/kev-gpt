@@ -237,20 +237,34 @@ each build is ~40 min.
 
 ---
 
-## 8. Where it stands + the numbers
+## 8. Where it stands + the numbers — IT WORKS (MEASURED)
 
-**Status (2026-06-03):** bug found, fixed, re-gated bit-exact; the corrected P=4/L=128 bitstream
-is building. The board measurement (load → `--readback` → fclk sweep) is the next step; the
-bit-honest driver prints a tok/s **only** if `tok_out == seq_ref`.
+**Status (2026-06-03): the wide-word datapath is correct AND fast on silicon.** Loaded the
+ci-fixed P=4/L=128 bitstream, ran `pl_seq_vec --readback`: **`tok_out=1 == gold`**, and x4/lnf/head
+all read back correct on real fabric. Then swept the PL clock (bit-honest — the driver withholds
+tok/s unless `tok_out == seq_ref`):
+
+| PL clock (achievable PLL rate) | MEASURED tok/s | token match |
+|---|---|---|
+| 40 MHz (build closure) | 753.1 | ✓ |
+| 76.9 MHz | 1,448.2 | ✓ |
+| **100 MHz** | **1,882.7** | ✓ **3/3 deterministic** |
+| 111.1 MHz | (2,091.9) | ✗ MARGINAL — passed 2×, failed 4× → **not claimed** |
+| 125 MHz | — | ✗ fails (past the silicon ceiling) |
+
+**Headline: 1,882.7 tok/s, bit-exact, CPU out of the loop — 2.5× over the prior 752.** Reported
+honestly at the highest *reliable* clock (100 MHz, 3/3 identical), not the lucky 111 MHz pass.
+STA closed at 40 MHz with +7.5 ns; silicon ran clean to 100 MHz (a ~2.5× STA-pessimism factor,
+consistent with the `sequencer_fast` 1.76×). The PLL snaps to 1000/N MHz (…100, 111.1, 125…), so
+100 is the top reliable rung; nothing exists between 100 and the marginal 111.1.
 
 | Quantity | Value | Tag |
 |---|---|---|
-| Best measured to date | **752 tok/s** (`sequencer_fast`) | MEASURED |
-| `sequencer_vec` P=4/L=128 cyc/token | **53,117** | MEASURED (sim+silicon cycle-exact) |
+| **Wide-datapath best** | **1,882.7 tok/s @ 100 MHz** | **MEASURED (bit-exact, 3/3)** |
+| Prior best | 752 tok/s (`sequencer_fast`) | MEASURED |
+| `sequencer_vec` P=4/L=128 cyc/token | 53,116 | MEASURED (sim+silicon cycle-exact) |
 | Fit (P=4/L=128) | 106,009 LUT (90.5%), 56 URAM, ~210 DSP | SYNTH |
 | Timing | +7.504 ns setup @ 40 MHz | SYNTH |
-| Projected @ 40 MHz | ~750 tok/s | PROJECTED |
-| Projected @ 125 MHz silicon | **~2,350 tok/s** (≈3.1× over 752) | PROJECTED |
 
 **Next levers (not yet done):**
 - **BRAM-buffer (synchronous-read) rewrite** → frees the ~20–31k distributed-RAM LUTs → **P=8
