@@ -402,8 +402,12 @@ module sequencer_pp #(
                     best_val<=32'sh80000000; best_idx<=0; ar<=0; arv<=0; av1<=0; amv<=0;
                     nl[gc]<=NL_WHEAD; gc<=~gc;
                 end
-                NL_WHEAD: if (!g_req[gc]) nl[gc] <= NL_ARG;
-                          else gc <= ~gc;
+                NL_WHEAD: if (!g_req[gc]) begin
+                    // argmax scratch is SHARED between groups — re-arm on entry
+                    best_val<=32'sh80000000; best_idx<=0;
+                    ar<=0; arv<=0; av1<=0; amv<=0;
+                    nl[gc] <= NL_ARG;
+                end else gc <= ~gc;
                 NL_ARG: begin
                     ard <= ar; arv <= (ar != ARROWS[$clog2(ARROWS+1)-1:0]);
                     if (ar != ARROWS[$clog2(ARROWS+1)-1:0]) ar <= ar + 1'b1;

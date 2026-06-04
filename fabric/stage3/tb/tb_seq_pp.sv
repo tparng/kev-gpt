@@ -138,8 +138,7 @@ module tb;
         end
         if (running) stcnt[dut.nl[dut.gc]] = stcnt[dut.nl[dut.gc]] + 1;
         if (dbgcyc % 100000 == 0)
-            $display("[cyc %0d] nl0=%0d nl1=%0d ge=%0d gc=%0d bs=%0d done=%b",
-                     dbgcyc, dut.nl[0], dut.nl[1], dut.ge, dut.gc, dut.bs, done);
+            $display("[cyc %0d] nl0=%0d nl1=%0d ge=%0d gc=%0d bs=%0d ar=%0d arv=%b amv=%b req0=%b req1=%b done=%b", dbgcyc, dut.nl[0], dut.nl[1], dut.ge, dut.gc, dut.bs, dut.ar, dut.arv, dut.amv, dut.g_req[0], dut.g_req[1], done);
     end
     initial begin #120000000; $display("TB_TIMEOUT cyc=%0d nl0=%0d nl1=%0d ge=%0d", dbgcyc, dut.nl[0], dut.nl[1], dut.ge); $finish; end
 endmodule
