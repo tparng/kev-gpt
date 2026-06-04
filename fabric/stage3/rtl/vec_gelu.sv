@@ -24,14 +24,17 @@ module vec_gelu #(
     output wire                       out_valid,
     output wire signed [16*P-1:0]     y          // P x Q4.12, lane k = y[16*k +: 16]
 );
-    // P independent single-lane cores; lane k drives x[k] -> y[k].
+    // P/2 paired cores: two lanes share one even/odd-banked LUT (same math,
+    // half the BRAM). Bit-identical to P independent gelu_lut lanes.
     genvar k;
     generate
-        for (k = 0; k < P; k = k + 1) begin : lane
-            wire signed [15:0] xk = x[16*k +: 16];
-            wire signed [15:0] yk;
-            gelu_lut u_gelu (.clk(clk), .x(xk), .y(yk));
-            assign y[16*k +: 16] = yk;
+        for (k = 0; k < P; k = k + 2) begin : lane
+            wire signed [15:0] xk0 = x[16*k +: 16];
+            wire signed [15:0] xk1 = x[16*(k+1) +: 16];
+            wire signed [15:0] yk0, yk1;
+            gelu_lut2 u_gelu (.clk(clk), .x0(xk0), .y0(yk0), .x1(xk1), .y1(yk1));
+            assign y[16*k +: 16]     = yk0;
+            assign y[16*(k+1) +: 16] = yk1;
         end
     endgenerate
 

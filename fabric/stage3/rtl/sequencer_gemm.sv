@@ -51,6 +51,7 @@ module sequencer_gemm #(
     output reg signed [63:0] rd_data,
     input  wire        wl_rst,
     input  wire        wl_we,
+    input  wire        el_we,        // embed-table load strobe (same wl_data path)
     input  wire [31:0] wl_data,
     input  wire [1:0]  dbg_stop
 );
@@ -78,31 +79,75 @@ module sequencer_gemm #(
     localparam integer HR      = HEAD_DIM / P;
 
     // ---- shared ROMs (one copy serves all streams round-robin) -----------------
-    (* rom_style = "block" *) reg [P*32-1:0] tok_emb_w [0:VOCAB*EROWS-1];
-    (* rom_style = "block" *) reg [P*32-1:0] pos_emb_w [0:TMAX*EROWS-1];
+    // The embeds are the BRAM budget: ~52 tiles at N=4 (the scratch needs them).
+    // They live in URAM instead (no bitstream init!) and are STREAMED at boot
+    // through the wl port after the weight image (el_we strobes, same 32-bit
+    // chunks, EROWS-aligned). In sim, $readmemh preloads them directly.
+    // tok table SDP URAM (write port = boot stream, read port = embed) — TDP URAM
+    // never maps (NO_CHANGE rule), so pos lives in its own small BRAM.
+    localparam integer EMB_ROWS = (VOCAB + TMAX) * EROWS;
+    (* ram_style = "ultra" *) reg [P*32-1:0] emb_w [0:VOCAB*EROWS-1];
+    (* ram_style = "block" *) reg [P*32-1:0] pos_w [0:TMAX*EROWS-1];
     (* rom_style = "block" *) reg [P*32-1:0] gamma_w   [0:GAMMA_N*EROWS-1];
     reg signed [63:0] inv_sact [0:NSACT-1];
-    (* rom_style = "block" *) reg [P*24-1:0] dqm_w [0:DQROWS-1];
-    (* rom_style = "block" *) reg [P*8-1:0]  dqe_w [0:DQROWS-1];
+    // distributed: BRAM budget is the binding constraint at N=4; ~5k LUT buys 15 tiles
+    (* rom_style = "distributed" *) reg [P*24-1:0] dqm_w [0:DQROWS-1];
+    (* rom_style = "distributed" *) reg [P*8-1:0]  dqe_w [0:DQROWS-1];
+`ifndef SYNTHESIS
     initial begin
-        $readmemh("tok_emb_w.mem", tok_emb_w);
-        $readmemh("pos_emb_w.mem", pos_emb_w);
+        $readmemh("tok_emb_w.mem", emb_w);
+        $readmemh("pos_emb_w.mem", pos_w, 0, TMAX*EROWS-1);
+    end
+`endif
+    initial begin
         $readmemh("gamma_w.mem",   gamma_w);
         $readmemh("inv_sact.mem",  inv_sact);
         $readmemh("dqm_w.mem",     dqm_w);
         $readmemh("dqe_w.mem",     dqe_w);
     end
 
-    // ---- stream-flattened scratch (row = stream*ROWS + r) -----------------------
-    (* ram_style = "block" *) reg [P*32-1:0] xres_bank  [0:N*ROWS-1];
-    (* ram_style = "block" *) reg [P*64-1:0] lnout1_bank[0:N*ROWS-1];
-    (* ram_style = "block" *) reg [P*64-1:0] lnout2_bank[0:N*ROWS-1];
-    (* ram_style = "block" *) reg [P*32-1:0] qkv_bank   [0:N*ROWS3-1];
-    (* ram_style = "block" *) reg [P*32-1:0] ctxv_bank  [0:N*ROWS-1];
-    (* ram_style = "block" *) reg [P*32-1:0] attn_bank  [0:N*ROWS-1];
-    (* ram_style = "block" *) reg [P*64-1:0] mlpbuf_bank[0:N*ROWSM-1];
-    (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:N*ROWS-1];
-    (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:N*ARROWS-1];
+    // ---- embed loader: 32-bit chunks -> P*32 words, tok_emb then pos_emb -------
+    localparam integer ESUB = (P*32)/32;
+    reg [$clog2(EMB_ROWS):0] el_word;
+    reg [$clog2(ESUB)-1:0]      el_sub;
+    reg [P*32-1:0]              el_buf;
+    wire [P*32-1:0] el_next = el_buf | ({{(P*32-32){1'b0}}, wl_data} << (el_sub*32));
+    always @(posedge clk) begin
+        if (wl_rst) begin el_word <= 0; el_sub <= 0; el_buf <= 0; end
+        else if (el_we) begin
+            if (el_sub == ESUB-1) begin
+                el_word <= el_word + 1'b1; el_sub <= 0; el_buf <= 0;
+            end else begin
+                el_buf <= el_next; el_sub <= el_sub + 1'b1;
+            end
+        end
+    end
+    wire el_commit = el_we && (el_sub == ESUB-1);
+
+    // tok URAM write port (boot stream); pos table is its own BRAM (write + read)
+    always @(posedge clk) begin
+        if (el_commit && el_word < VOCAB*EROWS)
+            emb_w[el_word] <= el_next;
+    end
+    always @(posedge clk) begin
+        if (el_commit && el_word >= VOCAB*EROWS)
+            pos_w[el_word - VOCAB*EROWS] <= el_next;
+        else
+            pemb_r <= pos_w[pos*EROWS + fr];
+    end
+
+    // ---- stream-flattened scratch (row = stream*ROWS + r). Depths pad to >=512:
+    // BRAM needs >=512 rows, shallower arrays fall back to LUTRAM (~kLUTs each).
+    localparam integer BD = 512;
+    (* ram_style = "block" *) reg [P*32-1:0] xres_bank  [0:BD-1];
+    (* ram_style = "block" *) reg [P*64-1:0] lnout1_bank[0:BD-1];
+    (* ram_style = "block" *) reg [P*64-1:0] lnout2_bank[0:BD-1];
+    (* ram_style = "block" *) reg [P*32-1:0] qkv_bank   [0:BD-1];
+    (* ram_style = "block" *) reg [P*32-1:0] ctxv_bank  [0:BD-1];
+    (* ram_style = "block" *) reg [P*32-1:0] attn_bank  [0:BD-1];
+    (* ram_style = "block" *) reg [P*64-1:0] mlpbuf_bank[0:BD-1];
+    (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:BD-1];
+    (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:BD-1];
 
     reg [P*32-1:0] xres_r, qkv_r, ctxv_r, attn_r, mlp_r, head_r;
     reg [P*64-1:0] lnout1_r, lnout2_r, mlpbuf_r;
@@ -279,8 +324,7 @@ module sequencer_gemm #(
         mlpbuf_r <= mlpbuf_bank[mlpbuf_ra];
         mlp_r    <= mlp_bank   [mlp_ra];
         head_r   <= head_bank  [head_ra];
-        temb_r   <= tok_emb_w[tok_id_b*EROWS + fr];
-        pemb_r   <= pos_emb_w[pos*EROWS + fr];
+        temb_r   <= emb_w[tok_id_b*EROWS + fr];   // emb_w port A: tok read
         gam_r    <= gamma_w  [l_gbase*EROWS + fr];
     end
 

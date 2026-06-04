@@ -42,6 +42,13 @@ def run(sim_dir, toks, P, lanes=128, tmax=32, npz="fabric/export/goformer.npz"):
         sigs.append(iseq.full_forward_signals(int(t)))
         iseq.reset()
     write_mems_wideword(sim_dir, iseq, lanes, 4, P)
+    # split GELU LUT into even/odd banks (gelu_lut2: 2 lanes per BRAM pair)
+    with open(os.path.join(sim_dir, "gelu_lut.mem")) as fh:
+        lut = [ln.strip() for ln in fh if ln.strip()]
+    with open(os.path.join(sim_dir, "gelu_lut_e.mem"), "w") as fh:
+        fh.write("\n".join(lut[0::2]) + "\n")
+    with open(os.path.join(sim_dir, "gelu_lut_o.mem"), "w") as fh:
+        fh.write("\n".join(lut[1::2]) + "\n")
     with open(os.path.join(sim_dir, "wrom.mem")) as fh:
         wrom_n = sum(1 for ln in fh if ln.strip())
 
@@ -57,6 +64,7 @@ def run(sim_dir, toks, P, lanes=128, tmax=32, npz="fabric/export/goformer.npz"):
                          os.path.join(RTL, "vec_attn.sv"),
                          os.path.join(RTL, "vec_gelu.sv"),
                          os.path.join(RTL, "gelu_lut.sv"),
+                         os.path.join(RTL, "gelu_lut2.sv"),
                          os.path.join(RTL, "softmax.sv"),
                          os.path.join(RTL, "gemm_banked_resident_vec.sv")],
                         capture_output=True, text=True)

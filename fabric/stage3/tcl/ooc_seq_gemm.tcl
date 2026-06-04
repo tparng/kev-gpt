@@ -28,6 +28,7 @@ read_verilog -sv [list \
     "$rtl/vec_attn.sv" \
     "$rtl/vec_gelu.sv" \
     "$rtl/gelu_lut.sv" \
+    "$rtl/gelu_lut2.sv" \
     "$rtl/softmax.sv" \
     "$rtl/gemm_banked_resident_vec.sv"]
 

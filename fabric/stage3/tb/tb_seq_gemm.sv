@@ -55,7 +55,7 @@ module tb;
     sequencer_gemm #(.P(P), .LANES(LANES), .N(N), .TMAX(TMAXP)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_ids(toks), .pos(pos), .done(done),
         .tok_outs(tok_outs), .rd_stream(rstream), .rd_sel(rsel), .rd_addr(raddr),
-        .rd_data(rdata), .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data),
+        .rd_data(rdata), .wl_rst(wl_rst), .wl_we(wl_we), .el_we(1'b0), .wl_data(wl_data),
         .dbg_stop(2'd`DBGSTOP));
 
     reg [WBITS-1:0] wimg [0:`WROMN-1];

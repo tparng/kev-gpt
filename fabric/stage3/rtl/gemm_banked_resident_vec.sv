@@ -133,37 +133,35 @@ module gemm_banked_resident_vec #(
     reg [LSHP-1:0]       xl_p   [0:RLAT-1];
     reg                  v_p    [0:RLAT-1];
     integer i, b;
-    reg [WBITS-1:0]      wsel;
 
     wire                 mac_v = v_p[RLAT-1];
 
     // ---- N MAC banks (generate: each accumulator is its own plain reg, so the
     // per-lane variable part-select hits a PLAIN reg, never an array element —
-    // accb[b][L*32 +: 32] reads/writes X under iverilog) ----------------------
-    always @* wsel = word_p[RLAT-2];
+    // accb[b][L*32 +: 32] reads/writes X under iverilog). wsel must be a WIRE:
+    // an always@* copy made Vivado trim the URAM read register to 4 bits and
+    // fall back to ~400k LUTRAM.
+    wire [WBITS-1:0] wsel = word_p[RLAT-2];
     wire [N*YBITS-1:0] acc_cat;        // packed (variable +: on a packed vector is safe)
     reg  [YBITS-1:0]   acc_sel;
-    genvar gm;
+    genvar gm, gl;
     generate
         for (gm = 0; gm < N; gm = gm + 1) begin : g_mac
-            reg [YBITS-1:0]   acc;
-            reg [P*8-1:0]     xrow;
-            reg signed [7:0]  xsel;
-            reg signed [31:0] prodL, sumL;
-            integer L;
-            always @(posedge clk) begin
-                if (rst || acc_clr) acc <= {YBITS{1'b0}};
-                else if (mac_v) begin
-                    xrow = xrow_p[RLAT-1][gm];
-                    xsel = xrow[xl_p[RLAT-1]*8 +: 8];
-                    for (L = 0; L < LANES; L = L + 1) begin
-                        prodL = $signed(wsel[L*4 +: 4]) * xsel;
-                        sumL  = $signed(acc[L*32 +: 32]) + prodL;
-                        acc[L*32 +: 32] <= sumL;
-                    end
+            // stream act lane (shared by this stream's LANES MACs) — combinational
+            wire [P*8-1:0]    xrow = xrow_p[RLAT-1][gm];
+            wire signed [7:0] xsel = xrow[xl_p[RLAT-1]*8 +: 8];
+            // one accumulator per lane: all weight indexing is genvar-CONSTANT —
+            // a runtime-L loop made Vivado fail to unroll and trim wsel to 4 bits
+            // (the URAM read died, weights fell back to ~400k LUTRAM).
+            for (gl = 0; gl < LANES; gl = gl + 1) begin : g_lane
+                reg signed [31:0] accL;
+                always @(posedge clk) begin
+                    if (rst || acc_clr) accL <= 32'sd0;
+                    else if (mac_v)
+                        accL <= accL + $signed(wsel[gl*4 +: 4]) * xsel;
                 end
+                assign acc_cat[gm*YBITS + gl*32 +: 32] = accL;
             end
-            assign acc_cat[gm*YBITS +: YBITS] = acc;
         end
     endgenerate
 
