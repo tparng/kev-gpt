@@ -489,3 +489,20 @@ LUTRAM. Final: 82k LUT (70%), BRAM 128/144, URAM 64/64 — full house.
 
 Silicon bugs found by the gate ladder: per-stream readback X (drain the dequant
 tail before stream switch), gelu_lut_e/o.mem missing from BD (zeroed GELU table).
+
+---
+
+## 15. Ping-pong N=8 — 17,740.6 tok/s MEASURED @166.7 MHz, 8/8 bit-exact
+
+Two engines, two groups of four streams: while the GEMM engine streams a weight
+pass for group A, the NL engine runs embed/LN/attention/residual/argmax for B.
+Descriptor handshake per call. Banks rate-halved (LN Q.22 -> 32-bit lanes, GELU
+sat16), 88k LUT, BRAM 139.5/144, URAM 64/64.
+
+Silicon: 125 -> 13,305.5 · 142.9 -> 15,206.3 · **166.7 -> 17,740.6 (3/3, 8/8 streams)**
+· 200 fails (tighter mux path). CYCLES = 75,157 == sim. WNS +0.017, impl 47m45.
+
+Profile: GEMM busy 51.2k cycles (2 weight passes), NL 24k overlapped. The lever:
+N=8 MAC banks - one URAM pass per 8 tokens - 75k -> ~40k cycles -> ~40k tok/s
+@200 MHz. LUT cost ~115k - knife-edge fit. Or LANES=64: 32k LUT MACs, ~50k tok/s
+@250 MHz. (~33k cycles per 8 tokens, NL-bound: overlap covers GEMM 14k cyc.)

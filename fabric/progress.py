@@ -51,6 +51,8 @@ LADDER = [
      "the last sub-8ns path (BRAM->mux->DSP) -> silicon clean at 200 (17,947 cyc/tok 3/3)"),
     ("+ batch GEMM N=4\n(4 streams share one weight pass)", 16969.3, "MEASURED",
      "per-stream weight reads (47,144 cyc / 4 tokens @ 200 MHz, 3/3 bit-exact x4)"),
+    ("+ ping-pong N=8\n(NL engine overlaps GEMM @166.7MHz)", 17740.6, "MEASURED",
+     "non-linear bubbles (75,157 cyc / 8 tokens; 8/8 bit-exact 3/3; 200 MHz fails)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]

@@ -24,7 +24,7 @@ set bdir  "C:/kevbuild/stage3_seqpp_bit"
 set mems  "C:/kevbuild/stage3_seq_vec_p$pp"       ;# wide-word ROMs — P-DEPENDENT (packed P/word)
 
 file mkdir $bdir
-create_project gemv_seqpp_pl "$bdir/gemv_seqgemm_pl" -part $part -force
+create_project gemv_seqpp_pl "$bdir/gemv_seqpp_pl" -part $part -force
 set_property board_part $board [current_project]
 
 add_files -norecurse [list \
