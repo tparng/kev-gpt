@@ -40,6 +40,23 @@ data tool and the model) for that project.
 | [`model/`](model/) | a 2–4M-param nanoGPT-scale model, trainer, sampler, evolution renderer ([README](model/README.md)) |
 | [`tests/`](tests/) | pytest suite for the Keviniser |
 
+## The speed ladder
+
+![Speed ladder](fabric/progress.png)
+
+Every green rung is **MEASURED on silicon** (3/3 runs, token-stream bit-exact
+vs the integer reference). The current state, all bit-honest:
+
+| What | tok/s | Tag |
+|---|---|---|
+| KV260 sequencer, 1 stream @ 200 MHz (17,931 cyc/token) | **11,143.9** | MEASURED |
+| Batch GEMM N=4 (4 streams share one weight pass; 11,786 cyc/token) | ~17,000 @ 200 MHz | SIM, bit-exact ×4, silicon pending |
+| Ping-pong overlap (GEMM never idles) | ~31,000 | in progress |
+| DSP-packed batch + KV-in-DDR | 70–100k | research notes: `fabric/stage3/research/` |
+
+References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
+CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop ~9x.
+
 ## What works today
 
 - **Keviniser**: POS-based so it keeps main-verb "do" and drops auxiliary "do".
@@ -66,9 +83,14 @@ data tool and the model) for that project.
   1.000** (gate > 0.9999); and a **Stage 0** A53 weight-streaming baseline (the
   bandwidth-wall proof).
 
-Not yet built: Stage 2 (heterogeneous ping-pong tax) and Stage 3 (fabric-native
-softmax/RMSNorm + the zero-DRAM headline); the per-lane banked, fully-pipelined
-GEMV for peak throughput; on-board bring-up. All need the Kria connected.
+- **Stage 3 on silicon**: the full forward (4 blocks + LN_f + head + argmax) runs
+  inside the PL with zero DRAM in the token loop — weights in URAM (60 banks),
+  activations and KV in BRAM. Bit-honest gate ladder: every RTL block is iverilog
+  bit-exact vs `seq_ref` before silicon, and tok/s claims need 3/3 bit-exact runs.
+  Engineering log: `fabric/stage3/WIDE-WORD-DATAPATH-LOG.md`. Batch GEMM N=4
+  (4 keystroke-speculative streams share one resident-weight pass) fits at 70 % LUT
+  and is bit-exact ×4 in sim. Speculative typing: every keypress forks a stream;
+  Enter blits the precomputed answer.
 
 ## Quickstart
 
