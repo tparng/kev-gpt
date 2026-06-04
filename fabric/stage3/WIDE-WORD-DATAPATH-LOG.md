@@ -454,3 +454,25 @@ Silicon: **200 MHz, 3/3 bit-exact, CYCLES 17,947 == sim.** PLL steps 1000/N — 
 
 Ceiling: GEMV reads 12.8k URAM words; cycle floor ~12.8k -> 200 MHz = 15.6k single-stream.
 Next: GEMM batch N=2/4/8 (keystroke speculative streams) -> 22k-43k aggregate. ROADMAP-100K.
+
+---
+
+## 14. Batch GEMM N=4 — four streams bit-exact, 11,786 cyc/token (SIM)
+
+The architecture jump after 11k: keystroke speculative decoding wants N concurrent streams.
+`gemm_banked_resident_vec` reads ONE resident weight word/cycle and feeds N=4 MAC banks —
+the URAM weight bandwidth (the single-stream floor at 12.8k words/token) is shared across 4
+tokens. Sequencer banks are stream-flattened (row = stream*ROWS + r); the non-linear phases
+round-robin over streams; one GEMM run serves all four.
+
+Gate: **4/4 streams bit-exact vs seq_ref full forward** (toks 48/10/100/77), 47,145 cyc /
+4 tokens = **11,786 cyc/token → ~17.0k tok/s aggregate @ 200 MHz (PROJECTED)**, 1.5x single
+stream. Next: overlap boundary phases with GEMM run → ~31k.
+
+The whole debug was iverilog NBA traps, every failing path "last stream lives, earlier
+streams X": packed-vector writes (`tok_outs[bs*9 +: 9] <=`, `xrow_p[0][b*W +: W] <=`) commit
+at update-time bs/b → all land in the LAST stream's slot; runtime-indexed generate-wire reads
+(`acc_flat[db]`) X; per-lane part-select on an unpacked element (`accb[b][L*32 +: 32]`) X.
+Fixes: per-stream generate MAC banks + packed concat with constant-base case mux.
+The killer: per-call act-quant streamed across stream switch — the pipeline tail wrote
+xptr 0 of the NEXT stream, shifting all rows by 1 (s3 OK = no successor). G_AQN drain fixed.
