@@ -48,3 +48,6 @@ vivado*.jou
 vivado*.log
 dfx_runtime.txt
 .Xil/
+
+# local scratch
+/blog/
