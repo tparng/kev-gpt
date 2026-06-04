@@ -45,8 +45,8 @@ LADDER = [
      "the 1-elem/cyc GEMV act/readback loops (35,596 cyc/tok; 125 MHz 3/3)"),
     ("+ LANES=256\n(72-bit URAM banks, 60/64)", 5448.8, "MEASURED",
      "half the GEMV passes (22,941 cyc/tok; 125 MHz 3/3, breaks 142.9)"),
-    ("+ cycle-floor cut + deep pipeline\n(fused RB+DQ+GELU, P-wide attn)", 7100.0, "SIM",
-     "attention scalar load + dequant round-trip (17,913 cyc/tok; Fmax push to ~119 STA)"),
+    ("+ cycle-floor cut + deep pipeline\n(fused RB+DQ+GELU, P-wide attn @166.7MHz)", 9295.4, "MEASURED",
+     "attention scalar load + dequant round-trip + Fmax 85->131 STA (17,930 cyc/tok; 166.7 MHz 3/3)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]

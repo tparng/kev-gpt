@@ -212,7 +212,8 @@ module sequencer_vec #(
     reg signed [31:0]  aq_int;
     reg signed [95:0]  aq_prod_r [0:P-1];     // G_AQ stage-1 product registers
     reg                aq_neg_r  [0:P-1];
-    reg [10:0]         cid2;  reg civ2;
+    reg signed [63:0]  lnt_r     [0:P-1];     // G_AQ stage-0 source registers
+    reg [10:0]         cid1, cid2;  reg civ1, civ2;
     reg signed [31:0]  cb, dqv, hv;
     reg [P*32-1:0]  ww, sw, dword, hw;
     reg [P*8-1:0]   aqw;                     // P-wide act-quant word
@@ -337,13 +338,14 @@ module sequencer_vec #(
                     g_ret<=S_AST; ci<=0; civ<=0; hh<=2'd0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // ================= callable GEMV ==============================
-                G_AQ: begin    // act-quant: P lanes/cycle, 2-STAGE (mult | round+sat).
-                    // The 64x40 multiply + 96-bit round/sat chain was the critical path;
-                    // registering the product lets the multiplier retime into DSPs.
+                G_AQ: begin    // act-quant: P lanes/cycle, 3-STAGE (mux | mult | round+sat).
+                    // Source mux + ctx-rounding registered BEFORE the 64x40 multiply —
+                    // the BRAM-read -> mux -> DSP chain was the post-pipeline critical path.
                     cid <= ci; civ <= (ci != (g_k >> LSH));
-                    cid2 <= cid; civ2 <= civ;
+                    cid1 <= cid; civ1 <= civ;
+                    cid2 <= cid1; civ2 <= civ1;
                     if (ci != (g_k >> LSH)) ci <= ci + 1'b1;
-                    if (civ) begin                 // stage 1: source mux -> multiply
+                    if (civ) begin                 // stage 0: source mux -> lnt_r
                         for (pp=0; pp<P; pp=pp+1) begin
                             case (g_asrc)
                                 2'd0: lntmp = $signed(lnout1_r[pp*64 +: 64]);
@@ -358,8 +360,13 @@ module sequencer_vec #(
                                 2'd2: lntmp = $signed(lnout2_r[pp*64 +: 64]);
                                 default: lntmp = $signed(mlpbuf_r[pp*64 +: 64]);
                             endcase
-                            aq_prod_r[pp] <= $signed(lntmp) * $signed(inv_sact[g_asel]);
-                            aq_neg_r[pp]  <= (lntmp < 0);
+                            lnt_r[pp] <= lntmp;
+                        end
+                    end
+                    if (civ1) begin                // stage 1: multiply (DSP-retimed)
+                        for (pp=0; pp<P; pp=pp+1) begin
+                            aq_prod_r[pp] <= $signed(lnt_r[pp]) * $signed(inv_sact[g_asel]);
+                            aq_neg_r[pp]  <= (lnt_r[pp] < 0);
                         end
                     end
                     if (civ2) begin                // stage 2: round/sat -> INT8 lane
@@ -374,7 +381,7 @@ module sequencer_vec #(
                             aqw[pp*8 +: 8] = aq_int[7:0];
                         end
                         gv_xwe<=1'b1; gv_xdata<=aqw;
-                        if (cid2==(g_k >> LSH)-1) begin ci<=0; civ<=0; civ2<=0; st<=G_RUN; end
+                        if (cid2==(g_k >> LSH)-1) begin ci<=0; civ<=0; civ1<=0; civ2<=0; st<=G_RUN; end
                     end
                 end
                 G_RUN: begin

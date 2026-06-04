@@ -430,3 +430,12 @@ Three cuts, gated bit-exact after each:
 Fmax prep: all heavy multiplies registered into 2-stage pipelines (one extra cycle each loop):
 G_AQ 64×40 mult, vec_dequant 32×25 + 96-bit barrel shift, vec_attn q·k tree and prob·v lanes,
 LN load squares (DSP retime). Total latency cost +187 cyc — buys silicon clock headroom.
+
+**On silicon (MEASURED): 9,295.4 tok/s @ 166.7 MHz, 3/3 bit-exact, CYCLES = 17,930 == sim.**
+Sweep: 125 MHz 6,971.6 · 142.9 7,967.5 · **166.7 9,295.4** · 200 fails (PLL has no 187.5 step:
+fclk snaps 166.7 -> 200). Constraint 8.0 ns; impl WNS −0.266 → silicon factor 1.60 at the edge.
+1.71x over the morning's 5,448.8; 12.4x over last week's 752. 10k = 179 MHz: one PLL step away.
+Next spin: 3-stage act-quant (mux | mult | round) targets WNS ≥ 0 at 8 ns → 200 MHz silicon
+(11,154 tok/s). BRAM gotcha: the AXI shim pushed 291/288 RAMB18 — pos_emb rows pad to a
+1k-row BRAM tile, so TMAX 64 -> 48 saved nothing; TMAX=32 (= Kevin attention window) freed
+4 tiles -> 283/288 fits.
