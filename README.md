@@ -50,8 +50,9 @@ vs the integer reference). The current state, all bit-honest:
 | What | tok/s | Tag |
 |---|---|---|
 | KV260 sequencer, 1 stream @ 200 MHz (17,931 cyc/token) | 11,143.9 | MEASURED |
-| Batch GEMM N=4 — 4 streams share one weight pass (47,144 cyc / 4 tokens) | **16,969.3** | MEASURED |
-| Ping-pong N=8 — non-linears overlap the GEMM, weight port never idles | ~49,000 | gating in sim — next hardware run |
+| Batch GEMM N=4 — 4 streams share one weight pass | 16,969.3 | MEASURED |
+| Ping-pong N=8 — non-linears overlap the GEMM (75,157 cyc / 8 tokens) | **17,740.6** | MEASURED |
+| Single-pass N=8 — one weight pass serves all 8 streams | ~50,000 | gating in sim — next hardware run |
 | DSP-packed batch (+8 streams on 740 free DSPs) / KV-in-DDR | 70–100k | research notes: `fabric/stage3/research/` |
 
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime

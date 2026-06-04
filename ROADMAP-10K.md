@@ -1,3 +1,9 @@
+> **STATUS (2026-06-04): TARGET BROKEN.** 11,143.9 tok/s single-stream MEASURED
+> @200 MHz (3/3 bit-exact); batch GEMM N=4 = 16,969.3; ping-pong N=8 = **17,740.6
+> MEASURED** — all on silicon, all bit-exact. The chase is now 50k (single-pass N=8,
+> gating in sim) -> 70-100k (DSP packing, KV-in-DDR; research notes in
+> fabric/stage3/research/). Engineering log: fabric/stage3/WIDE-WORD-DATAPATH-LOG.md.
+
 # Roadmap to 10,000 tok/s — and the honest ladder to the board's ceiling
 
 The committed target: **≥10,000 tok/s** generating Kevin on the KV260. That number
