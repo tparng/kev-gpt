@@ -122,18 +122,21 @@ module sequencer_pp #(
 
     // ---- stream-flattened scratch (row = stream*ROWS + r), depth 1024 ------------
     // One writing engine + one reading engine each; groups are disjoint.
+    // LN outputs are Q.22 with |y| < 2^26 -> 32-bit lanes; GELU hidden is Q4.12
+    // sat16 -> 16-bit lanes. Sign-extend on the GEMM side to Q.22.
     (* ram_style = "block" *) reg [P*32-1:0] xres_bank  [0:BD-1];
-    (* ram_style = "block" *) reg [P*64-1:0] lnout1_bank[0:BD-1];
-    (* ram_style = "block" *) reg [P*64-1:0] lnout2_bank[0:BD-1];
+    (* ram_style = "block" *) reg [P*32-1:0] lnout1_bank[0:BD-1];
+    (* ram_style = "block" *) reg [P*32-1:0] lnout2_bank[0:BD-1];
     (* ram_style = "block" *) reg [P*32-1:0] qkv_bank   [0:BD-1];
     (* ram_style = "block" *) reg [P*32-1:0] ctxv_bank  [0:BD-1];
     (* ram_style = "block" *) reg [P*32-1:0] attn_bank  [0:BD-1];
-    (* ram_style = "block" *) reg [P*64-1:0] mlpbuf_bank[0:BD-1];
+    (* ram_style = "block" *) reg [P*16-1:0] mlpbuf_bank[0:BD-1];
     (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:BD-1];
     (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:BD-1];
 
     reg [P*32-1:0] xres_r, qkv_r, attn_r, mlp_r, head_r;          // NL-side reads
-    reg [P*64-1:0] lnout1_r, lnout2_r, mlpbuf_r;                  // GEMM-side reads
+    reg [P*32-1:0] lnout1_r, lnout2_r;                            // GEMM-side reads
+    reg [P*16-1:0] mlpbuf_r;
     reg [P*32-1:0] ctxv_g;
     reg [P*32-1:0] temb_r, pemb_r, gam_r;
 
@@ -288,8 +291,10 @@ module sequencer_pp #(
                 end
                 NL_LCOLL: begin
                     if (ln_yv) begin
-                        if (lnphase[gc]==2'd1) lnout2_bank[sN + orow] <= ln_y;
-                        else                   lnout1_bank[sN + orow] <= ln_y;
+                        for (pp=0; pp<P; pp=pp+1)
+                            ww[pp*32 +: 32] = ln_y[pp*64 +: 32];   // Q.22 fits 32b
+                        if (lnphase[gc]==2'd1) lnout2_bank[sN + orow] <= ww;
+                        else                   lnout1_bank[sN + orow] <= ww;
                         if (orow==ROWS-1) begin
                             if (bs == G-1) begin
                                 bs<=0;
@@ -521,13 +526,12 @@ module sequencer_pp #(
     reg                aq_neg_r [0:P-1];
     reg signed [63:0] lnt_r [0:P-1];
     reg signed [31:0] cbg, dqv;
+    reg signed [15:0] mbg;
     reg [P*8-1:0]   aqw;
     reg [P*16-1:0]  mword;
     reg [P*32-1:0]  dword;
-    reg [P*64-1:0]  gsw;
     reg [P*24-1:0]  mwr;
     reg [P*8-1:0]   ewr;
-    reg signed [63:0] gl_sh;
     reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
     reg [$clog2(ROWSM+1)-1:0] gdor, gor;
     integer gp;
@@ -587,7 +591,10 @@ module sequencer_pp #(
                     if (gciv) begin
                         for (gp=0; gp<P; gp=gp+1) begin
                             case (a_asrc)
-                                2'd0: lntmp_g = $signed(lnout1_r[gp*64 +: 64]);
+                                2'd0: begin
+                                    cbg = lnout1_r[gp*32 +: 32];               // Q.22, 32b lane
+                                    lntmp_g = {{32{cbg[31]}}, cbg};
+                                end
                                 2'd1: begin
                                     cbg = ctxv_g[gp*32 +: 32];
                                     if ($signed({{32{cbg[31]}}, cbg}) >= 0)
@@ -595,8 +602,15 @@ module sequencer_pp #(
                                     else
                                         lntmp_g = -((-$signed({{32{cbg[31]}}, cbg}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC));
                                 end
-                                2'd2: lntmp_g = $signed(lnout2_r[gp*64 +: 64]);
-                                default: lntmp_g = $signed(mlpbuf_r[gp*64 +: 64]);
+                                2'd2: begin
+                                    cbg = lnout2_r[gp*32 +: 32];
+                                    lntmp_g = {{32{cbg[31]}}, cbg};
+                                end
+                                default: begin
+                                    // mlp hidden Q4.12 sat16 -> Q.22 (<< 10)
+                                    mbg = mlpbuf_r[gp*16 +: 16];
+                                    lntmp_g = $signed({{48{mbg[15]}}, mbg}) <<< (LN_OUT_FRAC - GELU_FRAC);
+                                end
                             endcase
                             lnt_r[gp] <= lntmp_g;
                         end
@@ -674,11 +688,8 @@ module sequencer_pp #(
                         end else gdor<=gdor+1'b1;
                     end
                     if (gl_vout) begin
-                        for (gp=0; gp<P; gp=gp+1) begin
-                            gl_sh = $signed(gl_y[gp*16 +: 16]) <<< (LN_OUT_FRAC-GELU_FRAC);
-                            gsw[gp*64 +: 64] = gl_sh;
-                        end
-                        mlpbuf_bank[sGM + gor] <= gsw;
+                        mlpbuf_bank[sGM + gor] <= gl_y;   // Q4.12 sat16: 16b lanes
+
                         if (gor==ROWSM-1) begin
                             gci<=0; gor<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
                             if (gbs == G-1) begin gbs<=0; ge<=GE_IDLE; end
@@ -703,12 +714,25 @@ module sequencer_pp #(
     always @* begin
         is64 = 1'b0; rw64 = {(P*64){1'b0}}; rw32 = {(P*32){1'b0}};
         case (rd_sel)
-            4'd0: begin rw64 = lnout1_r; is64 = 1'b1; end
+            4'd0: begin                                     // Q.22 stored in 32b lanes
+                for (pp = 0; pp < P; pp = pp + 1)
+                    rw64[pp*64 +: 64] = {{32{lnout1_r[pp*32 + 31]}}, lnout1_r[pp*32 +: 32]};
+                is64 = 1'b1;
+            end
             4'd1: rw32 = qkv_r;
             4'd2: rw32 = ctxv_g;
             4'd3: rw32 = attn_r;
-            4'd4: begin rw64 = lnout2_r; is64 = 1'b1; end
-            4'd5: begin rw64 = mlpbuf_r; is64 = 1'b1; end
+            4'd4: begin
+                for (pp = 0; pp < P; pp = pp + 1)
+                    rw64[pp*64 +: 64] = {{32{lnout2_r[pp*32 + 31]}}, lnout2_r[pp*32 +: 32]};
+                is64 = 1'b1;
+            end
+            4'd5: begin                                     // gelu Q4.12 -> Q.22 sign-ext
+                for (pp = 0; pp < P; pp = pp + 1)
+                    rw64[pp*64 +: 64] = $signed({{48{mlpbuf_r[pp*16 + 15]}}, mlpbuf_r[pp*16 +: 16]})
+                                        <<< (LN_OUT_FRAC - GELU_FRAC);
+                is64 = 1'b1;
+            end
             4'd6: rw32 = mlp_r;
             4'd7: rw32 = xres_r;
             default: rw32 = head_r;
