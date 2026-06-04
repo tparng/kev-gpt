@@ -113,9 +113,7 @@ module sequencer_vec #(
     (* ram_style = "block" *) reg [P*32-1:0] attn_bank  [0:ROWS-1];    // proj out Q6.25
     (* ram_style = "block" *) reg [P*64-1:0] mlpbuf_bank[0:ROWSM-1];   // mlp hidden Q4.12 / Q.22
     (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:ROWS-1];    // mlp_proj out Q6.25
-    (* ram_style = "block" *) reg [P*32-1:0] gemvy_bank [0:ROWSM-1];   // GEMV INT32
     (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:ARROWS-1];  // head logits Q6.25
-    reg [P*32-1:0] gystage, cstage;          // P-deep staging words for 1/cyc producers
 
     // ---- synchronous-read registers (BRAM output stage; declared before use) ---
     reg [P*32-1:0] xres_r, qkv_r, ctxv_r, attn_r, mlp_r, head_r;
@@ -175,19 +173,21 @@ module sequencer_vec #(
     reg               at_start, at_ldv;
     reg [8:0]         at_tcount;
     wire              at_ldready, at_ctxv, at_done;
-    wire [6:0]        at_ctxidx;
-    wire signed [31:0] at_ctxdata;
+    wire [6:0]        at_ctxidx;                 // dim-group index (0..HEAD_DIM/P-1)
+    wire [P*32-1:0]   at_ctxdata;                // P ctx lanes per strobe
     reg [1:0]  hh;
     reg [8:0]  wi;                          // load-address counter (runs ahead)
     reg [8:0]  wic;                         // accepted-word counter (consume stage)
     reg        wiv;                         // load-data valid (qkv read pipeline)
-    reg [LSH-1:0] awl;                      // delayed lane of the prefetched word
-    wire [10:0] aw_src = (wi < 64)  ? (hh*HEAD_DIM + wi) :
-                         (wi < 128) ? (11'd256 + hh*HEAD_DIM + (wi - 64)) :
-                                      (11'd512 + hh*HEAD_DIM + (wi - 128));
-    // sync-read prefetch: address on cycle k -> qkv_r/awl on k+1 (ld_ready stays high
+    // P-wide load: stream whole qkv_bank rows (P lanes per row). Per head: HEAD_DIM/P
+    // q rows, then K rows at +D/P, then V rows at +2*D/P. 3*HR rows per head.
+    localparam integer HR = HEAD_DIM / P;
+    wire [10:0] aw_src = (wi < HR)   ? (hh*HR + wi) :
+                         (wi < 2*HR) ? (D/P   + hh*HR + (wi - HR)) :
+                                       (2*D/P + hh*HR + (wi - 2*HR));
+    // sync-read prefetch: address on cycle k -> qkv_r on k+1 (ld_ready stays high
     // through the q/K/V stream, so the 1-deep prefetch keeps 1 word/cycle).
-    wire signed [31:0] aw_data = qkv_r[awl*32 +: 32];
+    wire [P*32-1:0] aw_data = qkv_r;
     vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(32)) u_attn (
         .clk(clk), .rst(rst), .start(at_start), .tcount(at_tcount),
         .ld_valid(at_ldv), .ld_data(aw_data), .ld_ready(at_ldready),
@@ -210,37 +210,50 @@ module sequencer_vec #(
     reg signed [63:0]  lntmp;
     reg signed [95:0]  aq_prod, aq_sh;
     reg signed [31:0]  aq_int;
+    reg signed [95:0]  aq_prod_r [0:P-1];     // G_AQ stage-1 product registers
+    reg                aq_neg_r  [0:P-1];
+    reg [10:0]         cid2;  reg civ2;
     reg signed [31:0]  cb, dqv, hv;
-    reg [P*32-1:0]  ww, sw, dword, gyr, hw, gyw, cw;
+    reg [P*32-1:0]  ww, sw, dword, hw;
     reg [P*8-1:0]   aqw;                     // P-wide act-quant word
-    reg [P*64-1:0]  mword, gsw;
+    reg [P*16-1:0]  mword;                   // P-wide sat16 word (GELU feed)
+    reg [P*64-1:0]  gsw;
     reg [P*24-1:0]  mwr;
     reg [P*8-1:0]   ewr;
     reg signed [63:0] gl_sh;
     reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
-    reg dq_rd_v;                             // G_DQ read-pipeline valid (BRAM 1-cyc latency)
-    reg [$clog2(ROWSM+1)-1:0] gfr, gor;
+    reg [$clog2(ROWSM+1)-1:0] gor;
     integer pp;
-    reg [8:0] ce;
     reg [3:0] blk;                           // transformer block 0..NLAYER-1
     reg signed [31:0] best_val; reg [8:0] best_idx, hidx;
     reg [$clog2(ARROWS+1)-1:0] ar;           // argmax row counter
+    reg signed [31:0] wm_val;  reg [8:0] wm_idx;        // word-max tree temporaries
+    reg signed [31:0] am_val;  reg [8:0] am_idx;        // stage-1 registers
+    reg [$clog2(ARROWS+1)-1:0] amd;  reg amv;
+    // argmax 3-stage pipeline (the head_bank -> compare chain was the OOC critical path):
+    // stage A registers the row, stage B halves P -> P/2, stage C reduces + running best.
+    reg [P*32-1:0] hw_r;
+    reg signed [31:0] pv0, pv1, pv2, pv3;     // P/2 pair maxima
+    reg [8:0]         pi0, pi1, pi2, pi3;
+    reg [$clog2(ARROWS+1)-1:0] ad1;  reg av1;
+    reg signed [31:0] va, vb;
+    reg [8:0]         ia, ib;
 
     // ---- FSM -------------------------------------------------------------------
     localparam [4:0]
       S_IDLE=0, S_EMB=1,
       L_GAM=2, L_FEED=3, L_COLL=4,                  // callable LN (L_GAM = start-only)
-      G_AQ=5, G_RUN=6, G_WAIT=7, G_RB=8, G_DQ=9,    // callable GEMV
+      G_AQ=5, G_RUN=6, G_WAIT=7, G_RB=8,            // callable GEMV (RB = fused rb+dq+gelu)
       S_QKVRET=10, S_AST=11, S_ALD=12, S_ACL=13,    // attention
       S_RES1=14, S_LN2=15, S_FCRET=16,              // proj/res1/LN2-call
-      S_GELU=17, S_GELUC=18, S_MPRET=19, S_RES2=20, S_FIN=21,
+      S_MPSET=17, S_RES2=20, S_FIN=21,              // mlp_proj setup (GELU folded into G_RB)
       S_HEADSET=22, S_ARGMAX=23;                    // final LN_f -> head -> argmax
     reg [4:0] st;
     reg [10:0] ci;
-    reg [$clog2(ROWSM+1)-1:0] fr, orow, dr, dor;
+    reg [$clog2(ROWSM+1)-1:0] fr, orow, dor;
     // read-pipeline delayed addresses + valids (consume stage of each FSM loop)
     reg [10:0] cid;  reg civ;
-    reg [$clog2(ROWSM+1)-1:0] frd, gfrd;  reg frv, gfrv;
+    reg [$clog2(ROWSM+1)-1:0] frd;  reg frv;
     reg [$clog2(ARROWS+1)-1:0] ard;  reg arv;
 
     // ---- synchronous reads (one read register per memory, address muxed) -------
@@ -251,9 +264,8 @@ module sequencer_vec #(
     wire [10:0] lnout1_ra = (st==G_AQ) ? ci : rbr;
     wire [10:0] lnout2_ra = (st==G_AQ) ? ci : rbr;
     wire [10:0] ctxv_ra   = (st==G_AQ) ? ci : rbr;
-    wire [10:0] mlpbuf_ra = (st==S_GELU) ? {{(11-$clog2(ROWSM+1)){1'b0}}, gfr} :
-                            (st==G_AQ) ? ci : rbr;
-    wire [10:0] qkv_ra    = (st==S_ALD) ? (aw_src >> LSH) : rbr;
+    wire [10:0] mlpbuf_ra = (st==G_AQ) ? ci : rbr;
+    wire [10:0] qkv_ra    = (st==S_ALD) ? aw_src : rbr;
     wire [10:0] attn_ra   = (st==S_RES1) ? ci : rbr;
     wire [10:0] mlp_ra    = (st==S_RES2) ? ci : rbr;
     wire [10:0] head_ra   = (st==S_ARGMAX) ? {{(11-$clog2(ARROWS+1)){1'b0}}, ar} : rbr;
@@ -271,20 +283,19 @@ module sequencer_vec #(
         temb_r   <= tok_emb_w[tok_id*EROWS + fr];
         pemb_r   <= pos_emb_w[pos*EROWS + fr];
         gam_r    <= gamma_w  [l_gbase*EROWS + fr];
-        awl      <= aw_src[LSH-1:0];
     end
 
     always @(posedge clk) begin
         ln_start<=1'b0; ln_vin<=1'b0; gv_ldrst<=1'b0; gv_xwe<=1'b0; gv_start<=1'b0;
         dq_vin<=1'b0; gl_vin<=1'b0; at_start<=1'b0; at_ldv<=1'b0; done<=1'b0;
         if (rst) begin
-            st<=S_IDLE; ci<=0; fr<=0; orow<=0; dr<=0; dor<=0; gfr<=0; gor<=0;
-            rv0<=0; rv1<=0; rv2<=0; gystage<=0; cstage<=0; dq_rd_v<=0;
-            civ<=0; frv<=0; gfrv<=0; arv<=0; wiv<=0;
+            st<=S_IDLE; ci<=0; fr<=0; orow<=0; dor<=0; gor<=0;
+            rv0<=0; rv1<=0; rv2<=0;
+            civ<=0; frv<=0; arv<=0; wiv<=0;
         end else begin
             case (st)
                 S_IDLE: if (go) begin
-                    fr<=0; frv<=0; blk<=4'd0; gystage<=0; cstage<=0; st<=S_EMB;
+                    fr<=0; frv<=0; blk<=4'd0; st<=S_EMB;
                 end
                 // ---- embed -> xres (wide ROM, sync read, P/cyc); then LN1 of block 0
                 S_EMB: begin
@@ -326,10 +337,13 @@ module sequencer_vec #(
                     g_ret<=S_AST; ci<=0; civ<=0; hh<=2'd0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // ================= callable GEMV ==============================
-                G_AQ: begin    // act-quant: P lanes per cycle into the GEMV boundary
+                G_AQ: begin    // act-quant: P lanes/cycle, 2-STAGE (mult | round+sat).
+                    // The 64x40 multiply + 96-bit round/sat chain was the critical path;
+                    // registering the product lets the multiplier retime into DSPs.
                     cid <= ci; civ <= (ci != (g_k >> LSH));
+                    cid2 <= cid; civ2 <= civ;
                     if (ci != (g_k >> LSH)) ci <= ci + 1'b1;
-                    if (civ) begin
+                    if (civ) begin                 // stage 1: source mux -> multiply
                         for (pp=0; pp<P; pp=pp+1) begin
                             case (g_asrc)
                                 2'd0: lntmp = $signed(lnout1_r[pp*64 +: 64]);
@@ -344,8 +358,14 @@ module sequencer_vec #(
                                 2'd2: lntmp = $signed(lnout2_r[pp*64 +: 64]);
                                 default: lntmp = $signed(mlpbuf_r[pp*64 +: 64]);
                             endcase
-                            aq_prod = $signed(lntmp) * $signed(inv_sact[g_asel]);
-                            if (lntmp >= 0)
+                            aq_prod_r[pp] <= $signed(lntmp) * $signed(inv_sact[g_asel]);
+                            aq_neg_r[pp]  <= (lntmp < 0);
+                        end
+                    end
+                    if (civ2) begin                // stage 2: round/sat -> INT8 lane
+                        for (pp=0; pp<P; pp=pp+1) begin
+                            aq_prod = aq_prod_r[pp];
+                            if (!aq_neg_r[pp])
                                 aq_sh = (aq_prod + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH);
                             else
                                 aq_sh = -(((-aq_prod) + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH));
@@ -354,7 +374,7 @@ module sequencer_vec #(
                             aqw[pp*8 +: 8] = aq_int[7:0];
                         end
                         gv_xwe<=1'b1; gv_xdata<=aqw;
-                        if (cid==(g_k >> LSH)-1) begin ci<=0; civ<=0; st<=G_RUN; end
+                        if (cid2==(g_k >> LSH)-1) begin ci<=0; civ<=0; civ2<=0; st<=G_RUN; end
                     end
                 end
                 G_RUN: begin
@@ -362,59 +382,56 @@ module sequencer_vec #(
                     gv_start<=1'b1; st<=G_WAIT;
                 end
                 G_WAIT: if (gv_done) begin
-                    ci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0; gystage<=0; dq_rd_v<=0; st<=G_RB;
+                    ci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0; dor<=0; st<=G_RB;
                 end
-                G_RB: begin              // readback ceil(g_m/P) wide words -> gemvy
+                G_RB: begin
+                    // FUSED readback -> dequant -> dest. ymem readback is 2-cycle
+                    // (rd_addr -> rd_word -> y_out): gv_yout for address rb0 lands at rv2.
+                    // dqm/dqe BRAM reads at rb1 land in the same cycle -> stream the
+                    // dequant unit at 1 word/cycle. For g_dst==2 (mlp hidden), dequant
+                    // output feeds vec_gelu in flight; exit when GELU drains.
                     if (ci < ((g_m + P-1) >> LSH)) begin
                         gv_rdaddr<=ci; rb0<=ci; ci<=ci+1'b1;
                     end else gv_rdaddr <= ((g_m + P-1) >> LSH) - 1'b1;
                     rb1<=rb0; rb2<=rb1;
                     rv0<=(ci < ((g_m + P-1) >> LSH)); rv1<=rv0; rv2<=rv1;
+                    mwr <= dqm_w[g_dqrow + rb1];
+                    ewr <= dqe_w[g_dqrow + rb1];
                     if (rv2) begin
-                        gemvy_bank[rb2] <= gv_yout;
-                        if (rb2==((g_m + P-1) >> LSH)-1) begin dr<=0; dor<=0; st<=G_DQ; end
-                    end
-                end
-                G_DQ: begin                               // P-wide dequant -> selected dest
-                    // gemvy/dqm_w/dqe_w are BLOCK RAM (1-cyc registered read). Stage 1:
-                    // registered read; stage 2: drive the dequant lanes.
-                    if (dr < ((g_m + P-1) >> LSH)) begin   // ceil rows (head VOCAB not P-mult)
-                        gyr <= gemvy_bank[dr];
-                        mwr <= dqm_w[g_dqrow + dr];
-                        ewr <= dqe_w[g_dqrow + dr];
-                        dq_rd_v <= 1'b1;
-                        dr<=dr+1'b1;
-                    end else dq_rd_v <= 1'b0;
-                    if (dq_rd_v) begin                      // BRAM outputs now valid
                         dq_vin<=1'b1; dq_frac<=g_frac;
-                        for (pp=0; pp<P; pp=pp+1) begin
-                            dq_gemvy[pp*32 +: 32] <= gyr[pp*32 +: 32];
-                            dq_mant [pp*24 +: 24] <= mwr[pp*24 +: 24];
-                            dq_exp  [pp*8  +: 8 ] <= ewr[pp*8  +: 8 ];
-                        end
+                        dq_gemvy <= gv_yout;
+                        dq_mant  <= mwr;
+                        dq_exp   <= ewr;
                     end
                     if (dq_vout) begin
                         for (pp=0; pp<P; pp=pp+1) begin
                             dqv = dq_out[pp*32 +: 32];
                             dword[pp*32 +: 32] = dqv;
-                            if      ($signed(dqv) >  32'sd32767)  mword[pp*64 +: 64] = 64'sd32767;
-                            else if ($signed(dqv) < -32'sd32768)  mword[pp*64 +: 64] = -64'sd32768;
-                            else    mword[pp*64 +: 64] = {{32{dqv[31]}}, dqv};
+                            if      ($signed(dqv) >  32'sd32767)  mword[pp*16 +: 16] = 16'sd32767;
+                            else if ($signed(dqv) < -32'sd32768)  mword[pp*16 +: 16] = -16'sd32768;
+                            else    mword[pp*16 +: 16] = dqv[15:0];
                         end
                         case (g_dst)
                             3'd0: qkv_bank [dor] <= dword;
                             3'd1: attn_bank[dor] <= dword;
-                            3'd2: mlpbuf_bank[dor] <= mword;   // Q4.12 sat16, sign-ext
+                            3'd2: begin gl_vin<=1'b1; gl_x<=mword; end // Q4.12 sat16 -> GELU
                             3'd3: mlp_bank [dor] <= dword;
                             default: head_bank[dor] <= dword;  // 4: head logits Q6.25
                         endcase
-                        // ci is left at g_m by G_RB; reset it so the g_ret consumer (S_RES1/
-                        // S_RES2 stream ci=0..ROWS-1) starts clean. Without this, ci enters res
-                        // as 256: iverilog drops the out-of-range xres_bank[256] (gate passes by
-                        // luck) but on silicon the 6-bit address WRAPS and the residual adds attn
-                        // ~29x as ci counts 256..2047..63 -> x_res1 blows up. The real bug.
-                        if (dor==((g_m + P-1) >> LSH)-1) begin ci<=0; civ<=0; st<=g_ret; end
-                        else dor<=dor+1'b1;
+                        // ci must re-enter g_ret as 0 (S_RES1/S_RES2 stream ci=0..ROWS-1).
+                        // On silicon the 6-bit address WRAPS (the §6 board bug); keep clean.
+                        if (g_dst != 3'd2 && dor==((g_m + P-1) >> LSH)-1) begin
+                            ci<=0; civ<=0; st<=g_ret;
+                        end else dor<=dor+1'b1;
+                    end
+                    if (gl_vout) begin                     // collect GELU -> mlpbuf (Q.22)
+                        for (pp=0; pp<P; pp=pp+1) begin
+                            gl_sh = $signed(gl_y[pp*16 +: 16]) <<< (LN_OUT_FRAC-GELU_FRAC);
+                            gsw[pp*64 +: 64] = gl_sh;
+                        end
+                        mlpbuf_bank[gor] <= gsw;
+                        if (gor==ROWSM-1) begin ci<=0; civ<=0; st<=g_ret; end
+                        else gor<=gor+1'b1;
                     end
                 end
                 // ================= attention ==================================
@@ -422,23 +439,19 @@ module sequencer_vec #(
                     at_start<=1'b1; at_tcount<=9'd1; wi<=9'd0; wic<=9'd0; wiv<=1'b0; st<=S_ALD;
                 end
                 S_ALD: begin
-                    // 1-deep prefetch: qkv_r/awl trail wi by one cycle, and at_ldv is one
+                    // 1-deep prefetch: qkv_r trails wi by one cycle, and at_ldv is one
                     // register behind wi — both land in the same cycle at vec_attn.
-                    at_ldv <= (wi != 9'd192);
-                    if (wi != 9'd192) wi <= wi + 1'b1;
+                    // P-wide: 3*HR rows per head (q, K, V).
+                    at_ldv <= (wi != 3*HR);
+                    if (wi != 3*HR) wi <= wi + 1'b1;
                     if (at_ldv) begin
-                        if (wic == 9'd191) st <= S_ACL;
+                        if (wic == 3*HR-1) st <= S_ACL;
                         else wic <= wic + 1'b1;
                     end
                 end
                 S_ACL: begin
-                    if (at_ctxv) begin
-                        ce = {2'd0, hh}*HEAD_DIM + {2'd0, at_ctxidx};
-                        cw = cstage;
-                        cw[(ce[LSH-1:0])*32 +: 32] = at_ctxdata;
-                        if (ce[LSH-1:0]==P-1) begin ctxv_bank[ce >> LSH] <= cw; cstage <= 0; end
-                        else cstage <= cw;
-                    end
+                    if (at_ctxv)                       // P lanes per strobe, direct row write
+                        ctxv_bank[hh*HR + at_ctxidx] <= at_ctxdata;
                     if (at_done) begin
                         if (hh==NHEAD-1) begin                    // -> proj GEMV
                             g_wbase<=blk*GW_BLK + WB_PROJ; g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
@@ -467,28 +480,13 @@ module sequencer_vec #(
                   else begin
                     g_wbase<=blk*GW_BLK + WB_FC; g_m<=D_MLP[10:0]; g_k<=D[10:0]; g_asrc<=2'd2;
                     g_asel<=blk*4 + 6'd2; g_frac<=7'd12; g_dqrow<=blk*DQB_P + DR_FC; g_dst<=3'd2;
-                    g_ret<=S_GELU; ci<=0; civ<=0; gfr<=0; gfrv<=0; gor<=0; gv_ldrst<=1'b1; st<=G_AQ;
+                    g_ret<=S_MPSET; ci<=0; civ<=0; gor<=0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
-                // ================= GELU (vec_gelu over mlpbuf, sync read) =====
-                S_GELU: begin
-                    gfrd <= gfr; gfrv <= (gfr != ROWSM[$clog2(ROWSM+1)-1:0]);
-                    if (gfr != ROWSM[$clog2(ROWSM+1)-1:0]) gfr <= gfr + 1'b1;
-                    gl_vin <= gfrv;
-                    if (gfrv)
-                        for (pp=0; pp<P; pp=pp+1)
-                            gl_x[pp*16 +: 16] <= mlpbuf_r[pp*64 +: 16];  // low 16 of each Q4.12 lane
-                    if (gl_vout) begin
-                        for (pp=0; pp<P; pp=pp+1) begin
-                            gl_sh = $signed(gl_y[pp*16 +: 16]) <<< (LN_OUT_FRAC-GELU_FRAC);
-                            gsw[pp*64 +: 64] = gl_sh;
-                        end
-                        mlpbuf_bank[gor] <= gsw;
-                        if (gor==ROWSM-1) begin                   // -> mlp_proj GEMV
-                            g_wbase<=blk*GW_BLK + WB_MP; g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
-                            g_asel<=blk*4 + 6'd3; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_MP; g_dst<=3'd3;
-                            g_ret<=S_RES2; ci<=0; civ<=0; gv_ldrst<=1'b1; st<=G_AQ;
-                        end else gor<=gor+1'b1;
-                    end
+                // mlp_proj GEMV setup (GELU already streamed inside G_RB) -------
+                S_MPSET: begin
+                    g_wbase<=blk*GW_BLK + WB_MP; g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
+                    g_asel<=blk*4 + 6'd3; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_MP; g_dst<=3'd3;
+                    g_ret<=S_RES2; ci<=0; civ<=0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // ---- res2: xres += mlp_out ; next block or final LN_f --------
                 S_RES2: begin
@@ -516,22 +514,44 @@ module sequencer_vec #(
                     g_wbase<=WB_HEAD; g_m<=VOCAB[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
                     g_asel<=4*NLAYER; g_frac<=7'd25; g_dqrow<=DR_HEAD[11:0]; g_dst<=3'd4;
                     g_ret<=S_ARGMAX; ci<=0; civ<=0; gv_ldrst<=1'b1;
-                    best_val<=32'sh80000000; best_idx<=9'd0; ar<=0; arv<=0; st<=G_AQ;
+                    best_val<=32'sh80000000; best_idx<=9'd0; ar<=0; arv<=0; av1<=0; amv<=0; st<=G_AQ;
                 end
                 // ---- P-wide argmax over the VOCAB logits (Q6.25, sync read) --
+                // 3-stage pipeline (head_bank -> compare chain was the critical path):
+                // A: register the row; B: P -> P/2 pairwise maxima; C: reduce + best.
+                // First index wins ties (strict >), matching the scalar reference.
                 S_ARGMAX: begin
                     ard <= ar; arv <= (ar != ARROWS[$clog2(ARROWS+1)-1:0]);
                     if (ar != ARROWS[$clog2(ARROWS+1)-1:0]) ar <= ar + 1'b1;
-                    if (arv) begin
-                        hw = head_r;
-                        for (pp=0; pp<P; pp=pp+1) begin
-                            hv   = hw[pp*32 +: 32];
-                            hidx = ard*P + pp;
-                            if (hidx < VOCAB && $signed(hv) > best_val) begin
-                                best_val = $signed(hv); best_idx = hidx;
-                            end
+                    hw_r <= head_r; ad1 <= ard; av1 <= arv;          // stage A
+                    if (av1) begin                                   // stage B: 4 pair maxima
+                        for (pp=0; pp<4; pp=pp+1) begin
+                            va = $signed(hw_r[pp*32 +: 32]);
+                            vb = $signed(hw_r[(pp+4)*32 +: 32]);
+                            ia = ad1*P + pp;  ib = ad1*P + pp + 4;
+                            if (ia >= VOCAB) va = 32'sh80000000;
+                            if (ib >= VOCAB) vb = 32'sh80000000;
+                            case (pp)
+                                0: begin pv0 <= (vb > va) ? vb : va; pi0 <= (vb > va) ? ib : ia; end
+                                1: begin pv1 <= (vb > va) ? vb : va; pi1 <= (vb > va) ? ib : ia; end
+                                2: begin pv2 <= (vb > va) ? vb : va; pi2 <= (vb > va) ? ib : ia; end
+                                default: begin pv3 <= (vb > va) ? vb : va; pi3 <= (vb > va) ? ib : ia; end
+                            endcase
                         end
-                        if (ard==ARROWS-1) begin tok_out<=best_idx; st<=S_FIN; end
+                    end
+                    amv <= av1; amd <= ad1;
+                    if (amv) begin                                   // stage C: reduce + best
+                        wm_val = pv0; wm_idx = pi0;
+                        if (pv1 > wm_val) begin wm_val = pv1; wm_idx = pi1; end
+                        if (pv2 > wm_val) begin wm_val = pv2; wm_idx = pi2; end
+                        if (pv3 > wm_val) begin wm_val = pv3; wm_idx = pi3; end
+                        if (wm_val > best_val) begin
+                            best_val <= wm_val; best_idx <= wm_idx;
+                        end
+                        if (amd==ARROWS-1) begin
+                            tok_out <= (wm_val > best_val) ? wm_idx : best_idx;
+                            st <= S_FIN;
+                        end
                     end
                 end
                 S_FIN: begin done<=1'b1; st<=S_IDLE; end

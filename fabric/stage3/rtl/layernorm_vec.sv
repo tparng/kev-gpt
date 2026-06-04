@@ -90,6 +90,10 @@ module layernorm_vec #(
     integer lp;
     reg signed [39:0]  psum;                    // sum of the P lanes this row
     reg signed [71:0]  psumxx;                  // sum of x*x of the P lanes this row
+    reg signed [39:0]  psum_r;                  // registered partials (Fmax: the P
+    reg signed [71:0]  psumxx_r;                //   squares retime into DSPs)
+    reg                lv1;
+    reg [$clog2(ROWS+1)-1:0] acnt;
     reg signed [31:0]  xl;                       // plain-vector lane copy
     always @(*) begin
         psum   = 40'sd0;
@@ -110,25 +114,34 @@ module layernorm_vec #(
             if (A[b]) msb_c = b[7:0];
     end
 
-    // ---- output pipeline (2 stages): stage1 prod=(x-mean)*Yr ; stage2 *gamma --
+    // ---- output pipeline (3 stages): s0 xc=(x-mean) ; s1 prod=xc*Yr ; s2 *gamma
+    reg signed [39:0]  xc     [0:P-1];
     reg signed [95:0]  prod   [0:P-1];
+    reg signed [31:0]  grow_0 [0:P-1];
     reg signed [31:0]  grow_r [0:P-1];
-    reg                s1v;
+    reg                s0v, s1v;
     reg signed [31:0]  xo, go;                   // plain-vector copies
+    reg signed [39:0]  xj;
     reg signed [95:0]  pj;
     reg signed [127:0] prod2;
 
     // ---- FSM ------------------------------------------------------------------
     localparam [3:0]
         S_IDLE=0, S_LOAD=1, S_VAR=2, S_MSB=3, S_SEED=4, S_SEED2=5,
-        S_NEWT0=6, S_NEWTA=7, S_NEWTB=8, S_NEWTC=9, S_OUT=10, S_DONE=11;
-    reg [3:0] state;
+        S_NEWT0=6, S_NEWTA=7, S_NEWTB=8, S_NEWTC=9, S_OUT=10, S_DONE=11,
+        S_VAR2=12, S_NEWTA2=13, S_NEWTB2=14, S_NEWTC2=15;
+    localparam [4:0] S_NEWTC3=16;
+    reg [4:0] state;
+    reg signed [127:0] p_ct, p_mq;        // S_VAR product registers
+    reg signed [127:0] yy_p;              // Newton stage product registers
+    reg signed [191:0] ay_p;
+    reg signed [63:0]  yn_r;              // Newton result settle register
     integer wp;
 
     always @(posedge clk) begin
         if (rst) begin
             state <= S_IDLE; wptr <= 0; ridx <= 0; oidx <= 0;
-            y_valid <= 1'b0; done <= 1'b0; s1v <= 1'b0;
+            y_valid <= 1'b0; done <= 1'b0; s0v <= 1'b0; s1v <= 1'b0;
             sum <= 0; sumxx <= 0; newt <= 0;
         end else begin
             y_valid <= 1'b0;
@@ -137,27 +150,40 @@ module layernorm_vec #(
                 S_IDLE: begin
                     if (start) begin
                         wptr <= 0; sum <= 0; sumxx <= 0; newt <= 0;
+                        acnt <= 0; lv1 <= 1'b0;
                         state <= S_LOAD;
                     end
                 end
-                // ---- P-wide load: store P lanes, fold the P partial sums in -----
+                // ---- P-wide load: store P lanes; partial sums REGISTERED then folded
+                // (1-cycle skew so the P squares + tree retime into DSPs) -----------
                 S_LOAD: begin
                     if (valid_in) begin
                         for (wp = 0; wp < P; wp = wp + 1) begin
                             xbank[wp][wptr] <= x_in[wp*32 +: 32];
                             gbank[wp][wptr] <= gamma_in[wp*32 +: 32];
                         end
-                        sum   <= sum   + psum;
-                        sumxx <= sumxx + psumxx;
-                        wptr  <= wptr + 1'b1;
-                        if (wptr == ROWS-1) state <= S_VAR;
+                        psum_r   <= psum;
+                        psumxx_r <= psumxx;
+                        wptr     <= wptr + 1'b1;
+                    end
+                    lv1 <= valid_in;
+                    if (lv1) begin
+                        sum   <= sum   + psum_r;
+                        sumxx <= sumxx + psumxx_r;
+                        acnt  <= acnt + 1'b1;
+                        if (acnt == ROWS-1) state <= S_VAR;
                     end
                 end
-                // ---- algebraic centered sum (exact identity) -------------------
+                // ---- algebraic centered sum (exact identity), 2-stage ----------
                 S_VAR: begin
                     mean  <= sum >>> 8;                                  // /256, Q6.25
-                    cterm = ($signed(sum >>> 8) * $signed(sum)) <<< 1;   // 2*mean*sum
-                    msq   = D * ($signed(sum >>> 8) * $signed(sum >>> 8)); // D*mean^2
+                    p_ct  <= $signed(sum >>> 8) * $signed(sum);          // mean*sum
+                    p_mq  <= $signed(sum >>> 8) * $signed(sum >>> 8);    // mean^2
+                    state <= S_VAR2;
+                end
+                S_VAR2: begin
+                    cterm = p_ct <<< 1;                                  // 2*mean*sum
+                    msq   = D * p_mq;                                    // D*mean^2
                     ssq   <= $signed(sumxx) - cterm + msq;               // centered Q.50
                     state <= S_MSB;
                 end
@@ -192,29 +218,49 @@ module layernorm_vec #(
                     Yr    <= Y0;
                     state <= S_NEWTA;
                 end
-                S_NEWTA: begin yy  <= Yr * Yr;               state <= S_NEWTB; end  // stage A
-                S_NEWTB: begin ayy <= (A * yy) >>> A_FRAC;   state <= S_NEWTC; end  // stage B
-                S_NEWTC: begin                                                       // stage C
-                    term = ONE_P5 - (ayy >>> 1);
+                // 2 Newton iterations, each multiply split product-reg | shift (Fmax)
+                S_NEWTA:  begin yy_p <= Yr * Yr;             state <= S_NEWTA2; end
+                S_NEWTA2: begin yy   <= yy_p;                state <= S_NEWTB;  end
+                S_NEWTB:  begin ay_p <= A * yy;              state <= S_NEWTB2; end
+                S_NEWTB2: begin ayy  <= ay_p >>> A_FRAC;     state <= S_NEWTC;  end
+                S_NEWTC: begin
+                    term  <= ONE_P5 - (ayy >>> 1);
+                    state <= S_NEWTC2;
+                end
+                S_NEWTC2: begin
                     ynew = (Yr * term) >>> (2*Y_FRAC);
-                    Yr   <= ynew[63:0];
+                    yn_r <= ynew[63:0];                 // settle one cycle: DSP out -> reg
+                    state <= S_NEWTC3;
+                end
+                S_NEWTC3: begin                          // -> next Yr is a plain reg
+                    Yr   <= yn_r;
                     newt <= newt + 1'b1;
-                    if (newt == 2'd1) begin ridx <= 0; oidx <= 0; s1v <= 1'b0; state <= S_OUT; end
+                    if (newt == 2'd1) begin ridx <= 0; oidx <= 0; s0v <= 1'b0; s1v <= 1'b0; state <= S_OUT; end
                     else state <= S_NEWTA;
                 end
                 // ---- P-wide pipelined output stream ----------------------------
                 S_OUT: begin
-                    // stage 1: P prods (x-mean)*Yr for row ridx
+                    // stage 0: P centered lanes (x-mean) for row ridx — registered so
+                    // the subtract is not chained into the DSP multiply (Fmax)
                     if (ridx < ROWS) begin
                         for (lp = 0; lp < P; lp = lp + 1) begin
                             xo = xbank[lp][ridx];               // plain-vector copy (iverilog-safe)
                             go = gbank[lp][ridx];
-                            prod[lp]   <= ($signed({{8{xo[31]}}, xo}) - mean) * Yr;
-                            grow_r[lp] <= go;
+                            xc[lp]     <= $signed({{8{xo[31]}}, xo}) - mean;
+                            grow_0[lp] <= go;
                         end
                         ridx <= ridx + 1'b1;
-                        s1v  <= 1'b1;
-                    end else s1v <= 1'b0;
+                        s0v  <= 1'b1;
+                    end else s0v <= 1'b0;
+                    // stage 1: P prods (x-mean)*Yr
+                    s1v <= s0v;
+                    if (s0v) begin
+                        for (lp = 0; lp < P; lp = lp + 1) begin
+                            xj = xc[lp];
+                            prod[lp]   <= xj * Yr;
+                            grow_r[lp] <= grow_0[lp];
+                        end
+                    end
                     // stage 2: P y = (prod*gamma)>>>OUT_SH for the row latched last cycle
                     if (s1v) begin
                         for (lp = 0; lp < P; lp = lp + 1) begin

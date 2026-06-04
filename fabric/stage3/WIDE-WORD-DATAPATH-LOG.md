@@ -408,3 +408,25 @@ Projection 5,449 → measured 5,448.8. One day, four bit-honest rungs: **1,883 �
 → 5,449** (2.9×). 10k now needs ~1.85×: pipeline the GEMV/non-linears to ~200 MHz, or cut the
 ~23k cyc floor (softmax overlap, attention restructure). Both are pure clock-or-cycles work
 within the proven gate ladder.
+
+---
+
+## 12. The cycle-floor cut — 17,839 cyc/token (SIM, gated bit-exact)
+
+Profiled the 22,941 with a per-FSM-state counter in the testbench. The split: GEMV run 12,706 ·
+attention 5,216 (load 3,088 + compute 2,128) · readback+dequant 2,456 · act-quant 945 ·
+LN 720 · GELU 532 · rest <400. So GEMV is the floor; the fat is attention + boundary.
+
+Three cuts, gated bit-exact after each:
+1. **Fused readback→dequant** (−1.2k): readback (2-cyc ymem pipeline) streams into vec_dequant
+   in flight; `gemvy_bank` and the entire G_DQ pass deleted.
+2. **GELU folded into G_RB** (−0.5k): mlp dequant words feed vec_gelu in flight; S_GELU is now
+   just a setup state.
+3. **P-wide attention load + ctx writeback** (−3.6k): vec_attn ld/ctx ports → P×32 wide.
+   16 head-loads/token at 24 wide rows each (was 192 scalar). Ctx emits one P-row per cycle.
+
+22,942 → **17,839 cyc/token** (−22%). @125 MHz = **7,082 tok/s PROJECTED**, target 10k = 178 MHz.
+
+Fmax prep: all heavy multiplies registered into 2-stage pipelines (one extra cycle each loop):
+G_AQ 64×40 mult, vec_dequant 32×25 + 96-bit barrel shift, vec_attn q·k tree and prob·v lanes,
+LN load squares (DSP retime). Total latency cost +187 cyc — buys silicon clock headroom.

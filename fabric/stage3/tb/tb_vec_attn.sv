@@ -33,11 +33,11 @@ module tb;
     reg                start;
     reg  [8:0]         tcount;
     reg                ld_valid;
-    reg  signed [31:0] ld_data;
+    reg  [P*32-1:0]    ld_data;
     wire               ld_ready;
     wire               ctx_valid;
-    wire [6:0]         ctx_idx;
-    wire signed [31:0] ctx_data;
+    wire [6:0]         ctx_idx;          // dim-group index
+    wire [P*32-1:0]    ctx_data;         // P ctx lanes per strobe
     wire               done;
 
     vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) dut (
@@ -78,35 +78,46 @@ module tb;
             @(posedge clk); #1;
             start  = 1'b0;
 
-            // stream q (HEAD_DIM words)
+            // stream q (HEAD_DIM/P wide words: P lanes per beat)
             k = 0;
             while (k < HEAD_DIM) begin
                 if (ld_ready) begin
-                    ld_valid = 1'b1; ld_data = qmem[qbase + k]; k = k + 1;
+                    ld_valid = 1'b1;
+                    for (i = 0; i < P; i = i + 1)
+                        ld_data[i*32 +: 32] = qmem[qbase + k + i];
+                    k = k + P;
                 end else ld_valid = 1'b0;
                 @(posedge clk); #1;
             end
-            // stream K (n*HEAD_DIM words)
+            // stream K (n*HEAD_DIM/P wide words)
             k = 0;
             while (k < n*HEAD_DIM) begin
                 if (ld_ready) begin
-                    ld_valid = 1'b1; ld_data = kmem[kbase + k]; k = k + 1;
+                    ld_valid = 1'b1;
+                    for (i = 0; i < P; i = i + 1)
+                        ld_data[i*32 +: 32] = kmem[kbase + k + i];
+                    k = k + P;
                 end else ld_valid = 1'b0;
                 @(posedge clk); #1;
             end
-            // stream V (n*HEAD_DIM words)
+            // stream V (n*HEAD_DIM/P wide words)
             k = 0;
             while (k < n*HEAD_DIM) begin
                 if (ld_ready) begin
-                    ld_valid = 1'b1; ld_data = vmem[kbase + k]; k = k + 1;
+                    ld_valid = 1'b1;
+                    for (i = 0; i < P; i = i + 1)
+                        ld_data[i*32 +: 32] = vmem[kbase + k + i];
+                    k = k + P;
                 end else ld_valid = 1'b0;
                 @(posedge clk); #1;
             end
             ld_valid = 1'b0;
 
-            // capture ctx until done
+            // capture ctx until done (P lanes per strobe)
             while (!done) begin
-                if (ctx_valid) ctxcap[ctx_idx] = ctx_data;
+                if (ctx_valid)
+                    for (i = 0; i < P; i = i + 1)
+                        ctxcap[ctx_idx*P + i] = ctx_data[i*32 +: 32];
                 @(posedge clk); #1;
             end
 

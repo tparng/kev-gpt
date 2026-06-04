@@ -51,6 +51,7 @@ module vec_dequant #(
         end
     endfunction
 
+    reg v1;                       // stage-1 valid
     genvar gi;
     generate
         for (gi = 0; gi < P; gi = gi + 1) begin : LANE
@@ -59,32 +60,39 @@ module vec_dequant #(
             reg signed [31:0] gemvy_v;
             reg        [23:0] mant_v;                          // mant is UNSIGNED 24-bit (a
             reg signed [7:0]  exp_v;                           // positive mantissa, up to 2^24)
-            reg signed [95:0] dq_prod;
-            reg signed [8:0]  dq_shv;
+            reg signed [95:0] dq_prod_r;                       // STAGE-1 product register
+            reg signed [8:0]  dq_shv_r;                        //   (multiplier retimes to DSPs)
             reg signed [95:0] dq_val;
 
             always @* begin
                 gemvy_v = gemvy[gi*32 +: 32];
                 mant_v  = mant [gi*24 +: 24];
                 exp_v   = exp  [gi*8  +: 8 ];
-                // zero-extend mant to a positive 25-bit signed before the signed product
-                // (values >= 2^23 would flip negative under a 24-bit signed read)
-                dq_prod = $signed(gemvy_v) * $signed({1'b0, mant_v});
-                dq_shv  = $signed(exp_v) + $signed(frac);       // signed sum (runtime frac)
-                if (dq_shv >= 0) dq_val = dq_prod <<< dq_shv;
-                else             dq_val = rsh_round(dq_prod, -dq_shv);
             end
 
-            // registered publish of this lane's low 32 bits
+            // stage 1: product + shift amount (registered)
             always @(posedge clk) begin
-                if (in_valid) dq_out[gi*32 +: 32] <= dq_val[31:0];
+                if (in_valid) begin
+                    // zero-extend mant to a positive 25-bit signed before the product
+                    dq_prod_r <= $signed(gemvy_v) * $signed({1'b0, mant_v});
+                    dq_shv_r  <= $signed(exp_v) + $signed(frac);
+                end
+            end
+
+            // stage 2: barrel shift + round, registered publish of low 32 bits
+            always @* begin
+                if (dq_shv_r >= 0) dq_val = dq_prod_r <<< dq_shv_r;
+                else               dq_val = rsh_round(dq_prod_r, -dq_shv_r);
+            end
+            always @(posedge clk) begin
+                if (v1) dq_out[gi*32 +: 32] <= dq_val[31:0];
             end
         end
     endgenerate
 
-    // valid pipeline (1-cycle latency, matches the registered dq_out stage)
+    // valid pipeline (2-cycle latency: product stage, then shift+publish stage)
     always @(posedge clk) begin
-        if (rst) out_valid <= 1'b0;
-        else     out_valid <= in_valid;
+        if (rst) begin v1 <= 1'b0; out_valid <= 1'b0; end
+        else     begin v1 <= in_valid; out_valid <= v1; end
     end
 endmodule

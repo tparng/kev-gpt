@@ -22,11 +22,11 @@
 // iverilog-2012 note: every indexed read of an UNPACKED-array element is first
 // copied to a plain vector reg before any part-select/shift (the X-on-unpacked rule).
 //
-// Load protocol (simple streaming, host asserts ld_valid for each word):
+// Load protocol (P-WIDE streaming, host asserts ld_valid for each wide word):
 //   1. pulse `start` with `tcount` = T (1..TMAX).
-//   2. stream HEAD_DIM q words, then T*HEAD_DIM K words (position-major: k_0[0..63],
-//      k_1[0..63], ...), then T*HEAD_DIM V words (position-major). Each word on
-//      `ld_data` qualified by `ld_valid`; `ld_ready` is high while loading.
+//   2. stream HEAD_DIM/P q words, then T*HEAD_DIM/P K words (position-major), then
+//      T*HEAD_DIM/P V words. Each wide word = P consecutive Q.16 lanes
+//      (lane l in bits [l*32 +: 32]) on `ld_data`, qualified by `ld_valid`.
 //   3. compute runs; `ctx_valid` strobes per output dim with (ctx_idx, ctx_data),
 //      then `done` pulses once.
 // -----------------------------------------------------------------------------
@@ -44,12 +44,12 @@ module vec_attn #(
     input  wire [8:0]          tcount,     // number of valid positions T (1..TMAX)
 
     input  wire                ld_valid,   // a load word is presented on ld_data
-    input  wire signed [31:0]  ld_data,    // Q.16 word (q, then K, then V streams)
+    input  wire [P*32-1:0]     ld_data,    // P Q.16 lanes (q, then K, then V streams)
     output reg                 ld_ready,   // high while the loader is consuming words
 
-    output reg                 ctx_valid,  // a ctx word is presented this cycle
-    output reg  [6:0]          ctx_idx,    // which output dim d (0..HEAD_DIM-1)
-    output reg  signed [31:0]  ctx_data,   // ctx[d] Q6.25
+    output reg                 ctx_valid,  // a ctx group is presented this cycle
+    output reg  [6:0]          ctx_idx,    // which dim group (0..HEAD_DIM/P-1)
+    output reg  [P*32-1:0]     ctx_data,   // P ctx lanes Q6.25 (dim = ctx_idx*P + lane)
     output reg                 done        // pulses 1 cycle when the head is complete
 );
     // ---- pinned constants (seq_ref.py) ----
@@ -63,10 +63,10 @@ module vec_attn #(
 
     localparam integer NGRP = HEAD_DIM / P;   // adder-tree passes per score / dim groups
 
-    // ---- on-chip storage ----
-    reg signed [31:0] qmem [0:HEAD_DIM-1];          // q[0..63]
-    reg signed [31:0] kmem [0:TMAX*HEAD_DIM-1];     // K cache, position-major
-    reg signed [31:0] vmem [0:TMAX*HEAD_DIM-1];     // V cache, position-major
+    // ---- on-chip storage (wide words: P lanes per row, lane l = [l*32 +: 32]) ----
+    reg [P*32-1:0]    qmem [0:HEAD_DIM/P-1];        // q
+    reg [P*32-1:0]    kmem [0:TMAX*HEAD_DIM/P-1];   // K cache, position-major
+    reg [P*32-1:0]    vmem [0:TMAX*HEAD_DIM/P-1];   // V cache, position-major
     reg [20:0]        probmem [0:TMAX-1];           // softmax probs Q1.20 (unsigned)
 
     // ---- softmax instance ----
@@ -112,15 +112,21 @@ module vec_attn #(
     reg [8:0]  pj;            // position index within ctx sum
     reg [6:0]  emit_idx;      // which lane is being emitted in S_CTX_EMIT
 
+    // pipeline registers: products registered before accumulate (Fmax)
+    reg signed [63:0] sc_prod  [0:P-1];   // q*k lane products
+    reg               sc_v;
+    reg signed [95:0] ctx_prod [0:P-1];   // prob*v lane products
+    reg               cx_v;
+
     integer lane;
 
     // ---- combinational P-wide score partial sum -------------------------------
     // sum over the P products in pass `grp`:  sum_l q[grp*P+l] * k_ji[grp*P+l]
     // copy unpacked elements to plain vectors before use (iverilog X rule).
+    reg [P*32-1:0]    qw, kw, vw;
     reg signed [31:0] q_l;
     reg signed [31:0] k_l;
     reg signed [63:0] sc_part;
-    integer kbase;
 
     // plain-vector scratch for unpacked reads in S_CTX / S_CTX_EMIT
     reg [20:0]        p_v;
@@ -151,36 +157,36 @@ module vec_attn #(
                     end
                 end
 
-                // ---- load q[0..HEAD_DIM-1] ----
+                // ---- load q: HEAD_DIM/P wide words ----
                 S_LD_Q: begin
                     ld_ready <= 1'b1;
                     if (ld_valid) begin
-                        qmem[ld_cnt[6:0]] <= ld_data;
-                        if (ld_cnt == HEAD_DIM-1) begin
+                        qmem[ld_cnt[2:0]] <= ld_data;
+                        if (ld_cnt == NGRP-1) begin
                             ld_cnt <= 16'd0;
                             st     <= S_LD_K;
                         end else ld_cnt <= ld_cnt + 16'd1;
                     end
                 end
 
-                // ---- load K cache: T*HEAD_DIM words ----
+                // ---- load K cache: T*HEAD_DIM/P wide words ----
                 S_LD_K: begin
                     ld_ready <= 1'b1;
                     if (ld_valid) begin
                         kmem[ld_cnt] <= ld_data;
-                        if (ld_cnt == (T*HEAD_DIM) - 1) begin
+                        if (ld_cnt == (T*NGRP) - 1) begin
                             ld_cnt <= 16'd0;
                             st     <= S_LD_V;
                         end else ld_cnt <= ld_cnt + 16'd1;
                     end
                 end
 
-                // ---- load V cache: T*HEAD_DIM words ----
+                // ---- load V cache: T*HEAD_DIM/P wide words ----
                 S_LD_V: begin
                     ld_ready <= 1'b1;
                     if (ld_valid) begin
                         vmem[ld_cnt] <= ld_data;
-                        if (ld_cnt == (T*HEAD_DIM) - 1) begin
+                        if (ld_cnt == (T*NGRP) - 1) begin
                             ld_ready  <= 1'b0;
                             // kick off softmax for T scores
                             sm_tcount <= T;
@@ -188,27 +194,36 @@ module vec_attn #(
                             ji        <= 9'd0;
                             grp       <= 9'd0;
                             score_acc <= 64'sd0;
+                            sc_v      <= 1'b0;
                             st        <= S_SCORE;
                         end else ld_cnt <= ld_cnt + 16'd1;
                     end
                 end
 
                 // ---- score: P-wide accumulate q.k for key ji ----
-                // One adder-tree pass per cycle (NGRP passes), then emit.
+                // 2-stage: lane products registered, adder tree accumulates the
+                // delayed products (one extra cycle per key, multipliers retime to DSPs).
                 S_SCORE: begin
-                    // accumulate P products of pass `grp`
-                    sc_part = 64'sd0;
-                    kbase   = ji*HEAD_DIM + grp*P;
+                    qw   = qmem[(grp < NGRP) ? grp : 9'd0];
+                    kw   = kmem[ji*NGRP + ((grp < NGRP) ? grp : 9'd0)];
                     for (lane = 0; lane < P; lane = lane + 1) begin
-                        q_l     = qmem[grp*P + lane];
-                        k_l     = kmem[kbase + lane];
-                        sc_part = sc_part + ($signed(q_l) * $signed(k_l));
+                        q_l = qw[lane*32 +: 32];
+                        k_l = kw[lane*32 +: 32];
+                        sc_prod[lane] <= $signed(q_l) * $signed(k_l);
                     end
-                    score_acc <= score_acc + sc_part;
-                    if (grp == NGRP-1) begin
-                        grp <= 9'd0;
-                        st  <= S_SCORE_EMIT;
-                    end else grp <= grp + 9'd1;
+                    sc_v <= (grp != NGRP);
+                    if (grp != NGRP) grp <= grp + 9'd1;
+                    if (sc_v) begin
+                        sc_part = 64'sd0;
+                        for (lane = 0; lane < P; lane = lane + 1)
+                            sc_part = sc_part + sc_prod[lane];
+                        score_acc <= score_acc + sc_part;
+                        if (grp == NGRP) begin
+                            grp  <= 9'd0;
+                            sc_v <= 1'b0;
+                            st   <= S_SCORE_EMIT;
+                        end
+                    end
                 end
 
                 // ---- round/sat the score and feed it to softmax ----
@@ -239,8 +254,9 @@ module vec_attn #(
                     end
                     if (sm_done) begin
                         // start ctx: group of P dims, base dim = 0
-                        grp <= 9'd0;
-                        pj  <= 9'd0;
+                        grp  <= 9'd0;
+                        pj   <= 9'd0;
+                        cx_v <= 1'b0;
                         for (lane = 0; lane < P; lane = lane + 1)
                             ctx_acc[lane] <= 96'sd0;
                         st  <= S_CTX;
@@ -248,39 +264,46 @@ module vec_attn #(
                 end
 
                 // ---- ctx: accumulate prob[pj]*v_pj[d] for P dims (d = grp*P+lane) ----
-                // one position pj per cycle; P lanes parallel.
+                // 2-stage: prob*v lane products registered, accumulate one cycle behind.
                 S_CTX: begin
                     // prob[pj] zero-extended (unsigned Q1.20)
-                    p_v  = probmem[pj[4:0]];
+                    p_v  = probmem[(pj < T) ? pj[4:0] : 5'd0];
+                    vw   = vmem[((pj < T) ? pj : 9'd0)*NGRP + grp];
                     for (lane = 0; lane < P; lane = lane + 1) begin
-                        v_l = vmem[pj*HEAD_DIM + grp*P + lane];
-                        ctx_acc[lane] <= ctx_acc[lane]
-                            + ($signed({75'd0, p_v}) * $signed({{64{v_l[31]}}, v_l}));
+                        v_l = vw[lane*32 +: 32];
+                        ctx_prod[lane] <= $signed({75'd0, p_v}) * $signed({{64{v_l[31]}}, v_l});
                     end
-                    if (pj == T-1) begin
-                        pj       <= 9'd0;
-                        emit_idx <= 7'd0;
-                        st       <= S_CTX_EMIT;
-                    end else pj <= pj + 9'd1;
+                    cx_v <= (pj != T);
+                    if (pj != T) pj <= pj + 9'd1;
+                    if (cx_v) begin
+                        for (lane = 0; lane < P; lane = lane + 1)
+                            ctx_acc[lane] <= ctx_acc[lane] + ctx_prod[lane];
+                        if (pj == T) begin
+                            pj       <= 9'd0;
+                            cx_v     <= 1'b0;
+                            emit_idx <= 7'd0;
+                            st       <= S_CTX_EMIT;
+                        end
+                    end
                 end
 
-                // ---- round + emit the P ctx words of this group, one per cycle ----
+                // ---- round + emit ALL P ctx lanes of this group in one cycle ----
                 S_CTX_EMIT: begin
-                    ca_v       = ctx_acc[emit_idx];
-                    ctx_data   <= rsh_round(ca_v, CTX_SH);
-                    ctx_idx    <= (grp*P) + emit_idx;
-                    ctx_valid  <= 1'b1;
-                    if (emit_idx == P-1) begin
-                        if (grp == NGRP-1) begin
-                            st <= S_DONE;
-                        end else begin
-                            grp <= grp + 9'd1;
-                            pj  <= 9'd0;
-                            for (lane = 0; lane < P; lane = lane + 1)
-                                ctx_acc[lane] <= 96'sd0;
-                            st  <= S_CTX;
-                        end
-                    end else emit_idx <= emit_idx + 7'd1;
+                    for (lane = 0; lane < P; lane = lane + 1) begin
+                        ca_v = ctx_acc[lane];
+                        ctx_data[lane*32 +: 32] <= rsh_round(ca_v, CTX_SH);
+                    end
+                    ctx_idx   <= grp[6:0];
+                    ctx_valid <= 1'b1;
+                    if (grp == NGRP-1) begin
+                        st <= S_DONE;
+                    end else begin
+                        grp <= grp + 9'd1;
+                        pj  <= 9'd0;
+                        for (lane = 0; lane < P; lane = lane + 1)
+                            ctx_acc[lane] <= 96'sd0;
+                        st  <= S_CTX;
+                    end
                 end
 
                 S_DONE: begin

@@ -39,4 +39,6 @@ puts "===== OOC sequencer_vec P=$pp LANES=$lanes @ ${period}ns ====="
 report_utilization
 puts "----- timing -----"
 report_timing_summary -max_paths 3 -delay_type max
+# the layers underneath the worst path: worst path per unique endpoint group
+report_timing -max_paths 30 -nworst 1 -unique_pins -file timing_paths.rpt
 puts "OOC_SEQ_VEC_DONE p=$pp lanes=$lanes period=$period"

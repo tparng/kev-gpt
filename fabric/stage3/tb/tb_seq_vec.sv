@@ -81,10 +81,24 @@ module tb;
         $display("TB_DONE tok_out=%0d", tok_out);
         $finish;
     end
-    // progress probe
+    // progress probe + per-state cycle profile (where do the cycles go?)
     integer dbgcyc = 0;
+    integer stcnt [0:31];
+    integer running = 0, k2, fprof;
+    initial for (k2 = 0; k2 < 32; k2 = k2 + 1) stcnt[k2] = 0;
     always @(posedge clk) begin
         dbgcyc = dbgcyc + 1;
+        if (go) running = 1;
+        if (done) begin
+            if (running) begin
+                fprof = $fopen("profile.out", "w");
+                for (k2 = 0; k2 < 32; k2 = k2 + 1)
+                    if (stcnt[k2] > 0) $fwrite(fprof, "%0d %0d\n", k2, stcnt[k2]);
+                $fclose(fprof);
+            end
+            running = 0;
+        end
+        if (running) stcnt[dut.st] = stcnt[dut.st] + 1;
         if (dbgcyc % 100000 == 0)
             $display("[cyc %0d] st=%0d blk=%0d ci=%0d done=%b", dbgcyc, dut.st, dut.blk, dut.ci, done);
     end
