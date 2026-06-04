@@ -49,6 +49,8 @@ LADDER = [
      "attention scalar load + dequant round-trip + Fmax 85->131 STA (17,930 cyc/tok; 166.7 MHz 3/3)"),
     ("+ 3-stage act-quant -> 200 MHz\n(WNS +0.011 closed @125)", 11143.9, "MEASURED",
      "the last sub-8ns path (BRAM->mux->DSP) -> silicon clean at 200 (17,947 cyc/tok 3/3)"),
+    ("+ batch GEMM N=4\n(4 streams share one weight pass)", 16969.3, "MEASURED",
+     "per-stream weight reads (47,144 cyc / 4 tokens @ 200 MHz, 3/3 bit-exact x4)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]

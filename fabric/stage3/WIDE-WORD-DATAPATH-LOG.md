@@ -476,3 +476,16 @@ at update-time bs/b → all land in the LAST stream's slot; runtime-indexed gene
 Fixes: per-stream generate MAC banks + packed concat with constant-base case mux.
 The killer: per-call act-quant streamed across stream switch — the pipeline tail wrote
 xptr 0 of the NEXT stream, shifting all rows by 1 (s3 OK = no successor). G_AQN drain fixed.
+
+**N=4 on silicon (MEASURED): 16,969.3 tok/s aggregate @ 200 MHz, 3/3, all four
+streams bit-exact, CYCLES = 47,144 == sim.** Sweep: 125 → 10,605.8 · 142.9 →
+12,120.9 · 166.7 → 14,141.1 · 200 → 16,969.3. impl WNS +0.012 (74 min).
+
+The fit campaign (192 → 128 BRAM): wsel always@*-copy made Vivado trim the URAM
+read register to 4 bits (weights → 400k LUTRAM); per-lane genvar MAC banks fixed
+the unroll; banks pad to 512 rows; tok embeds → 8 SDP URAM, streamed at boot; pos
+in BRAM; GELU LUT split into even/odd banks (2 lanes per BRAM pair); dq tables in
+LUTRAM. Final: 82k LUT (70%), BRAM 128/144, URAM 64/64 — full house.
+
+Silicon bugs found by the gate ladder: per-stream readback X (drain the dequant
+tail before stream switch), gelu_lut_e/o.mem missing from BD (zeroed GELU table).
