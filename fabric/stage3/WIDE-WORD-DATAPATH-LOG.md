@@ -439,3 +439,18 @@ Next spin: 3-stage act-quant (mux | mult | round) targets WNS ≥ 0 at 8 ns → 
 (11,154 tok/s). BRAM gotcha: the AXI shim pushed 291/288 RAMB18 — pos_emb rows pad to a
 1k-row BRAM tile, so TMAX 64 -> 48 saved nothing; TMAX=32 (= Kevin attention window) freed
 4 tiles -> 283/288 fits.
+
+---
+
+## 13. 10k broken — 11,143.9 tok/s MEASURED @ 200 MHz, 3/3 bit-exact
+
+The last sub-8 ns path was act-quant's BRAM-read -> source-mux -> 64x40 DSP chain. Split into
+3 stages (mux | mult | round/sat): impl closes WNS +0.011 @ 125 MHz - first non-negative build.
+Silicon: **200 MHz, 3/3 bit-exact, CYCLES 17,947 == sim.** PLL steps 1000/N — no fclk between
+166.7 and 200, so the gate is exactly 200 or 9.3k.
+
+**11,143.9 tok/s.** vs targets: 10k cleared with 11% margin. The day: 5,449 -> 6,972 -> 7,968 ->
+9,295 -> 11,144. 14.8x over last week's 752; 8.8x over the laptop ORT best; 1,013x over the A53.
+
+Ceiling: GEMV reads 12.8k URAM words; cycle floor ~12.8k -> 200 MHz = 15.6k single-stream.
+Next: GEMM batch N=2/4/8 (keystroke speculative streams) -> 22k-43k aggregate. ROADMAP-100K.

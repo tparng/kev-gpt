@@ -47,6 +47,8 @@ LADDER = [
      "half the GEMV passes (22,941 cyc/tok; 125 MHz 3/3, breaks 142.9)"),
     ("+ cycle-floor cut + deep pipeline\n(fused RB+DQ+GELU, P-wide attn @166.7MHz)", 9295.4, "MEASURED",
      "attention scalar load + dequant round-trip + Fmax 85->131 STA (17,930 cyc/tok; 166.7 MHz 3/3)"),
+    ("+ 3-stage act-quant -> 200 MHz\n(WNS +0.011 closed @125)", 11143.9, "MEASURED",
+     "the last sub-8ns path (BRAM->mux->DSP) -> silicon clean at 200 (17,947 cyc/tok 3/3)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]
