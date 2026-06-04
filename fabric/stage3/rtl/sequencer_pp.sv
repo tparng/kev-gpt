@@ -191,7 +191,8 @@ module sequencer_pp #(
     reg [1:0]  lnphase [0:1];       // 0 = LN1->QKV, 1 = LN2->FC, 2 = LNF->HEAD
     reg        donef [0:1];
 
-    reg [GSH-1:0] bs;
+    reg [GSH-1:0] bsg [0:1];           // PER-GROUP stream counter (argmax of group A
+                                        // and LN of group B run interleaved)
     reg [10:0] ci, cid;  reg civ;
     reg [$clog2(ROWSM+1)-1:0] fr, frd, orow;  reg frv;
     reg [$clog2(ARROWS+1)-1:0] ar, ard, amd, ad1;
@@ -207,6 +208,7 @@ module sequencer_pp #(
     reg [3:0] lgam;
     integer pp;
 
+    wire [GSH-1:0] bs = bsg[gc];
     wire [8:0] tok_id_b = tok_ids[({gc, bs})*9 +: 9];
     reg [8:0] tok_out_b [0:N-1];
     genvar gtb;
@@ -250,7 +252,7 @@ module sequencer_pp #(
     always @(posedge clk) begin
         ln_start<=1'b0; ln_vin<=1'b0; at_start<=1'b0; at_ldv<=1'b0; done<=1'b0;
         if (rst) begin
-            nl[0]<=NL_IDLE; nl[1]<=NL_IDLE; gc<=0; bs<=0;
+            nl[0]<=NL_IDLE; nl[1]<=NL_IDLE; gc<=0; bsg[0]<=0; bsg[1]<=0;
             g_req[0]<=0; g_req[1]<=0; donef[0]<=0; donef[1]<=0;
             lnphase[0]<=0; lnphase[1]<=0;
             fr<=0; frv<=0; civ<=0; arv<=0; av1<=0; amv<=0;
@@ -258,9 +260,12 @@ module sequencer_pp #(
             if (go) begin
                 nl[0]<=NL_EMB; nl[1]<=NL_EMB; blkg[0]<=0; blkg[1]<=0;
                 lnphase[0]<=0; lnphase[1]<=0; donef[0]<=0; donef[1]<=0;
-                gc<=0; bs<=0; fr<=0; frv<=0;
+                gc<=0; bsg[0]<=0; bsg[1]<=0; fr<=0; frv<=0;
             end
-            if (g_done_p) g_req[g_served] <= 1'b0;
+            if (g_done_p) begin
+                if (gmerge) begin g_req[0] <= 1'b0; g_req[1] <= 1'b0; end
+                else g_req[g_served] <= 1'b0;
+            end
 
             case (nl[gc])
                 NL_IDLE: ;
@@ -275,8 +280,8 @@ module sequencer_pp #(
                         if (frd==ROWS-1) begin
                             fr<=0; frv<=0;
                             if (bs == G-1) begin
-                                bs<=0; lgam<=blkg[gc]*2; nl[gc]<=NL_LGAM;
-                            end else bs <= bs + 1'b1;
+                                bsg[gc]<=0; lgam<=blkg[gc]*2; nl[gc]<=NL_LGAM;
+                            end else bsg[gc] <= bs + 1'b1;
                         end
                     end
                 end
@@ -297,13 +302,13 @@ module sequencer_pp #(
                         else                   lnout1_bank[sN + orow] <= ww;
                         if (orow==ROWS-1) begin
                             if (bs == G-1) begin
-                                bs<=0;
+                                bsg[gc]<=0;
                                 case (lnphase[gc])
                                     2'd0: nl[gc] <= NL_QKV;
                                     2'd1: nl[gc] <= NL_FC;
                                     default: nl[gc] <= NL_HEAD;
                                 endcase
-                            end else begin bs<=bs+1'b1; nl[gc]<=NL_LGAM; end
+                            end else begin bsg[gc]<=bs+1'b1; nl[gc]<=NL_LGAM; end
                         end else orow<=orow+1'b1;
                     end
                 end
@@ -314,7 +319,7 @@ module sequencer_pp #(
                     d_dqrow[gc]<=blkg[gc]*DQB_P + DR_QKV[11:0]; d_dst[gc]<=3'd0;
                     g_req[gc]<=1'b1; nl[gc]<=NL_WQKV; gc<=~gc;
                 end
-                NL_WQKV: if (!g_req[gc]) begin hh<=0; bs<=0; nl[gc] <= NL_AST; end
+                NL_WQKV: if (!g_req[gc]) begin hh<=0; bsg[gc]<=0; nl[gc] <= NL_AST; end
                          else gc <= ~gc;
                 NL_AST: begin
                     at_start<=1'b1; at_tcount<=9'd1; wi<=9'd0; wic<=9'd0; nl[gc]<=NL_ALD;
@@ -332,8 +337,8 @@ module sequencer_pp #(
                         ctxv_bank[sN + hh*HR + at_ctxidx] <= at_ctxdata;
                     if (at_done) begin
                         if (hh==NHEAD-1) begin
-                            if (bs == G-1) begin bs<=0; hh<=0; nl[gc]<=NL_PROJ; end
-                            else begin bs<=bs+1'b1; hh<=0; nl[gc]<=NL_AST; end
+                            if (bs == G-1) begin bsg[gc]<=0; hh<=0; nl[gc]<=NL_PROJ; end
+                            else begin bsg[gc]<=bs+1'b1; hh<=0; nl[gc]<=NL_AST; end
                         end else begin hh<=hh+2'd1; nl[gc]<=NL_AST; end
                     end
                 end
@@ -356,8 +361,8 @@ module sequencer_pp #(
                         if (cid==ROWS-1) begin
                             ci<=0; civ<=0;
                             if (bs == G-1) begin
-                                bs<=0; lnphase[gc]<=2'd1; lgam<=blkg[gc]*2 + 4'd1; nl[gc]<=NL_LGAM;
-                            end else bs<=bs+1'b1;
+                                bsg[gc]<=0; lnphase[gc]<=2'd1; lgam<=blkg[gc]*2 + 4'd1; nl[gc]<=NL_LGAM;
+                            end else bsg[gc]<=bs+1'b1;
                         end
                     end
                 end
@@ -388,14 +393,14 @@ module sequencer_pp #(
                         if (cid==ROWS-1) begin
                             ci<=0; civ<=0;
                             if (bs == G-1) begin
-                                bs<=0;
+                                bsg[gc]<=0;
                                 if (blkg[gc] == NLAYER-1) begin
                                     lnphase[gc]<=2'd2; lgam<=NLAYER*2; nl[gc]<=NL_LGAM;
                                 end else begin
                                     blkg[gc]<=blkg[gc]+1'b1; lnphase[gc]<=2'd0;
                                     lgam<=(blkg[gc]+1'b1)*2; nl[gc]<=NL_LGAM;
                                 end
-                            end else bs<=bs+1'b1;
+                            end else bsg[gc]<=bs+1'b1;
                         end
                     end
                 end
@@ -449,10 +454,10 @@ module sequencer_pp #(
                 end
                 NL_ARG2: begin
                     if (bs == G-1) begin
-                        bs<=0; donef[gc]<=1'b1; nl[gc]<=NL_DONE;
+                        bsg[gc]<=0; donef[gc]<=1'b1; nl[gc]<=NL_DONE;
                         if (donef[~gc]) done<=1'b1;
                     end else begin
-                        bs<=bs+1'b1;
+                        bsg[gc]<=bs+1'b1;
                         best_val<=32'sh80000000; best_idx<=0;
                         ar<=0; arv<=0; av1<=0; amv<=0; nl[gc]<=NL_ARG;
                     end
@@ -469,14 +474,14 @@ module sequencer_pp #(
     //                       GEMM ENGINE
     // ================================================================
     reg                gv_ldrst, gv_xrst, gv_xwe, gv_start;
-    reg  [GSH-1:0]     gv_xstream, gv_rdstream;
+    reg  [$clog2(N)-1:0] gv_xstream, gv_rdstream;
     reg  [P*8-1:0]     gv_xdata;
     reg [10:0]         gv_m, gv_k;
     reg [$clog2(WWORDS)-1:0] gv_wbase;
     wire               gv_done;
     reg [10:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
-    gemm_banked_resident_vec #(.LANES(LANES), .N(G), .P(P), .MMAX(1024), .KMAX(1024),
+    gemm_banked_resident_vec #(.LANES(LANES), .N(N), .P(P), .MMAX(1024), .KMAX(1024),
                   .RLAT(2), .WWORDS(WWORDS)) u_gemm (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
@@ -506,6 +511,7 @@ module sequencer_pp #(
 
     // active call context
     reg        ggrp;
+    reg        gmerge;                  // both groups share this pass
     reg [19:0] a_wbase;
     reg [10:0] a_m, a_k;
     reg [1:0]  a_asrc;
@@ -514,8 +520,9 @@ module sequencer_pp #(
     reg [11:0] a_dqrow;
     reg [2:0]  a_dst;
     wire g_served = ggrp;
+    wire [$clog2(N)-1:0] glim = gmerge ? N-1 : G-1;
 
-    reg [GSH-1:0] gbs;
+    reg [$clog2(N)-1:0] gbs;            // stream over ALL N (single-pass GEMM)
     reg [10:0] gci, gcid, gcid1, gcid2;
     reg        gciv, gciv1, gciv2;
     reg [2:0]  grbn;
@@ -536,10 +543,12 @@ module sequencer_pp #(
     reg [$clog2(ROWSM+1)-1:0] gdor, gor;
     integer gp;
 
-    wire [10:0] sG  = {ggrp, gbs} * ROWS;
-    wire [10:0] sG3 = {ggrp, gbs} * ROWS3;
-    wire [10:0] sGM = {ggrp, gbs} * ROWSM;
-    wire [10:0] sGA = {ggrp, gbs} * ARROWS;
+    // merged: gbs covers all N streams; single: ggrp's G streams
+    wire [$clog2(N)-1:0] sid = gmerge ? gbs : {ggrp, gbs[GSH-1:0]};
+    wire [10:0] sG  = sid * ROWS;
+    wire [10:0] sG3 = sid * ROWS3;
+    wire [10:0] sGM = sid * ROWSM;
+    wire [10:0] sGA = sid * ARROWS;
 
     localparam [2:0] GE_IDLE=0, GE_AQ=1, GE_AQN=2, GE_RUN=3, GE_WAIT=4, GE_RB=5, GE_RBN=6;
     reg [2:0] ge;
@@ -557,8 +566,8 @@ module sequencer_pp #(
         ewr      <= dqe_w[a_dqrow + rb1];
     end
 
-    assign rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == G-1)
-                                     : (dq_vout && gdor == ((a_m + P-1) >> LSH) - 1 && gbs == G-1);
+    assign rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == glim)
+                                     : (dq_vout && gdor == ((a_m + P-1) >> LSH) - 1 && gbs == glim);
     assign g_done_p = (ge == GE_RB) && rb_last;
 
     always @(posedge clk) begin
@@ -569,7 +578,21 @@ module sequencer_pp #(
         end else begin
             case (ge)
                 GE_IDLE: begin
-                    if (g_req[0] || g_req[1]) begin
+                    // SINGLE PASS: wait for BOTH groups to request the SAME call
+                    // (descriptors must match — NL groups run in near-lockstep but
+                    // attention serialization can put A a phase ahead of B), then
+                    // serve all 8 streams from one weight pass.
+                    if (g_req[0] && g_req[1] && d_wbase[0] == d_wbase[1]) begin
+                        gmerge  <= 1'b1;  ggrp <= 1'b0;
+                        a_wbase <= d_wbase[0]; a_m <= d_m[0]; a_k <= d_k[0];
+                        a_asrc  <= d_asrc[0];  a_asel <= d_asel[0];
+                        a_frac  <= d_frac[0];  a_dqrow <= d_dqrow[0];
+                        a_dst   <= d_dst[0];
+                        gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
+                        gv_ldrst<=1'b1; ge<=GE_AQ;
+                    end else if (g_req[0] || g_req[1]) begin
+                        // groups desynced (attention serialization): serve one alone
+                        gmerge  <= 1'b0;
                         ggrp    <= g_req[0] ? 1'b0 : 1'b1;
                         a_wbase <= g_req[0] ? d_wbase[0] : d_wbase[1];
                         a_m     <= g_req[0] ? d_m[0]     : d_m[1];
@@ -632,10 +655,10 @@ module sequencer_pp #(
                             if (aq_int>127) aq_int=127; if (aq_int<-128) aq_int=-128;
                             aqw[gp*8 +: 8] = aq_int[7:0];
                         end
-                        gv_xwe<=1'b1; gv_xdata<=aqw; gv_xstream<=gbs;
+                        gv_xwe<=1'b1; gv_xdata<=aqw; gv_xstream<=sid;
                         if (gcid2==(a_k >> LSH)-1) begin
                             gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
-                            if (gbs == G-1) begin gbs<=0; ge<=GE_RUN; end
+                            if (gbs == glim) begin gbs<=0; ge<=GE_RUN; end
                             else begin grbn<=0; ge<=GE_AQN; end
                         end
                     end
@@ -683,7 +706,7 @@ module sequencer_pp #(
                         endcase
                         if (a_dst != 3'd2 && gdor==((a_m + P-1) >> LSH)-1) begin
                             gci<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
-                            if (gbs == G-1) begin gbs<=0; ge<=GE_IDLE; end
+                            if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end
                             else begin grbn<=0; ge<=GE_RBN; end
                         end else gdor<=gdor+1'b1;
                     end
@@ -692,7 +715,7 @@ module sequencer_pp #(
 
                         if (gor==ROWSM-1) begin
                             gci<=0; gor<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
-                            if (gbs == G-1) begin gbs<=0; ge<=GE_IDLE; end
+                            if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end
                             else begin grbn<=0; ge<=GE_RBN; end
                         end else gor<=gor+1'b1;
                     end
@@ -700,7 +723,7 @@ module sequencer_pp #(
                 GE_RBN: begin
                     grbn <= grbn + 1'b1;
                     if (grbn == 3'd7) begin
-                        gbs<=gbs+1'b1; gv_rdstream<=gbs+1'b1; ge<=GE_RB;
+                        gbs<=gbs+1'b1; gv_rdstream<=gmerge ? gbs+1'b1 : {ggrp, gbs[GSH-1:0]+1'b1}; ge<=GE_RB;
                     end
                 end
                 default: ge<=GE_IDLE;

@@ -1,51 +1,50 @@
 // -----------------------------------------------------------------------------
-// gemm_banked_resident_vec — gemv_banked_resident_vec with N BATCH STREAMS.
+// gemm_dsp_resident_vec — gemm_banked_resident_vec with DSP-PACKED MAC banks.
 //
-// One resident weight word read per cycle feeds N MAC banks: each stream MACs
-// the same LANES nibbles against ITS OWN activation lane. Weight bandwidth is
-// shared — N tokens per pass — the lever from 11k tok/s single-stream to 33k+.
+// WP487 weight-packing, adapted to INT4 weights x INT8 activations: each DSP
+// multiplies TWO weight nibbles (wpak in the wide port at a 24-bit gap, each
+// biased +8 to make it non-negative) by ONE INT8 activation:
 //
-// Boundary (per stream): act feed P INT8/cycle (x_we; x_stream selects, x_rst
-// rewinds the row pointer); readback P INT32/cycle (rd_stream + rd_addr; same
-// 2-cycle latency). Per-stream activations / outputs are SEGMENTED:
-//     xmem row  = stream*XROWS  + r        (P INT8 lanes per row)
-//     ymem word = stream*GROUPS + g        (LANES INT32 per group word)
+//     wpak  = (w0 + 8)  +  (w1 + 8) << 24            (both in 0..15)
+//     product = wpak * act        (signed 18-bit port; product < 2^40)
+//     acc(48b)+= product             - up to 4096 accumulations, no overlap
 //
-// MAC: per cycle, N x LANES INT4xINT8 products into N accumulator banks.
-// Bit-exact per stream vs the proven single-stream MAC: same adds in the same
-// order within each stream, no cross-stream arithmetic.
+// After the run, lane sums are recovered EXACTLY (integers):
+//     y0 = acc[23:0] - 8*sum_act     (mod 2^24; |y0| < 2^21 - unambiguous)
+//     y1 = (acc >> 24) - carry - 8*sum_act
+//          carry = (y0 + 8*sum_act) >> 24
 //
-// iverilog: variable +: part-selects only on plain-reg copies.
+// sum_act is per stream per group. 2 MAC/DSP/cycle; LANES nibbles cost
+// LANES/2 DSPs per stream. The whole core is bit-exact vs the LUT MAC core
+// (same adds in the same order; bias-correction is exact integer algebra).
+//
+// Boundary, weight loader and ymem layout identical to gemm_banked_resident_vec.
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
-module gemm_banked_resident_vec #(
-    parameter integer LANES  = 128,       // PE lanes = nibbles per wide word (pow2)
-    parameter integer N      = 4,         // batch streams
-    parameter integer P      = 8,         // boundary width (P divides LANES, KMAX, MMAX)
-    parameter integer MMAX   = 1024,      // max output rows of any single layer
-    parameter integer KMAX   = 1024,      // max reduction length of any single layer
-    parameter integer WWORDS = 25600,     // resident capacity in wide words
-    parameter integer RLAT   = 2          // read->mac pipeline depth (cycles)
+module gemm_dsp_resident_vec #(
+    parameter integer LANES  = 128,       // PE lanes (pow2)
+    parameter integer N      = 8,         // batch streams
+    parameter integer P      = 8,
+    parameter integer MMAX   = 1024,
+    parameter integer KMAX   = 1024,
+    parameter integer WWORDS = 25600,
+    parameter integer RLAT   = 2
 ) (
     input  wire                          clk,
     input  wire                          rst,
     input  wire [$clog2(MMAX+1)-1:0]     m_count,
     input  wire [$clog2(KMAX+1)-1:0]     k_count,
     input  wire [$clog2(WWORDS)-1:0]     w_base,
-    // one-time load: 32-bit chunks assembled into LANES*4-bit wide words
     input  wire                          ld_rst,
     input  wire                          w_we,
     input  wire [31:0]                   w_data,
-    // per-call activation: P INT8 lanes per write into stream x_stream
-    input  wire                          x_rst,        // rewind act row pointer
+    input  wire                          x_rst,
     input  wire                          x_we,
     input  wire [$clog2(N)-1:0]          x_stream,
     input  wire [P*8-1:0]                x_data,
-    // run (all N streams together)
     input  wire                          start,
     output reg                           done,
-    // readback: P INT32 of stream rd_stream per address (2-cycle latency)
     input  wire [$clog2(N)-1:0]          rd_stream,
     input  wire [$clog2(MMAX/P)-1:0]     rd_addr,
     output reg  [P*32-1:0]               y_out
@@ -59,16 +58,14 @@ module gemm_banked_resident_vec #(
     localparam integer XROWS  = KMAX / P;
     localparam integer SUBW   = WBITS / 32;
     localparam integer SSW    = (SUBW > 1) ? $clog2(SUBW) : 1;
+    localparam integer BANKW  = (WBITS > 512) ? 72 : WBITS;
+    localparam integer NB     = (WBITS + BANKW - 1) / BANKW;
+    localparam integer WPAD   = NB * BANKW;
 
-    // URAM-native banking (72b) only needed above 512 bits; L=128 keeps 512b word.
-    localparam integer BANKW = (WBITS > 512) ? 72 : WBITS;
-    localparam integer NB    = (WBITS + BANKW - 1) / BANKW;
-    localparam integer WPAD  = NB * BANKW;
+    reg [P*8-1:0]    xmem [0:N*XROWS-1];
+    reg [YBITS-1:0]  ymem [0:N*GROUPS-1];
 
-    reg [P*8-1:0]    xmem [0:N*XROWS-1];     // stream b rows at b*XROWS
-    reg [YBITS-1:0]  ymem [0:N*GROUPS-1];    // stream b group g at b*GROUPS+g
-
-    // ---- one-time load: assemble SUBW chunks -> commit all banks in one shot ----
+    // ---- one-time load (identical to the LUT core) -----------------------------
     reg [WAW-1:0]    wword;
     reg [SSW-1:0]    wsub;
     reg [WBITS-1:0]  wbuf;
@@ -94,7 +91,6 @@ module gemm_banked_resident_vec #(
         end
     end
 
-    // ---- per-bank URAM arrays + registered read (= pipeline stage 0) ------------
     wire [$clog2(WWORDS)-1:0] waddr;
     wire [WPAD-1:0] wword_pad;
     wire [WBITS-1:0] wword_rd = wword_pad[WBITS-1:0];
@@ -111,23 +107,20 @@ module gemm_banked_resident_vec #(
         end
     endgenerate
 
-    // ---- run FSM + RLAT-deep read/mac pipeline -------------------------------
-    localparam [1:0] IDLE = 2'd0, RUN = 2'd1, DRAIN = 2'd3, FIN = 2'd2;
-    reg [1:0]            state;
+    // ---- run FSM ----------------------------------------------------------------
+    localparam [2:0] IDLE = 3'd0, RUN = 3'd1, DRAIN = 3'd3, FIN = 3'd2, SETTLE = 3'd4;
+    reg [2:0]            state;
+    reg [1:0]            settle;
     reg [$clog2(GROUPS):0] g;
     reg [$clog2(KMAX):0] kc, kmac;
     reg [WAW-1:0]        grp_base;
-    reg [$clog2(N):0]    db;                 // ymem drain stream counter
-    reg                  acc_clr;            // broadcast accumulator clear
+    reg [$clog2(N):0]    db;
+    reg                  acc_clr;
 
     wire [$clog2(GROUPS):0] gcount = (m_count + LANES - 1) >> LSH;
     wire                 issue   = (kc < k_count);
     assign               waddr   = grp_base + kc;
 
-    // pipeline: weight word (stage 0 = the per-bank URAM read reg) + acts + valid.
-    // Per-stream act rows are SEPARATE 2D arrays — a variable-base part-select
-    // NBA write (xrow_p[0][b*W +: W] <=) is an iverilog trap: the base is
-    // evaluated at update time, all N writes land in the LAST stream's slot.
     reg [WBITS-1:0]      word_p [0:RLAT-2];
     reg [P*8-1:0]        xrow_p [0:RLAT-1][0:N-1];
     reg [LSHP-1:0]       xl_p   [0:RLAT-1];
@@ -135,34 +128,50 @@ module gemm_banked_resident_vec #(
     integer i, b;
 
     wire                 mac_v = v_p[RLAT-1];
+    wire [WBITS-1:0]     wsel = word_p[RLAT-2];
 
-    // ---- N MAC banks (generate: each accumulator is its own plain reg, so the
-    // per-lane variable part-select hits a PLAIN reg, never an array element —
-    // accb[b][L*32 +: 32] reads/writes X under iverilog). wsel must be a WIRE:
-    // an always@* copy made Vivado trim the URAM read register to 4 bits and
-    // fall back to ~400k LUTRAM.
-    wire [WBITS-1:0] wsel = word_p[RLAT-2];
-    // per-stream wires: one flat N*YBITS concat wraps iverilog's 16-bit index
-    // space at stream 4 (bit 16384) � streams 4..7 would read stream 0..3.
+    // ---- N DSP-PACKED MAC banks --------------------------------------------------
+    // Each genvar lane pair (gl, gl+1) of stream gm is ONE DSP:
+    //   wpak = (w[gl]+8) + (w[gl+1]+8) << 24, product = wpak * act (signed)
+    //   acc accumulates the wpak sums; recovery happens at DRAIN with sum_act.
+    // one wire vector per stream � a flat N*YBITS concat crosses iverilog's
+    // 16-bit part-select index space at stream 4 (bit 16384), silently wrapping
     wire [YBITS-1:0] acc_str [0:N-1];
+    reg  [YBITS-1:0] y_lat [0:N-1];     // recovered outputs latched at SETTLE end
     reg  [YBITS-1:0] acc_sel;
     genvar gm, gl;
     generate
         for (gm = 0; gm < N; gm = gm + 1) begin : g_mac
-            // stream act lane (shared by this stream's LANES MACs) — combinational
             wire [P*8-1:0]    xrow = xrow_p[RLAT-1][gm];
-            wire signed [7:0] xsel = xrow[xl_p[RLAT-1]*8 +: 8];
-            // one accumulator per lane: all weight indexing is genvar-CONSTANT —
-            // a runtime-L loop made Vivado fail to unroll and trim wsel to 4 bits
-            // (the URAM read died, weights fell back to ~400k LUTRAM).
-            for (gl = 0; gl < LANES; gl = gl + 1) begin : g_lane
-                reg signed [31:0] accL;
+            wire signed [8:0] xsel = $signed(xrow[xl_p[RLAT-1]*8 +: 8]);
+            // per-stream sum of activations (for the +8 bias correction)
+            reg signed [22:0] sum_act;
+            always @(posedge clk) begin
+                if (rst || acc_clr) sum_act <= 23'sd0;
+                else if (mac_v)     sum_act <= sum_act + xsel;
+            end
+            for (gl = 0; gl < LANES; gl = gl + 2) begin : g_dsp
+                // wpak unsigned weights: (w0+8) lives in bits 3:0, (w1+8) at 27:24
+                wire [3:0]  w0 = wsel[gl*4 +: 4]    ^ 4'h8;     // +8 bias
+                wire [3:0]  w1 = wsel[(gl+1)*4 +: 4] ^ 4'h8;
+                wire [27:0] wpak = {w1, 20'b0, w0};
+                reg signed [47:0] acc;
                 always @(posedge clk) begin
-                    if (rst || acc_clr) accL <= 32'sd0;
+                    if (rst || acc_clr) acc <= 48'sd0;
                     else if (mac_v)
-                        accL <= accL + $signed(wsel[gl*4 +: 4]) * xsel;
+                        acc <= acc + $signed({1'b0, wpak}) * xsel;
                 end
-                assign acc_str[gm][gl*32 +: 32] = accL;
+                // recovery: y0 = (acc_lo - 8*sum_act) mod 2^24 (|y0| < 2^21 so the
+                // 24-bit window is unambiguous); carry = (y0 + 8*sum_act) >> 24;
+                // y1 = acc_hi - 8*sum_act - carry. Exact integer algebra.
+                wire signed [25:0] sa8   = {sum_act, 3'b000};               // 8*sum_act
+                wire [23:0]        y0m   = acc[23:0] - sa8[23:0];           // mod 2^24
+                wire signed [31:0] y0    = {{8{y0m[23]}}, y0m};
+                wire signed [27:0] hsum  = y0 + sa8;
+                wire signed [3:0]  carry = hsum >>> 24;
+                wire signed [31:0] y1    = $signed(acc[47:24]) - sa8 - carry;
+                assign acc_str[gm][gl*32 +: 32]     = y0;
+                assign acc_str[gm][(gl+1)*32 +: 32] = y1;
             end
         end
     endgenerate
@@ -203,18 +212,21 @@ module gemm_banked_resident_vec #(
                 RUN: begin
                     if (issue) kc <= kc + 1'b1;
                     if (mac_v) kmac <= kmac + 1'b1;
-                    if (kmac == k_count) begin db <= 0; state <= DRAIN; end
+                    // settle: sum_act/acc must be FULLY drained before recovery —
+                    // streams drained late would otherwise see trailing MAC terms
+                    if (kmac == k_count) begin db <= 0; settle <= 0; state <= SETTLE; end
                 end
-                DRAIN: begin                  // one stream's group word per cycle
-                    // acc_str is a generate-wire array: CONSTANT indices only
-                    acc_sel = (N > 4)
-                        ? (db[2] ? (db[1] ? (db[0] ? acc_str[N-1] : acc_str[N-2])
-                                          : (db[0] ? acc_str[N-3] : acc_str[N-4]))
-                                 : (db[1] ? (db[0] ? acc_str[3] : acc_str[2])
-                                          : (db[0] ? acc_str[1] : acc_str[0])))
-                        : (db[1] ? (db[0] ? acc_str[N > 3 ? 3 : 0] : acc_str[N > 2 ? 2 : 0])
-                                 : (db[0] ? acc_str[N > 1 ? 1 : 0] : acc_str[0]));
-                    ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= acc_sel;
+                SETTLE: begin
+                    settle <= settle + 1'b1;
+                    if (settle == 2'd3) begin
+                        for (b = 0; b < N; b = b + 1)
+                            y_lat[b] <= acc_str[b];     // genvar-built wires; constant unroll
+                        state <= DRAIN;
+                    end
+                end
+                DRAIN: begin
+                    // reg-array runtime index is safe; recovery was latched at SETTLE
+                    ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= y_lat[db];
                     if (db == N-1) begin
                         acc_clr <= 1'b1;
                         if (g == gcount - 1) state <= FIN;
@@ -232,8 +244,8 @@ module gemm_banked_resident_vec #(
         end
     end
 
-    // ---- readback: P consecutive outputs of one stream per address (2-cycle) --
-    localparam integer PPG = LANES / P;            // P-groups per ymem word
+    // ---- readback ---------------------------------------------------------------
+    localparam integer PPG = LANES / P;
     reg [YBITS-1:0]        rd_word;
     reg [$clog2(PPG)-1:0]  rd_off;
     always @(posedge clk) begin
