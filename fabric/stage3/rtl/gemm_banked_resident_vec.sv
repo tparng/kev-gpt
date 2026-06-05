@@ -112,8 +112,9 @@ module gemm_banked_resident_vec #(
     endgenerate
 
     // ---- run FSM + RLAT-deep read/mac pipeline -------------------------------
-    localparam [1:0] IDLE = 2'd0, RUN = 2'd1, DRAIN = 2'd3, FIN = 2'd2;
-    reg [1:0]            state;
+    localparam [2:0] IDLE = 3'd0, RUN = 3'd1, DRAIN = 3'd3, FIN = 3'd2, SETTLE = 3'd4;
+    reg [2:0]            state;
+    reg [1:0]            settle;
     reg [$clog2(GROUPS):0] g;
     reg [$clog2(KMAX):0] kc, kmac;
     reg [WAW-1:0]        grp_base;
@@ -144,7 +145,13 @@ module gemm_banked_resident_vec #(
     wire [WBITS-1:0] wsel = word_p[RLAT-2];
     // per-stream wires: one flat N*YBITS concat wraps iverilog's 16-bit index
     // space at stream 4 (bit 16384) ï¿½ streams 4..7 would read stream 0..3.
-    wire [YBITS-1:0] acc_str [0:N-1];
+`ifdef SYNTHESIS
+    wire [N*YBITS-1:0] acc_cat;          // packed concat — Vivado fails URAM
+                                         // inference with unpacked wire arrays
+`else
+    wire [YBITS-1:0] acc_str [0:N-1];    // iverilog wraps >16k part-selects
+`endif
+    reg  [YBITS-1:0] y_lat [0:N-1];     // outputs latched at SETTLE (constant unroll)
     reg  [YBITS-1:0] acc_sel;
     genvar gm, gl;
     generate
@@ -162,7 +169,11 @@ module gemm_banked_resident_vec #(
                     else if (mac_v)
                         accL <= accL + $signed(wsel[gl*4 +: 4]) * xsel;
                 end
-                assign acc_str[gm][gl*32 +: 32] = accL;
+    `ifdef SYNTHESIS
+            assign acc_cat[gm*YBITS + gl*32 +: 32] = accL;
+`else
+            assign acc_str[gm][gl*32 +: 32] = accL;
+`endif
             end
         end
     endgenerate
@@ -203,18 +214,35 @@ module gemm_banked_resident_vec #(
                 RUN: begin
                     if (issue) kc <= kc + 1'b1;
                     if (mac_v) kmac <= kmac + 1'b1;
-                    if (kmac == k_count) begin db <= 0; state <= DRAIN; end
+                    if (kmac == k_count) begin db <= 0; settle <= 0; state <= SETTLE; end
+                end
+                SETTLE: begin
+                    // 4-cycle settle keeps sim/synth cycle counts identical; the
+                    // sim branch also uses it to latch outputs into y_lat
+                    settle <= settle + 1'b1;
+                    if (settle == 2'd3) begin
+`ifndef SYNTHESIS
+                        for (b = 0; b < N; b = b + 1)
+                            y_lat[b] <= acc_str[b];
+`endif
+                        state <= DRAIN;
+                    end
                 end
                 DRAIN: begin                  // one stream's group word per cycle
-                    // acc_str is a generate-wire array: CONSTANT indices only
+`ifdef SYNTHESIS
+                    // packed concat + constant mux tree: the only encoding
+                    // Vivado accepts WITHOUT killing the URAM weight banks
                     acc_sel = (N > 4)
-                        ? (db[2] ? (db[1] ? (db[0] ? acc_str[N-1] : acc_str[N-2])
-                                          : (db[0] ? acc_str[N-3] : acc_str[N-4]))
-                                 : (db[1] ? (db[0] ? acc_str[3] : acc_str[2])
-                                          : (db[0] ? acc_str[1] : acc_str[0])))
-                        : (db[1] ? (db[0] ? acc_str[N > 3 ? 3 : 0] : acc_str[N > 2 ? 2 : 0])
-                                 : (db[0] ? acc_str[N > 1 ? 1 : 0] : acc_str[0]));
-                    ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= acc_sel;
+                        ? (db[2] ? (db[1] ? (db[0] ? acc_cat[(N-1)*YBITS +: YBITS] : acc_cat[(N-2)*YBITS +: YBITS])
+                                          : (db[0] ? acc_cat[(N-3)*YBITS +: YBITS] : acc_cat[(N-4)*YBITS +: YBITS]))
+                                 : (db[1] ? (db[0] ? acc_cat[3*YBITS +: YBITS] : acc_cat[2*YBITS +: YBITS])
+                                          : (db[0] ? acc_cat[1*YBITS +: YBITS] : acc_cat[0*YBITS +: YBITS])))
+                        : (db[1] ? (db[0] ? acc_cat[(N>3 ? 3:0)*YBITS +: YBITS] : acc_cat[(N>2 ? 2:0)*YBITS +: YBITS])
+                                 : (db[0] ? acc_cat[(N>1 ? 1:0)*YBITS +: YBITS] : acc_cat[0*YBITS +: YBITS]));
+    ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= acc_sel;
+`else
+                    ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= y_lat[db];
+`endif
                     if (db == N-1) begin
                         acc_clr <= 1'b1;
                         if (g == gcount - 1) state <= FIN;

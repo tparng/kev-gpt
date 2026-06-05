@@ -136,7 +136,12 @@ module gemm_dsp_resident_vec #(
     //   acc accumulates the wpak sums; recovery happens at DRAIN with sum_act.
     // one wire vector per stream ï¿½ a flat N*YBITS concat crosses iverilog's
     // 16-bit part-select index space at stream 4 (bit 16384), silently wrapping
-    wire [YBITS-1:0] acc_str [0:N-1];
+`ifdef SYNTHESIS
+    wire [N*YBITS-1:0] acc_cat;          // packed concat — Vivado fails URAM
+                                         // inference with unpacked wire arrays
+`else
+    wire [YBITS-1:0] acc_str [0:N-1];    // iverilog wraps >16k part-selects
+`endif
     reg  [YBITS-1:0] y_lat [0:N-1];     // recovered outputs latched at SETTLE end
     reg  [YBITS-1:0] acc_sel;
     genvar gm, gl;
@@ -170,8 +175,13 @@ module gemm_dsp_resident_vec #(
                 wire signed [27:0] hsum  = y0 + sa8;
                 wire signed [3:0]  carry = hsum >>> 24;
                 wire signed [31:0] y1    = $signed(acc[47:24]) - sa8 - carry;
+`ifdef SYNTHESIS
+                assign acc_cat[gm*YBITS + gl*32 +: 32]     = y0;
+                assign acc_cat[gm*YBITS + (gl+1)*32 +: 32] = y1;
+`else
                 assign acc_str[gm][gl*32 +: 32]     = y0;
                 assign acc_str[gm][(gl+1)*32 +: 32] = y1;
+`endif
             end
         end
     endgenerate
@@ -220,7 +230,11 @@ module gemm_dsp_resident_vec #(
                     settle <= settle + 1'b1;
                     if (settle == 2'd3) begin
                         for (b = 0; b < N; b = b + 1)
-                            y_lat[b] <= acc_str[b];     // genvar-built wires; constant unroll
+`ifdef SYNTHESIS
+                            y_lat[b] <= acc_cat[b*YBITS +: YBITS];
+`else
+                            y_lat[b] <= acc_str[b];
+`endif
                         state <= DRAIN;
                     end
                 end
