@@ -27,6 +27,10 @@ module sequencer_pp #(
     parameter integer LANES = 128,
     parameter integer N     = 8,        // total streams (= 2 groups of G)
     parameter integer G     = 4,        // streams per group
+    parameter integer ND    = 0,        // DSP-packed GEMM streams (of the N)
+    parameter integer GWAIT = 2048,     // merge patience: cycles to hold a lone
+                                        // request hoping the partner group asks
+                                        // for the same pass (then serve solo)
     parameter integer VOCAB = 193,
     parameter integer TMAX  = 32,
     parameter integer GAMMA_N = 9,
@@ -80,7 +84,13 @@ module sequencer_pp #(
     localparam integer ARROWS  = (VOCAB + P - 1)/P;
     localparam integer EROWS   = D / P;
     localparam integer HR      = HEAD_DIM / P;
-    localparam integer BD      = 1024;      // bank depth (N * ROWSM rows worst case)
+    // per-bank depths, stride-tight (the strides always were: sN = stream*ROWS
+    // etc.) — a uniform BD=1024 wasted tiles: a 512-deep x 256b bank maps to 4
+    // RAMB36 (512x72 mode) vs 7.5 at 1K and 15 at 2K. Sized exactly by N.
+    localparam integer BD_S = N * ROWS;     // xres/lnout/attn/mlp/ctxv (32/stream)
+    localparam integer BD_H = N * ARROWS;   // head logits (25/stream)
+    localparam integer BD_Q = N * ROWS3;    // qkv (96/stream)
+    localparam integer BD_M = N * ROWSM;    // mlpbuf (128/stream)
 
     // ---- shared ROMs ------------------------------------------------------------
     localparam integer EMB_ROWS = (VOCAB + TMAX) * EROWS;
@@ -124,15 +134,15 @@ module sequencer_pp #(
     // One writing engine + one reading engine each; groups are disjoint.
     // LN outputs are Q.22 with |y| < 2^26 -> 32-bit lanes; GELU hidden is Q4.12
     // sat16 -> 16-bit lanes. Sign-extend on the GEMM side to Q.22.
-    (* ram_style = "block" *) reg [P*32-1:0] xres_bank  [0:BD-1];
-    (* ram_style = "block" *) reg [P*32-1:0] lnout1_bank[0:BD-1];
-    (* ram_style = "block" *) reg [P*32-1:0] lnout2_bank[0:BD-1];
-    (* ram_style = "block" *) reg [P*32-1:0] qkv_bank   [0:BD-1];
-    (* ram_style = "block" *) reg [P*32-1:0] ctxv_bank  [0:BD-1];
-    (* ram_style = "block" *) reg [P*32-1:0] attn_bank  [0:BD-1];
-    (* ram_style = "block" *) reg [P*16-1:0] mlpbuf_bank[0:BD-1];
-    (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:BD-1];
-    (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:BD-1];
+    (* ram_style = "block" *) reg [P*32-1:0] xres_bank  [0:BD_S-1];
+    (* ram_style = "block" *) reg [P*32-1:0] lnout1_bank[0:BD_S-1];
+    (* ram_style = "block" *) reg [P*32-1:0] lnout2_bank[0:BD_S-1];
+    (* ram_style = "block" *) reg [P*32-1:0] qkv_bank   [0:BD_Q-1];
+    (* ram_style = "block" *) reg [P*32-1:0] ctxv_bank  [0:BD_S-1];
+    (* ram_style = "block" *) reg [P*32-1:0] attn_bank  [0:BD_S-1];
+    (* ram_style = "block" *) reg [P*16-1:0] mlpbuf_bank[0:BD_M-1];
+    (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:BD_S-1];
+    (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:BD_H-1];
 
     reg [P*32-1:0] xres_r, qkv_r, attn_r, mlp_r, head_r;          // NL-side reads
     reg [P*32-1:0] lnout1_r, lnout2_r;                            // GEMM-side reads
@@ -496,8 +506,8 @@ module sequencer_pp #(
     // stop that pass; the core also pins rd/word_p with dont_touch. Kept for
     // QoR isolation.
     (* keep_hierarchy = "yes" *)
-    gemm_banked_resident_vec #(.LANES(LANES), .N(N), .P(P), .MMAX(1024), .KMAX(1024),
-                  .RLAT(2), .WWORDS(WWORDS)) u_gemm (
+    gemm_banked_resident_vec #(.LANES(LANES), .N(N), .ND(ND), .P(P), .MMAX(1024),
+                  .KMAX(1024), .RLAT(2), .WWORDS(WWORDS)) u_gemm (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
         .x_rst(gv_xrst), .x_we(gv_xwe), .x_stream(gv_xstream), .x_data(gv_xdata),
@@ -527,7 +537,7 @@ module sequencer_pp #(
     // active call context
     reg        ggrp;
     reg        gmerge;                  // both groups share this pass
-    reg [11:0] gwait;                   // solo-serve patience: wait for the partner
+    reg [17:0] gwait;                   // solo-serve patience: wait for the partner
     reg [19:0] a_wbase;
     reg [10:0] a_m, a_k;
     reg [1:0]  a_asrc;
@@ -607,7 +617,7 @@ module sequencer_pp #(
                         a_dst   <= d_dst[0];
                         gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
                         gv_ldrst<=1'b1; ge<=GE_AQ;
-                    end else if ((g_req[0] || g_req[1]) && gwait < 12'd2048) begin
+                    end else if ((g_req[0] || g_req[1]) && gwait < GWAIT[17:0]) begin
                         // wait for the partner group — merged passes serve all 8
                         // streams from ONE weight pass (the 21k -> 40k lever)
                         gwait <= gwait + 1'b1;

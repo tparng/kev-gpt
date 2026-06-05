@@ -33,7 +33,8 @@ def _read_hex(path):
     return out
 
 
-def run(sim_dir, toks, P, lanes=128, tmax=32, npz="fabric/export/goformer.npz"):
+def run(sim_dir, toks, P, lanes=128, tmax=32, nd=0, gwait=2048,
+        npz="fabric/export/goformer.npz"):
     os.makedirs(sim_dir, exist_ok=True)
     p, cfg = seq_ref.build(npz)
     iseq = seq_ref.IntSequencer(p, cfg)
@@ -55,7 +56,8 @@ def run(sim_dir, toks, P, lanes=128, tmax=32, npz="fabric/export/goformer.npz"):
     vvp = os.path.join(sim_dir, "sim.vvp")
     defs = [f"-DTOK{i}={int(t)}" for i, t in enumerate(toks)]
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
-                         *defs, f"-DPVAL={P}", f"-DNVAL={len(toks)}",
+                         *defs, f"-DPVAL={P}", f"-DNVAL={len(toks)}", f"-DNDVAL={nd}",
+                         f"-DGWAITVAL={gwait}",
                          f"-DLVAL={lanes}", f"-DWROMN={wrom_n}", f"-DTMAXVAL={tmax}",
                          TB,
                          os.path.join(RTL, "sequencer_pp.sv"),
@@ -106,21 +108,29 @@ def run(sim_dir, toks, P, lanes=128, tmax=32, npz="fabric/export/goformer.npz"):
     except Exception:
         pass
     n = len(toks)
-    print(f"SEQ_PP_FULL N={n} P={P} L={lanes} TMAX={tmax} " + " ".join(parts) +
+    print(f"SEQ_PP_FULL N={n} ND={nd} P={P} L={lanes} TMAX={tmax} " + " ".join(parts) +
           f" ALL={all_ok} cyc_total={cyc} cyc/token={(cyc or 0)//n}")
     return all_ok
 
 
+TOKS8 = "48,10,100,77,5,60,120,180"
+TOKS16 = TOKS8 + ",33,7,150,90,14,66,111,173"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="fabric.stage3.run_pp_seq")
-    ap.add_argument("--toks", default="48,10,100,77,5,60,120,180")
+    ap.add_argument("--toks", default=None, help=f"default: 8-stream {TOKS8}; --n 16 default adds 8 more")
+    ap.add_argument("--n", type=int, default=8, help="stream count (sets default toks)")
+    ap.add_argument("--nd", type=int, default=0, help="DSP-packed GEMM streams")
+    ap.add_argument("--gwait", type=int, default=2048, help="merge patience cycles")
     ap.add_argument("--p", type=int, default=8)
     ap.add_argument("--lanes", type=int, default=128)
     ap.add_argument("--tmax", type=int, default=32)
     ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_seq_gemm"))
     a = ap.parse_args(argv)
-    toks = [int(t) for t in a.toks.split(",")]
-    ok = run(a.dir, toks, a.p, a.lanes, a.tmax)
+    toks_s = a.toks if a.toks else (TOKS16 if a.n == 16 else TOKS8)
+    toks = [int(t) for t in toks_s.split(",")]
+    ok = run(a.dir, toks, a.p, a.lanes, a.tmax, a.nd, a.gwait)
     raise SystemExit(0 if ok else 1)
 
 

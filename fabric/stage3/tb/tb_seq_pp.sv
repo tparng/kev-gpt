@@ -41,8 +41,39 @@
 `ifndef NVAL
  `define NVAL 8
 `endif
+`ifndef NDVAL
+ `define NDVAL 0
+`endif
+`ifndef GWAITVAL
+ `define GWAITVAL 2048
+`endif
 `ifndef DBGSTOP
  `define DBGSTOP 0
+`endif
+// streams 8..15 (the N=16 build; ignored at N=8)
+`ifndef TOK8
+ `define TOK8 33
+`endif
+`ifndef TOK9
+ `define TOK9 7
+`endif
+`ifndef TOK10
+ `define TOK10 150
+`endif
+`ifndef TOK11
+ `define TOK11 90
+`endif
+`ifndef TOK12
+ `define TOK12 14
+`endif
+`ifndef TOK13
+ `define TOK13 66
+`endif
+`ifndef TOK14
+ `define TOK14 111
+`endif
+`ifndef TOK15
+ `define TOK15 173
 `endif
 module tb;
     localparam integer P     = `PVAL;
@@ -56,7 +87,7 @@ module tb;
     reg rst, go;
     reg [N*9-1:0] toks;
     reg [8:0] pos;
-    reg [2:0]  rstream;
+    reg [3:0]  rstream;
     reg [3:0]  rsel;
     reg [10:0] raddr;
     wire done;
@@ -64,17 +95,18 @@ module tb;
     wire signed [63:0] rdata;
     reg wl_rst, wl_we; reg [31:0] wl_data;
 
-    sequencer_pp #(.P(P), .LANES(LANES), .N(N), .TMAX(TMAXP)) dut (
+    sequencer_pp #(.P(P), .LANES(LANES), .N(N), .G(N/2), .ND(`NDVAL),
+                   .GWAIT(`GWAITVAL), .TMAX(TMAXP)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_ids(toks), .pos(pos), .done(done),
-        .tok_outs(tok_outs), .rd_stream(rstream), .rd_sel(rsel), .rd_addr(raddr),
-        .rd_data(rdata), .wl_rst(wl_rst), .wl_we(wl_we), .el_we(1'b0), .wl_data(wl_data),
-        .dbg_stop(2'd`DBGSTOP));
+        .tok_outs(tok_outs), .rd_stream(rstream[$clog2(N)-1:0]), .rd_sel(rsel),
+        .rd_addr(raddr), .rd_data(rdata), .wl_rst(wl_rst), .wl_we(wl_we),
+        .el_we(1'b0), .wl_data(wl_data), .dbg_stop(2'd`DBGSTOP));
 
     reg [WBITS-1:0] wimg [0:`WROMN-1];
     reg [WBITS-1:0] wword;
     integer i, s, f, cyc0, cyc1, b;
 
-    task dump(input [2:0] strm, input [3:0] sel, input integer n, input [255:0] fname);
+    task dump(input [3:0] strm, input [3:0] sel, input integer n, input [255:0] fname);
         integer k, ff;
         begin
             ff = $fopen(fname, "w");
@@ -86,11 +118,19 @@ module tb;
             $fclose(ff);
         end
     endtask
+    // all 16 token defines; streams >= N unused
+    integer tokv [0:15];
+    initial begin
+        tokv[0]=`TOK0;  tokv[1]=`TOK1;  tokv[2]=`TOK2;  tokv[3]=`TOK3;
+        tokv[4]=`TOK4;  tokv[5]=`TOK5;  tokv[6]=`TOK6;  tokv[7]=`TOK7;
+        tokv[8]=`TOK8;  tokv[9]=`TOK9;  tokv[10]=`TOK10; tokv[11]=`TOK11;
+        tokv[12]=`TOK12; tokv[13]=`TOK13; tokv[14]=`TOK14; tokv[15]=`TOK15;
+    end
 
     reg [255:0] fn;
     initial begin
         rst = 1'b1; go = 1'b0; pos = 9'd0; rstream = 0; rsel = 0; raddr = 0;
-        toks = {9'd`TOK7, 9'd`TOK6, 9'd`TOK5, 9'd`TOK4, 9'd`TOK3, 9'd`TOK2, 9'd`TOK1, 9'd`TOK0};
+        #1; for (b = 0; b < N; b = b + 1) toks[b*9 +: 9] = tokv[b][8:0];
         wl_rst = 1'b0; wl_we = 1'b0; wl_data = 32'b0;
         $readmemh("wrom.mem", wimg);
         repeat (4) @(posedge clk); #1; rst = 1'b0; @(posedge clk); #1;
@@ -111,9 +151,9 @@ module tb;
         for (b = 0; b < N; b = b + 1) $fwrite(f, "%0d\n", tok_outs[b*9 +: 9]);
         $fclose(f);
         for (b = 0; b < N; b = b + 1) begin
-            $sformat(fn, "x4_%0d.out", b);   dump(b[2:0], 4'd7, 256, fn);
-            $sformat(fn, "lnf_%0d.out", b);  dump(b[2:0], 4'd0, 256, fn);
-            $sformat(fn, "head_%0d.out", b); dump(b[2:0], 4'd8, 193, fn);
+            $sformat(fn, "x4_%0d.out", b);   dump(b[3:0], 4'd7, 256, fn);
+            $sformat(fn, "lnf_%0d.out", b);  dump(b[3:0], 4'd0, 256, fn);
+            $sformat(fn, "head_%0d.out", b); dump(b[3:0], 4'd8, 193, fn);
         end
         $display("TB_DONE tok0=%0d tok1=%0d tok2=%0d tok3=%0d",
                  tok_outs[8:0], tok_outs[17:9], tok_outs[26:18], tok_outs[35:27]);
