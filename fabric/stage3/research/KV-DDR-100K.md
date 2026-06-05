@@ -182,6 +182,34 @@ Kevin window to halve KV traffic.
   image" + latency model) or the async/sync class of bug (§6/§7 of the log) returns. Gate the
   `kv_dma` brick against `seq_ref` attention before any board run.
 
+### Headroom lever: low-bit KV — MEASURED (`model/exp_kvarn.py`)
+
+[KVarN](https://github.com/huawei-csl/KVarN) (Huawei CSL, arXiv:2606.03458) ships 4-bit-key /
+2-bit-value KV quantization in vLLM (Hadamard rotation to spread outliers + variance-normalized
+asymmetric quant). The code is GPU/Triton — zero reuse — but the arithmetic transfers, so
+`model/exp_kvarn.py` fake-quantizes K/V **at write time** (bits fixed when produced, causal
+scales only — exactly what stored RAM bits would hold) inside the bit-true KV decoder on the
+trained QAT export, 8 natural telegraphic prompts + held-out NLL on `sample.kevin.txt`:
+
+| config (streaming-honest)   | KB/stream | tf argmax | held-out NLL delta |
+|-----------------------------|-----------|-----------|--------------------|
+| K8/V8 per-pos               | 68        | 98.6%     | +0.13%             |
+| **K4/V4 + Hadamard**        | **36**    | **96.3%** | **+0.72%**         |
+| K4/V4 per-pos               | 36        | 96.3%     | +1.20%             |
+| K4/V2 + Hadamard            | 28        | 89.3%     | +2.91%             |
+| K4/V2 per-pos (KVarN cfg)   | 28        | 87.3%     | **+13.95%**        |
+| K3/V2 + Hadamard            | 24        | 88.1%     | +7.58%             |
+
+**KVarN's headline 4/2 config does NOT survive at 3M params** — 2-bit values cost +14% NLL
+plain; even Hadamard-rescued it is +2.9%. A tiny model lacks a 32B model's redundancy. But two
+results stand: (1) **K4/V4 + per-head Hadamard holds +0.72% NLL at 1.78× compression** — at
+100k aggregate the §1 read budget drops 6.4 → **3.6 GB/s**, comfortably under the ~6–7.5 GB/s
+ceiling, lifting the §Go 80k co-limit to the ~125k compute ceiling (PROJECTED). (2) The
+Hadamard rotation does most of the rescue work everywhere (V2: 14→2.9%; V4: 1.2→0.72%) and is
+the one piece that is nearly free in fabric: ±1 matrix, hd=64, adds/subtracts only, no DSPs.
+If adopted, the K4/V4+Had path needs its own `seq_ref`-style gate (quantize-at-write modelled
+bit-exactly in the reference) before any RTL claims a number.
+
 ---
 
 ## Go / No-go
