@@ -70,7 +70,11 @@ module gemm_banked_resident_vec #(
     localparam integer NB    = (WBITS + BANKW - 1) / BANKW;
     localparam integer WPAD  = NB * BANKW;
 
-    reg [P*8-1:0]    xmem [0:N*XROWS-1];     // stream b rows at b*XROWS
+    // per-stream act memories: ONE xmem with N read ports made Vivado replicate
+    // it N times at N=8 and refuse outright at N=16 ("Failed to dissolve the
+    // memory... 131072 bits too large"). Each stream only ever reads its own
+    // rows, so N small 1W/1R SDPs are the natural shape. Declared inside the
+    // g_mac generate below; the write decodes on x_stream there.
     // distributed: shallow x very-wide in BRAM wastes a full RAMB36 per 72 bits
     // of width (57 tiles at N=8/32b); as LUTRAM it is a few k LUTs, tiles freed.
     (* ram_style = "distributed" *)
@@ -95,10 +99,7 @@ module gemm_banked_resident_vec #(
                 end
             end
             if (x_rst) xptr <= 0;
-            else if (x_we) begin
-                xmem[x_stream*XROWS + xptr] <= x_data;
-                xptr <= xptr + 1'b1;
-            end
+            else if (x_we) xptr <= xptr + 1'b1;   // per-stream mems write in g_mac
         end
     end
 
@@ -134,14 +135,14 @@ module gemm_banked_resident_vec #(
     assign               waddr   = grp_base + kc;
 
     // pipeline: weight word (stage 0 = the per-bank URAM read reg) + acts + valid.
-    // Per-stream act rows are SEPARATE 2D arrays — a variable-base part-select
-    // NBA write (xrow_p[0][b*W +: W] <=) is an iverilog trap: the base is
-    // evaluated at update time, all N writes land in the LAST stream's slot.
+    // Per-stream act pipelines live INSIDE g_mac (per-stream xm memories +
+    // their own xr stages) — one xmem with N read ports made Vivado replicate
+    // at N=8 and refuse at N=16; per-stream 1W/1R SDPs are the natural shape.
     reg [WBITS-1:0]      word_p [0:RLAT-2];
-    reg [P*8-1:0]        xrow_p [0:RLAT-1][0:N-1];
     reg [LSHP-1:0]       xl_p   [0:RLAT-1];
     reg                  v_p    [0:RLAT-1];
     integer i, b;
+    wire [$clog2(XROWS)-1:0] xrd_row = kc[$clog2(KMAX)-1:0] >> LSHP;
 
     wire                 mac_v = v_p[RLAT-1];
 
@@ -170,8 +171,20 @@ module gemm_banked_resident_vec #(
     genvar gm, gl;
     generate
         for (gm = 0; gm < N; gm = gm + 1) begin : g_mac
-            // stream act lane (shared by this stream's LANES MACs) — combinational
-            wire [P*8-1:0]    xrow = xrow_p[RLAT-1][gm];
+            // per-stream act memory (1W/1R SDP) + its own RLAT-deep row pipeline.
+            // Same cycle timing as the old shared-xmem stage-0 read.
+            reg [P*8-1:0] xm [0:XROWS-1];
+            reg [P*8-1:0] xr [0:RLAT-1];
+            integer xi;
+            always @(posedge clk) begin
+                if (x_we && x_stream == gm[$clog2(N)-1:0]) xm[xptr] <= x_data;
+                xr[0] <= xm[xrd_row];
+                for (xi = 1; xi < RLAT; xi = xi + 1) xr[xi] <= xr[xi-1];
+            end
+            // stream act lane (shared by this stream's LANES MACs): copy the
+            // unpacked element to a plain wire BEFORE the variable part-select
+            // (the iverilog X rule).
+            wire [P*8-1:0]    xrow = xr[RLAT-1];
             wire signed [7:0] xsel = xrow[xl_p[RLAT-1]*8 +: 8];
             // one accumulator per lane: all weight indexing is genvar-CONSTANT —
             // a runtime-L loop made Vivado fail to unroll and trim wsel to 4 bits
@@ -212,15 +225,11 @@ module gemm_banked_resident_vec #(
 
     always @(posedge clk) begin
         word_p[0] <= wword_rd;
-        for (b = 0; b < N; b = b + 1)
-            xrow_p[0][b] <= xmem[b*XROWS + (kc[$clog2(KMAX)-1:0] >> LSHP)];
         xl_p[0]   <= kc[LSHP-1:0];
         v_p[0]    <= (state == RUN) && issue;
         for (i = 1; i < RLAT-1; i = i + 1)
             word_p[i] <= word_p[i-1];
         for (i = 1; i < RLAT; i = i + 1) begin
-            for (b = 0; b < N; b = b + 1)
-                xrow_p[i][b] <= xrow_p[i-1][b];
             xl_p[i]   <= xl_p[i-1];
             v_p[i]    <= v_p[i-1];
         end
