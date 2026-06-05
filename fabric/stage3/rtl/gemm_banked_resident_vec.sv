@@ -360,9 +360,12 @@ endmodule
 // leaf the parent's bulk multiplier optimization cannot restructure across
 // (the N=8-in-context URAM killer; per-lane/per-stream/DSP variants all map
 // URAM 64 — and all land ~126k LUT, so the cost is the N=8 MAC array itself,
-// not the isolation style; use_dsp burned 1,239 DSPs for zero LUT and was
-// reverted to keep them for the packed 2-streams-per-DSP core, roadmap #13).
-(* keep_hierarchy = "yes" *)
+// not the isolation style). use_dsp=no: a 4x8 mult is ~15 fabric LUTs, but
+// Vivado auto-absorbed ~350 of them into DSPs — at N=16 that overflow (1,304
+// > 1,248 with the packed banks) EVICTED the 32x32-class LN/attention/dequant
+// multipliers to fabric at ~1.1k LUT each (366k total). Cheap mults stay in
+// fabric; DSPs go to the expensive ones.
+(* keep_hierarchy = "yes", use_dsp = "no" *)
 module mac_bank #(
     parameter integer LANES = 128,
     parameter integer ABITS = 24       // see core note: |acc| <= 2^20 range-proven
@@ -389,14 +392,18 @@ endmodule
 
 
 // one stream's LANES lanes as LANES/2 DSP-packed MACs (WP487 adapted): two
-// +8-biased INT4 weights at a 24-bit gap share one INT8 activation —
-//   wpak = {w1^8, 20'b0, w0^8};  acc48 += $unsigned(wpak) * $signed(x)
-// recovery (exact integer algebra, proven bit-exact 0/768 vs the LUT bank):
-//   y0 = (acc[23:0] - 8*sum_act) mod 2^24      (|y0| < 2^21: window unambiguous)
-//   carry = (y0 + 8*sum_act) >>> 24
-//   y1 = acc[47:24] - 8*sum_act - carry
-// At ABITS=24 the y0 window IS the output lane verbatim. Same keep_hierarchy
-// rationale as mac_bank (the bulk-mult URAM killer).
+// +8-biased INT4 weights at a 22-BIT gap share one INT8 activation —
+//   wpak = {w1^8, 18'b0, w0^8};  acc48 += $unsigned(wpak) * $signed(x)
+// The gap is 22, not 24: wpak must stay under 2^26 so the signed-extended
+// operand fits the DSP48E2's 27-bit port — at a 24-bit gap (28-bit wpak)
+// Vivado cascaded TWO DSPs per multiply (1,024 for 8 banks). The 22-bit lower
+// field still exactly holds K<=1024 of 12-bit products (12+10), and |y0| <
+// 2^21 keeps the mod-2^22 window unambiguous.
+// recovery (exact integer algebra, gated vs the LUT bank incl. the 2^20 corner):
+//   y0 = (acc[21:0] - 8*sum_act) mod 2^22
+//   carry = (y0 + 8*sum_act) >>> 22
+//   y1 = acc[47:22] - 8*sum_act - carry
+// Same keep_hierarchy rationale as mac_bank (the bulk-mult URAM killer).
 (* keep_hierarchy = "yes" *)
 module mac_bank_dsp #(
     parameter integer LANES = 128,
@@ -422,17 +429,17 @@ module mac_bank_dsp #(
         for (gl = 0; gl < LANES; gl = gl + 2) begin : g_d
             wire [3:0]  w0 = w[gl*4 +: 4]     ^ 4'h8;   // +8 bias -> unsigned
             wire [3:0]  w1 = w[(gl+1)*4 +: 4] ^ 4'h8;
-            wire [27:0] wpak = {w1, 20'b0, w0};
+            wire [25:0] wpak = {w1, 18'b0, w0};         // < 2^26: one DSP
             (* use_dsp = "yes" *) reg signed [47:0] a;
             always @(posedge clk) begin
                 if (clr) a <= 48'sd0;
                 else if (en) a <= a + $signed({1'b0, wpak}) * xs;
             end
-            wire [23:0]        y0m   = a[23:0] - sa8[23:0];          // mod 2^24
-            wire signed [31:0] y0    = {{8{y0m[23]}}, y0m};
+            wire [21:0]        y0m   = a[21:0] - sa8[21:0];          // mod 2^22
+            wire signed [31:0] y0    = {{10{y0m[21]}}, y0m};
             wire signed [27:0] hsum  = y0 + sa8;
-            wire signed [3:0]  carry = hsum >>> 24;
-            wire signed [31:0] y1    = $signed(a[47:24]) - sa8 - carry;
+            wire signed [5:0]  carry = hsum >>> 22;
+            wire signed [31:0] y1    = $signed(a[47:22]) - sa8 - carry;
             assign acc[gl*ABITS +: ABITS]     = y0[ABITS-1:0];
             assign acc[(gl+1)*ABITS +: ABITS] = y1[ABITS-1:0];
         end
