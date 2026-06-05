@@ -63,6 +63,8 @@ module gemm_dsp_resident_vec #(
     localparam integer WPAD   = NB * BANKW;
 
     reg [P*8-1:0]    xmem [0:N*XROWS-1];
+    // distributed: 64-deep x 4096-wide in BRAM wastes a RAMB36 per 72b of width
+    (* ram_style = "distributed" *)
     reg [YBITS-1:0]  ymem [0:N*GROUPS-1];
 
     // ---- one-time load (identical to the LUT core) -----------------------------
@@ -137,7 +139,7 @@ module gemm_dsp_resident_vec #(
     // one wire vector per stream ï¿½ a flat N*YBITS concat crosses iverilog's
     // 16-bit part-select index space at stream 4 (bit 16384), silently wrapping
 `ifdef SYNTHESIS
-    wire [N*YBITS-1:0] acc_cat;          // packed concat — Vivado fails URAM
+    wire [N*YBITS-1:0] acc_cat;          // packed concat ï¿½ Vivado fails URAM
                                          // inference with unpacked wire arrays
 `else
     wire [YBITS-1:0] acc_str [0:N-1];    // iverilog wraps >16k part-selects

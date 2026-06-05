@@ -66,6 +66,9 @@ module gemm_banked_resident_vec #(
     localparam integer WPAD  = NB * BANKW;
 
     reg [P*8-1:0]    xmem [0:N*XROWS-1];     // stream b rows at b*XROWS
+    // distributed: 64-deep x 4096-wide in BRAM wastes a full RAMB36 per 72 bits
+    // of width (57 tiles); as LUTRAM it is ~4-5k LUTs and frees the tiles.
+    (* ram_style = "distributed" *)
     reg [YBITS-1:0]  ymem [0:N*GROUPS-1];    // stream b group g at b*GROUPS+g
 
     // ---- one-time load: assemble SUBW chunks -> commit all banks in one shot ----
@@ -146,12 +149,21 @@ module gemm_banked_resident_vec #(
     // per-stream wires: one flat N*YBITS concat wraps iverilog's 16-bit index
     // space at stream 4 (bit 16384) � streams 4..7 would read stream 0..3.
 `ifdef SYNTHESIS
-    wire [N*YBITS-1:0] acc_cat;          // packed concat � Vivado fails URAM
-                                         // inference with unpacked wire arrays
+    // TWO N<=4-shaped packed halves. One N*YBITS concat is URAM-fatal at N=8
+    // in any parent context (A/B: N=4 in-context 64 URAM, N=8 in-context 8
+    // URAM, N=8 standalone 56) — past 16,384 bits Vivado loses the wsel loads,
+    // trims rd/word_p 512->4b, and LUTRAMs the weights (~450k LUT). Each half
+    // stays at <=16,384b, the exact shape of the URAM-clean a783c4a build.
+    localparam integer NLO = (N > 4) ? 4 : N;
+    localparam integer NHI = (N > NLO) ? N - NLO : 1;   // >=1 keeps widths legal
+    wire [NLO*YBITS-1:0] acc_lo;
+    wire [NHI*YBITS-1:0] acc_hi;
+    reg  [YBITS-1:0] sel_lo, sel_hi;
 `else
     wire [YBITS-1:0] acc_str [0:N-1];    // iverilog wraps >16k part-selects
+    reg  [YBITS-1:0] y_lat [0:N-1];      // outputs latched at SETTLE (sim only:
+                                         // dead regs in the synth view trip it)
 `endif
-    reg  [YBITS-1:0] y_lat [0:N-1];     // outputs latched at SETTLE (constant unroll)
     reg  [YBITS-1:0] acc_sel;
     genvar gm, gl;
     generate
@@ -162,19 +174,25 @@ module gemm_banked_resident_vec #(
             // one accumulator per lane: all weight indexing is genvar-CONSTANT —
             // a runtime-L loop made Vivado fail to unroll and trim wsel to 4 bits
             // (the URAM read died, weights fell back to ~400k LUTRAM).
-            for (gl = 0; gl < LANES; gl = gl + 1) begin : g_lane
-                reg signed [31:0] accL;
-                always @(posedge clk) begin
-                    if (rst || acc_clr) accL <= 32'sd0;
-                    else if (mac_v)
-                        accL <= accL + $signed(wsel[gl*4 +: 4]) * xsel;
-                end
-    `ifdef SYNTHESIS
-            assign acc_cat[gm*YBITS + gl*32 +: 32] = accL;
-`else
-            assign acc_str[gm][gl*32 +: 32] = accL;
-`endif
+            // the stream's whole MAC array is ONE keep_hierarchy leaf: at N=8
+            // (1,024 mults) the parent's bulk multiplier optimization detaches
+            // the wsel loads before RAM mapping and the URAM weight banks fall
+            // to ~450k LUTRAM — N=4 (512 mults) never tripped it, so 128-mult
+            // leaves are safe. Per-LANE leaves also fixed URAM but cost +36k
+            // LUT (no cross-lane xsel sharing): 127.5k > 117.1k capacity.
+            wire [YBITS-1:0] acc_bank;
+            mac_bank #(.LANES(LANES)) u_mac (
+                .clk(clk), .clr(rst || acc_clr), .en(mac_v),
+                .w(wsel), .x(xsel), .acc(acc_bank));
+`ifdef SYNTHESIS
+            if (gm < NLO) begin : g_lo
+                assign acc_lo[gm*YBITS +: YBITS] = acc_bank;
+            end else begin : g_hi
+                assign acc_hi[(gm-NLO)*YBITS +: YBITS] = acc_bank;
             end
+`else
+            assign acc_str[gm] = acc_bank;
+`endif
         end
     endgenerate
 
@@ -214,32 +232,47 @@ module gemm_banked_resident_vec #(
                 RUN: begin
                     if (issue) kc <= kc + 1'b1;
                     if (mac_v) kmac <= kmac + 1'b1;
+`ifdef SYNTHESIS
+                    // straight to DRAIN — the exact FSM of the URAM-clean
+                    // a783c4a build. SETTLE is a sim-only mechanism (y_lat
+                    // latch), so silicon finishes each call 4 cyc earlier
+                    // than sim: sim cyc/tok is an upper bound (~0.8%).
+                    if (kmac == k_count) begin db <= 0; state <= DRAIN; end
+`else
                     if (kmac == k_count) begin db <= 0; settle <= 0; state <= SETTLE; end
+`endif
                 end
+`ifndef SYNTHESIS
                 SETTLE: begin
-                    // 4-cycle settle keeps sim/synth cycle counts identical; the
-                    // sim branch also uses it to latch outputs into y_lat
+                    // sim-only: wait out the MAC pipeline tail, then latch the
+                    // per-stream accumulators into y_lat for constant unroll
                     settle <= settle + 1'b1;
                     if (settle == 2'd3) begin
-`ifndef SYNTHESIS
                         for (b = 0; b < N; b = b + 1)
                             y_lat[b] <= acc_str[b];
-`endif
                         state <= DRAIN;
                     end
                 end
+`endif
                 DRAIN: begin                  // one stream's group word per cycle
 `ifdef SYNTHESIS
-                    // packed concat + constant mux tree: the only encoding
-                    // Vivado accepts WITHOUT killing the URAM weight banks
-                    acc_sel = (N > 4)
-                        ? (db[2] ? (db[1] ? (db[0] ? acc_cat[(N-1)*YBITS +: YBITS] : acc_cat[(N-2)*YBITS +: YBITS])
-                                          : (db[0] ? acc_cat[(N-3)*YBITS +: YBITS] : acc_cat[(N-4)*YBITS +: YBITS]))
-                                 : (db[1] ? (db[0] ? acc_cat[3*YBITS +: YBITS] : acc_cat[2*YBITS +: YBITS])
-                                          : (db[0] ? acc_cat[1*YBITS +: YBITS] : acc_cat[0*YBITS +: YBITS])))
-                        : (db[1] ? (db[0] ? acc_cat[(N>3 ? 3:0)*YBITS +: YBITS] : acc_cat[(N>2 ? 2:0)*YBITS +: YBITS])
-                                 : (db[0] ? acc_cat[(N>1 ? 1:0)*YBITS +: YBITS] : acc_cat[0*YBITS +: YBITS]));
-    ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= acc_sel;
+                    // per-half constant-base case — the EXACT idiom of the
+                    // URAM-clean a783c4a build, once per <=4-stream half, then
+                    // one 2:1 select. See the acc_lo/acc_hi declaration note.
+                    case (db[1:0])
+                        2'd0: sel_lo = acc_lo[0*YBITS +: YBITS];
+                        2'd1: sel_lo = acc_lo[(NLO > 1 ? 1 : 0)*YBITS +: YBITS];
+                        2'd2: sel_lo = acc_lo[(NLO > 2 ? 2 : 0)*YBITS +: YBITS];
+                        default: sel_lo = acc_lo[(NLO > 3 ? 3 : 0)*YBITS +: YBITS];
+                    endcase
+                    case (db[1:0])
+                        2'd0: sel_hi = acc_hi[0*YBITS +: YBITS];
+                        2'd1: sel_hi = acc_hi[(NHI > 1 ? 1 : 0)*YBITS +: YBITS];
+                        2'd2: sel_hi = acc_hi[(NHI > 2 ? 2 : 0)*YBITS +: YBITS];
+                        default: sel_hi = acc_hi[(NHI > 3 ? 3 : 0)*YBITS +: YBITS];
+                    endcase
+                    acc_sel = ((N > 4) && db[2]) ? sel_hi : sel_lo;
+                    ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= acc_sel;
 `else
                     ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= y_lat[db];
 `endif
@@ -269,4 +302,35 @@ module gemm_banked_resident_vec #(
         rd_off  <= rd_addr % PPG;
         y_out   <= rd_word[rd_off*(P*32) +: P*32];
     end
+endmodule
+
+
+// one stream's LANES INT4xINT8 MAC+accumulate lanes. keep_hierarchy: an opaque
+// leaf the parent's bulk multiplier optimization cannot restructure across
+// (the N=8-in-context URAM killer; per-lane/per-stream/DSP variants all map
+// URAM 64 — and all land ~126k LUT, so the cost is the N=8 MAC array itself,
+// not the isolation style; use_dsp burned 1,239 DSPs for zero LUT and was
+// reverted to keep them for the packed 2-streams-per-DSP core, roadmap #13).
+(* keep_hierarchy = "yes" *)
+module mac_bank #(
+    parameter integer LANES = 128
+) (
+    input  wire                  clk,
+    input  wire                  clr,
+    input  wire                  en,
+    input  wire [LANES*4-1:0]    w,
+    input  wire signed [7:0]     x,
+    output wire [LANES*32-1:0]   acc
+);
+    genvar gl;
+    generate
+        for (gl = 0; gl < LANES; gl = gl + 1) begin : g_l
+            reg signed [31:0] a;
+            always @(posedge clk) begin
+                if (clr) a <= 32'sd0;
+                else if (en) a <= a + $signed(w[gl*4 +: 4]) * x;
+            end
+            assign acc[gl*32 +: 32] = a;
+        end
+    endgenerate
 endmodule

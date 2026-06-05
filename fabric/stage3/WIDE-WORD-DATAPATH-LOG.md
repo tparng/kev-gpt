@@ -506,3 +506,53 @@ Profile: GEMM busy 51.2k cycles (2 weight passes), NL 24k overlapped. The lever:
 N=8 MAC banks - one URAM pass per 8 tokens - 75k -> ~40k cycles -> ~40k tok/s
 @200 MHz. LUT cost ~115k - knife-edge fit. Or LANES=64: 32k LUT MACs, ~50k tok/s
 @250 MHz. (~33k cycles per 8 tokens, NL-bound: overlap covers GEMM 14k cyc.)
+
+---
+
+## 16. Single-pass N=8 and the 1,024-multiplier URAM cliff (SIM gated; fit 95.6%)
+
+The merge: GE_IDLE serves both groups in ONE weight pass when their descriptors
+agree on d_wbase (gwait patience 2,048 cyc before solo fallback). Core widened
+N=4 -> N=8. Gate: **8/8 bit-exact, 69,469 cyc / 8 tok = 8,683.6 cyc/token —
+23,033 tok/s @200 PROJECTED.** Then every full-design synth dumped the weight
+URAMs into ~29,600 RAM64M8 (~450k LUT, "Infeasible ram_style=ultra").
+
+Eight OOC A/Bs to corner it. Falsified in order: cross-boundary flattening
+(keep_hierarchy on the instance — no change), the rd/word_p 512->4b trim
+warnings (present in GOOD builds too; dont_touch removed them, URAM still died),
+URAM cascade sizing (cascade_height=7 pinned — no change), y_lat's dead regs,
+ternary-vs-case select form, the SETTLE state, the merge sequencer itself
+(old pre-merge sequencer + new core also died), and the 32,768-bit acc concat
+(two 16,384-bit halves died identically). The decisive matrix: standalone N=8
+clean / in-context N=4 clean / in-context N=8 broken under ANY sequencer.
+
+**Root cause: the multiplier population.** At N=8 the core holds 1,024 4x8
+MACs; Vivado 2025.2's bulk multiplier optimization (runs right after DSP
+absorption, before RAM mapping) restructures them and detaches the URAM read
+register's loads — the mapper then sees a dead read port and refuses ultra.
+512 mults (N=4) never trips it. **Fix: each stream's 128 MACs are one
+keep_hierarchy leaf (`mac_bank`)** — an opaque boundary the bulk pass cannot
+cross. URAM 64/64 restored on the first try and in every variant since.
+(use_dsp on the leaves: 1,239 DSPs consumed, zero LUT saved — the accumulate
+adds stayed in fabric. Reverted; DSPs reserved for the packed N=16 core. A
+bottom-up DCP-link flow was prepared as Plan A — synth_gemm_core_dcp.tcl /
+ooc_seq_pp_linkdcp.tcl, kept as fallback — but DCP stubs are parameterless,
+so the instance's #(...) overrides must go if it is ever needed.)
+
+The fit campaign that followed (126.6k LUT = 108% after the fix — single-pass
+honestly costs +512 MAC lanes over the ping-pong's N=4 core):
+- **ymem -> distributed** (both cores): 64-deep x 4,096-wide in BRAM burned a
+  RAMB36 per 72b of width = 57 tiles for 256 kb; as LUTRAM ~4.7k LUT.
+  BRAM 149.5 -> 100/144.
+- **xres_bank -> one write site**: three FSM states wrote the bank; Vivado saw
+  a multi-writer RAM, replicated LUTRAM ~3.5x (1,776 RAM64M8 ~ 14k LUT,
+  "Infeasible ram_style=block" — in EVERY build since the bank existed, good
+  ones included). Blocking-muxed xr_we/xr_wa/xr_wd into a single write after
+  the case — same cycle, same values. xres now BRAM (+7.5 tiles), -14.3k LUT.
+- SETTLE is sim-only now (y_lat latch); synth goes RUN->DRAIN directly, so
+  silicon runs ~4 cyc/call (~0.8%) faster than sim — sim cyc/tok is an upper
+  bound, and the tok/s claim is board wall-clock anyway.
+
+**OOC fit: 111.9k LUT (95.6%), BRAM 107.5/144, URAM 64/64, DSP 403.** In
+reserve if impl congests: 32->24-bit accumulators (|acc| <= 2^20 at k<=1024,
+range-proven exact) ~ -10k LUT.

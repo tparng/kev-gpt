@@ -205,6 +205,13 @@ module sequencer_pp #(
     reg signed [31:0] va, vb;
     reg [8:0]         ia, ib;
     reg [P*32-1:0] ww, sw;
+    // xres_bank single-write-port temps: three FSM states write the bank; as
+    // three write SITES Vivado sees a multi-writer RAM, replicates the LUTRAM
+    // ~3.5x (1,776 RAM64M8 ~= 14k LUT, "Infeasible block") instead of BRAM.
+    // Blocking-muxed into ONE site after the case — same cycle, same values.
+    reg              xr_we;
+    reg [10:0]       xr_wa;
+    reg [P*32-1:0]   xr_wd;
     reg [3:0] lgam;
     integer pp;
 
@@ -267,6 +274,7 @@ module sequencer_pp #(
                 else g_req[g_served] <= 1'b0;
             end
 
+            xr_we = 1'b0;                       // default: no xres write this cycle
             case (nl[gc])
                 NL_IDLE: ;
                 NL_EMB: begin
@@ -276,7 +284,7 @@ module sequencer_pp #(
                         for (pp=0; pp<P; pp=pp+1)
                             ww[pp*32 +: 32] = $signed(temb_r[pp*32 +: 32])
                                             + $signed(pemb_r[pp*32 +: 32]);
-                        xres_bank[sN + frd] <= ww;
+                        xr_we = 1'b1; xr_wa = sN + frd; xr_wd = ww;
                         if (frd==ROWS-1) begin
                             fr<=0; frv<=0;
                             if (bs == G-1) begin
@@ -357,7 +365,7 @@ module sequencer_pp #(
                         for (pp=0; pp<P; pp=pp+1)
                             sw[pp*32 +: 32] = $signed(xres_r[pp*32 +: 32])
                                             + $signed(attn_r[pp*32 +: 32]);
-                        xres_bank[sN + cid] <= sw;
+                        xr_we = 1'b1; xr_wa = sN + cid; xr_wd = sw;
                         if (cid==ROWS-1) begin
                             ci<=0; civ<=0;
                             if (bs == G-1) begin
@@ -389,7 +397,7 @@ module sequencer_pp #(
                         for (pp=0; pp<P; pp=pp+1)
                             sw[pp*32 +: 32] = $signed(xres_r[pp*32 +: 32])
                                             + $signed(mlp_r[pp*32 +: 32]);
-                        xres_bank[sN + cid] <= sw;
+                        xr_we = 1'b1; xr_wa = sN + cid; xr_wd = sw;
                         if (cid==ROWS-1) begin
                             ci<=0; civ<=0;
                             if (bs == G-1) begin
@@ -467,6 +475,7 @@ module sequencer_pp #(
                 end
                 default: nl[gc] <= NL_IDLE;
             endcase
+            if (xr_we) xres_bank[xr_wa] <= xr_wd;   // the bank's ONLY write site
         end
     end
 
@@ -481,6 +490,12 @@ module sequencer_pp #(
     wire               gv_done;
     reg [10:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
+    // keep_hierarchy: the core is URAM-clean standalone (56 URAM, 72k LUT) but
+    // a global post-synth pass in the FULL design trims its g_w rd/word_p regs
+    // 512->4b and LUTRAMs the weights (449k LUT). keep_hierarchy alone did NOT
+    // stop that pass; the core also pins rd/word_p with dont_touch. Kept for
+    // QoR isolation.
+    (* keep_hierarchy = "yes" *)
     gemm_banked_resident_vec #(.LANES(LANES), .N(N), .P(P), .MMAX(1024), .KMAX(1024),
                   .RLAT(2), .WWORDS(WWORDS)) u_gemm (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
