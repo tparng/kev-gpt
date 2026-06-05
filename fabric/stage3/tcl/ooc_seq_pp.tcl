@@ -27,6 +27,7 @@ set rtl  "$root/fabric/stage3/rtl"
 
 read_verilog -sv [list \
     "$rtl/sequencer_pp.sv" \
+    "$rtl/nl_engine.sv" \
     "$rtl/layernorm_vec.sv" \
     "$rtl/vec_dequant.sv" \
     "$rtl/vec_attn.sv" \

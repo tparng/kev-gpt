@@ -176,9 +176,9 @@ module tb;
             end
             running = 0;
         end
-        if (running) stcnt[dut.nl[dut.gc]] = stcnt[dut.nl[dut.gc]] + 1;
+        if (running) stcnt[dut.eng0.nl] = stcnt[dut.eng0.nl] + 1;
         if (dbgcyc % 100000 == 0)
-            $display("[cyc %0d] nl0=%0d nl1=%0d ge=%0d gc=%0d bs=%0d ar=%0d arv=%b amv=%b req0=%b req1=%b done=%b", dbgcyc, dut.nl[0], dut.nl[1], dut.ge, dut.gc, dut.bs, dut.ar, dut.arv, dut.amv, dut.g_req[0], dut.g_req[1], done);
+            $display("[cyc %0d] nl0=%0d nl1=%0d ge=%0d bs0=%0d bs1=%0d ar0=%0d req0=%b req1=%b done=%b", dbgcyc, dut.eng0.nl, dut.eng1.nl, dut.ge, dut.eng0.bs, dut.eng1.bs, dut.eng0.ar, dut.g_req[0], dut.g_req[1], done);
     end
-    initial begin #120000000; $display("TB_TIMEOUT cyc=%0d nl0=%0d nl1=%0d ge=%0d", dbgcyc, dut.nl[0], dut.nl[1], dut.ge); $finish; end
+    initial begin #120000000; $display("TB_TIMEOUT cyc=%0d nl0=%0d nl1=%0d ge=%0d", dbgcyc, dut.eng0.nl, dut.eng1.nl, dut.ge); $finish; end
 endmodule

@@ -32,6 +32,7 @@ set_property board_part $board [current_project]
 add_files -norecurse [list \
     "$root/fabric/stage3/rtl/gemv_axi_seq_pp.v" \
     "$root/fabric/stage3/rtl/sequencer_pp.sv" \
+    "$root/fabric/stage3/rtl/nl_engine.sv" \
     "$root/fabric/stage3/rtl/layernorm_vec.sv" \
     "$root/fabric/stage3/rtl/vec_dequant.sv" \
     "$root/fabric/stage3/rtl/vec_attn.sv" \

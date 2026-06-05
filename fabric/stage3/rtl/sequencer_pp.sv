@@ -1,21 +1,21 @@
 // -----------------------------------------------------------------------------
-// sequencer_pp — PING-PONG batch sequencer: N=8 streams, two groups of 4.
+// sequencer_pp — PING-PONG batch sequencer: N=8 streams, two groups of G=N/2.
 //
-// While the GEMM engine streams the resident URAM weight image for group A,
-// the NL engine runs the non-linears (embed/LN/attention/residual/argmax) for
-// group B, then they swap. One weight pass feeds 4 token streams; the URAM
-// read port never idles. ~32.7k cycles per 8 tokens = ~4.1k cyc/token.
+// While the GEMM engine streams the resident URAM weight image, two PER-GROUP
+// nl_engine instances run their non-linears (embed / LN / attention / residual /
+// argmax) IN PARALLEL — one engine per stream-group — instead of the old single
+// shared NL FSM that toggled gc<=~gc. The GEMM engine, weight/embed loaders,
+// vec_dequant and vec_gelu stay SHARED here. One weight pass can feed all N
+// streams (merged) or one group's G streams (solo); the URAM read port never idles.
 //
 // Engines:
-//   GEMM: act-quant feed (4 streams) -> run -> fused readback/dequant/GELU.
-//   NL:   embed / LayerNorm / attention / residual / argmax, group-blocked
-//         on the GEMM via a request/done handshake (one in-flight call/group).
-//
-// Bank discipline: every bank has exactly one writing engine and one reading
-// engine, on disjoint groups - no port conflicts (TDP BRAM, one port each).
+//   GEMM (shared): act-quant feed -> run -> fused readback/dequant/GELU, draining
+//        results back into the selected engine's banks via dw_*/dwm_* buses.
+//   NL (x2):       embed / LayerNorm / attention / residual / argmax, each requesting
+//        GEMM calls via req/d_* and acknowledged by `served`.
 //
 // Bit-exact per stream vs seq_ref.full_forward_signals (same arithmetic).
-// iverilog-2012 traps honoured (plain-reg part-selects, generate MAC banks).
+// iverilog-2012 traps honoured (plain-reg part-selects, single-write-site banks).
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
@@ -84,36 +84,25 @@ module sequencer_pp #(
     localparam integer ARROWS  = (VOCAB + P - 1)/P;
     localparam integer EROWS   = D / P;
     localparam integer HR      = HEAD_DIM / P;
-    // per-bank depths, stride-tight (the strides always were: sN = stream*ROWS
-    // etc.) — a uniform BD=1024 wasted tiles: a 512-deep x 256b bank maps to 4
-    // RAMB36 (512x72 mode) vs 7.5 at 1K and 15 at 2K. Sized exactly by N.
-    localparam integer BD_S = N * ROWS;     // xres/lnout/attn/mlp/ctxv (32/stream)
-    localparam integer BD_H = N * ARROWS;   // head logits (25/stream)
-    localparam integer BD_Q = N * ROWS3;    // qkv (96/stream)
-    localparam integer BD_M = N * ROWSM;    // mlpbuf (128/stream)
 
     // ---- shared ROMs ------------------------------------------------------------
-    localparam integer EMB_ROWS = (VOCAB + TMAX) * EROWS;
     (* ram_style = "ultra" *) reg [P*32-1:0] emb_w [0:VOCAB*EROWS-1];
-    (* ram_style = "block" *) reg [P*32-1:0] pos_w [0:TMAX*EROWS-1];
-    (* rom_style = "block" *) reg [P*32-1:0] gamma_w [0:GAMMA_N*EROWS-1];
     reg signed [63:0] inv_sact [0:NSACT-1];
     (* rom_style = "distributed" *) reg [P*24-1:0] dqm_w [0:DQROWS-1];
     (* rom_style = "distributed" *) reg [P*8-1:0]  dqe_w [0:DQROWS-1];
 `ifndef SYNTHESIS
     initial begin
         $readmemh("tok_emb_w.mem", emb_w);
-        $readmemh("pos_emb_w.mem", pos_w, 0, TMAX*EROWS-1);
     end
 `endif
     initial begin
-        $readmemh("gamma_w.mem",   gamma_w);
         $readmemh("inv_sact.mem",  inv_sact);
         $readmemh("dqm_w.mem",     dqm_w);
         $readmemh("dqe_w.mem",     dqe_w);
     end
 
-    // ---- embed loader (URAM tok + BRAM pos, streamed at boot) --------------------
+    // ---- embed loader (URAM tok + per-engine BRAM pos, streamed at boot) ---------
+    localparam integer EMB_ROWS = (VOCAB + TMAX) * EROWS;
     localparam integer ESUB = (P*32)/32;
     reg [$clog2(EMB_ROWS):0] el_word;
     reg [$clog2(ESUB)-1:0]   el_sub;
@@ -130,367 +119,133 @@ module sequencer_pp #(
     always @(posedge clk)
         if (el_commit && el_word < VOCAB*EROWS) emb_w[el_word] <= el_next;
 
-    // ---- stream-flattened scratch (row = stream*ROWS + r), depth 1024 ------------
-    // One writing engine + one reading engine each; groups are disjoint.
-    // LN outputs are Q.22 with |y| < 2^26 -> 32-bit lanes; GELU hidden is Q4.12
-    // sat16 -> 16-bit lanes. Sign-extend on the GEMM side to Q.22.
-    (* ram_style = "block" *) reg [P*32-1:0] xres_bank  [0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] lnout1_bank[0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] lnout2_bank[0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] qkv_bank   [0:BD_Q-1];
-    (* ram_style = "block" *) reg [P*32-1:0] ctxv_bank  [0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] attn_bank  [0:BD_S-1];
-    (* ram_style = "block" *) reg [P*16-1:0] mlpbuf_bank[0:BD_M-1];
-    (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:BD_H-1];
-
-    reg [P*32-1:0] xres_r, qkv_r, attn_r, mlp_r, head_r;          // NL-side reads
-    reg [P*32-1:0] lnout1_r, lnout2_r;                            // GEMM-side reads
-    reg [P*16-1:0] mlpbuf_r;
-    reg [P*32-1:0] ctxv_g;
-    reg [P*32-1:0] temb_r, pemb_r, gam_r;
+    // pos_emb writes are broadcast to BOTH engines' local pos_w copies
+    wire        pw_we   = el_commit && (el_word >= VOCAB*EROWS);
+    wire [$clog2(TMAX*EROWS)-1:0] pw_addr = el_word - VOCAB*EROWS;
+    wire [P*32-1:0] pw_data = el_next;
 
     // ================================================================
-    //                       NL  ENGINE
+    //              EMBED ARBITER (shared URAM read port)
     // ================================================================
-    reg                ln_start, ln_vin;
-    reg  [P*32-1:0]    ln_x, ln_g;
-    wire               ln_yv, ln_done;
-    wire [P*64-1:0]    ln_y;
-    layernorm_vec #(.P(P)) u_ln (
-        .clk(clk), .rst(rst), .start(ln_start), .valid_in(ln_vin),
-        .x_in(ln_x), .gamma_in(ln_g), .y_valid(ln_yv), .y_out(ln_y), .done(ln_done));
+    wire        emb_req0, emb_req1;
+    wire [$clog2(VOCAB*EROWS)-1:0] emb_addr0, emb_addr1;
+    wire        emb_gnt0 = emb_req0;            // group 0 has priority
+    wire        emb_gnt1 = emb_req1 && !emb_req0;
+    reg  [P*32-1:0] emb_q;
+    always @(posedge clk)
+        emb_q <= emb_w[emb_gnt0 ? emb_addr0 : emb_addr1];
 
-    reg               at_start, at_ldv;
-    reg [8:0]         at_tcount;
-    wire              at_ldready, at_ctxv, at_done;
-    wire [6:0]        at_ctxidx;
-    wire [P*32-1:0]   at_ctxdata;
-    reg [1:0]  hh;
-    reg [8:0]  wi, wic;
-    wire [10:0] aw_src = (wi < HR)   ? (hh*HR + wi) :
-                         (wi < 2*HR) ? (D/P   + hh*HR + (wi - HR)) :
-                                       (2*D/P + hh*HR + (wi - 2*HR));
-    wire [P*32-1:0] aw_data = qkv_r;
-    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(32)) u_attn (
-        .clk(clk), .rst(rst), .start(at_start), .tcount(at_tcount),
-        .ld_valid(at_ldv), .ld_data(aw_data), .ld_ready(at_ldready),
-        .ctx_valid(at_ctxv), .ctx_idx(at_ctxidx), .ctx_data(at_ctxdata), .done(at_done));
+    // ================================================================
+    //              GE <-> NL engine interconnect
+    // ================================================================
+    // per-engine descriptor + request (wires from the two nl_engine instances)
+    wire [19:0] d_wbase [0:1];
+    wire [10:0] d_m [0:1], d_k [0:1];
+    wire [1:0]  d_asrc [0:1];
+    wire [5:0]  d_asel [0:1];
+    wire signed [6:0] d_frac [0:1];
+    wire [11:0] d_dqrow [0:1];
+    wire [2:0]  d_dst [0:1];
+    wire        g_req [0:1];
+    wire        done_o0, done_o1;
+    wire [G*9-1:0] tok_outs_g0, tok_outs_g1;
 
-    // per-group GEMM-call descriptor + request flag (cleared by the GEMM engine)
-    reg  [19:0] d_wbase [0:1];
-    reg  [10:0] d_m [0:1], d_k [0:1];
-    reg  [1:0]  d_asrc [0:1];
-    reg  [5:0]  d_asel [0:1];
-    reg signed [6:0] d_frac [0:1];
-    reg  [11:0] d_dqrow [0:1];
-    reg  [2:0]  d_dst [0:1];
-    reg         g_req [0:1];
+    // GE-side registered reads from each engine (muxed by delayed group bit)
+    wire [P*32-1:0] e0_lnout1_r, e0_lnout2_r, e0_ctxv_g; wire [P*16-1:0] e0_mlpbuf_r;
+    wire [P*32-1:0] e1_lnout1_r, e1_lnout2_r, e1_ctxv_g; wire [P*16-1:0] e1_mlpbuf_r;
+    // NL-side registered reads from each engine (host debug)
+    wire [P*32-1:0] e0_xres_r, e0_qkv_r, e0_attn_r, e0_mlp_r, e0_head_r;
+    wire [P*32-1:0] e1_xres_r, e1_qkv_r, e1_attn_r, e1_mlp_r, e1_head_r;
+
     wire        g_done_p;            // pulse: current GEMM call fully drained
-    wire        rb_last;
 
-    localparam [4:0]
-      NL_IDLE=0, NL_EMB=1, NL_LGAM=2, NL_LFEED=3, NL_LCOLL=4,
-      NL_QKV=5, NL_WQKV=6, NL_AST=7, NL_ALD=8, NL_ACL=9,
-      NL_PROJ=10, NL_WPROJ=11, NL_RES1=12,
-      NL_FC=13, NL_WFC=14, NL_MP=15, NL_WMP=16, NL_RES2=17,
-      NL_HEAD=18, NL_WHEAD=19, NL_ARG=20, NL_ARG2=21, NL_DONE=22;
-    reg [4:0]  nl [0:1];
-    reg        gc;                  // group the NL engine is working on
-    reg [3:0]  blkg [0:1];
-    reg [1:0]  lnphase [0:1];       // 0 = LN1->QKV, 1 = LN2->FC, 2 = LNF->HEAD
-    reg        donef [0:1];
+    // drain-write + AQ-read buses driven by the GE (combinational from GE state)
+    reg         dwr_we;            // generic bank drain
+    reg  [2:0]  dwr_dst;
+    reg  [10:0] dwr_addr;          // LOCAL
+    reg  [P*32-1:0] dwr_data;
+    reg         dwmr_we;           // mlpbuf drain
+    reg  [10:0] dwmr_addr;         // LOCAL
+    reg  [P*16-1:0] dwmr_data;
+    reg         dwr_eng;           // engine select for both drain buses
+    reg  [10:0] ge_ra_local;       // LOCAL AQ/host read address (both engines)
 
-    reg [GSH-1:0] bsg [0:1];           // PER-GROUP stream counter (argmax of group A
-                                        // and LN of group B run interleaved)
-    reg [10:0] ci, cid;  reg civ;
-    reg [$clog2(ROWSM+1)-1:0] fr, frd, orow;  reg frv;
-    reg [$clog2(ARROWS+1)-1:0] ar, ard, amd, ad1;
-    reg arv, av1, amv;
-    reg [8:0] wm_idx, am_idx, best_idx;
-    reg signed [31:0] wm_val, am_val, best_val;
-    reg [P*32-1:0] hw_r;
-    reg signed [31:0] pv0, pv1, pv2, pv3;
-    reg [8:0]         pi0, pi1, pi2, pi3;
-    reg signed [31:0] va, vb;
-    reg [8:0]         ia, ib;
-    reg [P*32-1:0] ww, sw;
-    // xres_bank single-write-port temps: three FSM states write the bank; as
-    // three write SITES Vivado sees a multi-writer RAM, replicates the LUTRAM
-    // ~3.5x (1,776 RAM64M8 ~= 14k LUT, "Infeasible block") instead of BRAM.
-    // Blocking-muxed into ONE site after the case — same cycle, same values.
-    reg              xr_we;
-    reg [10:0]       xr_wa;
-    reg [P*32-1:0]   xr_wd;
-    reg [3:0] lgam;
-    integer pp;
+    // GE-side read mux: read regs are 1 cycle behind ge_ra -> delay group bit by 1
+    reg         ge_grp_d;
+    wire [P*32-1:0] lnout1_r = ge_grp_d ? e1_lnout1_r : e0_lnout1_r;
+    wire [P*32-1:0] lnout2_r = ge_grp_d ? e1_lnout2_r : e0_lnout2_r;
+    wire [P*32-1:0] ctxv_g   = ge_grp_d ? e1_ctxv_g   : e0_ctxv_g;
+    wire [P*16-1:0] mlpbuf_r = ge_grp_d ? e1_mlpbuf_r : e0_mlpbuf_r;
 
-    wire [GSH-1:0] bs = bsg[gc];
-    wire [8:0] tok_id_b = tok_ids[({gc, bs})*9 +: 9];
-    reg [8:0] tok_out_b [0:N-1];
-    genvar gtb;
-    generate
-        for (gtb = 0; gtb < N; gtb = gtb + 1) begin : g_tok
-            assign tok_outs[gtb*9 +: 9] = tok_out_b[gtb];
-        end
-    endgenerate
+    // NL-side host-debug read mux (rd_stream held constant across a dump)
+    wire [P*32-1:0] xres_r = rd_stream[GSH] ? e1_xres_r : e0_xres_r;
+    wire [P*32-1:0] qkv_r  = rd_stream[GSH] ? e1_qkv_r  : e0_qkv_r;
+    wire [P*32-1:0] attn_r = rd_stream[GSH] ? e1_attn_r : e0_attn_r;
+    wire [P*32-1:0] mlp_r  = rd_stream[GSH] ? e1_mlp_r  : e0_mlp_r;
+    wire [P*32-1:0] head_r = rd_stream[GSH] ? e1_head_r : e0_head_r;
 
-    // NL-side addressing: stream = {gc, bs}
-    wire [10:0] sN  = {gc, bs} * ROWS;
-    wire [10:0] sN3 = {gc, bs} * ROWS3;
-    wire [10:0] sNA = {gc, bs} * ARROWS;
-    wire [10:0] rbr  = rd_stream*ROWS   + (rd_addr >> LSH);
-    wire [10:0] rbr3 = rd_stream*ROWS3  + (rd_addr >> LSH);
-    wire [10:0] rbrA = rd_stream*ARROWS + (rd_addr >> LSH);
+    nl_engine #(.D(D), .D3(D3), .D_MLP(D_MLP), .P(P), .LANES(LANES), .G(G),
+                .VOCAB(VOCAB), .TMAX(TMAX), .GAMMA_N(GAMMA_N), .NLAYER(NLAYER),
+                .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .RESID_FRAC(RESID_FRAC),
+                .LN_OUT_FRAC(LN_OUT_FRAC), .VFRAC(VFRAC), .GELU_FRAC(GELU_FRAC),
+                .ISH(ISH)) eng0 (
+        .clk(clk), .rst(rst), .go(go),
+        .tok_ids(tok_ids[G*9-1:0]), .pos(pos),
+        .served(g_done_p && (gmerge || ggrp == 1'b0)),
+        .emb_gnt(emb_gnt0), .emb_q(emb_q), .emb_req(emb_req0), .emb_addr(emb_addr0),
+        .dw_we(dwr_we && (dwr_eng == 1'b0)), .dw_dst(dwr_dst), .dw_addr(dwr_addr), .dw_data(dwr_data),
+        .dwm_we(dwmr_we && (dwr_eng == 1'b0)), .dwm_addr(dwmr_addr), .dwm_data(dwmr_data),
+        .ge_ra(ge_ra_local),
+        .dbg_stream(rd_stream[GSH-1:0]), .dbg_addr(rd_addr),
+        .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
+        .req(g_req[0]), .d_wbase(d_wbase[0]), .d_m(d_m[0]), .d_k(d_k[0]),
+        .d_asrc(d_asrc[0]), .d_asel(d_asel[0]), .d_frac(d_frac[0]),
+        .d_dqrow(d_dqrow[0]), .d_dst(d_dst[0]), .done_o(done_o0),
+        .tok_outs_g(tok_outs_g0),
+        .lnout1_r(e0_lnout1_r), .lnout2_r(e0_lnout2_r), .ctxv_g(e0_ctxv_g),
+        .mlpbuf_r(e0_mlpbuf_r),
+        .xres_r(e0_xres_r), .qkv_r(e0_qkv_r), .attn_r(e0_attn_r),
+        .mlp_r(e0_mlp_r), .head_r(e0_head_r));
 
-    wire [10:0] xres_ra = (nl[gc]==NL_LFEED) ? sN + {{(11-$clog2(ROWSM+1)){1'b0}}, fr} :
-                          (nl[gc]==NL_RES1 || nl[gc]==NL_RES2) ? sN + ci : rbr;
-    wire [10:0] qkv_ra  = (nl[gc]==NL_ALD) ? sN3 + aw_src : rbr3;
-    wire [10:0] attn_ra = (nl[gc]==NL_RES1) ? sN + ci : rbr;
-    wire [10:0] mlp_ra  = (nl[gc]==NL_RES2) ? sN + ci : rbr;
-    wire [10:0] head_ra = (nl[gc]==NL_ARG) ? sNA + {{(11-$clog2(ARROWS+1)){1'b0}}, ar} : rbrA;
+    nl_engine #(.D(D), .D3(D3), .D_MLP(D_MLP), .P(P), .LANES(LANES), .G(G),
+                .VOCAB(VOCAB), .TMAX(TMAX), .GAMMA_N(GAMMA_N), .NLAYER(NLAYER),
+                .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .RESID_FRAC(RESID_FRAC),
+                .LN_OUT_FRAC(LN_OUT_FRAC), .VFRAC(VFRAC), .GELU_FRAC(GELU_FRAC),
+                .ISH(ISH)) eng1 (
+        .clk(clk), .rst(rst), .go(go),
+        .tok_ids(tok_ids[N*9-1:G*9]), .pos(pos),
+        .served(g_done_p && (gmerge || ggrp == 1'b1)),
+        .emb_gnt(emb_gnt1), .emb_q(emb_q), .emb_req(emb_req1), .emb_addr(emb_addr1),
+        .dw_we(dwr_we && (dwr_eng == 1'b1)), .dw_dst(dwr_dst), .dw_addr(dwr_addr), .dw_data(dwr_data),
+        .dwm_we(dwmr_we && (dwr_eng == 1'b1)), .dwm_addr(dwmr_addr), .dwm_data(dwmr_data),
+        .ge_ra(ge_ra_local),
+        .dbg_stream(rd_stream[GSH-1:0]), .dbg_addr(rd_addr),
+        .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
+        .req(g_req[1]), .d_wbase(d_wbase[1]), .d_m(d_m[1]), .d_k(d_k[1]),
+        .d_asrc(d_asrc[1]), .d_asel(d_asel[1]), .d_frac(d_frac[1]),
+        .d_dqrow(d_dqrow[1]), .d_dst(d_dst[1]), .done_o(done_o1),
+        .tok_outs_g(tok_outs_g1),
+        .lnout1_r(e1_lnout1_r), .lnout2_r(e1_lnout2_r), .ctxv_g(e1_ctxv_g),
+        .mlpbuf_r(e1_mlpbuf_r),
+        .xres_r(e1_xres_r), .qkv_r(e1_qkv_r), .attn_r(e1_attn_r),
+        .mlp_r(e1_mlp_r), .head_r(e1_head_r));
 
+    assign tok_outs = {tok_outs_g1, tok_outs_g0};
+
+    // done: pulse on rising edge of (both engines done)
+    wire both_done = done_o0 && done_o1;
+    reg  both_done_d;
     always @(posedge clk) begin
-        xres_r <= xres_bank[xres_ra];
-        qkv_r  <= qkv_bank [qkv_ra];
-        attn_r <= attn_bank[attn_ra];
-        mlp_r  <= mlp_bank [mlp_ra];
-        head_r <= head_bank[head_ra];
-        temb_r <= emb_w[tok_id_b*EROWS + fr];
-        gam_r  <= gamma_w[lgam*EROWS + fr];
-    end
-    always @(posedge clk) begin
-        if (el_commit && el_word >= VOCAB*EROWS)
-            pos_w[el_word - VOCAB*EROWS] <= el_next;
-        else
-            pemb_r <= pos_w[pos*EROWS + fr];
-    end
-
-    always @(posedge clk) begin
-        ln_start<=1'b0; ln_vin<=1'b0; at_start<=1'b0; at_ldv<=1'b0; done<=1'b0;
-        if (rst) begin
-            nl[0]<=NL_IDLE; nl[1]<=NL_IDLE; gc<=0; bsg[0]<=0; bsg[1]<=0;
-            g_req[0]<=0; g_req[1]<=0; donef[0]<=0; donef[1]<=0;
-            lnphase[0]<=0; lnphase[1]<=0;
-            fr<=0; frv<=0; civ<=0; arv<=0; av1<=0; amv<=0;
-        end else begin
-            if (go) begin
-                nl[0]<=NL_EMB; nl[1]<=NL_EMB; blkg[0]<=0; blkg[1]<=0;
-                lnphase[0]<=0; lnphase[1]<=0; donef[0]<=0; donef[1]<=0;
-                gc<=0; bsg[0]<=0; bsg[1]<=0; fr<=0; frv<=0;
-            end
-            if (g_done_p) begin
-                if (gmerge) begin g_req[0] <= 1'b0; g_req[1] <= 1'b0; end
-                else g_req[g_served] <= 1'b0;
-            end
-
-            xr_we = 1'b0;                       // default: no xres write this cycle
-            case (nl[gc])
-                NL_IDLE: ;
-                NL_EMB: begin
-                    frd <= fr; frv <= (fr != ROWS[$clog2(ROWSM+1)-1:0]);
-                    if (fr != ROWS[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
-                    if (frv) begin
-                        for (pp=0; pp<P; pp=pp+1)
-                            ww[pp*32 +: 32] = $signed(temb_r[pp*32 +: 32])
-                                            + $signed(pemb_r[pp*32 +: 32]);
-                        xr_we = 1'b1; xr_wa = sN + frd; xr_wd = ww;
-                        if (frd==ROWS-1) begin
-                            fr<=0; frv<=0;
-                            if (bs == G-1) begin
-                                bsg[gc]<=0; lgam<=blkg[gc]*2; nl[gc]<=NL_LGAM;
-                            end else bsg[gc] <= bs + 1'b1;
-                        end
-                    end
-                end
-                NL_LGAM: begin ln_start<=1'b1; fr<=0; frv<=0; nl[gc]<=NL_LFEED; end
-                NL_LFEED: begin
-                    frd <= fr; frv <= (fr != ROWS[$clog2(ROWSM+1)-1:0]);
-                    if (fr != ROWS[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
-                    ln_vin <= frv;
-                    ln_x   <= xres_r;
-                    ln_g   <= gam_r;
-                    if (frv && frd==ROWS-1) begin orow<=0; fr<=0; frv<=0; nl[gc]<=NL_LCOLL; end
-                end
-                NL_LCOLL: begin
-                    if (ln_yv) begin
-                        for (pp=0; pp<P; pp=pp+1)
-                            ww[pp*32 +: 32] = ln_y[pp*64 +: 32];   // Q.22 fits 32b
-                        if (lnphase[gc]==2'd1) lnout2_bank[sN + orow] <= ww;
-                        else                   lnout1_bank[sN + orow] <= ww;
-                        if (orow==ROWS-1) begin
-                            if (bs == G-1) begin
-                                bsg[gc]<=0;
-                                case (lnphase[gc])
-                                    2'd0: nl[gc] <= NL_QKV;
-                                    2'd1: nl[gc] <= NL_FC;
-                                    default: nl[gc] <= NL_HEAD;
-                                endcase
-                            end else begin bsg[gc]<=bs+1'b1; nl[gc]<=NL_LGAM; end
-                        end else orow<=orow+1'b1;
-                    end
-                end
-                // ---- GEMM requests: queue + switch group while waiting --------
-                NL_QKV: begin
-                    d_wbase[gc]<=blkg[gc]*GW_BLK + WB_QKV; d_m[gc]<=D3[10:0]; d_k[gc]<=D[10:0];
-                    d_asrc[gc]<=2'd0; d_asel[gc]<=blkg[gc]*4 + 6'd0; d_frac[gc]<=7'd16;
-                    d_dqrow[gc]<=blkg[gc]*DQB_P + DR_QKV[11:0]; d_dst[gc]<=3'd0;
-                    g_req[gc]<=1'b1; nl[gc]<=NL_WQKV; gc<=~gc;
-                end
-                NL_WQKV: if (!g_req[gc]) begin hh<=0; bsg[gc]<=0; nl[gc] <= NL_AST; end
-                         else gc <= ~gc;
-                NL_AST: begin
-                    at_start<=1'b1; at_tcount<=9'd1; wi<=9'd0; wic<=9'd0; nl[gc]<=NL_ALD;
-                end
-                NL_ALD: begin
-                    at_ldv <= (wi != 3*HR);
-                    if (wi != 3*HR) wi <= wi + 1'b1;
-                    if (at_ldv) begin
-                        if (wic == 3*HR-1) nl[gc] <= NL_ACL;
-                        else wic <= wic + 1'b1;
-                    end
-                end
-                NL_ACL: begin
-                    if (at_ctxv)
-                        ctxv_bank[sN + hh*HR + at_ctxidx] <= at_ctxdata;
-                    if (at_done) begin
-                        if (hh==NHEAD-1) begin
-                            if (bs == G-1) begin bsg[gc]<=0; hh<=0; nl[gc]<=NL_PROJ; end
-                            else begin bsg[gc]<=bs+1'b1; hh<=0; nl[gc]<=NL_AST; end
-                        end else begin hh<=hh+2'd1; nl[gc]<=NL_AST; end
-                    end
-                end
-                NL_PROJ: begin
-                    d_wbase[gc]<=blkg[gc]*GW_BLK + WB_PROJ; d_m[gc]<=D[10:0]; d_k[gc]<=D[10:0];
-                    d_asrc[gc]<=2'd1; d_asel[gc]<=blkg[gc]*4 + 6'd1; d_frac[gc]<=7'd25;
-                    d_dqrow[gc]<=blkg[gc]*DQB_P + DR_PROJ[11:0]; d_dst[gc]<=3'd1;
-                    g_req[gc]<=1'b1; nl[gc]<=NL_WPROJ; gc<=~gc;
-                end
-                NL_WPROJ: if (!g_req[gc]) begin ci<=0; civ<=0; nl[gc] <= NL_RES1; end
-                          else gc <= ~gc;
-                NL_RES1: begin
-                    cid <= ci; civ <= (ci != ROWS[10:0]);
-                    if (ci != ROWS[10:0]) ci <= ci + 1'b1;
-                    if (civ) begin
-                        for (pp=0; pp<P; pp=pp+1)
-                            sw[pp*32 +: 32] = $signed(xres_r[pp*32 +: 32])
-                                            + $signed(attn_r[pp*32 +: 32]);
-                        xr_we = 1'b1; xr_wa = sN + cid; xr_wd = sw;
-                        if (cid==ROWS-1) begin
-                            ci<=0; civ<=0;
-                            if (bs == G-1) begin
-                                bsg[gc]<=0; lnphase[gc]<=2'd1; lgam<=blkg[gc]*2 + 4'd1; nl[gc]<=NL_LGAM;
-                            end else bsg[gc]<=bs+1'b1;
-                        end
-                    end
-                end
-                NL_FC: begin
-                    d_wbase[gc]<=blkg[gc]*GW_BLK + WB_FC; d_m[gc]<=D_MLP[10:0]; d_k[gc]<=D[10:0];
-                    d_asrc[gc]<=2'd2; d_asel[gc]<=blkg[gc]*4 + 6'd2; d_frac[gc]<=7'd12;
-                    d_dqrow[gc]<=blkg[gc]*DQB_P + DR_FC[11:0]; d_dst[gc]<=3'd2;
-                    g_req[gc]<=1'b1; nl[gc]<=NL_WFC; gc<=~gc;
-                end
-                NL_WFC: if (!g_req[gc]) nl[gc] <= NL_MP;
-                        else gc <= ~gc;
-                NL_MP: begin
-                    d_wbase[gc]<=blkg[gc]*GW_BLK + WB_MP; d_m[gc]<=D[10:0]; d_k[gc]<=D_MLP[10:0];
-                    d_asrc[gc]<=2'd3; d_asel[gc]<=blkg[gc]*4 + 6'd3; d_frac[gc]<=7'd25;
-                    d_dqrow[gc]<=blkg[gc]*DQB_P + DR_MP[11:0]; d_dst[gc]<=3'd3;
-                    g_req[gc]<=1'b1; nl[gc]<=NL_WMP; gc<=~gc;
-                end
-                NL_WMP: if (!g_req[gc]) begin ci<=0; civ<=0; nl[gc] <= NL_RES2; end
-                        else gc <= ~gc;
-                NL_RES2: begin
-                    cid <= ci; civ <= (ci != ROWS[10:0]);
-                    if (ci != ROWS[10:0]) ci <= ci + 1'b1;
-                    if (civ) begin
-                        for (pp=0; pp<P; pp=pp+1)
-                            sw[pp*32 +: 32] = $signed(xres_r[pp*32 +: 32])
-                                            + $signed(mlp_r[pp*32 +: 32]);
-                        xr_we = 1'b1; xr_wa = sN + cid; xr_wd = sw;
-                        if (cid==ROWS-1) begin
-                            ci<=0; civ<=0;
-                            if (bs == G-1) begin
-                                bsg[gc]<=0;
-                                if (blkg[gc] == NLAYER-1) begin
-                                    lnphase[gc]<=2'd2; lgam<=NLAYER*2; nl[gc]<=NL_LGAM;
-                                end else begin
-                                    blkg[gc]<=blkg[gc]+1'b1; lnphase[gc]<=2'd0;
-                                    lgam<=(blkg[gc]+1'b1)*2; nl[gc]<=NL_LGAM;
-                                end
-                            end else bsg[gc]<=bs+1'b1;
-                        end
-                    end
-                end
-                NL_HEAD: begin
-                    d_wbase[gc]<=WB_HEAD[19:0]; d_m[gc]<=VOCAB[10:0]; d_k[gc]<=D[10:0];
-                    d_asrc[gc]<=2'd0; d_asel[gc]<=4*NLAYER; d_frac[gc]<=7'd25;
-                    d_dqrow[gc]<=DR_HEAD[11:0]; d_dst[gc]<=3'd4;
-                    g_req[gc]<=1'b1;
-                    best_val<=32'sh80000000; best_idx<=0; ar<=0; arv<=0; av1<=0; amv<=0;
-                    nl[gc]<=NL_WHEAD; gc<=~gc;
-                end
-                NL_WHEAD: if (!g_req[gc]) begin
-                    // argmax scratch is SHARED between groups — re-arm on entry
-                    best_val<=32'sh80000000; best_idx<=0;
-                    ar<=0; arv<=0; av1<=0; amv<=0;
-                    nl[gc] <= NL_ARG;
-                end else gc <= ~gc;
-                NL_ARG: begin
-                    ard <= ar; arv <= (ar != ARROWS[$clog2(ARROWS+1)-1:0]);
-                    if (ar != ARROWS[$clog2(ARROWS+1)-1:0]) ar <= ar + 1'b1;
-                    hw_r <= head_r; ad1 <= ard; av1 <= arv;
-                    if (av1) begin
-                        for (pp=0; pp<4; pp=pp+1) begin
-                            va = $signed(hw_r[pp*32 +: 32]);
-                            vb = $signed(hw_r[(pp+4)*32 +: 32]);
-                            ia = ad1*P + pp;  ib = ad1*P + pp + 4;
-                            if (ia >= VOCAB) va = 32'sh80000000;
-                            if (ib >= VOCAB) vb = 32'sh80000000;
-                            case (pp)
-                                0: begin pv0 <= (vb > va) ? vb : va; pi0 <= (vb > va) ? ib : ia; end
-                                1: begin pv1 <= (vb > va) ? vb : va; pi1 <= (vb > va) ? ib : ia; end
-                                2: begin pv2 <= (vb > va) ? vb : va; pi2 <= (vb > va) ? ib : ia; end
-                                default: begin pv3 <= (vb > va) ? vb : va; pi3 <= (vb > va) ? ib : ia; end
-                            endcase
-                        end
-                    end
-                    amv <= av1; amd <= ad1;
-                    if (amv) begin
-                        wm_val = pv0; wm_idx = pi0;
-                        if (pv1 > wm_val) begin wm_val = pv1; wm_idx = pi1; end
-                        if (pv2 > wm_val) begin wm_val = pv2; wm_idx = pi2; end
-                        if (pv3 > wm_val) begin wm_val = pv3; wm_idx = pi3; end
-                        if (wm_val > best_val) begin
-                            best_val <= wm_val; best_idx <= wm_idx;
-                        end
-                        if (amd==ARROWS-1) begin
-                            tok_out_b[{gc, bs}] <= (wm_val > best_val) ? wm_idx : best_idx;
-                            nl[gc] <= NL_ARG2;
-                        end
-                    end
-                end
-                NL_ARG2: begin
-                    if (bs == G-1) begin
-                        bsg[gc]<=0; donef[gc]<=1'b1; nl[gc]<=NL_DONE;
-                        if (donef[~gc]) done<=1'b1;
-                    end else begin
-                        bsg[gc]<=bs+1'b1;
-                        best_val<=32'sh80000000; best_idx<=0;
-                        ar<=0; arv<=0; av1<=0; amv<=0; nl[gc]<=NL_ARG;
-                    end
-                end
-                NL_DONE: begin
-                    if (!donef[~gc]) gc <= ~gc;
-                end
-                default: nl[gc] <= NL_IDLE;
-            endcase
-            if (xr_we) xres_bank[xr_wa] <= xr_wd;   // the bank's ONLY write site
+        if (rst) begin done <= 1'b0; both_done_d <= 1'b0; end
+        else begin
+            done <= both_done && !both_done_d;
+            both_done_d <= both_done;
+            if (go) both_done_d <= 1'b0;
         end
     end
 
     // ================================================================
-    //                       GEMM ENGINE
+    //                       GEMM ENGINE  (shared)
     // ================================================================
     reg                gv_ldrst, gv_xrst, gv_xwe, gv_start;
     reg  [$clog2(N)-1:0] gv_xstream, gv_rdstream;
@@ -500,11 +255,6 @@ module sequencer_pp #(
     wire               gv_done;
     reg [10:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
-    // keep_hierarchy: the core is URAM-clean standalone (56 URAM, 72k LUT) but
-    // a global post-synth pass in the FULL design trims its g_w rd/word_p regs
-    // 512->4b and LUTRAMs the weights (449k LUT). keep_hierarchy alone did NOT
-    // stop that pass; the core also pins rd/word_p with dont_touch. Kept for
-    // QoR isolation.
     (* keep_hierarchy = "yes" *)
     gemm_banked_resident_vec #(.LANES(LANES), .N(N), .ND(ND), .P(P), .MMAX(1024),
                   .KMAX(1024), .RLAT(2), .WWORDS(WWORDS)) u_gemm (
@@ -571,30 +321,67 @@ module sequencer_pp #(
 
     // merged: gbs covers all N streams; single: ggrp's G streams
     wire [$clog2(N)-1:0] sid = gmerge ? gbs : {ggrp, gbs[GSH-1:0]};
-    wire [10:0] sG  = sid * ROWS;
-    wire [10:0] sG3 = sid * ROWS3;
-    wire [10:0] sGM = sid * ROWSM;
-    wire [10:0] sGA = sid * ARROWS;
+    wire             sid_eng = sid[GSH];          // group (engine) of current stream
+    wire [GSH-1:0]   sidl    = sid[GSH-1:0];      // LOCAL stream within its engine
+    wire [10:0] sGl  = sidl * ROWS;
+    wire [10:0] sG3l = sidl * ROWS3;
+    wire [10:0] sGMl = sidl * ROWSM;
+    wire [10:0] sGAl = sidl * ARROWS;
 
     localparam [2:0] GE_IDLE=0, GE_AQ=1, GE_AQN=2, GE_RUN=3, GE_WAIT=4, GE_RB=5, GE_RBN=6;
     reg [2:0] ge;
 
-    // GEMM-side reads; board readback reuses this port while the engine idles
-    wire [10:0] rbrM = rd_stream*ROWSM + (rd_addr >> LSH);
-    wire [10:0] gemm_ra = (ge == GE_IDLE) ? ((rd_sel == 4'd5) ? rbrM : rbr)
-                        : (a_asrc == 2'd3) ? (sGM + gci) : (sG + gci);
+    // GE-side read address (LOCAL): board readback reuses this port while idle
+    wire [10:0] rbr   = rd_stream[GSH-1:0]*ROWS   + (rd_addr >> LSH);
+    wire [10:0] rbrM  = rd_stream[GSH-1:0]*ROWSM  + (rd_addr >> LSH);
+    wire        ge_grp = (ge == GE_IDLE) ? rd_stream[GSH] : sid_eng;
+    always @(posedge clk) ge_grp_d <= ge_grp;
+    always @* begin
+        if (ge == GE_IDLE)
+            ge_ra_local = (rd_sel == 4'd5) ? rbrM : rbr;
+        else
+            ge_ra_local = (a_asrc == 2'd3) ? (sGMl + gci) : (sGl + gci);
+    end
+
     always @(posedge clk) begin
-        lnout1_r <= lnout1_bank[gemm_ra];
-        lnout2_r <= lnout2_bank[gemm_ra];
-        ctxv_g   <= ctxv_bank  [gemm_ra];
-        mlpbuf_r <= mlpbuf_bank[gemm_ra];
         mwr      <= dqm_w[a_dqrow + rb1];
         ewr      <= dqe_w[a_dqrow + rb1];
     end
 
-    assign rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == glim)
-                                     : (dq_vout && gdor == ((a_m + P-1) >> LSH) - 1 && gbs == glim);
+    wire rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == glim)
+                                   : (dq_vout && gdor == ((a_m + P-1) >> LSH) - 1 && gbs == glim);
     assign g_done_p = (ge == GE_RB) && rb_last;
+
+    // combinational dequant/saturate words used by the drain bus + gelu feed
+    always @* begin
+        dword = {(P*32){1'b0}}; mword = {(P*16){1'b0}};
+        for (gp=0; gp<P; gp=gp+1) begin
+            dqv = dq_out[gp*32 +: 32];
+            dword[gp*32 +: 32] = dqv;
+            if      ($signed(dqv) >  32'sd32767)  mword[gp*16 +: 16] = 16'sd32767;
+            else if ($signed(dqv) < -32'sd32768)  mword[gp*16 +: 16] = -16'sd32768;
+            else    mword[gp*16 +: 16] = dqv[15:0];
+        end
+    end
+
+    // drain-write buses (combinational): mirror the cycle the old bank write fired
+    always @* begin
+        dwr_we = 1'b0; dwr_dst = 3'd0; dwr_addr = 11'd0; dwr_data = dword;
+        dwmr_we = 1'b0; dwmr_addr = 11'd0; dwmr_data = gl_y;
+        dwr_eng = sid_eng;
+        if (ge == GE_RB) begin
+            if (dq_vout) begin
+                case (a_dst)
+                    3'd0: begin dwr_we = 1'b1; dwr_dst = 3'd0; dwr_addr = sG3l + gdor; end
+                    3'd1: begin dwr_we = 1'b1; dwr_dst = 3'd1; dwr_addr = sGl  + gdor; end
+                    3'd2: ;   // gelu hidden: routed through dwm on gl_vout
+                    3'd3: begin dwr_we = 1'b1; dwr_dst = 3'd3; dwr_addr = sGl  + gdor; end
+                    default: begin dwr_we = 1'b1; dwr_dst = 3'd4; dwr_addr = sGAl + gdor; end
+                endcase
+            end
+            if (gl_vout) begin dwmr_we = 1'b1; dwmr_addr = sGMl + gor; end
+        end
+    end
 
     always @(posedge clk) begin
         gv_ldrst<=0; gv_xrst<=0; gv_xwe<=0; gv_start<=0; dq_vin<=0; gl_vin<=0;
@@ -605,10 +392,7 @@ module sequencer_pp #(
             case (ge)
                 GE_IDLE: begin
                     // SINGLE PASS: wait for BOTH groups to request the SAME call
-                    // (descriptors must match — NL groups run in near-lockstep but
-                    // attention serialization can put A a phase ahead of B), then
-                    // serve all 8 streams from one weight pass.
-    if (g_req[0] && g_req[1] && d_wbase[0] == d_wbase[1]) begin
+                    if (g_req[0] && g_req[1] && d_wbase[0] == d_wbase[1]) begin
                         gwait   <= 0;
                         gmerge  <= 1'b1;  ggrp <= 1'b0;
                         a_wbase <= d_wbase[0]; a_m <= d_m[0]; a_k <= d_k[0];
@@ -618,15 +402,11 @@ module sequencer_pp #(
                         gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
                         gv_ldrst<=1'b1; ge<=GE_AQ;
                     end else if ((g_req[0] || g_req[1]) && gwait < GWAIT[17:0]) begin
-                        // wait for the partner group — merged passes serve all 8
-                        // streams from ONE weight pass (the 21k -> 40k lever)
                         gwait <= gwait + 1'b1;
                     end else if (g_req[0] || g_req[1]) begin
-                        // partner did not arrive: serve one group alone
                         gwait   <= 0;
                         gmerge  <= 1'b0;
                         ggrp    <= g_req[0] ? 1'b0 : 1'b1;
-                        // (no-request idle resets the patience timer below)
                         a_wbase <= g_req[0] ? d_wbase[0] : d_wbase[1];
                         a_m     <= g_req[0] ? d_m[0]     : d_m[1];
                         a_k     <= g_req[0] ? d_k[0]     : d_k[1];
@@ -708,7 +488,6 @@ module sequencer_pp #(
                 end
                 GE_WAIT: if (gv_done) begin
                     gci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0;
-                    // readback starts at THIS group's first stream (solo passes!)
                     gv_rdstream <= gmerge ? {($clog2(N)){1'b0}} : {ggrp, {GSH{1'b0}}};
                     gdor<=0; gor<=0; ge<=GE_RB;
                 end
@@ -725,20 +504,8 @@ module sequencer_pp #(
                         dq_exp   <= ewr;
                     end
                     if (dq_vout) begin
-                        for (gp=0; gp<P; gp=gp+1) begin
-                            dqv = dq_out[gp*32 +: 32];
-                            dword[gp*32 +: 32] = dqv;
-                            if      ($signed(dqv) >  32'sd32767)  mword[gp*16 +: 16] = 16'sd32767;
-                            else if ($signed(dqv) < -32'sd32768)  mword[gp*16 +: 16] = -16'sd32768;
-                            else    mword[gp*16 +: 16] = dqv[15:0];
-                        end
-                        case (a_dst)
-                            3'd0: qkv_bank [sG3 + gdor] <= dword;
-                            3'd1: attn_bank[sG  + gdor] <= dword;
-                            3'd2: begin gl_vin<=1'b1; gl_x<=mword; end
-                            3'd3: mlp_bank [sG  + gdor] <= dword;
-                            default: head_bank[sGA + gdor] <= dword;
-                        endcase
+                        // bank write now via dwr_* bus (combinational, this cycle)
+                        if (a_dst == 3'd2) begin gl_vin<=1'b1; gl_x<=mword; end
                         if (a_dst != 3'd2 && gdor==((a_m + P-1) >> LSH)-1) begin
                             gci<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
                             if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end
@@ -746,8 +513,7 @@ module sequencer_pp #(
                         end else gdor<=gdor+1'b1;
                     end
                     if (gl_vout) begin
-                        mlpbuf_bank[sGM + gor] <= gl_y;   // Q4.12 sat16: 16b lanes
-
+                        // mlpbuf write via dwmr_* bus (combinational, this cycle)
                         if (gor==ROWSM-1) begin
                             gci<=0; gor<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
                             if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end
@@ -769,6 +535,7 @@ module sequencer_pp #(
     // ---- board readback ----------------------------------------------------------
     reg [LSH-1:0] rd_lane;
     reg [P*64-1:0] rw64; reg [P*32-1:0] rw32; reg is64;
+    integer pp;
     always @* begin
         is64 = 1'b0; rw64 = {(P*64){1'b0}}; rw32 = {(P*32){1'b0}};
         case (rd_sel)
