@@ -184,6 +184,84 @@ module sequencer_pp #(
     wire [P*32-1:0] mlp_r  = rd_stream[GSH] ? e1_mlp_r  : e0_mlp_r;
     wire [P*32-1:0] head_r = rd_stream[GSH] ? e1_head_r : e0_head_r;
 
+    // ================================================================
+    //         SHARED LayerNorm + Attention (one each, arbitrated)
+    // ================================================================
+    // Each engine drives ln_*_o / at_*_o request-side signals and qualifies its
+    // captures by its own FSM state + its gnt. Fixed priority eng0 > eng1 with HOLD:
+    // once granted, the grant is kept until the holder drops its req (req fall edge
+    // releases). LN and attn holds within one engine never overlap/nest (see
+    // nl_engine header), so the two independent fixed-priority arbiters cannot
+    // deadlock.
+
+    // ---- per-engine LN request-side signals ----
+    wire        ln_req0, ln_start0, ln_vin0;  wire [P*32-1:0] ln_x0, ln_g0;
+    wire        ln_req1, ln_start1, ln_vin1;  wire [P*32-1:0] ln_x1, ln_g1;
+    // ---- per-engine attn request-side signals ----
+    wire        at_req0, at_start0, at_ldv0;  wire [8:0] at_tcount0;  wire [P*32-1:0] at_lddat0;
+    wire        at_req1, at_start1, at_ldv1;  wire [8:0] at_tcount1;  wire [P*32-1:0] at_lddat1;
+
+    // ---- LN arbiter (fixed priority eng0 > eng1, hold until req falls) ----
+    reg  ln_owner;        // 0 = eng0 holds, 1 = eng1 holds
+    reg  ln_busy;         // a grant is currently held
+    always @(posedge clk) begin
+        if (rst) begin ln_busy <= 1'b0; ln_owner <= 1'b0; end
+        else if (!ln_busy) begin
+            if (ln_req0)      begin ln_busy <= 1'b1; ln_owner <= 1'b0; end
+            else if (ln_req1) begin ln_busy <= 1'b1; ln_owner <= 1'b1; end
+        end else begin
+            // release when the current owner drops its request
+            if ((ln_owner == 1'b0 && !ln_req0) || (ln_owner == 1'b1 && !ln_req1))
+                ln_busy <= 1'b0;
+        end
+    end
+    wire ln_gnt0 = ln_busy && (ln_owner == 1'b0);
+    wire ln_gnt1 = ln_busy && (ln_owner == 1'b1);
+
+    // ---- attn arbiter (same shape) ----
+    reg  at_owner;
+    reg  at_busy;
+    always @(posedge clk) begin
+        if (rst) begin at_busy <= 1'b0; at_owner <= 1'b0; end
+        else if (!at_busy) begin
+            if (at_req0)      begin at_busy <= 1'b1; at_owner <= 1'b0; end
+            else if (at_req1) begin at_busy <= 1'b1; at_owner <= 1'b1; end
+        end else begin
+            if ((at_owner == 1'b0 && !at_req0) || (at_owner == 1'b1 && !at_req1))
+                at_busy <= 1'b0;
+        end
+    end
+    wire at_gnt0 = at_busy && (at_owner == 1'b0);
+    wire at_gnt1 = at_busy && (at_owner == 1'b1);
+
+    // ---- request-side muxes into the shared units (granted engine) ----
+    wire           sh_ln_start = ln_gnt1 ? ln_start1 : ln_start0;
+    wire           sh_ln_vin   = ln_gnt1 ? ln_vin1   : ln_vin0;
+    wire [P*32-1:0] sh_ln_x    = ln_gnt1 ? ln_x1     : ln_x0;
+    wire [P*32-1:0] sh_ln_g    = ln_gnt1 ? ln_g1     : ln_g0;
+    wire           sh_ln_yv;
+    wire [P*64-1:0] sh_ln_y;
+    wire           sh_ln_done;
+    layernorm_vec #(.P(P)) u_ln (
+        .clk(clk), .rst(rst), .start(sh_ln_start), .valid_in(sh_ln_vin),
+        .x_in(sh_ln_x), .gamma_in(sh_ln_g),
+        .y_valid(sh_ln_yv), .y_out(sh_ln_y), .done(sh_ln_done));
+
+    wire           sh_at_start = at_gnt1 ? at_start1 : at_start0;
+    wire [8:0]     sh_at_tcount= at_gnt1 ? at_tcount1: at_tcount0;
+    wire           sh_at_ldv   = at_gnt1 ? at_ldv1   : at_ldv0;
+    wire [P*32-1:0] sh_at_lddat= at_gnt1 ? at_lddat1 : at_lddat0;
+    wire           sh_at_ldready;
+    wire           sh_at_ctxv;
+    wire [6:0]     sh_at_ctxidx;
+    wire [P*32-1:0] sh_at_ctxdata;
+    wire           sh_at_done;
+    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(32)) u_attn (
+        .clk(clk), .rst(rst), .start(sh_at_start), .tcount(sh_at_tcount),
+        .ld_valid(sh_at_ldv), .ld_data(sh_at_lddat), .ld_ready(sh_at_ldready),
+        .ctx_valid(sh_at_ctxv), .ctx_idx(sh_at_ctxidx), .ctx_data(sh_at_ctxdata),
+        .done(sh_at_done));
+
     nl_engine #(.D(D), .D3(D3), .D_MLP(D_MLP), .P(P), .LANES(LANES), .G(G),
                 .VOCAB(VOCAB), .TMAX(TMAX), .GAMMA_N(GAMMA_N), .NLAYER(NLAYER),
                 .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .RESID_FRAC(RESID_FRAC),
@@ -198,6 +276,13 @@ module sequencer_pp #(
         .ge_ra(ge_ra_local),
         .dbg_stream(rd_stream[GSH-1:0]), .dbg_addr(rd_addr),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
+        .ln_req(ln_req0), .ln_start_o(ln_start0), .ln_vin_o(ln_vin0),
+        .ln_x_o(ln_x0), .ln_g_o(ln_g0),
+        .ln_gnt(ln_gnt0), .ln_yv_i(sh_ln_yv), .ln_y_i(sh_ln_y), .ln_done_i(sh_ln_done),
+        .at_req(at_req0), .at_start_o(at_start0), .at_tcount_o(at_tcount0),
+        .at_ldv_o(at_ldv0), .at_ld_data_o(at_lddat0),
+        .at_gnt(at_gnt0), .at_ldready_i(sh_at_ldready), .at_ctxv_i(sh_at_ctxv),
+        .at_ctxidx_i(sh_at_ctxidx), .at_ctxdata_i(sh_at_ctxdata), .at_done_i(sh_at_done),
         .req(g_req[0]), .d_wbase(d_wbase[0]), .d_m(d_m[0]), .d_k(d_k[0]),
         .d_asrc(d_asrc[0]), .d_asel(d_asel[0]), .d_frac(d_frac[0]),
         .d_dqrow(d_dqrow[0]), .d_dst(d_dst[0]), .done_o(done_o0),
@@ -221,6 +306,13 @@ module sequencer_pp #(
         .ge_ra(ge_ra_local),
         .dbg_stream(rd_stream[GSH-1:0]), .dbg_addr(rd_addr),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
+        .ln_req(ln_req1), .ln_start_o(ln_start1), .ln_vin_o(ln_vin1),
+        .ln_x_o(ln_x1), .ln_g_o(ln_g1),
+        .ln_gnt(ln_gnt1), .ln_yv_i(sh_ln_yv), .ln_y_i(sh_ln_y), .ln_done_i(sh_ln_done),
+        .at_req(at_req1), .at_start_o(at_start1), .at_tcount_o(at_tcount1),
+        .at_ldv_o(at_ldv1), .at_ld_data_o(at_lddat1),
+        .at_gnt(at_gnt1), .at_ldready_i(sh_at_ldready), .at_ctxv_i(sh_at_ctxv),
+        .at_ctxidx_i(sh_at_ctxidx), .at_ctxdata_i(sh_at_ctxdata), .at_done_i(sh_at_done),
         .req(g_req[1]), .d_wbase(d_wbase[1]), .d_m(d_m[1]), .d_k(d_k[1]),
         .d_asrc(d_asrc[1]), .d_asel(d_asel[1]), .d_frac(d_frac[1]),
         .d_dqrow(d_dqrow[1]), .d_dst(d_dst[1]), .done_o(done_o1),

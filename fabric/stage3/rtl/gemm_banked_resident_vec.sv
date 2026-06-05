@@ -79,6 +79,10 @@ module gemm_banked_resident_vec #(
     // of width (57 tiles at N=8/32b); as LUTRAM it is a few k LUTs, tiles freed.
     (* ram_style = "distributed" *)
     reg [YBITS-1:0]  ymem [0:N*GROUPS-1];    // stream b group g at b*GROUPS+g
+    // side memory: per (stream,group) sum_act for DSP-stream readback recovery.
+    // Same N*GROUPS geometry/addressing as ymem; only DSP-stream rows are read.
+    (* ram_style = "distributed" *)
+    reg signed [22:0] sumact_mem [0:N*GROUPS-1];
 
     // ---- one-time load: assemble SUBW chunks -> commit all banks in one shot ----
     reg [WAW-1:0]    wword;
@@ -168,6 +172,9 @@ module gemm_banked_resident_vec #(
                                          // dead regs in the synth view trip it)
 `endif
     reg  [YBITS-1:0] acc_sel;
+    // per-stream sum_act (only DSP streams drive a real value; LUT streams 0).
+    wire signed [22:0] sa_str [0:N-1];
+    reg  signed [22:0] sa_sel;                // selected stream's sum_act in DRAIN
     genvar gm, gl;
     generate
         for (gm = 0; gm < N; gm = gm + 1) begin : g_mac
@@ -202,10 +209,12 @@ module gemm_banked_resident_vec #(
                 mac_bank #(.LANES(LANES), .ABITS(ABITS)) u_mac (
                     .clk(clk), .clr(rst || acc_clr), .en(mac_v),
                     .w(wsel), .x(xsel), .acc(acc_bank));
+                assign sa_str[gm] = 23'sd0;        // LUT streams: no recovery
             end else begin : g_dsp
                 mac_bank_dsp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
                     .clk(clk), .clr(rst || acc_clr), .en(mac_v),
-                    .w(wsel), .x(xsel), .acc(acc_bank));
+                    .w(wsel), .x(xsel), .acc(acc_bank),
+                    .sum_act_o(sa_str[gm]));        // RAW-pair encoding now
             end
 `ifdef SYNTHESIS
             if (gm/4 == 0) begin : g_q0
@@ -313,8 +322,14 @@ module gemm_banked_resident_vec #(
                         default: acc_sel = (N > 12) ? sel_q3 : sel_q0;
                     endcase
                     ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= acc_sel;
+                    // sum_act is stable from end-of-RUN until acc_clr (asserted
+                    // only at db==N-1 below), so DRAIN samples it safely.
+                    sa_sel = sa_str[db];
+                    sumact_mem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= sa_sel;
 `else
                     ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= y_lat[db];
+                    sa_sel = sa_str[db];
+                    sumact_mem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= sa_sel;
 `endif
                     if (db == N-1) begin
                         acc_clr <= 1'b1;
@@ -334,24 +349,55 @@ module gemm_banked_resident_vec #(
     end
 
     // ---- readback: P consecutive outputs of one stream per address (2-cycle) --
-    // ABITS-wide internal lanes sign-extend to the unchanged P*32 boundary.
-    // y_raw NBAs at the same edge y_out used to; y_out is now a wire off it,
-    // so downstream sampling (one edge later) sees identical values/timing.
+    // LUT streams: y_raw holds P x ABITS recovered lanes -> sign-extend (as
+    // before). DSP streams: y_raw now holds P/2 RAW 48-bit pair accumulators;
+    // the per-pair recovery that used to ride the always-on MAC datapath is
+    // done HERE (4 pairs/cycle) using the stream/group's stored sum_act read
+    // alongside ymem on the same address pipeline. Recovery is combinational
+    // after y_raw (a few narrow adders) — no extra pipeline stage, so the GE
+    // engine's read timing is unchanged. y_raw NBAs at the same edge y_out
+    // used to; y_out is a wire off it, identical downstream values/timing.
     localparam integer PPG = LANES / P;            // P-groups per ymem word
     reg [YBITS-1:0]        rd_word;
     reg [$clog2(PPG)-1:0]  rd_off;
     reg [P*ABITS-1:0]      y_raw;
+    // sum_act for the addressed (stream,group), aligned to y_raw (2-cycle path);
+    // DSP-stream flag of rd_stream, delayed the same 2 cycles.
+    reg signed [22:0]      sa_rd, sa_pipe;
+    reg                    dsp0, dsp1;
     always @(posedge clk) begin
         rd_word <= ymem[rd_stream*GROUPS + rd_addr / PPG];
         rd_off  <= rd_addr % PPG;
         y_raw   <= rd_word[rd_off*(P*ABITS) +: P*ABITS];
+        sa_rd   <= sumact_mem[rd_stream*GROUPS + rd_addr / PPG];
+        sa_pipe <= sa_rd;
+        dsp0    <= (rd_stream >= (N - ND));
+        dsp1    <= dsp0;
     end
-    genvar gy;
+    // 8*sum_act, sign-extended for the recovery algebra
+    wire signed [25:0] sa8 = {sa_pipe, 3'b000};
+    genvar gy, gp;
     generate
+        // LUT form: sign-extend each ABITS lane to 32 (unchanged).
+        wire [P*32-1:0] y_lut;
         for (gy = 0; gy < P; gy = gy + 1) begin : g_yext
-            assign y_out[gy*32 +: 32] =
+            assign y_lut[gy*32 +: 32] =
                 {{(32-ABITS){y_raw[gy*ABITS + ABITS-1]}}, y_raw[gy*ABITS +: ABITS]};
         end
+        // DSP form: recover y0/y1 from each raw 48-bit pair (P/2 pairs).
+        // Lane l of the P-wide word maps to pair l/2: pair gp -> lanes 2gp,2gp+1.
+        wire [P*32-1:0] y_dsp;
+        for (gp = 0; gp < P/2; gp = gp + 1) begin : g_rec
+            wire [47:0]        a     = y_raw[gp*48 +: 48];      // raw pair acc
+            wire [21:0]        y0m   = a[21:0] - sa8[21:0];     // mod 2^22
+            wire signed [31:0] y0    = {{10{y0m[21]}}, y0m};
+            wire signed [27:0] hsum  = y0 + sa8;
+            wire signed [5:0]  carry = hsum >>> 22;
+            wire signed [31:0] y1    = $signed(a[47:22]) - sa8 - carry;
+            assign y_dsp[(2*gp)  *32 +: 32] = y0;
+            assign y_dsp[(2*gp+1)*32 +: 32] = y1;
+        end
+        assign y_out = dsp1 ? y_dsp : y_lut;
     endgenerate
 endmodule
 
@@ -399,10 +445,17 @@ endmodule
 // Vivado cascaded TWO DSPs per multiply (1,024 for 8 banks). The 22-bit lower
 // field still exactly holds K<=1024 of 12-bit products (12+10), and |y0| <
 // 2^21 keeps the mod-2^22 window unambiguous.
-// recovery (exact integer algebra, gated vs the LUT bank incl. the 2^20 corner):
-//   y0 = (acc[21:0] - 8*sum_act) mod 2^22
-//   carry = (y0 + 8*sum_act) >>> 22
-//   y1 = acc[47:22] - 8*sum_act - carry
+//
+// RAW-PAIR datapath: this leaf now outputs the UNRECOVERED 48-bit pair
+// accumulators packed into the acc bus (pair p in acc[p*48 +: 48]). The
+// per-pair recovery (the ~5.4k LUT/bank that used to ride the always-on
+// datapath) is hoisted to the parent's P-wide readback path (4 pairs/cycle)
+// using the sum_act this leaf exports. LANES*ABITS == (LANES/2)*48 == 3072 at
+// LANES=128/ABITS=24, so the acc bus width is unchanged — only its ENCODING.
+//   recovery (done at readback, exact integer algebra; gated incl. 2^20 corner):
+//     y0 = (acc[21:0] - 8*sum_act) mod 2^22
+//     carry = (y0 + 8*sum_act) >>> 22
+//     y1 = acc[47:22] - 8*sum_act - carry
 // Same keep_hierarchy rationale as mac_bank (the bulk-mult URAM killer).
 (* keep_hierarchy = "yes" *)
 module mac_bank_dsp #(
@@ -414,7 +467,8 @@ module mac_bank_dsp #(
     input  wire                      en,
     input  wire [LANES*4-1:0]        w,
     input  wire signed [7:0]         x,
-    output wire [LANES*ABITS-1:0]    acc
+    output wire [LANES*ABITS-1:0]    acc,        // RAW pairs: pair p at p*48
+    output wire signed [22:0]        sum_act_o   // for parent readback recovery
 );
     wire signed [8:0] xs = x;                       // explicit sign-extend
     // shared per-stream sum of activations (the +8 bias correction term)
@@ -423,7 +477,7 @@ module mac_bank_dsp #(
         if (clr) sum_act <= 23'sd0;
         else if (en) sum_act <= sum_act + xs;
     end
-    wire signed [25:0] sa8 = {sum_act, 3'b000};     // 8*sum_act
+    assign sum_act_o = sum_act;
     genvar gl;
     generate
         for (gl = 0; gl < LANES; gl = gl + 2) begin : g_d
@@ -435,13 +489,9 @@ module mac_bank_dsp #(
                 if (clr) a <= 48'sd0;
                 else if (en) a <= a + $signed({1'b0, wpak}) * xs;
             end
-            wire [21:0]        y0m   = a[21:0] - sa8[21:0];          // mod 2^22
-            wire signed [31:0] y0    = {{10{y0m[21]}}, y0m};
-            wire signed [27:0] hsum  = y0 + sa8;
-            wire signed [5:0]  carry = hsum >>> 22;
-            wire signed [31:0] y1    = $signed(a[47:22]) - sa8 - carry;
-            assign acc[gl*ABITS +: ABITS]     = y0[ABITS-1:0];
-            assign acc[(gl+1)*ABITS +: ABITS] = y1[ABITS-1:0];
+            // raw 48-bit pair accumulator: pair (gl/2) in acc[(gl/2)*48 +: 48].
+            // (LANES/2)*48 == LANES*ABITS, so acc bus width is unchanged.
+            assign acc[(gl/2)*48 +: 48] = a;
         end
     endgenerate
 endmodule

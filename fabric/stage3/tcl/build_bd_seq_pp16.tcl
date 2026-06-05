@@ -19,7 +19,8 @@ if {$freq   eq ""} { set freq 125 }
 if {$tmax   eq ""} { set tmax 32 }
 if {$nn     eq ""} { set nn 16 }
 if {$bdir   eq ""} { set bdir "C:/kevbuild/stage3_seqpp16_bit" }
-set nd 8                                          ;# DSP-packed streams (wrapper default)
+set nd 12                                         ;# DSP-packed streams (4 LUT + 12 DSP
+                                                  ;# banks: the post-sharing DSP budget)
 
 set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"

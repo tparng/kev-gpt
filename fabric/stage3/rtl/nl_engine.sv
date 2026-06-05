@@ -68,6 +68,28 @@ module nl_engine #(
     input  wire        pw_we,
     input  wire [$clog2(TMAX*(D/P))-1:0] pw_addr,
     input  wire [P*32-1:0] pw_data,
+    // ---- SHARED LayerNorm port (hoisted into sequencer_pp) ----
+    output reg         ln_req,        // 1 while this engine wants the LN unit
+    output reg         ln_start_o,
+    output reg         ln_vin_o,
+    output reg  [P*32-1:0] ln_x_o,
+    output reg  [P*32-1:0] ln_g_o,
+    input  wire        ln_gnt,        // 1 when this engine holds the LN unit
+    input  wire        ln_yv_i,
+    input  wire [P*64-1:0] ln_y_i,
+    input  wire        ln_done_i,     // (unused by FSM; orow drives collect end)
+    // ---- SHARED attention port (hoisted into sequencer_pp) ----
+    output reg         at_req,        // 1 while this engine wants the attn unit
+    output reg         at_start_o,
+    output reg  [8:0]  at_tcount_o,
+    output reg         at_ldv_o,
+    output wire [P*32-1:0] at_ld_data_o,
+    input  wire        at_gnt,        // 1 when this engine holds the attn unit
+    input  wire        at_ldready_i,
+    input  wire        at_ctxv_i,
+    input  wire [6:0]  at_ctxidx_i,
+    input  wire [P*32-1:0] at_ctxdata_i,
+    input  wire        at_done_i,
     // GEMM-call descriptor + request
     output reg         req,
     output reg  [19:0] d_wbase,
@@ -146,29 +168,25 @@ module nl_engine #(
     // ================================================================
     //                       NL  ENGINE
     // ================================================================
-    reg                ln_start, ln_vin;
-    reg  [P*32-1:0]    ln_x, ln_g;
-    wire               ln_yv, ln_done;
-    wire [P*64-1:0]    ln_y;
-    layernorm_vec #(.P(P)) u_ln (
-        .clk(clk), .rst(rst), .start(ln_start), .valid_in(ln_vin),
-        .x_in(ln_x), .gamma_in(ln_g), .y_valid(ln_yv), .y_out(ln_y), .done(ln_done));
-
-    reg               at_start, at_ldv;
-    reg [8:0]         at_tcount;
-    wire              at_ldready, at_ctxv, at_done;
-    wire [6:0]        at_ctxidx;
-    wire [P*32-1:0]   at_ctxdata;
+    // LN/attn units are now SHARED in sequencer_pp. The signals that used to
+    // drive/return from the local u_ln / u_attn are mapped to the new ports:
+    //   ln_start -> ln_start_o, ln_vin -> ln_vin_o, ln_x -> ln_x_o, ln_g -> ln_g_o,
+    //   ln_yv    -> ln_yv_i,    ln_done -> ln_done_i, ln_y -> ln_y_i.
+    //   at_start -> at_start_o, at_ldv -> at_ldv_o, at_tcount -> at_tcount_o,
+    //   at_ldready->at_ldready_i, at_ctxv->at_ctxv_i, at_ctxidx->at_ctxidx_i,
+    //   at_ctxdata->at_ctxdata_i, at_done->at_done_i, aw_data -> at_ld_data_o.
+    // ARBITRATION (see header): ln_req asserted on entering NL_LGAM and held
+    // through LFEED/LCOLL, dropped after the final collect row of the LAST stream;
+    // at_req asserted at NL_AST entry of head 0 and held across the whole per-head
+    // loop, dropped after the last head's at_done. Engine ln_start_o/at_start_o are
+    // gated by ln_gnt/at_gnt so the FSM idle-waits in NL_LGAM/NL_AST until granted.
     reg [1:0]  hh;
     reg [8:0]  wi, wic;
     wire [10:0] aw_src = (wi < HR)   ? (hh*HR + wi) :
                          (wi < 2*HR) ? (D/P   + hh*HR + (wi - HR)) :
                                        (2*D/P + hh*HR + (wi - 2*HR));
     wire [P*32-1:0] aw_data = qkv_r;
-    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(32)) u_attn (
-        .clk(clk), .rst(rst), .start(at_start), .tcount(at_tcount),
-        .ld_valid(at_ldv), .ld_data(aw_data), .ld_ready(at_ldready),
-        .ctx_valid(at_ctxv), .ctx_idx(at_ctxidx), .ctx_data(at_ctxdata), .done(at_done));
+    assign at_ld_data_o = aw_data;          // combinational, aligned with at_ldv_o
 
     localparam [4:0]
       NL_IDLE=0, NL_EMB=1, NL_LGAM=2, NL_LFEED=3, NL_LCOLL=4,
@@ -265,10 +283,11 @@ module nl_engine #(
     end
 
     always @(posedge clk) begin
-        ln_start<=1'b0; ln_vin<=1'b0; at_start<=1'b0; at_ldv<=1'b0;
+        ln_start_o<=1'b0; ln_vin_o<=1'b0; at_start_o<=1'b0; at_ldv_o<=1'b0;
         if (rst) begin
             nl<=NL_IDLE; bs<=0; req<=0; done_o<=0; lnphase<=0;
             fr<=0; frv<=0; civ<=0; arv<=0; av1<=0; amv<=0;
+            ln_req<=0; at_req<=0;
         end else begin
             if (go) begin
                 nl<=NL_EMB; blkg<=0; lnphase<=0; done_o<=0;
@@ -295,24 +314,29 @@ module nl_engine #(
                         end
                     end
                 end
-                NL_LGAM: begin ln_start<=1'b1; fr<=0; frv<=0; nl<=NL_LFEED; end
+                NL_LGAM: begin
+                    ln_req <= 1'b1;                 // request the shared LN unit (held)
+                    if (ln_gnt) begin              // idle-wait here until granted
+                        ln_start_o<=1'b1; fr<=0; frv<=0; nl<=NL_LFEED;
+                    end
+                end
                 NL_LFEED: begin
                     frd <= fr; frv <= (fr != ROWS[$clog2(ROWSM+1)-1:0]);
                     if (fr != ROWS[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
-                    ln_vin <= frv;
-                    ln_x   <= xres_r;
-                    ln_g   <= gam_r;
+                    ln_vin_o <= frv;
+                    ln_x_o   <= xres_r;
+                    ln_g_o   <= gam_r;
                     if (frv && frd==ROWS-1) begin orow<=0; fr<=0; frv<=0; nl<=NL_LCOLL; end
                 end
                 NL_LCOLL: begin
-                    if (ln_yv) begin
+                    if (ln_yv_i) begin
                         for (pp=0; pp<P; pp=pp+1)
-                            ww[pp*32 +: 32] = ln_y[pp*64 +: 32];   // Q.22 fits 32b
+                            ww[pp*32 +: 32] = ln_y_i[pp*64 +: 32];   // Q.22 fits 32b
                         if (lnphase==2'd1) lnout2_bank[sN + orow] <= ww;
                         else               lnout1_bank[sN + orow] <= ww;
                         if (orow==ROWS-1) begin
                             if (bs == G-1) begin
-                                bs<=0;
+                                bs<=0; ln_req <= 1'b0;     // drop: last stream's last row
                                 case (lnphase)
                                     2'd0: nl <= NL_QKV;
                                     2'd1: nl <= NL_FC;
@@ -331,22 +355,25 @@ module nl_engine #(
                 end
                 NL_WQKV: if (!req) begin hh<=0; bs<=0; nl <= NL_AST; end
                 NL_AST: begin
-                    at_start<=1'b1; at_tcount<=9'd1; wi<=9'd0; wic<=9'd0; nl<=NL_ALD;
+                    at_req <= 1'b1;                 // request the shared attn unit (held)
+                    if (at_gnt) begin             // idle-wait here until granted
+                        at_start_o<=1'b1; at_tcount_o<=9'd1; wi<=9'd0; wic<=9'd0; nl<=NL_ALD;
+                    end
                 end
                 NL_ALD: begin
-                    at_ldv <= (wi != 3*HR);
+                    at_ldv_o <= (wi != 3*HR);
                     if (wi != 3*HR) wi <= wi + 1'b1;
-                    if (at_ldv) begin
+                    if (at_ldv_o) begin
                         if (wic == 3*HR-1) nl <= NL_ACL;
                         else wic <= wic + 1'b1;
                     end
                 end
                 NL_ACL: begin
-                    if (at_ctxv)
-                        ctxv_bank[sN + hh*HR + at_ctxidx] <= at_ctxdata;
-                    if (at_done) begin
+                    if (at_ctxv_i)
+                        ctxv_bank[sN + hh*HR + at_ctxidx_i] <= at_ctxdata_i;
+                    if (at_done_i) begin
                         if (hh==NHEAD-1) begin
-                            if (bs == G-1) begin bs<=0; hh<=0; nl<=NL_PROJ; end
+                            if (bs == G-1) begin bs<=0; hh<=0; at_req<=1'b0; nl<=NL_PROJ; end
                             else begin bs<=bs+1'b1; hh<=0; nl<=NL_AST; end
                         end else begin hh<=hh+2'd1; nl<=NL_AST; end
                     end
