@@ -53,6 +53,8 @@ LADDER = [
      "per-stream weight reads (47,144 cyc / 4 tokens @ 200 MHz, 3/3 bit-exact x4)"),
     ("+ ping-pong N=8\n(NL engine overlaps GEMM @166.7MHz)", 17740.6, "MEASURED",
      "non-linear bubbles (75,157 cyc / 8 tokens; 8/8 bit-exact 3/3; 200 MHz fails)"),
+    ("+ single-pass merge N=8\n(both groups share one weight pass)", 19275.6, "MEASURED",
+     "the second weight pass (69,172 cyc / 8 tok @166.7; 8/8 bit-exact 3/3; 200 fails)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]

@@ -556,3 +556,12 @@ honestly costs +512 MAC lanes over the ping-pong's N=4 core):
 **OOC fit: 111.9k LUT (95.6%), BRAM 107.5/144, URAM 64/64, DSP 403.** In
 reserve if impl congests: 32->24-bit accumulators (|acc| <= 2^20 at k<=1024,
 range-proven exact) ~ -10k LUT.
+
+**Silicon (MEASURED): 19,275.6 tok/s aggregate @166.7 MHz — 8/8 streams
+bit-exact, 3/3 runs. CYCLES = 69,172** (sim 69,469; the 297-cycle gap = 4 cyc x
+~74 GEMM calls, exactly the sim-only SETTLE — silicon faster than sim, as
+predicted in the §16 fit notes). Sweep: 125 -> 14,456.7 · 142.9 -> 16,522.0 ·
+**166.7 -> 19,275.6** · 200 -> match=False x3 (no PLL step exists between).
+Build: BD 1m21 + impl 109m12 at 95.6% LUT — the router closed WNS +0.026 from
+-1.05 over ~14 passes. 200 MHz needs slack back: the 24-bit accumulator trim
+(range-proven, ~-10k LUT) is the queued lever — at 69,172 cyc, 200 MHz = 23,131.

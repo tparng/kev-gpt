@@ -51,9 +51,10 @@ vs the integer reference). The current state, all bit-honest:
 |---|---|---|
 | KV260 sequencer, 1 stream @ 200 MHz (17,931 cyc/token) | 11,143.9 | MEASURED |
 | Batch GEMM N=4 — 4 streams share one weight pass | 16,969.3 | MEASURED |
-| Ping-pong N=8 — non-linears overlap the GEMM (75,157 cyc / 8 tokens) | **17,740.6** | MEASURED |
-| Single-pass N=8 — one weight pass serves all 8 streams | ~50,000 | gating in sim — next hardware run |
-| DSP-packed batch (+8 streams on 740 free DSPs) / KV-in-DDR | 70–100k | research notes: `fabric/stage3/research/` |
+| Ping-pong N=8 — non-linears overlap the GEMM (75,157 cyc / 8 tokens) | 17,740.6 | MEASURED |
+| Single-pass N=8 — one weight pass serves all 8 streams (69,172 cyc / 8 tokens @166.7 MHz) | **19,275.6** | MEASURED |
+| Same build at 200 MHz (needs timing slack back — 24-bit accumulator trim queued) | 23,131 | PROJECTED |
+| DSP-packed batch N=16 / KV-in-DDR (K4/V4+Hadamard measured: +0.72% NLL at 1.78×) | 40–100k+ | research notes: `fabric/stage3/research/` |
 
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
 CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop ~9x.
