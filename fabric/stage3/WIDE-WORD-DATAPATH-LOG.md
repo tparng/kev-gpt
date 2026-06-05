@@ -565,3 +565,26 @@ predicted in the §16 fit notes). Sweep: 125 -> 14,456.7 · 142.9 -> 16,522.0 ·
 Build: BD 1m21 + impl 109m12 at 95.6% LUT — the router closed WNS +0.026 from
 -1.05 over ~14 passes. 200 MHz needs slack back: the 24-bit accumulator trim
 (range-proven, ~-10k LUT) is the queued lever — at 69,172 cyc, 200 MHz = 23,131.
+
+---
+
+## 17. N=16 on silicon — 24,134.0 tok/s MEASURED @166.7 MHz, 16/16 bit-exact
+
+The fit campaign's payoff (see §16 + commits 66646a7 and the three before it):
+12 DSP-packed banks + 4 LUT banks, raw-48b drain with readback recovery, one
+shared LayerNorm + one shared attention arbitrated between the two NL engines.
+Fit: 106,493 LUT (90.9%), 1,171 DSP, 132 BRAM, 64/64 URAM. Impl WNS -0.203
+(102 min); silicon overclock factor 1.37x to 166.7 holds, 1.64x to 200 fails
+(garbage tokens, withheld) — consistent with every prior build's ~1.6 ceiling.
+
+Sweep: 125 -> 18,100.5 · 142.9 -> 20,686.3 · **166.7 -> 24,134.0 (3/3, 16/16
+streams)** · 200 -> match=False. CYCLES = 110,494 vs sim 110,791: the 297-cycle
+SETTLE signature AGAIN (the merged design makes the same ~74 GEMM calls as the
+N=8 single-pass — both groups share every pass, so the same sim-only settle
+count). Prediction methodology: two for two.
+
+Ladder context: 19,275.6 -> 24,134.0 = +25.2%. The arbitration tax (+20.7k cyc
+vs the unbuildable dual-private design) is the known next target: attention
+overhead (344 cyc/head at T=1, mostly softmax+drain latency) shrinks both the
+NL time and the collision windows. Then P=16 act/RB boundary, then more
+streams on 151-LUT/64-DSP banks, then 250 MHz.

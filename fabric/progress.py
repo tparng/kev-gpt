@@ -55,8 +55,8 @@ LADDER = [
      "non-linear bubbles (75,157 cyc / 8 tokens; 8/8 bit-exact 3/3; 200 MHz fails)"),
     ("+ single-pass merge N=8\n(both groups share one weight pass)", 19275.6, "MEASURED",
      "the second weight pass (69,172 cyc / 8 tok @166.7; 8/8 bit-exact 3/3; 200 fails)"),
-    ("+ N=16: 12 DSP-packed banks,\nshared LN/attn (fits: 106.5k LUT)", 24068.0, "SIM",
-     "per-stream MAC fabric (110,791 cyc / 16 tok @166.7; 16/16 bit-exact; bitstream building)"),
+    ("+ N=16: 12 DSP-packed banks,\nshared LN/attn (fits: 106.5k LUT)", 24134.0, "MEASURED",
+     "per-stream MAC fabric (110,494 cyc / 16 tok @166.7; 16/16 bit-exact 3/3; 200 fails)"),
     ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
      "per-stage idle — overlap units across streams"),
 ]
