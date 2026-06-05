@@ -8,7 +8,11 @@ set period [lindex $argv 2]
 set wwords [lindex $argv 3]
 set tmax   [lindex $argv 4]
 set nn     [lindex $argv 5]
+set nd     [lindex $argv 6]
+set gwait  [lindex $argv 7]
 if {$nn     eq ""} { set nn 4 }
+if {$nd     eq ""} { set nd 0 }
+if {$gwait  eq ""} { set gwait 2048 }
 if {$pp     eq ""} { set pp 16 }
 if {$lanes  eq ""} { set lanes 128 }
 if {$period eq ""} { set period 8.0 }
@@ -33,7 +37,8 @@ read_verilog -sv [list \
     "$rtl/gemm_banked_resident_vec.sv"]
 
 synth_design -top sequencer_pp -part $part -mode out_of_context \
-    -generic P=$pp -generic LANES=$lanes -generic N=$nn -generic NLAYER=4 \
+    -generic P=$pp -generic LANES=$lanes -generic N=$nn -generic G=[expr {$nn/2}] \
+    -generic ND=$nd -generic GWAIT=$gwait -generic NLAYER=4 \
     -generic WWORDS=$wwords -generic TMAX=$tmax
 
 create_clock -name clk -period $period [get_ports clk]

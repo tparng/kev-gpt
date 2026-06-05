@@ -17,6 +17,11 @@ module gemv_axi_seq_pp16 #(
     parameter integer LANES  = 128,
     parameter integer N      = 16,
     parameter integer ND     = 8,
+    // always-merge: the serial NL engine desyncs the two G=8 groups far past
+    // any small patience, and solo passes at N=16 REGRESS below the N=8 build
+    // (164k vs 113k cyc/16tok measured in sim). Program order guarantees the
+    // partner requests the same pass next, so waiting is deadlock-free.
+    parameter integer GWAIT  = 120000,
     parameter integer NLAYER = 4,
     parameter integer WWORDS = 25600,
     parameter integer TMAX   = 32,
@@ -152,7 +157,7 @@ module gemv_axi_seq_pp16 #(
         end
     end
 
-    sequencer_pp #(.P(P), .LANES(LANES), .N(N), .G(N/2), .ND(ND),
+    sequencer_pp #(.P(P), .LANES(LANES), .N(N), .G(N/2), .ND(ND), .GWAIT(GWAIT),
                    .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX)) u_seq (
         .clk(clk), .rst(core_rst), .go(go_pulse),
         .tok_ids({tok_id[15], tok_id[14], tok_id[13], tok_id[12],

@@ -1,4 +1,4 @@
-# Stage 3 10k — PS+PL block design for the P-WIDE datapath sequencer (gemv_axi_seq_pp +
+# Stage 3 10k — PS+PL block design for the P-WIDE datapath sequencer (gemv_axi_seq_pp16 +
 # sequencer_pp + layernorm_vec + vec_dequant + vec_attn + vec_gelu + gelu_lut + softmax +
 # gemv_banked_resident). Build-only; impl_seq_vec.tcl does synth/impl/bitstream.
 #   vivado -mode batch -source build_bd_seq_vec.tcl -tclargs <P> <LANES> <WWORDS> <FREQMHZ>
@@ -17,8 +17,9 @@ if {$wwords eq ""} { set wwords 25600 }
 if {$freq   eq ""} { set freq 125 }
 # TMAX=32 keeps the embed ROMs + N=4 stream scratch inside the 144-BRAM budget.
 if {$tmax   eq ""} { set tmax 32 }
-if {$nn     eq ""} { set nn 4 }
-if {$bdir   eq ""} { set bdir "C:/kevbuild/stage3_seqpp_bit" }
+if {$nn     eq ""} { set nn 16 }
+if {$bdir   eq ""} { set bdir "C:/kevbuild/stage3_seqpp16_bit" }
+set nd 8                                          ;# DSP-packed streams (wrapper default)
 
 set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"
@@ -26,11 +27,11 @@ set root  [file normalize [file dirname [info script]]/../../..]
 set mems  "C:/kevbuild/stage3_seq_vec_p$pp"       ;# wide-word ROMs — P-DEPENDENT (packed P/word)
 
 file mkdir $bdir
-create_project gemv_seqpp_pl "$bdir/gemv_seqpp_pl" -part $part -force
+create_project gemv_seqpp16_pl "$bdir/gemv_seqpp16_pl" -part $part -force
 set_property board_part $board [current_project]
 
 add_files -norecurse [list \
-    "$root/fabric/stage3/rtl/gemv_axi_seq_pp.v" \
+    "$root/fabric/stage3/rtl/gemv_axi_seq_pp16.v" \
     "$root/fabric/stage3/rtl/sequencer_pp.sv" \
     "$root/fabric/stage3/rtl/layernorm_vec.sv" \
     "$root/fabric/stage3/rtl/vec_dequant.sv" \
@@ -60,9 +61,10 @@ set_property -dict [list \
     CONFIG.PSU__USE__M_AXI_GP2 {0} CONFIG.PSU__FPGA_PL0_ENABLE {1} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $freq] [get_bd_cells ps]
 
-set g [create_bd_cell -type module -reference gemv_axi_seq_pp seq]
-set_property -dict [list CONFIG.P $pp CONFIG.LANES $lanes CONFIG.N $nn CONFIG.NLAYER {4} \
-    CONFIG.WWORDS $wwords CONFIG.TMAX $tmax CONFIG.C_S_AXI_ADDR_WIDTH {8}] [get_bd_cells seq]
+set g [create_bd_cell -type module -reference gemv_axi_seq_pp16 seq]
+set_property -dict [list CONFIG.P $pp CONFIG.LANES $lanes CONFIG.N $nn CONFIG.ND $nd \
+    CONFIG.NLAYER {4} CONFIG.WWORDS $wwords CONFIG.TMAX $tmax \
+    CONFIG.C_S_AXI_ADDR_WIDTH {8}] [get_bd_cells seq]
 
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list \
     Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \

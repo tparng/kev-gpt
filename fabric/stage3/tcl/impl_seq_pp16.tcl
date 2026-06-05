@@ -1,9 +1,9 @@
 # Stage 3 10k — synth + implement + bitstream for the P-wide datapath sequencer.
-# Run AFTER build_bd_seq_pp.tcl. Emits gemv_seqpp.bit/.bin + util/timing.
+# Run AFTER build_bd_seq_pp16.tcl. Emits gemv_seqpp16.bit/.bin + util/timing.
 #   vivado -mode batch -source impl_seq_pp.tcl [-tclargs <bdir>]
 set bdir [lindex $argv 0]
-if {$bdir eq ""} { set bdir "C:/kevbuild/stage3_seqpp_bit" }
-open_project "$bdir/gemv_seqpp_pl/gemv_seqpp_pl.xpr"
+if {$bdir eq ""} { set bdir "C:/kevbuild/stage3_seqpp16_bit" }
+open_project "$bdir/gemv_seqpp16_pl/gemv_seqpp16_pl.xpr"
 
 launch_runs synth_1 -jobs 8
 wait_on_run synth_1
@@ -24,11 +24,11 @@ report_utilization    -file "$bdir/util_impl.rpt"
 report_timing_summary -file "$bdir/timing_impl.rpt"
 set wns [get_property SLACK [get_timing_paths -delay_type min_max -nworst 1]]
 
-set bit "$bdir/gemv_seqpp_pl/gemv_seqpp_pl.runs/impl_1/design_1_wrapper.bit"
+set bit "$bdir/gemv_seqpp16_pl/gemv_seqpp16_pl.runs/impl_1/design_1_wrapper.bit"
 if {[file exists $bit]} {
-    file copy -force $bit "$bdir/gemv_seqpp.bit"
+    file copy -force $bit "$bdir/gemv_seqpp16.bit"
     write_cfgmem -force -format BIN -interface SMAPx32 -disablebitswap \
-        -loadbit "up 0x0 $bit" "$bdir/gemv_seqpp" -quiet
-    puts "BITSTREAM -> $bdir/gemv_seqpp.bit"
+        -loadbit "up 0x0 $bit" "$bdir/gemv_seqpp16" -quiet
+    puts "BITSTREAM -> $bdir/gemv_seqpp16.bit"
 }
 puts "IMPL_PP_DONE WNS=$wns"
