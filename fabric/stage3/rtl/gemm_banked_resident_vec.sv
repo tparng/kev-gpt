@@ -22,11 +22,16 @@
 module gemm_banked_resident_vec #(
     parameter integer LANES  = 128,       // PE lanes = nibbles per wide word (pow2)
     parameter integer N      = 4,         // batch streams
+    parameter integer ND     = 0,         // of which DSP-packed (streams N-ND..N-1)
     parameter integer P      = 8,         // boundary width (P divides LANES, KMAX, MMAX)
     parameter integer MMAX   = 1024,      // max output rows of any single layer
     parameter integer KMAX   = 1024,      // max reduction length of any single layer
     parameter integer WWORDS = 25600,     // resident capacity in wide words
-    parameter integer RLAT   = 2          // read->mac pipeline depth (cycles)
+    parameter integer RLAT   = 2,         // read->mac pipeline depth (cycles)
+    // accumulator width: |acc| <= 8*128*1024 = 2^20 exactly (w=-8, x=-128,
+    // k=1024 corner), so 24 bits holds every partial sum with 3 bits margin.
+    // y_out stays P*32 (sign-extended) so the sequencer interface is unchanged.
+    parameter integer ABITS  = 24
 ) (
     input  wire                          clk,
     input  wire                          rst,
@@ -48,10 +53,10 @@ module gemm_banked_resident_vec #(
     // readback: P INT32 of stream rd_stream per address (2-cycle latency)
     input  wire [$clog2(N)-1:0]          rd_stream,
     input  wire [$clog2(MMAX/P)-1:0]     rd_addr,
-    output reg  [P*32-1:0]               y_out
+    output wire [P*32-1:0]               y_out
 );
     localparam integer WBITS  = LANES*4;
-    localparam integer YBITS  = LANES*32;
+    localparam integer YBITS  = LANES*ABITS;   // internal acc/ymem lane width
     localparam integer LSH    = $clog2(LANES);
     localparam integer LSHP   = $clog2(P);
     localparam integer GROUPS = (MMAX + LANES - 1) / LANES;
@@ -66,8 +71,8 @@ module gemm_banked_resident_vec #(
     localparam integer WPAD  = NB * BANKW;
 
     reg [P*8-1:0]    xmem [0:N*XROWS-1];     // stream b rows at b*XROWS
-    // distributed: 64-deep x 4096-wide in BRAM wastes a full RAMB36 per 72 bits
-    // of width (57 tiles); as LUTRAM it is ~4-5k LUTs and frees the tiles.
+    // distributed: shallow x very-wide in BRAM wastes a full RAMB36 per 72 bits
+    // of width (57 tiles at N=8/32b); as LUTRAM it is a few k LUTs, tiles freed.
     (* ram_style = "distributed" *)
     reg [YBITS-1:0]  ymem [0:N*GROUPS-1];    // stream b group g at b*GROUPS+g
 
@@ -149,16 +154,13 @@ module gemm_banked_resident_vec #(
     // per-stream wires: one flat N*YBITS concat wraps iverilog's 16-bit index
     // space at stream 4 (bit 16384) � streams 4..7 would read stream 0..3.
 `ifdef SYNTHESIS
-    // TWO N<=4-shaped packed halves. One N*YBITS concat is URAM-fatal at N=8
-    // in any parent context (A/B: N=4 in-context 64 URAM, N=8 in-context 8
-    // URAM, N=8 standalone 56) — past 16,384 bits Vivado loses the wsel loads,
-    // trims rd/word_p 512->4b, and LUTRAMs the weights (~450k LUT). Each half
-    // stays at <=16,384b, the exact shape of the URAM-clean a783c4a build.
-    localparam integer NLO = (N > 4) ? 4 : N;
-    localparam integer NHI = (N > NLO) ? N - NLO : 1;   // >=1 keeps widths legal
-    wire [NLO*YBITS-1:0] acc_lo;
-    wire [NHI*YBITS-1:0] acc_hi;
-    reg  [YBITS-1:0] sel_lo, sel_hi;
+    // FOUR <=4-stream packed chunks + a 4:1 final select. Named wires (an
+    // unpacked wire array broke URAM inference in the saga); each chunk stays
+    // well under 16,384 bits (4 x LANES*ABITS = 12,288 at 24b), the shape of
+    // every URAM-clean build. Unused chunks at small N dangle and trim.
+    wire [4*YBITS-1:0] acc_q0, acc_q1, acc_q2, acc_q3;
+    reg  [YBITS-1:0] sel_q0, sel_q1, sel_q2, sel_q3;
+    wire [4:0] dbw = db;                  // db zero-extended (db[3:2] at any N)
 `else
     wire [YBITS-1:0] acc_str [0:N-1];    // iverilog wraps >16k part-selects
     reg  [YBITS-1:0] y_lat [0:N-1];      // outputs latched at SETTLE (sim only:
@@ -180,15 +182,27 @@ module gemm_banked_resident_vec #(
             // to ~450k LUTRAM — N=4 (512 mults) never tripped it, so 128-mult
             // leaves are safe. Per-LANE leaves also fixed URAM but cost +36k
             // LUT (no cross-lane xsel sharing): 127.5k > 117.1k capacity.
+            // Streams >= N-ND use the DSP-packed leaf (2 lanes/DSP, WP487):
+            // same weight word, same interface, recovered y values out.
             wire [YBITS-1:0] acc_bank;
-            mac_bank #(.LANES(LANES)) u_mac (
-                .clk(clk), .clr(rst || acc_clr), .en(mac_v),
-                .w(wsel), .x(xsel), .acc(acc_bank));
+            if (gm < N - ND) begin : g_lut
+                mac_bank #(.LANES(LANES), .ABITS(ABITS)) u_mac (
+                    .clk(clk), .clr(rst || acc_clr), .en(mac_v),
+                    .w(wsel), .x(xsel), .acc(acc_bank));
+            end else begin : g_dsp
+                mac_bank_dsp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
+                    .clk(clk), .clr(rst || acc_clr), .en(mac_v),
+                    .w(wsel), .x(xsel), .acc(acc_bank));
+            end
 `ifdef SYNTHESIS
-            if (gm < NLO) begin : g_lo
-                assign acc_lo[gm*YBITS +: YBITS] = acc_bank;
-            end else begin : g_hi
-                assign acc_hi[(gm-NLO)*YBITS +: YBITS] = acc_bank;
+            if (gm/4 == 0) begin : g_q0
+                assign acc_q0[(gm%4)*YBITS +: YBITS] = acc_bank;
+            end else if (gm/4 == 1) begin : g_q1
+                assign acc_q1[(gm%4)*YBITS +: YBITS] = acc_bank;
+            end else if (gm/4 == 2) begin : g_q2
+                assign acc_q2[(gm%4)*YBITS +: YBITS] = acc_bank;
+            end else begin : g_q3
+                assign acc_q3[(gm%4)*YBITS +: YBITS] = acc_bank;
             end
 `else
             assign acc_str[gm] = acc_bank;
@@ -256,22 +270,39 @@ module gemm_banked_resident_vec #(
 `endif
                 DRAIN: begin                  // one stream's group word per cycle
 `ifdef SYNTHESIS
-                    // per-half constant-base case — the EXACT idiom of the
-                    // URAM-clean a783c4a build, once per <=4-stream half, then
-                    // one 2:1 select. See the acc_lo/acc_hi declaration note.
+                    // per-chunk constant-base case — the EXACT idiom of the
+                    // URAM-clean a783c4a build, once per <=4-stream chunk,
+                    // then one 4:1 select. See the acc_q* declaration note.
                     case (db[1:0])
-                        2'd0: sel_lo = acc_lo[0*YBITS +: YBITS];
-                        2'd1: sel_lo = acc_lo[(NLO > 1 ? 1 : 0)*YBITS +: YBITS];
-                        2'd2: sel_lo = acc_lo[(NLO > 2 ? 2 : 0)*YBITS +: YBITS];
-                        default: sel_lo = acc_lo[(NLO > 3 ? 3 : 0)*YBITS +: YBITS];
+                        2'd0: sel_q0 = acc_q0[0*YBITS +: YBITS];
+                        2'd1: sel_q0 = acc_q0[(N > 1 ? 1 : 0)*YBITS +: YBITS];
+                        2'd2: sel_q0 = acc_q0[(N > 2 ? 2 : 0)*YBITS +: YBITS];
+                        default: sel_q0 = acc_q0[(N > 3 ? 3 : 0)*YBITS +: YBITS];
                     endcase
                     case (db[1:0])
-                        2'd0: sel_hi = acc_hi[0*YBITS +: YBITS];
-                        2'd1: sel_hi = acc_hi[(NHI > 1 ? 1 : 0)*YBITS +: YBITS];
-                        2'd2: sel_hi = acc_hi[(NHI > 2 ? 2 : 0)*YBITS +: YBITS];
-                        default: sel_hi = acc_hi[(NHI > 3 ? 3 : 0)*YBITS +: YBITS];
+                        2'd0: sel_q1 = acc_q1[0*YBITS +: YBITS];
+                        2'd1: sel_q1 = acc_q1[(N > 5 ? 1 : 0)*YBITS +: YBITS];
+                        2'd2: sel_q1 = acc_q1[(N > 6 ? 2 : 0)*YBITS +: YBITS];
+                        default: sel_q1 = acc_q1[(N > 7 ? 3 : 0)*YBITS +: YBITS];
                     endcase
-                    acc_sel = ((N > 4) && db[2]) ? sel_hi : sel_lo;
+                    case (db[1:0])
+                        2'd0: sel_q2 = acc_q2[0*YBITS +: YBITS];
+                        2'd1: sel_q2 = acc_q2[(N > 9 ? 1 : 0)*YBITS +: YBITS];
+                        2'd2: sel_q2 = acc_q2[(N > 10 ? 2 : 0)*YBITS +: YBITS];
+                        default: sel_q2 = acc_q2[(N > 11 ? 3 : 0)*YBITS +: YBITS];
+                    endcase
+                    case (db[1:0])
+                        2'd0: sel_q3 = acc_q3[0*YBITS +: YBITS];
+                        2'd1: sel_q3 = acc_q3[(N > 13 ? 1 : 0)*YBITS +: YBITS];
+                        2'd2: sel_q3 = acc_q3[(N > 14 ? 2 : 0)*YBITS +: YBITS];
+                        default: sel_q3 = acc_q3[(N > 15 ? 3 : 0)*YBITS +: YBITS];
+                    endcase
+                    case (dbw[3:2])
+                        2'd0: acc_sel = sel_q0;
+                        2'd1: acc_sel = (N > 4)  ? sel_q1 : sel_q0;
+                        2'd2: acc_sel = (N > 8)  ? sel_q2 : sel_q0;
+                        default: acc_sel = (N > 12) ? sel_q3 : sel_q0;
+                    endcase
                     ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= acc_sel;
 `else
                     ymem[db*GROUPS + g[$clog2(GROUPS)-1:0]] <= y_lat[db];
@@ -294,14 +325,25 @@ module gemm_banked_resident_vec #(
     end
 
     // ---- readback: P consecutive outputs of one stream per address (2-cycle) --
+    // ABITS-wide internal lanes sign-extend to the unchanged P*32 boundary.
+    // y_raw NBAs at the same edge y_out used to; y_out is now a wire off it,
+    // so downstream sampling (one edge later) sees identical values/timing.
     localparam integer PPG = LANES / P;            // P-groups per ymem word
     reg [YBITS-1:0]        rd_word;
     reg [$clog2(PPG)-1:0]  rd_off;
+    reg [P*ABITS-1:0]      y_raw;
     always @(posedge clk) begin
         rd_word <= ymem[rd_stream*GROUPS + rd_addr / PPG];
         rd_off  <= rd_addr % PPG;
-        y_out   <= rd_word[rd_off*(P*32) +: P*32];
+        y_raw   <= rd_word[rd_off*(P*ABITS) +: P*ABITS];
     end
+    genvar gy;
+    generate
+        for (gy = 0; gy < P; gy = gy + 1) begin : g_yext
+            assign y_out[gy*32 +: 32] =
+                {{(32-ABITS){y_raw[gy*ABITS + ABITS-1]}}, y_raw[gy*ABITS +: ABITS]};
+        end
+    endgenerate
 endmodule
 
 
@@ -313,24 +355,77 @@ endmodule
 // reverted to keep them for the packed 2-streams-per-DSP core, roadmap #13).
 (* keep_hierarchy = "yes" *)
 module mac_bank #(
-    parameter integer LANES = 128
+    parameter integer LANES = 128,
+    parameter integer ABITS = 24       // see core note: |acc| <= 2^20 range-proven
 ) (
-    input  wire                  clk,
-    input  wire                  clr,
-    input  wire                  en,
-    input  wire [LANES*4-1:0]    w,
-    input  wire signed [7:0]     x,
-    output wire [LANES*32-1:0]   acc
+    input  wire                      clk,
+    input  wire                      clr,
+    input  wire                      en,
+    input  wire [LANES*4-1:0]        w,
+    input  wire signed [7:0]         x,
+    output wire [LANES*ABITS-1:0]    acc
 );
     genvar gl;
     generate
         for (gl = 0; gl < LANES; gl = gl + 1) begin : g_l
-            reg signed [31:0] a;
+            reg signed [ABITS-1:0] a;
             always @(posedge clk) begin
-                if (clr) a <= 32'sd0;
+                if (clr) a <= {ABITS{1'b0}};
                 else if (en) a <= a + $signed(w[gl*4 +: 4]) * x;
             end
-            assign acc[gl*32 +: 32] = a;
+            assign acc[gl*ABITS +: ABITS] = a;
+        end
+    endgenerate
+endmodule
+
+
+// one stream's LANES lanes as LANES/2 DSP-packed MACs (WP487 adapted): two
+// +8-biased INT4 weights at a 24-bit gap share one INT8 activation —
+//   wpak = {w1^8, 20'b0, w0^8};  acc48 += $unsigned(wpak) * $signed(x)
+// recovery (exact integer algebra, proven bit-exact 0/768 vs the LUT bank):
+//   y0 = (acc[23:0] - 8*sum_act) mod 2^24      (|y0| < 2^21: window unambiguous)
+//   carry = (y0 + 8*sum_act) >>> 24
+//   y1 = acc[47:24] - 8*sum_act - carry
+// At ABITS=24 the y0 window IS the output lane verbatim. Same keep_hierarchy
+// rationale as mac_bank (the bulk-mult URAM killer).
+(* keep_hierarchy = "yes" *)
+module mac_bank_dsp #(
+    parameter integer LANES = 128,
+    parameter integer ABITS = 24
+) (
+    input  wire                      clk,
+    input  wire                      clr,
+    input  wire                      en,
+    input  wire [LANES*4-1:0]        w,
+    input  wire signed [7:0]         x,
+    output wire [LANES*ABITS-1:0]    acc
+);
+    wire signed [8:0] xs = x;                       // explicit sign-extend
+    // shared per-stream sum of activations (the +8 bias correction term)
+    reg signed [22:0] sum_act;
+    always @(posedge clk) begin
+        if (clr) sum_act <= 23'sd0;
+        else if (en) sum_act <= sum_act + xs;
+    end
+    wire signed [25:0] sa8 = {sum_act, 3'b000};     // 8*sum_act
+    genvar gl;
+    generate
+        for (gl = 0; gl < LANES; gl = gl + 2) begin : g_d
+            wire [3:0]  w0 = w[gl*4 +: 4]     ^ 4'h8;   // +8 bias -> unsigned
+            wire [3:0]  w1 = w[(gl+1)*4 +: 4] ^ 4'h8;
+            wire [27:0] wpak = {w1, 20'b0, w0};
+            (* use_dsp = "yes" *) reg signed [47:0] a;
+            always @(posedge clk) begin
+                if (clr) a <= 48'sd0;
+                else if (en) a <= a + $signed({1'b0, wpak}) * xs;
+            end
+            wire [23:0]        y0m   = a[23:0] - sa8[23:0];          // mod 2^24
+            wire signed [31:0] y0    = {{8{y0m[23]}}, y0m};
+            wire signed [27:0] hsum  = y0 + sa8;
+            wire signed [3:0]  carry = hsum >>> 24;
+            wire signed [31:0] y1    = $signed(a[47:24]) - sa8 - carry;
+            assign acc[gl*ABITS +: ABITS]     = y0[ABITS-1:0];
+            assign acc[(gl+1)*ABITS +: ABITS] = y1[ABITS-1:0];
         end
     endgenerate
 endmodule
