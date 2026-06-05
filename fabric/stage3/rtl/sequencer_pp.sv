@@ -512,6 +512,7 @@ module sequencer_pp #(
     // active call context
     reg        ggrp;
     reg        gmerge;                  // both groups share this pass
+    reg [11:0] gwait;                   // solo-serve patience: wait for the partner
     reg [19:0] a_wbase;
     reg [10:0] a_m, a_k;
     reg [1:0]  a_asrc;
@@ -582,7 +583,8 @@ module sequencer_pp #(
                     // (descriptors must match — NL groups run in near-lockstep but
                     // attention serialization can put A a phase ahead of B), then
                     // serve all 8 streams from one weight pass.
-                    if (g_req[0] && g_req[1] && d_wbase[0] == d_wbase[1]) begin
+    if (g_req[0] && g_req[1] && d_wbase[0] == d_wbase[1]) begin
+                        gwait   <= 0;
                         gmerge  <= 1'b1;  ggrp <= 1'b0;
                         a_wbase <= d_wbase[0]; a_m <= d_m[0]; a_k <= d_k[0];
                         a_asrc  <= d_asrc[0];  a_asel <= d_asel[0];
@@ -590,10 +592,16 @@ module sequencer_pp #(
                         a_dst   <= d_dst[0];
                         gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
                         gv_ldrst<=1'b1; ge<=GE_AQ;
+                    end else if ((g_req[0] || g_req[1]) && gwait < 12'd2048) begin
+                        // wait for the partner group — merged passes serve all 8
+                        // streams from ONE weight pass (the 21k -> 40k lever)
+                        gwait <= gwait + 1'b1;
                     end else if (g_req[0] || g_req[1]) begin
-                        // groups desynced (attention serialization): serve one alone
+                        // partner did not arrive: serve one group alone
+                        gwait   <= 0;
                         gmerge  <= 1'b0;
                         ggrp    <= g_req[0] ? 1'b0 : 1'b1;
+                        // (no-request idle resets the patience timer below)
                         a_wbase <= g_req[0] ? d_wbase[0] : d_wbase[1];
                         a_m     <= g_req[0] ? d_m[0]     : d_m[1];
                         a_k     <= g_req[0] ? d_k[0]     : d_k[1];
@@ -604,7 +612,7 @@ module sequencer_pp #(
                         a_dst   <= g_req[0] ? d_dst[0]   : d_dst[1];
                         gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
                         gv_ldrst<=1'b1; ge<=GE_AQ;
-                    end
+                    end else gwait <= 0;
                 end
                 GE_AQ: begin
                     gcid <= gci; gciv <= (gci != (a_k >> LSH));
@@ -674,7 +682,9 @@ module sequencer_pp #(
                     gv_start<=1'b1; ge<=GE_WAIT;
                 end
                 GE_WAIT: if (gv_done) begin
-                    gci<=0; gv_rdaddr<=0; gv_rdstream<=0; rv0<=0; rv1<=0; rv2<=0;
+                    gci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0;
+                    // readback starts at THIS group's first stream (solo passes!)
+                    gv_rdstream <= gmerge ? {($clog2(N)){1'b0}} : {ggrp, {GSH{1'b0}}};
                     gdor<=0; gor<=0; ge<=GE_RB;
                 end
                 GE_RB: begin
