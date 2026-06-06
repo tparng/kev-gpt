@@ -57,8 +57,12 @@ LADDER = [
      "the second weight pass (69,172 cyc / 8 tok @166.7; 8/8 bit-exact 3/3; 200 fails)"),
     ("+ N=16: 12 DSP-packed banks,\nshared LN/attn (fits: 106.5k LUT)", 24134.0, "MEASURED",
      "per-stream MAC fabric (110,494 cyc / 16 tok @166.7; 16/16 bit-exact 3/3; 200 fails)"),
-    ("+ batched serving\n(concurrent streams)", 100000.0, "PROJECTED",
-     "per-stage idle — overlap units across streams"),
+    ("+ softmax latency cut\n(103,879 cyc, 16/16 gated)", 25671.0, "SIM",
+     "dead wait-states between exp/sum/recip (bitstream building)"),
+    ("+ cycle floor push @200 MHz\n(AQ/RB overlap -> ~40k cyc)", 80000.0, "PROJECTED",
+     "GE-engine idle: AQ/RB serialization, group gaps, merge-wait (the solid case)"),
+    ("x 250 MHz silicon\n(16 x 250MHz / 40k cyc)", 100000.0, "PROJECTED",
+     "the last 25%: a 7ns-target timing campaign on a -2LV part (unproven)"),
 ]
 
 # reference baselines (drawn as guide lines, not rungs) — all the same model, B=1 greedy
