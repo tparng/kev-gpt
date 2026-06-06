@@ -63,15 +63,18 @@ a head's live window is one contiguous AXI INCR burst (the §2 burst-friendly ac
 the kv_dma FSM relies on). Within a position-row the bytes are head-major:
 
   row = [ head0_hdr | head0_codes | head1_hdr | ... | head{nh-1}_codes ]
-  per head:  hdr  = lo (int16, signed Q.16 low 16b) || scale (uint16, Q.16)  -> 4 B
-             codes= hd codes of `bits` each, packed LSB-first into bytes      -> hd*bits/8 B
+  per head:  hdr  = lo (int32, signed Q.16, LSB-first) || scale (uint16, Q.16)  -> 6 B
+             codes= hd codes of `bits` each, packed LSB-first into bytes         -> hd*bits/8 B
 
-For K4 (bits=4) one head = 4 hdr + 64*4/8 = 4 + 32 = 36 B; 4 heads = 144 B/position
-for K, same for V at V4. (At full window TMAX=32 that is 32*144 = 4608 B per K block.)
+For K4 (bits=4) one head = 6 hdr + 64*4/8 = 6 + 32 = 38 B; 4 heads = 152 B/position
+for K, same for V at V4. (At full window TMAX=32 that is 32*152 = 4864 B per K block.)
 The `ddr_words()` signal-exposure method emits exactly these per-position byte rows,
-LSB-first nibble order, so the future `run_kv_*.py` gate can `$readmemh` a `.mem`
-"DDR image" and compare word-for-word. `lo` is stored as the low 16 bits of the
-signed Q.16 value (two's complement); the RTL sign-extends it back.
+LSB-first nibble order, so the `run_kv_dma.py` gate can `$readmemh` a `.mem` "DDR
+image" and compare word-for-word. `lo` is stored as a full signed int32 (two's
+complement, LSB-first) because the per-head asymmetric `lo` reaches ~3e5 (≈20 signed
+bits) on this model and a 16-bit field would be lossy (un-reconstructable); the RTL
+sign-extends the 32-bit field. `scale` is a non-negative Q.16 magnitude that fits
+uint16. (Earlier drafts stored lo16; that could not round-trip — kv_dma needs lo32.)
 
     python -m model.goformer_kvq                 # FP-identity + K4/V4+Hadamard NLL gate
     python -m model.goformer_kvq --gen 24        # quicker
@@ -175,7 +178,19 @@ def _pack_codes_lsb(codes, bits):
 
 def position_ddr_row(vec_q16, bits, nh=NHEAD, hd=HEAD_DIM):
     """Build the per-position DDR byte row for ONE K (or V) vector (nh*hd Q.16 ints,
-    already rotated if Hadamard is on). Head-major: [lo16 | scale16 | packed codes]*nh.
+    already rotated if Hadamard is on). Head-major: [lo32 | scale16 | packed codes]*nh.
+
+    Header is 6 B/head: `lo` as a signed int32 (LSB-first, full Q.16 — see note) then
+    `scale` as uint16 (LSB-first). The codes follow, LSB-first packed nibbles.
+
+    NOTE (lossless lo): the per-head asymmetric `lo` is a full signed Q.16 value whose
+    magnitude on this model reaches ~3e5 (≈20 signed bits) — it does NOT fit in 16 bits,
+    so storing only `lo & 0xFFFF` would make the DDR row UN-reconstructable (the kv_dma
+    RTL could not regenerate the `k_deq_q16`/`v_deq_q16` cache the sequencer attends to).
+    `lo` is therefore stored as a 4-byte signed int32; `scale` is a non-negative Q.16
+    magnitude that fits uint16 (max observed ~41k). Header = 4 + 2 = 6 B; at K4 one head
+    = 6 + 64*4/8 = 38 B, 4 heads = 152 B/position. The RTL sign-extends lo32 and reads
+    scale as unsigned, then dequant = code*scale + lo (exact integer).
 
     Returns (row_bytes, per_head) where per_head is a list of (codes, lo, scale) so the
     reference can dequant from EXACTLY the stored bits (no separate float path)."""
@@ -184,9 +199,10 @@ def position_ddr_row(vec_q16, bits, nh=NHEAD, hd=HEAD_DIM):
     for h in range(nh):
         base = h * hd
         codes, lo, scale = quant_head_asym(vec_q16[base:base + hd], bits)
-        lo16 = lo & 0xFFFF                          # low 16b of signed Q.16 (RTL sign-extends)
+        lo32 = lo & 0xFFFFFFFF                       # full signed Q.16 as int32 (RTL sign-extends)
         sc16 = int(scale) & 0xFFFF
-        row += [lo16 & 0xFF, (lo16 >> 8) & 0xFF, sc16 & 0xFF, (sc16 >> 8) & 0xFF]
+        row += [lo32 & 0xFF, (lo32 >> 8) & 0xFF, (lo32 >> 16) & 0xFF, (lo32 >> 24) & 0xFF,
+                sc16 & 0xFF, (sc16 >> 8) & 0xFF]
         row += _pack_codes_lsb(codes, bits)
         per_head.append((codes, lo, scale))
     return row, per_head

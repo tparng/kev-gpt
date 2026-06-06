@@ -92,15 +92,17 @@ def test_position_ddr_row_size_and_decode():
     vec = rng.integers(-100000, 100000, size=NHEAD * HEAD_DIM).tolist()
     bits = 4
     row, per_head = position_ddr_row(vec, bits)
-    # header 4B + hd*bits/8 codes bytes, per head
-    expect = NHEAD * (4 + HEAD_DIM * bits // 8)
+    # header 6B (lo int32 LSB-first + scale uint16) + hd*bits/8 codes bytes, per head
+    expect = NHEAD * (6 + HEAD_DIM * bits // 8)
     assert len(row) == expect
-    # decode head 0's lo/scale from the first 4 bytes and check it matches per_head
-    lo16 = row[0] | (row[1] << 8)
-    sc16 = row[2] | (row[3] << 8)
+    # decode head 0's lo (int32) / scale (uint16) from the first 6 bytes; lossless lo
+    lo32 = row[0] | (row[1] << 8) | (row[2] << 16) | (row[3] << 24)
+    if lo32 >= (1 << 31):
+        lo32 -= (1 << 32)
+    sc16 = row[4] | (row[5] << 8)
     codes0, lo0, scale0 = per_head[0]
     assert sc16 == (scale0 & 0xFFFF)
-    assert lo16 == (lo0 & 0xFFFF)
+    assert lo32 == lo0                       # full lo round-trips (no 16-bit truncation)
 
 
 # ---------------------------------------------------------------- integration
@@ -139,6 +141,48 @@ def test_cache_matches_ddr_row_decode():
         assert kvq.k_cache[bi][pos] == stored
 
 
+def _decode_row_to_q16(row, bits, nh=NHEAD, hd=HEAD_DIM):
+    """Decode a DDR position-row (the kv_dma RTL's exact job, in Python) back to the
+    nh*hd signed Q.16 words: per head [lo int32 | scale uint16 | LSB-first codes]."""
+    out = []
+    off = 0
+    code_bytes = hd * bits // 8
+    for _ in range(nh):
+        lo = row[off] | (row[off + 1] << 8) | (row[off + 2] << 16) | (row[off + 3] << 24)
+        if lo >= (1 << 31):
+            lo -= (1 << 32)
+        scale = row[off + 4] | (row[off + 5] << 8)
+        off += 6
+        bitbuf = 0
+        nbits = 0
+        codes = []
+        for b in range(code_bytes):
+            bitbuf |= row[off + b] << nbits
+            nbits += 8
+            while nbits >= bits and len(codes) < hd:
+                codes.append(bitbuf & ((1 << bits) - 1))
+                bitbuf >>= bits
+                nbits -= bits
+        off += code_bytes
+        out += [c * scale + lo for c in codes]
+    return out
+
+
+@_pc
+def test_ddr_row_bytes_reconstruct_cache_losslessly():
+    """The DDR BYTE ROW (what kv_dma physically reads) decodes EXACTLY to k_deq_q16/
+    v_deq_q16 — the lossless-lo property the kv_dma gate depends on. This is the
+    round-trip the earlier lo16 layout silently failed (lo reaches ~3e5 > int16)."""
+    p, cfg = build(NPZ)
+    kvq = IntKVQSequencer(p, cfg, kbits=4, vbits=4, rotate=True)
+    kvq.reset()
+    kvq.step(5); kvq.step(9); kvq.step(2)
+    for bi in range(kvq.nblocks):
+        for e in kvq.kv_ddr[bi]:
+            assert _decode_row_to_q16(e["k_row"], 4) == e["k_deq_q16"]
+            assert _decode_row_to_q16(e["v_row"], 4) == e["v_deq_q16"]
+
+
 @_pc
 def test_kv_ddr_words_shape():
     p, cfg = build(NPZ)
@@ -146,5 +190,5 @@ def test_kv_ddr_words_shape():
     words = kvq.kv_ddr_words([1, 2, 3])
     assert len(words) == kvq.nblocks
     assert len(words[0]) == 3            # 3 positions
-    # K4: 4 heads * (4 hdr + 64*4/8 codes) = 4*36 = 144 B
-    assert len(words[0][0]["k_row"]) == NHEAD * (4 + HEAD_DIM * 4 // 8)
+    # K4: 4 heads * (6 hdr + 64*4/8 codes) = 4*38 = 152 B
+    assert len(words[0][0]["k_row"]) == NHEAD * (6 + HEAD_DIM * 4 // 8)
