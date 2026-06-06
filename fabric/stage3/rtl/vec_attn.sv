@@ -113,8 +113,12 @@ module vec_attn #(
     reg [6:0]  emit_idx;      // which lane is being emitted in S_CTX_EMIT
 
     // pipeline registers: products registered before accumulate (Fmax)
+    reg signed [31:0] sc_qreg  [0:P-1];   // operand stage: q lanes (breaks grp->mul cone)
+    reg signed [31:0] sc_kreg  [0:P-1];   // operand stage: k lanes
+    reg               sc_opv;             // operand-stage valid
     reg signed [63:0] sc_prod  [0:P-1];   // q*k lane products
     reg               sc_v;
+    reg [8:0]         sc_nacc;            // count of accumulated product-groups (0..NGRP)
     reg signed [95:0] ctx_prod [0:P-1];   // prob*v lane products
     reg               cx_v;
 
@@ -194,34 +198,51 @@ module vec_attn #(
                             ji        <= 9'd0;
                             grp       <= 9'd0;
                             score_acc <= 64'sd0;
+                            sc_opv    <= 1'b0;
                             sc_v      <= 1'b0;
+                            sc_nacc   <= 9'd0;
                             st        <= S_SCORE;
                         end else ld_cnt <= ld_cnt + 16'd1;
                     end
                 end
 
                 // ---- score: P-wide accumulate q.k for key ji ----
-                // 2-stage: lane products registered, adder tree accumulates the
-                // delayed products (one extra cycle per key, multipliers retime to DSPs).
+                // 3-stage pipeline (one product-group/cycle streaming, throughput
+                // unchanged; latency +2 per score, absorbed by the shared-unit handshake):
+                //   A operand-reg: latch q/k lanes selected by `grp` (breaks the
+                //                  grp -> mem-read -> mul critical cone)
+                //   B product-reg: multiply the registered operands -> sc_prod
+                //   C accumulate : adder tree of delayed products -> score_acc
                 S_SCORE: begin
+                    // --- stage A: read mem word for `grp`, register P operand lanes ---
                     qw   = qmem[(grp < NGRP) ? grp : 9'd0];
                     kw   = kmem[ji*NGRP + ((grp < NGRP) ? grp : 9'd0)];
                     for (lane = 0; lane < P; lane = lane + 1) begin
-                        q_l = qw[lane*32 +: 32];
-                        k_l = kw[lane*32 +: 32];
-                        sc_prod[lane] <= $signed(q_l) * $signed(k_l);
+                        sc_qreg[lane] <= qw[lane*32 +: 32];
+                        sc_kreg[lane] <= kw[lane*32 +: 32];
                     end
-                    sc_v <= (grp != NGRP);
+                    sc_opv <= (grp != NGRP);
                     if (grp != NGRP) grp <= grp + 9'd1;
+
+                    // --- stage B: multiply registered operands ---
+                    for (lane = 0; lane < P; lane = lane + 1)
+                        sc_prod[lane] <= $signed(sc_qreg[lane]) * $signed(sc_kreg[lane]);
+                    sc_v <= sc_opv;
+
+                    // --- stage C: accumulate the delayed products ---
                     if (sc_v) begin
                         sc_part = 64'sd0;
                         for (lane = 0; lane < P; lane = lane + 1)
                             sc_part = sc_part + sc_prod[lane];
                         score_acc <= score_acc + sc_part;
-                        if (grp == NGRP) begin
-                            grp  <= 9'd0;
-                            sc_v <= 1'b0;
-                            st   <= S_SCORE_EMIT;
+                        if (sc_nacc == NGRP-1) begin
+                            grp     <= 9'd0;
+                            sc_opv  <= 1'b0;
+                            sc_v    <= 1'b0;
+                            sc_nacc <= 9'd0;
+                            st      <= S_SCORE_EMIT;
+                        end else begin
+                            sc_nacc <= sc_nacc + 9'd1;
                         end
                     end
                 end
