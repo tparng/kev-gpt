@@ -114,24 +114,24 @@ module gemv_axi_seq_sb #(
                     6'h01: S_AXI_RDATA <= {30'b0, core_busy, done_latched};
                     6'h07: S_AXI_RDATA <= core_rd_data[31:0];
                     6'h08: S_AXI_RDATA <= core_rd_data[63:32];
-                    6'h09: S_AXI_RDATA <= {23'b0, tok_outs[8:0]};
+                    6'h09: S_AXI_RDATA <= {23'b0, tok_outs_pad[8:0]};
                     6'h0A: S_AXI_RDATA <= cycles_latched;
                     6'h0B: S_AXI_RDATA <= 32'h5351_5342;          // "SQSB"
-                    6'h0F: S_AXI_RDATA <= {23'b0, tok_outs[17:9]};
-                    6'h10: S_AXI_RDATA <= {23'b0, tok_outs[26:18]};
-                    6'h11: S_AXI_RDATA <= {23'b0, tok_outs[35:27]};
-                    6'h18: S_AXI_RDATA <= {23'b0, tok_outs[44:36]};   // 0x60
-                    6'h19: S_AXI_RDATA <= {23'b0, tok_outs[53:45]};
-                    6'h1A: S_AXI_RDATA <= {23'b0, tok_outs[62:54]};
-                    6'h1B: S_AXI_RDATA <= {23'b0, tok_outs[71:63]};
-                    6'h28: S_AXI_RDATA <= {23'b0, tok_outs[80:72]};   // 0xA0
-                    6'h29: S_AXI_RDATA <= {23'b0, tok_outs[89:81]};
-                    6'h2A: S_AXI_RDATA <= {23'b0, tok_outs[98:90]};
-                    6'h2B: S_AXI_RDATA <= {23'b0, tok_outs[107:99]};
-                    6'h2C: S_AXI_RDATA <= {23'b0, tok_outs[116:108]};
-                    6'h2D: S_AXI_RDATA <= {23'b0, tok_outs[125:117]};
-                    6'h2E: S_AXI_RDATA <= {23'b0, tok_outs[134:126]};
-                    6'h2F: S_AXI_RDATA <= {23'b0, tok_outs[143:135]};  // 0xBC
+                    6'h0F: S_AXI_RDATA <= {23'b0, tok_outs_pad[17:9]};
+                    6'h10: S_AXI_RDATA <= {23'b0, tok_outs_pad[26:18]};
+                    6'h11: S_AXI_RDATA <= {23'b0, tok_outs_pad[35:27]};
+                    6'h18: S_AXI_RDATA <= {23'b0, tok_outs_pad[44:36]};   // 0x60
+                    6'h19: S_AXI_RDATA <= {23'b0, tok_outs_pad[53:45]};
+                    6'h1A: S_AXI_RDATA <= {23'b0, tok_outs_pad[62:54]};
+                    6'h1B: S_AXI_RDATA <= {23'b0, tok_outs_pad[71:63]};
+                    6'h28: S_AXI_RDATA <= {23'b0, tok_outs_pad[80:72]};   // 0xA0
+                    6'h29: S_AXI_RDATA <= {23'b0, tok_outs_pad[89:81]};
+                    6'h2A: S_AXI_RDATA <= {23'b0, tok_outs_pad[98:90]};
+                    6'h2B: S_AXI_RDATA <= {23'b0, tok_outs_pad[107:99]};
+                    6'h2C: S_AXI_RDATA <= {23'b0, tok_outs_pad[116:108]};
+                    6'h2D: S_AXI_RDATA <= {23'b0, tok_outs_pad[125:117]};
+                    6'h2E: S_AXI_RDATA <= {23'b0, tok_outs_pad[134:126]};
+                    6'h2F: S_AXI_RDATA <= {23'b0, tok_outs_pad[143:135]};  // 0xBC
                     default: S_AXI_RDATA <= 32'b0;
                 endcase
             end else if (S_AXI_RVALID && S_AXI_RREADY) S_AXI_RVALID<=0;
@@ -140,6 +140,18 @@ module gemv_axi_seq_sb #(
 
     wire               core_done_w;
     wire [N*9-1:0]     tok_outs;
+    // N-agnostic register-map plumbing (N may be 14 at NC=7, not just 16):
+    // build the full 16-slot concat, slice the low N*9 into the core, and pad
+    // tok_outs back to 16 slots (upper reads return 0) so the SQ16 map holds.
+    wire [16*9-1:0]    tok_ids_all = {tok_id[15], tok_id[14], tok_id[13], tok_id[12],
+                                      tok_id[11], tok_id[10], tok_id[9],  tok_id[8],
+                                      tok_id[7],  tok_id[6],  tok_id[5],  tok_id[4],
+                                      tok_id[3],  tok_id[2],  tok_id[1],  tok_id[0]};
+    wire [16*9-1:0]    tok_outs_pad;
+    assign tok_outs_pad[N*9-1:0] = tok_outs;
+    generate if (N < 16) begin : g_pad
+        assign tok_outs_pad[16*9-1:N*9] = {(16*9-N*9){1'b0}};
+    end endgenerate
     wire signed [63:0] core_rd_data;
     reg                core_busy, done_latched;
     reg  [31:0]        cycles_run, cycles_latched;
@@ -157,10 +169,7 @@ module gemv_axi_seq_sb #(
     sequencer_sb #(.P(P), .LANES(LANES), .N(N), .NC(NC), .ND(ND),
                    .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX)) u_seq (
         .clk(clk), .rst(core_rst), .go(go_pulse),
-        .tok_ids({tok_id[15], tok_id[14], tok_id[13], tok_id[12],
-                  tok_id[11], tok_id[10], tok_id[9],  tok_id[8],
-                  tok_id[7],  tok_id[6],  tok_id[5],  tok_id[4],
-                  tok_id[3],  tok_id[2],  tok_id[1],  tok_id[0]}),
+        .tok_ids(tok_ids_all[N*9-1:0]),
         .pos(pos),
         .done(core_done_w), .tok_outs(tok_outs),
         .rd_stream(rd_stream), .rd_sel(rd_sel), .rd_addr(rd_addr), .rd_data(core_rd_data),

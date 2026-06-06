@@ -672,3 +672,39 @@ Next: OOC fit of `sequencer_sb` (the LUT question: 2× GE FSM + dequant + gelu
 vs ONE of each shared at §18's 107.4k; ND=12 total DSP banks), then BD+impl →
 silicon. PROJECTED if the §17/18 sim→silicon pattern holds: ~38.7k tok/s
 @166.7 — past the 30k line in one step, before the timing campaign.
+
+## 20. The split-brain fit campaign — NC=7 fits at 97.0%, 36,805 tok/s SIM
+
+First OOC of `sequencer_sb` (N=16, ND=6/cohort): **143,552 LUT = 122.6%** of
+the device. The hierarchical autopsy vs §18's 107.4k single-engine:
+duplicated dequant engines + the per-cohort distributed dqm/dqe ROM copies
+(~12k), a fatter shared attention (14.1k @ 32 DSP vs 8.2k @ 50 — LUT-evicted
+because the DUPLICATED AQ multiplier eats 88 DSP/cohort vs pp16's 96 total),
+duplicated gelu, and a coh0/coh1 asymmetry that is const-prop through the
+fixed-priority embed arbiter (coh0 gets `gnt0 ≡ req0` and shrinks; coh1's
+10.5k nl_engine is the honest size).
+
+**Cut 1 — the shared dq+gelu channel (committed 800bf48):** one vec_dequant +
+ONE dqm/dqe ROM copy + one vec_gelu serve both cohorts behind a third
+hold-until-done arbiter (the LN/attn pattern; new GE_DQW park state; a cohort
+holds the channel for one whole GEMM-call readback, so beats never
+interleave; the ROM fetch free-runs 2-stage on the shared side, cycle-aligned
+with the old local mwr/dq_mant registers). **143.6k → 127,177 LUT (108.6%),
+BRAM 143 → 133. Cycle cost: +17 cycles TOTAL** (68,799 → 68,816 for 16 tok) —
+the cohorts' readbacks essentially never collide. 16/16 bit-exact.
+
+**Cut 2 — NC=7 (N=14):** one fewer stream per cohort drops one 6,720-LUT
+mac_bank per cohort: **113,659 LUT = 97.04%, BRAM 131/144 — FITS.**
+14/14 bit-exact, **63,410 cyc / 14 tok = 4,529 cyc/token → 36,805 tok/s
+@166.7 / 44,157 @200 (SIM)**. En route NC=7 flushed a real bug: the
+host-readback cohort select used a high-bit slice (`rd_stream[CSH]`,
+`[CSH-1:0]`) that only works when NC is a power of two — cohort 1's streams
+read back shifted by one. Now arithmetic (`>= NC`, `- NC`); N=16 regated
+bit-exact at identical cycles. The AXI shell (`gemv_axi_seq_sb`, IDCODE
+"SQSB") is N-agnostic: 16-slot register map padded, upper TOK_OUT reads 0.
+
+Bitstream building (BD+impl @166.7, C:/kevbuild/stage3_seqsb14_bit).
+PROJECTED on the §17/18 sim→silicon pattern: **~36.8k MEASURED** (+43% on the
+25,744.5 record). The NC=8 path back to ~38.7k: range-prove + narrow the AQ
+multiplier (frees ~80 DSP) → un-evict attention (−5.8k) → ~121k, then one
+more cut (TMAX=16 or the asymmetry) closes it.

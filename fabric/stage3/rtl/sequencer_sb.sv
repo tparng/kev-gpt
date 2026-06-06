@@ -241,6 +241,9 @@ module sequencer_sb #(
     //                       COHORT ENGINES (x2)
     // ================================================================
     wire [NC*9-1:0] tok_outs0, tok_outs1;
+    // arithmetic global->local stream map (works for any NC, not just 2^k)
+    wire                  rd_is_c1  = (rd_stream >= NC);
+    wire [$clog2(N)-1:0]  rd_local1 = rd_stream - NC[$clog2(N)-1:0];
     wire        done_o0, done_o1;
     wire signed [63:0] rd_data0, rd_data1;
 
@@ -254,7 +257,7 @@ module sequencer_sb #(
         .tok_ids(tok_ids[NC*9-1:0]), .pos(pos),
         .done_o(done_o0), .tok_outs(tok_outs0),
         .rd_stream(rd_stream[CSH-1:0]), .rd_sel(rd_sel), .rd_addr(rd_addr),
-        .rd_data(rd_data0),
+        .rd_data(rd_data0),                  // global stream < NC == local
         .waddr(waddr0), .wword_rd(wword0),
         .emb_req(emb_req0), .emb_addr(emb_addr0), .emb_gnt(emb_gnt0), .emb_q(emb_q),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
@@ -280,8 +283,8 @@ module sequencer_sb #(
         .clk(clk), .rst(rst), .go(go),
         .tok_ids(tok_ids[N*9-1:NC*9]), .pos(pos),
         .done_o(done_o1), .tok_outs(tok_outs1),
-        .rd_stream(rd_stream[CSH-1:0]), .rd_sel(rd_sel), .rd_addr(rd_addr),
-        .rd_data(rd_data1),
+        .rd_stream(rd_local1[CSH-1:0]), .rd_sel(rd_sel), .rd_addr(rd_addr),
+        .rd_data(rd_data1),                  // local = global - NC (any NC)
         .waddr(waddr1), .wword_rd(wword1),
         .emb_req(emb_req1), .emb_addr(emb_addr1), .emb_gnt(emb_gnt1), .emb_q(emb_q),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
@@ -312,8 +315,10 @@ module sequencer_sb #(
         end
     end
 
-    // host-debug readback mux: cohort selected by the high stream bit
+    // host-debug readback mux: arithmetic cohort select (a high-bit slice only
+    // works when NC is a power of two — NC=7 broke it: global stream 7 is
+    // coh1-local 0, not coh0-local 7)
     reg rd_coh_d;
-    always @(posedge clk) rd_coh_d <= rd_stream[CSH];
+    always @(posedge clk) rd_coh_d <= rd_is_c1;
     always @* rd_data = rd_coh_d ? rd_data1 : rd_data0;
 endmodule

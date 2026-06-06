@@ -19,6 +19,10 @@ if {$tmax   eq ""} { set tmax 32 }
 # ND = DSP-packed GEMM streams PER COHORT (6 -> 12 of 16 total, the SS18 DSP budget)
 if {$nd     eq ""} { set nd 6 }
 if {$bdir   eq ""} { set bdir "C:/kevbuild/stage3_seqsb_bit" }
+# NC = streams per cohort (8 -> N=16; 7 -> N=14, the fit variant: 97.0% LUT OOC)
+set nc [lindex $argv 7]
+if {$nc     eq ""} { set nc 8 }
+set nn [expr {2 * $nc}]
 
 set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"
@@ -65,7 +69,7 @@ set_property -dict [list \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $freq] [get_bd_cells ps]
 
 set g [create_bd_cell -type module -reference gemv_axi_seq_sb seq]
-set_property -dict [list CONFIG.P $pp CONFIG.LANES $lanes CONFIG.N {16} CONFIG.NC {8} \
+set_property -dict [list CONFIG.P $pp CONFIG.LANES $lanes CONFIG.N $nn CONFIG.NC $nc \
     CONFIG.ND $nd CONFIG.NLAYER {4} CONFIG.WWORDS $wwords CONFIG.TMAX $tmax \
     CONFIG.C_S_AXI_ADDR_WIDTH {8}] [get_bd_cells seq]
 
@@ -83,4 +87,4 @@ make_wrapper -files [get_files design_1.bd] -top -import
 set_property top design_1_wrapper [current_fileset]
 generate_target all [get_files design_1.bd]
 update_compile_order -fileset sources_1
-puts "BD_BUILD_SB_OK p=$pp lanes=$lanes wwords=$wwords freq=$freq tmax=$tmax nd=$nd"
+puts "BD_BUILD_SB_OK p=$pp lanes=$lanes wwords=$wwords freq=$freq tmax=$tmax nd=$nd n=$nn nc=$nc"
