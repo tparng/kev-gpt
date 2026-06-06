@@ -162,8 +162,11 @@ module tb;
     // progress probe + per-state cycle profile
     integer dbgcyc = 0;
     integer stcnt [0:31];
-    integer running = 0, k2, fprof;
+    integer gestcnt [0:7];
+    integer running = 0, k2, fprof, fgprof;
+    integer idle_both = 0, idle_one = 0, idle_none = 0;
     initial for (k2 = 0; k2 < 32; k2 = k2 + 1) stcnt[k2] = 0;
+    initial for (k2 = 0; k2 < 8;  k2 = k2 + 1) gestcnt[k2] = 0;
     always @(posedge clk) begin
         dbgcyc = dbgcyc + 1;
         if (go) running = 1;
@@ -173,10 +176,23 @@ module tb;
                 for (k2 = 0; k2 < 32; k2 = k2 + 1)
                     if (stcnt[k2] > 0) $fwrite(fprof, "%0d %0d\n", k2, stcnt[k2]);
                 $fclose(fprof);
+                fgprof = $fopen("ge_profile.out", "w");
+                for (k2 = 0; k2 < 8; k2 = k2 + 1)
+                    if (gestcnt[k2] > 0) $fwrite(fgprof, "%0d %0d\n", k2, gestcnt[k2]);
+                $fclose(fgprof);
+                fgprof = $fopen("idle_breakdown.out", "w");
+                $fwrite(fgprof, "both %0d\none %0d\nnone %0d\n", idle_both, idle_one, idle_none);
+                $fclose(fgprof);
             end
             running = 0;
         end
         if (running) stcnt[dut.eng0.nl] = stcnt[dut.eng0.nl] + 1;
+        if (running) gestcnt[dut.ge] = gestcnt[dut.ge] + 1;
+        if (running && dut.ge == 0) begin
+            if      (dut.g_req[0] && dut.g_req[1]) idle_both = idle_both + 1;
+            else if (dut.g_req[0] || dut.g_req[1]) idle_one  = idle_one  + 1;
+            else                                   idle_none = idle_none + 1;
+        end
         if (dbgcyc % 100000 == 0)
             $display("[cyc %0d] nl0=%0d nl1=%0d ge=%0d bs0=%0d bs1=%0d ar0=%0d req0=%b req1=%b done=%b", dbgcyc, dut.eng0.nl, dut.eng1.nl, dut.ge, dut.eng0.bs, dut.eng1.bs, dut.eng0.ar, dut.g_req[0], dut.g_req[1], done);
     end

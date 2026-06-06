@@ -411,17 +411,30 @@ module sequencer_pp #(
     reg [$clog2(ROWSM+1)-1:0] gdor, gor;
     integer gp;
 
-    // merged: gbs covers all N streams; single: ggrp's G streams
-    wire [$clog2(N)-1:0] sid = gmerge ? gbs : {ggrp, gbs[GSH-1:0]};
+    localparam [2:0] GE_IDLE=0, GE_AQ=1, GE_AQN=2, GE_RUN=3, GE_WAIT=4, GE_RB=5, GE_RBN=6, GE_AQW=7;
+    reg [2:0] ge;
+
+    // ---- EARLY-AQ context ----
+    // During AQ phases (GE_AQ/GE_AQN/GE_AQW) the activation feed is driven for a
+    // SINGLE engine `aq_eng`: its G local streams map to global sids {aq_eng,gbs}.
+    // This lets the GE pre-feed whichever engine requests first while it waits in
+    // GE_AQW for the partner — overlapping one engine's AQ with the partner's NL.
+    // aq_fed0/aq_fed1 record which engines have been fed for the pending pass.
+    // During RB phases the original merged ordering (gbs over all N) is used.
+    reg        aq_eng;            // engine whose streams the AQ phase feeds
+    reg        aq_fed0, aq_fed1;  // streams of engine 0/1 fed for pending pass
+    wire in_aq = (ge == GE_AQ) || (ge == GE_AQN) || (ge == GE_AQW);
+
+    // merged: gbs covers all N streams; single: ggrp's G streams.
+    // In AQ phases the feed targets engine aq_eng's local stream gbs[GSH-1:0].
+    wire [$clog2(N)-1:0] sid = in_aq ? {aq_eng, gbs[GSH-1:0]}
+                                     : (gmerge ? gbs : {ggrp, gbs[GSH-1:0]});
     wire             sid_eng = sid[GSH];          // group (engine) of current stream
     wire [GSH-1:0]   sidl    = sid[GSH-1:0];      // LOCAL stream within its engine
     wire [10:0] sGl  = sidl * ROWS;
     wire [10:0] sG3l = sidl * ROWS3;
     wire [10:0] sGMl = sidl * ROWSM;
     wire [10:0] sGAl = sidl * ARROWS;
-
-    localparam [2:0] GE_IDLE=0, GE_AQ=1, GE_AQN=2, GE_RUN=3, GE_WAIT=4, GE_RB=5, GE_RBN=6;
-    reg [2:0] ge;
 
     // GE-side read address (LOCAL): board readback reuses this port while idle
     wire [10:0] rbr   = rd_stream[GSH-1:0]*ROWS   + (rd_addr >> LSH);
@@ -480,25 +493,18 @@ module sequencer_pp #(
         if (rst) begin
             ge<=GE_IDLE; gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
             rv0<=0; rv1<=0; rv2<=0; gdor<=0; gor<=0;
+            aq_eng<=0; aq_fed0<=0; aq_fed1<=0; gwait<=0;
         end else begin
             case (ge)
                 GE_IDLE: begin
-                    // SINGLE PASS: wait for BOTH groups to request the SAME call
-                    if (g_req[0] && g_req[1] && d_wbase[0] == d_wbase[1]) begin
+                    // EARLY-AQ: as soon as EITHER engine requests, latch its
+                    // descriptor and begin pre-feeding ITS G streams. The merge-vs-
+                    // solo decision is deferred to GE_AQW (after this engine is fed),
+                    // so the requester's AQ overlaps the partner's remaining NL work.
+                    if (g_req[0] || g_req[1]) begin
                         gwait   <= 0;
-                        gmerge  <= 1'b1;  ggrp <= 1'b0;
-                        a_wbase <= d_wbase[0]; a_m <= d_m[0]; a_k <= d_k[0];
-                        a_asrc  <= d_asrc[0];  a_asel <= d_asel[0];
-                        a_frac  <= d_frac[0];  a_dqrow <= d_dqrow[0];
-                        a_dst   <= d_dst[0];
-                        gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
-                        gv_ldrst<=1'b1; ge<=GE_AQ;
-                    end else if ((g_req[0] || g_req[1]) && gwait < GWAIT[17:0]) begin
-                        gwait <= gwait + 1'b1;
-                    end else if (g_req[0] || g_req[1]) begin
-                        gwait   <= 0;
-                        gmerge  <= 1'b0;
-                        ggrp    <= g_req[0] ? 1'b0 : 1'b1;
+                        aq_eng  <= g_req[0] ? 1'b0 : 1'b1;
+                        aq_fed0 <= 1'b0; aq_fed1 <= 1'b0;
                         a_wbase <= g_req[0] ? d_wbase[0] : d_wbase[1];
                         a_m     <= g_req[0] ? d_m[0]     : d_m[1];
                         a_k     <= g_req[0] ? d_k[0]     : d_k[1];
@@ -561,10 +567,14 @@ module sequencer_pp #(
                             aqw[gp*8 +: 8] = aq_int[7:0];
                         end
                         gv_xwe<=1'b1; gv_xdata<=aqw; gv_xstream<=sid;
+                        // each AQ run feeds exactly this engine's G local streams
                         if (gcid2==(a_k >> LSH)-1) begin
                             gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
-                            if (gbs == glim) begin gbs<=0; ge<=GE_RUN; end
-                            else begin grbn<=0; ge<=GE_AQN; end
+                            if (gbs[GSH-1:0] == G-1) begin
+                                if (aq_eng == 1'b0) aq_fed0 <= 1'b1;
+                                else                aq_fed1 <= 1'b1;
+                                gbs<=0; ge<=GE_AQW;
+                            end else begin grbn<=0; ge<=GE_AQN; end
                         end
                     end
                 end
@@ -572,6 +582,29 @@ module sequencer_pp #(
                     grbn <= grbn + 1'b1;
                     if (grbn == 3'd3) begin
                         gbs<=gbs+1'b1; gv_xrst<=1'b1; ge<=GE_AQ;
+                    end
+                end
+                GE_AQW: begin
+                    // one engine's streams are fed; decide: feed partner (merge),
+                    // wait for it (patience), or run solo (patience exhausted).
+                    if (g_req[0] && g_req[1] && d_wbase[0] == d_wbase[1]
+                        && !(aq_fed0 && aq_fed1)) begin
+                        // partner present + same call: feed the un-fed engine, merge
+                        gwait <= 0; gmerge <= 1'b1; ggrp <= 1'b0;
+                        aq_eng <= aq_fed0 ? 1'b1 : 1'b0;
+                        gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
+                        gv_xrst<=1'b1; ge<=GE_AQ;
+                    end else if (aq_fed0 && aq_fed1) begin
+                        // both engines fed -> merged run over all N streams
+                        gwait <= 0; gmerge <= 1'b1; ggrp <= 1'b0;
+                        gbs<=0; ge<=GE_RUN;
+                    end else if (gwait < GWAIT[17:0]) begin
+                        gwait <= gwait + 1'b1;          // hold for the partner
+                    end else begin
+                        // patience exhausted: solo-run the fed engine's G streams
+                        gwait <= 0; gmerge <= 1'b0;
+                        ggrp  <= aq_fed0 ? 1'b0 : 1'b1;
+                        gbs<=0; ge<=GE_RUN;
                     end
                 end
                 GE_RUN: begin
