@@ -72,7 +72,7 @@ module layernorm_vec #(
     reg [$clog2(ROWS+1)-1:0] ridx, oidx;        // output row counters
 
     // ---- rsqrt registers (verbatim from the scalar core) ---------------------
-    reg signed [63:0] A, Yr, Y0;
+    reg signed [63:0] A, Yr;
     reg [1:0]  newt;
     reg [7:0]  msb;
     reg [5:0]  seed_idx;
@@ -127,16 +127,22 @@ module layernorm_vec #(
             if (A[b]) msb_c = b[7:0];
     end
 
-    // ---- output pipeline (3 stages): s0 xc=(x-mean) ; s1 prod=xc*Yr ; s2 *gamma
+    // ---- output pipeline (4 stages): s0 xc=(x-mean) ; s1 prod=xc*Yr ; s2 prod2=prod*gamma
+    //   ; s3 y=prod2>>>OUT_SH. Stage 2/3 split (Fmax: after the qsh->Newton fix, the worst
+    //   u_ln path is prod_reg(DSP) -> prod*gamma multiply + the wide >>>49/sign-extend net
+    //   -> y_out_reg, 19 logic levels). Register the raw product prod2_r, then do the shift
+    //   + 64b pack the next cycle — same value, one cycle later, absorbed by done/y_valid.
     reg signed [39:0]  xc     [0:P-1];
     reg signed [95:0]  prod   [0:P-1];
     reg signed [31:0]  grow_0 [0:P-1];
     reg signed [31:0]  grow_r [0:P-1];
-    reg                s0v, s1v;
+    reg signed [127:0] prod2_r [0:P-1];          // s2: registered raw products (DSP out)
+    reg                s0v, s1v, s2v;
     reg signed [31:0]  xo, go;                   // plain-vector copies
     reg signed [39:0]  xj;
     reg signed [95:0]  pj;
     reg signed [127:0] prod2;
+    reg signed [127:0] p2j;                      // s3 plain-vector copy of prod2_r[lp]
 
     // ---- FSM ------------------------------------------------------------------
     localparam [3:0]
@@ -144,17 +150,20 @@ module layernorm_vec #(
         S_NEWT0=6, S_NEWTA=7, S_NEWTB=8, S_NEWTC=9, S_OUT=10, S_DONE=11,
         S_VAR2=12, S_NEWTA2=13, S_NEWTB2=14, S_NEWTC2=15;
     localparam [4:0] S_NEWTC3=16;
+    localparam [4:0] S_NEWT0B=17;         // Fmax: barrel-shift result settle stage
     reg [4:0] state;
     reg signed [127:0] p_ct, p_mq;        // S_VAR product registers
     reg signed [127:0] yy_p;              // Newton stage product registers
     reg signed [191:0] ay_p;
     reg signed [63:0]  yn_r;              // Newton result settle register
+    reg signed [63:0]  Y0_r;              // Fmax: registered barrel-shift seed (qsh shifter
+    reg                rbit_r;            //   isolated from the Newton Yr*Yr multiply)
     integer wp;
 
     always @(posedge clk) begin
         if (rst) begin
             state <= S_IDLE; wptr <= 0; ridx <= 0; oidx <= 0;
-            y_valid <= 1'b0; done <= 1'b0; s0v <= 1'b0; s1v <= 1'b0;
+            y_valid <= 1'b0; done <= 1'b0; s0v <= 1'b0; s1v <= 1'b0; s2v <= 1'b0;
             sum <= 0; sumxx <= 0; newt <= 0;
         end else begin
             y_valid <= 1'b0;
@@ -231,12 +240,24 @@ module layernorm_vec #(
                     state <= S_NEWT0;
                 end
                 // ---- build Y0 from the registered seed, then 2 pipelined Newtons --
+                // Fmax (the worst impl path qsh_reg -> yy_p DSP): the variable shift by qsh
+                // is a deep barrel shifter, and Vivado retimes Yr forward into the Newton
+                // Yr*Yr multiply, fusing the barrel shifter with the squarer into one
+                // combinational cloud. Split into two cycles: S_NEWT0 registers ONLY the
+                // qsh barrel-shift into a plain reg Y0_r (a hard boundary retiming cannot
+                // cross); S_NEWT0B applies the conditional sqrt2 correction and sets Yr.
+                // One extra LN-latency cycle, absorbed by the done/valid handshake. The
+                // arithmetic is byte-identical (same shift, same SQRT2Q15 path).
                 S_NEWT0: begin
                     seed_shifted = $signed({44'd0, seed_val}) <<< (Y_FRAC - SEED_OUT_FRAC);
-                    if (qsh[8] == 1'b0) Y0 = seed_shifted <<< qsh;
-                    else                Y0 = seed_shifted >>> (-qsh);
-                    if (rbit) Y0 = (Y0 * $signed({33'd0, SQRT2Q15})) >>> 15;
-                    Yr    <= Y0;
+                    if (qsh[8] == 1'b0) Y0_r <= seed_shifted <<< qsh;
+                    else                Y0_r <= seed_shifted >>> (-qsh);
+                    rbit_r <= rbit;
+                    state  <= S_NEWT0B;
+                end
+                S_NEWT0B: begin
+                    if (rbit_r) Yr <= (Y0_r * $signed({33'd0, SQRT2Q15})) >>> 15;
+                    else        Yr <= Y0_r;
                     state <= S_NEWTA;
                 end
                 // 2 Newton iterations, each multiply split product-reg | shift (Fmax)
@@ -256,7 +277,7 @@ module layernorm_vec #(
                 S_NEWTC3: begin                          // -> next Yr is a plain reg
                     Yr   <= yn_r;
                     newt <= newt + 1'b1;
-                    if (newt == 2'd1) begin ridx <= 0; oidx <= 0; s0v <= 1'b0; s1v <= 1'b0; state <= S_OUT; end
+                    if (newt == 2'd1) begin ridx <= 0; oidx <= 0; s0v <= 1'b0; s1v <= 1'b0; s2v <= 1'b0; state <= S_OUT; end
                     else state <= S_NEWTA;
                 end
                 // ---- P-wide pipelined output stream ----------------------------
@@ -282,13 +303,21 @@ module layernorm_vec #(
                             grow_r[lp] <= grow_0[lp];
                         end
                     end
-                    // stage 2: P y = (prod*gamma)>>>OUT_SH for the row latched last cycle
+                    // stage 2: register the raw products prod2_r = prod*gamma (DSP out only,
+                    // no shift chained into it — Fmax: isolates the multiply from the >>>OUT_SH)
+                    s2v <= s1v;
                     if (s1v) begin
                         for (lp = 0; lp < P; lp = lp + 1) begin
                             pj    = prod[lp];                   // plain-vector copies
                             go    = grow_r[lp];
-                            prod2 = pj * $signed({{96{go[31]}}, go});
-                            y_out[lp*64 +: 64] <= prod2 >>> OUT_SH;
+                            prod2_r[lp] <= pj * $signed({{96{go[31]}}, go});
+                        end
+                    end
+                    // stage 3: P y = prod2>>>OUT_SH (the wide shift + 64b pack), one row/cycle
+                    if (s2v) begin
+                        for (lp = 0; lp < P; lp = lp + 1) begin
+                            p2j = prod2_r[lp];                  // plain-vector copy
+                            y_out[lp*64 +: 64] <= p2j >>> OUT_SH;
                         end
                         y_valid <= 1'b1;
                         if (oidx == ROWS-1) state <= S_DONE;

@@ -205,7 +205,14 @@ module cohort_engine #(
     reg signed [31:0] aq_int;
     reg signed [95:0] aq_prod_r [0:P-1];
     reg                aq_neg_r [0:P-1];
-    reg signed [63:0] lnt_r [0:P-1];
+    // AQ-multiply operand widths NARROWED from 64x64 to 32x48 (research/aq_range_proof.py):
+    //   lnt_r : signed [31:0]  — sources 0/2 ARE 32-bit Q.22 LN/lnf regs (cbg slice);
+    //           source 3 (GELU 16b sat <<<10) <= 2^25; source 1 (ctx>>>3) observed 24b.
+    //           PROVEN LN container |lnt|<2^29 (|n|<sqrt(D)=16 * |gamma|<8) -> 31b, so 32b
+    //           is exact-by-construction for all four sources. lntmp_g still computes in 64b
+    //           (no overflow possible) and is truncated to the proven-32b register here.
+    //   inv_sact: sliced [47:0] at use — PROVEN ROM max = 137979319167552 ~ 2^47 (48b signed).
+    reg signed [31:0] lnt_r [0:P-1];
     reg signed [31:0] cbg, dqv;
     reg signed [15:0] mbg;
     reg [P*8-1:0]   aqw;
@@ -325,7 +332,11 @@ module cohort_engine #(
                     end
                     if (gciv1) begin
                         for (gp=0; gp<P; gp=gp+1) begin
-                            aq_prod_r[gp] <= $signed(lnt_r[gp]) * $signed(inv_sact[a_asel]);
+                            // 32x48 signed multiply (was 64x64). Operand widths PROVEN in
+                            // research/aq_range_proof.py: lnt_r is signed[31:0]; inv_sact is
+                            // a fixed positive ROM with max ~2^47 < 2^47, so bit[47]=0 and the
+                            // signed[47:0] slice is always non-negative -> bit-identical product.
+                            aq_prod_r[gp] <= $signed(lnt_r[gp]) * $signed(inv_sact[a_asel][47:0]);
                             aq_neg_r[gp]  <= (lnt_r[gp] < 0);
                         end
                     end
