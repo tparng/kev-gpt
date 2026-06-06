@@ -51,3 +51,4 @@ dfx_runtime.txt
 
 # local scratch
 /blog/
+.claude/
