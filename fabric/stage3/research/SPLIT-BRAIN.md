@@ -54,7 +54,21 @@ BRAM: +2 gelu/kmem tiles ≈ 136/144.
 
 ## Risks (honest)
 
-1. **URAM TDP with both ports reading at speed** — the saga (log §16) proved
+1. **RESOLVED (2026-06-06): dual-port URAM works via XPM, not inference.**
+   Five-toy micro-synth ladder (C:/kevbuild/uram_dual): HDL inference of TDP
+   UltraRAM is dead in Vivado 2025.2 — two-address ports map to BRAM (400
+   tiles!); symmetric UG901 and NO_CHANGE templates both refuse with
+   `[Synth 8-12186] ram_style="ultra" ignored: invalid write mode`. The
+   supported path: **xpm_memory_tdpram, MEMORY_PRIMITIVE="ultra"** at bank
+   geometry (72b × 25,600 × 8 banks) → **URAM 56 / 0 LUT / 0 BRAM**, both
+   ports independent. Integration = the codebase's dual-dialect pattern (XPM
+   under `ifdef SYNTHESIS`, behavioral 2-port array for iverilog; gates verify
+   the behavioral side, the board run is the final bit-exactness check).
+   Loader keeps port A (we_a at boot, cohort-1 reads at runtime via the
+   address mux); cohort-0 stays on port B.
+
+1b. *(superseded original risk text follows)* **URAM TDP with both ports
+   reading at speed** — the saga (log §16) proved
    the weight banks are the most synthesis-fragile structure in the design.
    The canonical TDP template change is a 5-minute standalone OOC experiment
    — RUN IT FIRST. If port A refuses, fallback: time-multiplex one port at 2×
