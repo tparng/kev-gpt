@@ -708,3 +708,16 @@ PROJECTED on the §17/18 sim→silicon pattern: **~36.8k MEASURED** (+43% on the
 25,744.5 record). The NC=8 path back to ~38.7k: range-prove + narrow the AQ
 multiplier (frees ~80 DSP) → un-evict attention (−5.8k) → ~121k, then one
 more cut (TMAX=16 or the asymmetry) closes it.
+
+**§20 silicon addendum: 36,970.7 tok/s MEASURED @166.7 (14/14, 3/3) — NEW
+RECORD, +43.6%.** Impl: BD 55s + synth/impl 1h32m, WNS **−1.876** (the LN
+sum-of-squares path again, degraded by 97% density — 75k failing endpoints).
+STA says ~127 MHz; silicon ran 166.7 bit-exact anyway (1.31× of the ~1.76×
+observed margin) — 63,113 cyc on silicon vs 63,410 sim, the −297 SETTLE
+signature for the fourth consecutive build, CYCLES identical across all
+reps. Sweep: 125 → 27,728.0 (already a record) / 142.9 → 31,689.2 / 166.7 →
+**36,970.7** / 200 → match=False (WITHHELD, as every build). Driver:
+`board/pl_seq_sb.py` (--n 14, IDCODE SQSB). Next levers, in expected-value
+order: the 7ns timing campaign (200 MHz at NC=7 = 44.3k — the WNS −1.876
+says LN needs another pipeline stage first), AQ-mult narrowing → NC=8
+(~38.7k @166.7), and KV-DDR for context.
