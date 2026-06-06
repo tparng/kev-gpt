@@ -155,34 +155,59 @@ module softmax #(
                     endcase
                 end
                 // ---------------- reciprocal: r = floor(2^40 / sum) --------------
-                // Restoring long division of dividend 2^40 (bit 40 set) by `sum`.
-                // 41 iterations (div_bit = 40..0). Each: shift remainder left, OR in
-                // dividend bit, compare/subtract divisor, shift a quotient bit into quo.
-                // Only the low 21 quotient bits matter (r <= 2^20).
+                // Restoring long division of dividend 2^40 (bit 40 set) by `sum`,
+                // UNROLLED 3 restoring steps per cycle (radix-8). Each inner step is
+                // bit-identical to the old 1-bit step (shift rem<<1, OR in this
+                // position's dividend bit = (pos==40), compare/subtract sum, shift a
+                // quotient bit in), so the final quotient is unchanged; only the cycle
+                // count drops from 41 to ceil(41/3)=14. div_bit is the NEXT dividend
+                // position to consume (40..0); we consume up to 3 per cycle.
+                // Bit-budget note: there are 41 dividend positions (40..0). We append
+                // exactly 3 quotient bits/cycle via {quo[17:0],qb}, so 14 cycles emit
+                // 42 bits. To keep the kept low-21 bits identical to the old 41-bit
+                // result, the FIRST cycle does only 2 real restoring steps (pos 40,39)
+                // plus 1 leading PAD bit; the remaining 13 cycles do 3 steps each
+                // (2 + 13*3 = 41 real bits). The pad lands above bit 20 (r <= 2^20, so
+                // the top quotient bits are 0) and is discarded — quotient unchanged.
                 S_RECIP: begin : div_step
-                    reg [41:0] shifted;
-                    reg        dbit;
-                    reg [40:0] rem_n;
-                    reg        qbit;
-                    dbit    = (div_bit == 6'd40);
-                    shifted = {rem, dbit};                // 42-bit: (rem<<1)|dbit
-                    if (shifted >= {13'd0, sum}) begin
-                        rem_n = shifted[40:0] - {12'd0, sum};
-                        qbit  = 1'b1;
-                    end else begin
-                        rem_n = shifted[40:0];
-                        qbit  = 1'b0;
+                    reg [41:0] sh;
+                    reg [40:0] r_w;
+                    reg [2:0]  qb;        // 3 quotient bits produced this cycle
+                    reg [5:0]  pos;       // current dividend position
+                    reg        fin;       // cycle-local: position 0 consumed this cycle
+                    reg [1:0]  nstep;     // real steps to perform this cycle (2 or 3)
+                    integer    s;
+                    r_w   = rem;
+                    qb    = 3'd0;
+                    pos   = div_bit;
+                    fin   = 1'b0;
+                    nstep = (div_bit == 6'd40) ? 2'd2 : 2'd3;   // first cycle: 2 + pad
+                    for (s = 0; s < 3; s = s + 1) begin
+                        if (s < nstep && !fin) begin
+                            sh = {r_w, (pos == 6'd40)};   // (r_w<<1) | dividend_bit
+                            if (sh >= {13'd0, sum}) begin
+                                r_w = sh[40:0] - {12'd0, sum};
+                                qb  = {qb[1:0], 1'b1};
+                            end else begin
+                                r_w = sh[40:0];
+                                qb  = {qb[1:0], 1'b0};
+                            end
+                            if (pos == 6'd0) fin = 1'b1;   // last position consumed
+                            else             pos = pos - 6'd1;
+                        end else begin
+                            qb = {qb[1:0], 1'b0};          // PAD / already finished
+                        end
                     end
-                    rem <= rem_n;
-                    quo <= {quo[19:0], qbit};
-                    if (div_bit == 6'd0) begin
-                        recip   <= {quo[19:0], qbit};     // final 21-bit quotient
+                    rem <= r_w;
+                    quo <= {quo[17:0], qb};                // append the 3 bits
+                    if (fin) begin
+                        recip   <= {quo[17:0], qb};        // final 21-bit quotient
                         i       <= 9'd0;
                         j       <= 9'd0;
                         norm_ph <= 2'd0;
                         state   <= S_NORM;
                     end else begin
-                        div_bit <= div_bit - 6'd1;
+                        div_bit <= pos;
                     end
                 end
                 // ---------------- PASS3: prob = (e*r) >> 20 ----------------------

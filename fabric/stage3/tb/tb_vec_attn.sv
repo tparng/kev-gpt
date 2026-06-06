@@ -142,4 +142,31 @@ module tb;
         $display("TB_TIMEOUT");
         $finish;
     end
+
+`ifdef PROFILE
+    // -------- per-state cycle profiler (counts cycles in each DUT FSM state) -----
+    // Also profiles the softmax sub-FSM. Reports cumulative counts over the whole
+    // run; for a single-case (NCASE=1, T=1) run these ARE the per-head budget.
+    integer cnt_st [0:15];
+    integer cnt_sm [0:7];
+    integer tot_cyc;
+    integer pidx;
+    initial begin
+        for (pidx = 0; pidx < 16; pidx = pidx + 1) cnt_st[pidx] = 0;
+        for (pidx = 0; pidx < 8;  pidx = pidx + 1) cnt_sm[pidx] = 0;
+        tot_cyc = 0;
+    end
+    always @(posedge clk) if (!rst) begin
+        tot_cyc = tot_cyc + 1;
+        cnt_st[dut.st]        = cnt_st[dut.st] + 1;
+        cnt_sm[dut.u_sm.state]= cnt_sm[dut.u_sm.state] + 1;
+    end
+    final begin
+        $display("PROF total=%0d", tot_cyc);
+        $display("PROF attn IDLE=%0d LD_Q=%0d LD_K=%0d LD_V=%0d SCORE=%0d SCORE_EMIT=%0d SM_COLL=%0d CTX=%0d CTX_EMIT=%0d DONE=%0d",
+            cnt_st[0],cnt_st[1],cnt_st[2],cnt_st[3],cnt_st[4],cnt_st[5],cnt_st[6],cnt_st[7],cnt_st[8],cnt_st[9]);
+        $display("PROF smax IDLE=%0d LOAD=%0d EXP=%0d RECIP=%0d NORM=%0d DONE=%0d",
+            cnt_sm[0],cnt_sm[1],cnt_sm[2],cnt_sm[3],cnt_sm[4],cnt_sm[5]);
+    end
+`endif
 endmodule

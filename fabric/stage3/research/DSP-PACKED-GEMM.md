@@ -189,6 +189,102 @@ INT4×INT8 MACs/DSP/cycle** (WP487 weight-share pack, 24-bit separation, K≤102
 field), broadcasting the **same 12.8k-word/token URAM read** to all streams. Watch **BRAM
 (142.5/144)** as the true limiter — lean on TMAX=32. **PROJECTED ~70k tok/s aggregate** at 200 MHz.
 
+## 3-per-DSP: proven scheme (or impossibility)
+
+**Verdict (PROVED, arithmetic): exact 3-INT4×INT8-per-DSP with a shared activation is
+IMPOSSIBLE on the DSP48E2 27×18 multiplier. The exact ceiling is 2.0 MACs/DSP.** The
+proof is `fabric/stage3/research/dsp3_pack_proof.py` — a bit-accurate DSP model plus
+610,756 zero-mismatch verifications. The N=24 target (which needs 3/DSP) is therefore
+not reachable; the DSP-batch ceiling at LANES=128 on 1,024 DSPs is **N = 16**.
+
+The brief asked for the shape "one INT8 activation `x` shared by three INT4 weights
+`w0,w1,w2`", packed so the 27-bit signed weight operand `w0 + w1·2^g + w2·2^(2g)` holds
+all three, with recovery via overlap-correction or periodic drains. It fails on **two
+independent walls**, either of which alone is fatal:
+
+### Wall 1 — the operand port is one bit too narrow (blocks even K=1)
+
+A single `int4 × int8` product is **12 bits** (signed: range −1920..1905; a negative
+product's sign bits ripple the full field width). To keep field 0 from bleeding into
+field 1 in even **one** cycle, the gap must be `g ≥ 12`. But three nibbles at gap `g`
+put the top weight's MSB at `2g + 4`, and the 27-bit *signed* operand allows the packed
+value `15·(1 + 2^g + 2^{2g}) < 2^26`, i.e. `2g ≤ 22 → g ≤ 11`.
+
+> No-bleed needs `g ≥ 12`. Operand-legal needs `g ≤ 11`. **11 < 12 → no gap works.**
+> Equivalently: three 4-bit nibbles with 12-bit gaps need `2·12 + 4 = 28` bits, but the
+> port is 27. The A+D pre-adder does not help — it feeds the **same** 27-bit multiplier
+> input, so the truncation-to-27 wall is unchanged.
+
+`dsp3_pack_proof.py` demonstrates this concretely against the bit-accurate model at the
+largest legal gap `g = 11`: packing `w0'=15`, activation `x = −128`, the field-0 readback
+is `128`, not the intended `−1920` (`clean=False`) — the product has bled.
+
+### Wall 2 — three 22-bit neuron sums don't fit a 48-bit accumulator (blocks full K)
+
+Even if the operand fit, the three results `y_i = Σ_k w_i·x_k` are three **distinct
+output neurons**, each a 22-bit signed value at K=1024 (`|y| < 1024·1024 < 2^21`).
+Three of them carry `3 × 22 = 66` bits of independent information; one 48-bit accumulator
+holds 48. **66 > 48** — no overlap-correction can recover them, because a per-*stream*
+side scalar (the only cheap side state, like `sum_act`) carries `O(log K)` bits, not the
+22 bits each that three *distinct* neurons need. (Side state that *could* separate them
+would have to be per-(lane,DSP), which is exactly the cost the pack is meant to avoid.)
+
+### The drain escape, and why it also collapses here
+
+The literature's route to ~3/DSP is **periodic drains**: fold the 48-bit acc into three
+separate 24-bit fabric accumulators every `D` cycles, so each field only has to hold a
+`D`-cycle window sum. Exactness needs three non-overlapping fields each wide enough for
+the window sum (`3825·D < 2^w`), with `3w ≤ 48 → w ≤ 16`. That alone would allow `D ≤ 17`
+(already marginal — the brief notes `D ≥ 64` to amortize fabric cost). **But Wall 1 caps
+the gap at `g ≤ 11`, so the usable field width is `w = 11`, giving `3825·D < 2^11 = 2048
+→ D = 0`.** There is *no* valid drain window. The search over `g ∈ [8,16]` in
+`max_drain_period_3()` returns `D = 0`. (If the operand port were 28 bits, the drain
+scheme would work at `D = 16` with three 24-bit fabric accs and +1 add/lane every 16
+cycles — recorded as a counterfactual only.)
+
+### 2.5-per-DSP hybrid (5 weights / 2 DSPs) — also blocked
+
+- **Independent accumulators:** each DSP exact-packs at most 2 weights (Walls 1+2), so two
+  DSPs give 4 weights = **2.0/DSP**, not 2.5.
+- **Cascade** (DSP-A `P → DSP-B PCIN`, two multiplies summed into one 48-bit acc): even if
+  each multiply 2-packs, that is **4** distinct neuron sums in one 48-bit acc → `4·22 = 88
+  > 48` (Wall 2) → not separable at full K; and the per-window drain collapses for the same
+  `g ≤ 11 < 12` reason as the 3-pack. No 2.5/DSP path is exact. **Ceiling stays 2.0/DSP.**
+
+### Verification counts (verbatim from the proof run)
+
+```
+[2-per-DSP verification against the bit-accurate DSP model]
+  (a) exhaustive K=1  (all w0,w1 x sample x) ... mismatches=0/10752
+  (b) randomized K=1024 (600000 pairs = 1200000 lanes) . mismatches=0/600000
+  (c) adversarial corners ...................... mismatches=0/4
+
+DSP3_PROOF scheme=3-per-DSP-INT4xINT8-shared-act result=IMPOSSIBLE(operand27<28 & info66>48) fallback=2.0-per-DSP(22b-gap,debias) mismatches=0/610756 OK
+```
+
+The 2-per-DSP scheme re-verified here uses biased-unsigned weights `w' = w+8` (0..15) and
+biased-unsigned activations `x' = x+128` (0..255), packed as `operand = w0' + (w1' << 22)`
+(max `15 + 15·2^22 = 6.29e7 < 2^26`, fits 27-bit signed). The two biased field sums split
+positionally (no overlap, since each field sum `< 2^22` at K≤1024), then de-bias exactly via
+`y_i = SUM_i' − 128·Σw_i − 8·Σx − 1024·K`, where `Σw_i` is one per-lane scalar and `Σx` one
+per-stream scalar (the proven `sum_act`-style correction, generalised to also de-bias the
+weight). Recovery cost per lane-pair: 1 mask + 1 shift + 3 mul-sub. **No drain, no per-MAC
+correction.** This matches the committed bit-exact silicon scheme.
+
+### Implied stream budget (the headline)
+
+| rate (exact) | DSP/stream @ LANES=128 | N on 1,024 DSPs | status |
+|---|---|---|---|
+| 3/DSP | 128/3 ≈ 43 | **24** | **IMPOSSIBLE** (Walls 1+2) |
+| 2.5/DSP | 128/2.5 ≈ 51 | 20 | **IMPOSSIBLE** (cascade info wall) |
+| **2/DSP** | **64** | **16** | **PROVEN bit-exact** |
+
+> **The N = 24 plan is not reachable via DSP packing.** At the proven 2.0 MACs/DSP the hard
+> ceiling is **N = 16** DSP-batch streams on 1,024 DSPs at LANES=128. To exceed it you must
+> either add LUT-MAC streams (as today's stream 0), shorten LANES, or change the operand
+> precision (INT4×INT4 *can* reach higher pack rates — but that is a different activation
+> precision than Kevin's INT8 acts).
+
 ## Sources
 - Xilinx WP487, *Deep Learning with INT8 Optimization on Xilinx Devices*
   (https://docs.amd.com/api/khub/documents/z7yAy_aweTmRYkGaTVyhbw/content)
