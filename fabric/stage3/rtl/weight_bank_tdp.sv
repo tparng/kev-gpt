@@ -92,7 +92,10 @@ module weight_bank_tdp #(
                 .READ_DATA_WIDTH_A(BANKW), .READ_DATA_WIDTH_B(BANKW),
                 .READ_LATENCY_A(1), .READ_LATENCY_B(1),
                 .WRITE_DATA_WIDTH_A(BANKW), .WRITE_DATA_WIDTH_B(BANKW),
-                .WRITE_MODE_A("read_first"), .WRITE_MODE_B("read_first")
+                // TDP UltraRAM REQUIRES no_change (XPM_MEMORY 40-14) — and it is
+                // what the proven uram_dual experiment used. Runtime-identical to
+                // the behavioral model: the loader is idle (wea=0) once boot ends.
+                .WRITE_MODE_A("no_change"), .WRITE_MODE_B("no_change")
             ) u_tdp (
                 .clka(clk), .clkb(clk),
                 .rsta(1'b0), .rstb(1'b0),

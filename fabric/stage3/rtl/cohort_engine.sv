@@ -84,7 +84,22 @@ module cohort_engine #(
     input  wire        at_ctxv_i,
     input  wire [6:0]  at_ctxidx_i,
     input  wire [P*32-1:0] at_ctxdata_i,
-    input  wire        at_done_i
+    input  wire        at_done_i,
+    // ---- shared dequant+gelu readback channel (arbitrated in sequencer_sb) ----
+    // req/gnt span one whole GEMM call's readback (GE_DQW..GE_RB..GE_IDLE);
+    // the ROM fetch + dq/gelu beats keep EXACTLY the per-cohort pipeline timing.
+    output wire        dq_req,
+    input  wire        dq_gnt,
+    output wire [11:0] dq_raddr_o,         // dqm/dqe ROM row = a_dqrow + rb1
+    output reg         dq_vin_o,
+    output reg signed [6:0] dq_frac_o,
+    output reg  [P*32-1:0] dq_gemvy_o,
+    input  wire        dq_vout_i,
+    input  wire [P*32-1:0] dq_out_i,
+    output reg         gl_vin_o,
+    output reg  [P*16-1:0] gl_x_o,
+    input  wire        gl_vout_i,
+    input  wire [P*16-1:0] gl_y_i
 );
     localparam integer ROWS  = D    / P;
     localparam integer ROWS3 = D3   / P;
@@ -93,14 +108,12 @@ module cohort_engine #(
     localparam integer DQROWS = (DQ_N + P - 1) / P;
     localparam integer ARROWS  = (VOCAB + P - 1)/P;
 
-    // ---- per-cohort dequant / inv_sact ROMs (replicated; budget = dequant x2) ----
+    // ---- per-cohort inv_sact ROM (tiny). The dequant mant/exp ROMs + the
+    // vec_dequant/vec_gelu engines are SHARED (hoisted to sequencer_sb behind
+    // the dq-channel arbiter) — replicating them cost ~12k LUT at N=16.
     reg signed [63:0] inv_sact [0:NSACT-1];
-    (* rom_style = "distributed" *) reg [P*24-1:0] dqm_w [0:DQROWS-1];
-    (* rom_style = "distributed" *) reg [P*8-1:0]  dqe_w [0:DQROWS-1];
     initial begin
         $readmemh("inv_sact.mem", inv_sact);
-        $readmemh("dqm_w.mem",    dqm_w);
-        $readmemh("dqe_w.mem",    dqe_w);
     end
 
     // ================================================================
@@ -166,25 +179,12 @@ module cohort_engine #(
         .rd_stream(gv_rdstream), .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),
         .waddr(waddr), .wword_rd(wword_rd));
 
-    reg               dq_vin;
-    reg signed [6:0]  dq_frac;
-    reg  [P*32-1:0]   dq_gemvy;
-    reg  [P*24-1:0]   dq_mant;
-    reg  [P*8-1:0]    dq_exp;
-    wire              dq_vout;
-    wire [P*32-1:0]   dq_out;
-    vec_dequant #(.P(P)) u_dq (
-        .clk(clk), .rst(rst), .in_valid(dq_vin), .frac(dq_frac),
-        .gemvy(dq_gemvy), .mant(dq_mant), .exp(dq_exp),
-        .out_valid(dq_vout), .dq_out(dq_out));
-
-    reg             gl_vin;
-    reg [P*16-1:0]  gl_x;
-    wire            gl_vout;
-    wire [P*16-1:0] gl_y;
-    vec_gelu #(.P(P)) u_gelu (
-        .clk(clk), .in_valid(gl_vin), .x(gl_x),
-        .out_valid(gl_vout), .y(gl_y));
+    // dq/gelu live in sequencer_sb (shared channel); this cohort's beats are
+    // gated on its grant so the other cohort's traffic is invisible here.
+    wire              dq_vout = dq_vout_i && dq_gnt;
+    wire [P*32-1:0]   dq_out  = dq_out_i;
+    wire              gl_vout = gl_vout_i && dq_gnt;
+    wire [P*16-1:0]   gl_y    = gl_y_i;
 
     // active call context (no merge: one engine, all N streams)
     reg [19:0] a_wbase;
@@ -211,14 +211,19 @@ module cohort_engine #(
     reg [P*8-1:0]   aqw;
     reg [P*16-1:0]  mword;
     reg [P*32-1:0]  dword;
-    reg [P*24-1:0]  mwr;
-    reg [P*8-1:0]   ewr;
     reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
     reg [$clog2(ROWSM+1)-1:0] gdor, gor;
     integer gp;
 
-    localparam [2:0] GE_IDLE=0, GE_AQ=1, GE_AQN=2, GE_RUN=3, GE_WAIT=4, GE_RB=5, GE_RBN=6;
+    localparam [2:0] GE_IDLE=0, GE_AQ=1, GE_AQN=2, GE_RUN=3, GE_WAIT=4, GE_RB=5, GE_RBN=6,
+                     GE_DQW=7;   // waiting for the shared dq channel grant
     reg [2:0] ge;
+
+    // dq channel request: from the cycle gv_done arrives (zero-cycle grant when
+    // the channel is free) until the call's last readback beat returns to IDLE.
+    assign dq_req = (ge == GE_WAIT && gv_done) || (ge == GE_DQW) ||
+                    (ge == GE_RB) || (ge == GE_RBN);
+    assign dq_raddr_o = a_dqrow + rb1;
 
     // current stream addressing (LOCAL = global; one engine)
     wire [$clog2(N)-1:0] sid = gbs;
@@ -235,11 +240,6 @@ module cohort_engine #(
             ge_ra_local = (rd_sel == 4'd5) ? rbrM : rbr;
         else
             ge_ra_local = (a_asrc == 2'd3) ? (sGMl + gci) : (sGl + gci);
-    end
-
-    always @(posedge clk) begin
-        mwr <= dqm_w[a_dqrow + rb1];
-        ewr <= dqe_w[a_dqrow + rb1];
     end
 
     wire rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == glim)
@@ -275,7 +275,7 @@ module cohort_engine #(
     end
 
     always @(posedge clk) begin
-        gv_xrst<=0; gv_xwe<=0; gv_start<=0; dq_vin<=0; gl_vin<=0;
+        gv_xrst<=0; gv_xwe<=0; gv_start<=0; dq_vin_o<=0; gl_vin_o<=0;
         if (rst) begin
             ge<=GE_IDLE; gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
             rv0<=0; rv1<=0; rv2<=0; gdor<=0; gor<=0;
@@ -361,8 +361,13 @@ module cohort_engine #(
                 GE_WAIT: if (gv_done) begin
                     gci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0;
                     gv_rdstream <= {($clog2(N)){1'b0}};
-                    gdor<=0; gor<=0; ge<=GE_RB;
+                    gdor<=0; gor<=0;
+                    // zero-cycle grant when the shared dq channel is free;
+                    // otherwise park in GE_DQW (req held) until the other
+                    // cohort's readback completes.
+                    ge <= dq_gnt ? GE_RB : GE_DQW;
                 end
+                GE_DQW: if (dq_gnt) ge<=GE_RB;
                 GE_RB: begin
                     if (gci < ((a_m + P-1) >> LSH)) begin
                         gv_rdaddr<=gci; rb0<=gci; gci<=gci+1'b1;
@@ -370,13 +375,14 @@ module cohort_engine #(
                     rb1<=rb0; rb2<=rb1;
                     rv0<=(gci < ((a_m + P-1) >> LSH)); rv1<=rv0; rv2<=rv1;
                     if (rv2) begin
-                        dq_vin<=1'b1; dq_frac<=a_frac;
-                        dq_gemvy <= gv_yout;
-                        dq_mant  <= mwr;
-                        dq_exp   <= ewr;
+                        dq_vin_o<=1'b1; dq_frac_o<=a_frac;
+                        dq_gemvy_o <= gv_yout;
+                        // mant/exp ride the shared side's free-running 2-stage
+                        // ROM fetch at dq_raddr_o — same alignment as the old
+                        // local mwr/ewr -> dq_mant/dq_exp registers.
                     end
                     if (dq_vout) begin
-                        if (a_dst == 3'd2) begin gl_vin<=1'b1; gl_x<=mword; end
+                        if (a_dst == 3'd2) begin gl_vin_o<=1'b1; gl_x_o<=mword; end
                         if (a_dst != 3'd2 && gdor==((a_m + P-1) >> LSH)-1) begin
                             gci<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
                             if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end

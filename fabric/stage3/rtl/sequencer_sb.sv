@@ -171,6 +171,73 @@ module sequencer_sb #(
         .done(sh_at_done));
 
     // ================================================================
+    //   SHARED dequant+gelu readback channel (arbitrated 2-way)
+    //   One vec_dequant + one vec_gelu + ONE copy of the dqm/dqe ROMs
+    //   serve both cohorts; a cohort holds the channel for one whole
+    //   GEMM call's readback (req spans GE_DQW..GE_RB..IDLE), so beats
+    //   never interleave. Replicating all this cost ~12k LUT at N=16.
+    // ================================================================
+    localparam integer DQROWS = (DQ_N + P - 1) / P;
+    (* rom_style = "distributed" *) reg [P*24-1:0] dqm_w [0:DQROWS-1];
+    (* rom_style = "distributed" *) reg [P*8-1:0]  dqe_w [0:DQROWS-1];
+    initial begin
+        $readmemh("dqm_w.mem", dqm_w);
+        $readmemh("dqe_w.mem", dqe_w);
+    end
+
+    wire        dq_req0, dq_req1, dq_vin0, dq_vin1, gl_vin0, gl_vin1;
+    wire [11:0] dq_ra0, dq_ra1;
+    wire signed [6:0] dq_frac0, dq_frac1;
+    wire [P*32-1:0] dq_gemvy0, dq_gemvy1;
+    wire [P*16-1:0] gl_x0, gl_x1;
+
+    reg  dq_owner, dq_busy;
+    always @(posedge clk) begin
+        if (rst) begin dq_busy <= 1'b0; dq_owner <= 1'b0; end
+        else if (!dq_busy) begin
+            if (dq_req0)      begin dq_busy <= 1'b1; dq_owner <= 1'b0; end
+            else if (dq_req1) begin dq_busy <= 1'b1; dq_owner <= 1'b1; end
+        end else begin
+            if ((dq_owner == 1'b0 && !dq_req0) || (dq_owner == 1'b1 && !dq_req1))
+                dq_busy <= 1'b0;
+        end
+    end
+    wire dq_gnt0 = dq_busy && (dq_owner == 1'b0);
+    wire dq_gnt1 = dq_busy && (dq_owner == 1'b1);
+
+    // free-running 2-stage ROM fetch on the granted cohort's row address —
+    // stage 1 = the old per-cohort mwr/ewr register, stage 2 = the old
+    // dq_mant/dq_exp input register. vin/gemvy are registered cohort-side at
+    // the rv2 stage, so all vec_dequant inputs stay cycle-aligned.
+    wire [11:0] sh_dq_ra = dq_gnt1 ? dq_ra1 : dq_ra0;
+    reg [P*24-1:0] mwr_sh, mant_sh;
+    reg [P*8-1:0]  ewr_sh, exp_sh;
+    always @(posedge clk) begin
+        mwr_sh  <= dqm_w[sh_dq_ra];
+        ewr_sh  <= dqe_w[sh_dq_ra];
+        mant_sh <= mwr_sh;
+        exp_sh  <= ewr_sh;
+    end
+
+    wire           sh_dq_vin   = (dq_vin0 && dq_gnt0) || (dq_vin1 && dq_gnt1);
+    wire signed [6:0] sh_dq_frac = dq_gnt1 ? dq_frac1  : dq_frac0;
+    wire [P*32-1:0] sh_dq_gemvy = dq_gnt1 ? dq_gemvy1 : dq_gemvy0;
+    wire           sh_dq_vout;
+    wire [P*32-1:0] sh_dq_out;
+    vec_dequant #(.P(P)) u_dq (
+        .clk(clk), .rst(rst), .in_valid(sh_dq_vin), .frac(sh_dq_frac),
+        .gemvy(sh_dq_gemvy), .mant(mant_sh), .exp(exp_sh),
+        .out_valid(sh_dq_vout), .dq_out(sh_dq_out));
+
+    wire           sh_gl_vin = (gl_vin0 && dq_gnt0) || (gl_vin1 && dq_gnt1);
+    wire [P*16-1:0] sh_gl_x  = dq_gnt1 ? gl_x1 : gl_x0;
+    wire           sh_gl_vout;
+    wire [P*16-1:0] sh_gl_y;
+    vec_gelu #(.P(P)) u_gelu (
+        .clk(clk), .in_valid(sh_gl_vin), .x(sh_gl_x),
+        .out_valid(sh_gl_vout), .y(sh_gl_y));
+
+    // ================================================================
     //                       COHORT ENGINES (x2)
     // ================================================================
     wire [NC*9-1:0] tok_outs0, tok_outs1;
@@ -197,7 +264,12 @@ module sequencer_sb #(
         .at_req(at_req0), .at_start_o(at_start0), .at_tcount_o(at_tcount0),
         .at_ldv_o(at_ldv0), .at_ld_data_o(at_lddat0),
         .at_gnt(at_gnt0), .at_ldready_i(sh_at_ldready), .at_ctxv_i(sh_at_ctxv),
-        .at_ctxidx_i(sh_at_ctxidx), .at_ctxdata_i(sh_at_ctxdata), .at_done_i(sh_at_done));
+        .at_ctxidx_i(sh_at_ctxidx), .at_ctxdata_i(sh_at_ctxdata), .at_done_i(sh_at_done),
+        .dq_req(dq_req0), .dq_gnt(dq_gnt0), .dq_raddr_o(dq_ra0),
+        .dq_vin_o(dq_vin0), .dq_frac_o(dq_frac0), .dq_gemvy_o(dq_gemvy0),
+        .dq_vout_i(sh_dq_vout), .dq_out_i(sh_dq_out),
+        .gl_vin_o(gl_vin0), .gl_x_o(gl_x0),
+        .gl_vout_i(sh_gl_vout), .gl_y_i(sh_gl_y));
 
     cohort_engine #(.D(D), .D3(D3), .D_MLP(D_MLP), .P(P), .LANES(LANES), .N(NC),
                     .ND(ND), .VOCAB(VOCAB), .TMAX(TMAX), .GAMMA_N(GAMMA_N),
@@ -219,7 +291,12 @@ module sequencer_sb #(
         .at_req(at_req1), .at_start_o(at_start1), .at_tcount_o(at_tcount1),
         .at_ldv_o(at_ldv1), .at_ld_data_o(at_lddat1),
         .at_gnt(at_gnt1), .at_ldready_i(sh_at_ldready), .at_ctxv_i(sh_at_ctxv),
-        .at_ctxidx_i(sh_at_ctxidx), .at_ctxdata_i(sh_at_ctxdata), .at_done_i(sh_at_done));
+        .at_ctxidx_i(sh_at_ctxidx), .at_ctxdata_i(sh_at_ctxdata), .at_done_i(sh_at_done),
+        .dq_req(dq_req1), .dq_gnt(dq_gnt1), .dq_raddr_o(dq_ra1),
+        .dq_vin_o(dq_vin1), .dq_frac_o(dq_frac1), .dq_gemvy_o(dq_gemvy1),
+        .dq_vout_i(sh_dq_vout), .dq_out_i(sh_dq_out),
+        .gl_vin_o(gl_vin1), .gl_x_o(gl_x1),
+        .gl_vout_i(sh_gl_vout), .gl_y_i(sh_gl_y));
 
     assign tok_outs = {tok_outs1, tok_outs0};
 
