@@ -1,0 +1,138 @@
+<!doctype html>
+<!--
+  dashboard.html — the load dashboard (the centrepiece).
+
+  Single file, no build step. Polls /latest ~1 Hz (Worker serves the latest
+  telemetry record + rolling history out of a Durable Object). Charts are
+  hand-rolled on <canvas> (no external deps, so it loads from the edge with no
+  supply chain). Honest metric DEFINITIONS render on the page, straight from the
+  server. When the feed stops (rip=true) it keeps the last-known values and shows
+  an explicit RIP banner — the dashboard survives the box dying, which is the
+  whole point of putting it on the edge.
+-->
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kevin on Kria — load</title>
+<style>
+ :root{color-scheme:dark}
+ body{margin:0;font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3}
+ header{padding:14px 20px;background:#161b22;border-bottom:1px solid #30363d;
+        display:flex;justify-content:space-between;align-items:center}
+ h1{font-size:18px;margin:0}
+ #rip{font-weight:700;padding:4px 10px;border-radius:8px}
+ .live{background:#1a3a1a;color:#3fb950}
+ .dead{background:#3a1a1a;color:#f85149}
+ .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;padding:16px}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px}
+ .card h3{margin:0 0 2px;font-size:12px;color:#8b949e;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+ .big{font-size:30px;font-weight:700;font-variant-numeric:tabular-nums}
+ .sub{font-size:12px;color:#8b949e;margin-top:2px}
+ .def{font-size:11px;color:#6e7681;margin-top:8px;line-height:1.4}
+ canvas{width:100%;height:90px;display:block;margin-top:6px}
+ .charts{padding:0 16px 24px}
+ .chartcard{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px;margin-bottom:12px}
+ footer{padding:14px 20px;color:#6e7681;font-size:12px;border-top:1px solid #30363d}
+</style></head><body>
+<header>
+ <h1>🧒 Kevin on Kria — single-chip load experiment</h1>
+ <span id="rip" class="dead">connecting…</span>
+</header>
+
+<div class="grid" id="cards"></div>
+
+<div class="charts">
+ <div class="chartcard"><h3 style="margin:0 0 4px;color:#8b949e">aggregate tok/s &amp; active users</h3>
+   <canvas id="c_rate"></canvas></div>
+ <div class="chartcard"><h3 style="margin:0 0 4px;color:#8b949e">latency p50 / p95 / p99 (ms)</h3>
+   <canvas id="c_lat"></canvas></div>
+ <div class="chartcard"><h3 style="margin:0 0 4px;color:#8b949e">fabric occupancy &amp; queue depth</h3>
+   <canvas id="c_occ"></canvas></div>
+</div>
+
+<footer id="peak">peak concurrent: — · honest metrics; percentiles not averages; occupancy is a software proxy until a hardware busy-cycle counter lands.</footer>
+
+<script>
+const DEFS = {
+ active_users:"Distinct clients with a keystroke in the last N seconds. Not total connections.",
+ agg_tok_s:"Chars emitted across all completions in the last second. Aggregate, not per-stream.",
+ latency_ms:"End-to-end ms, submit-eligible to delivery. Percentiles, never the mean.",
+ queue_depth:"Prompts past debounce not yet submitted. Work waiting on the fabric.",
+ fabric_occupancy:"Backend busy-seconds / window, weighted by slot-fill. SOFTWARE PROXY (no hardware counter yet).",
+ amplification:"keystrokes : inferences : blits. The fusion made visible.",
+ ready_at_enter:"Fraction of Enters that blitted a fresh buffer with no round trip.",
+ power_w:"Board INA226 rail power (W). Hero efficiency stat. None off-box.",
+ temp_c:"SoC thermal-zone temperature (C). None off-box."
+};
+function fmt(v,d=1){return v==null?"—":(typeof v==="number"?v.toFixed(d):v);}
+
+function card(id,title,big,sub,def){
+ return `<div class="card"><h3>${title}</h3><div class="big" id="v_${id}">${big}</div>`+
+        `<div class="sub" id="s_${id}">${sub||""}</div><div class="def">${def||""}</div></div>`;
+}
+
+function render(d){
+ const t=d.latest||{};
+ const rip=document.getElementById('rip');
+ if(d.rip){rip.className='dead';rip.textContent='⚰ FEED DOWN — last known '+fmt(d.age_s,0)+'s ago';}
+ else{rip.className='live';rip.textContent='● LIVE';}
+ const amp=t.amplification||{};
+ const lat=t.latency_ms||{};
+ const cards=document.getElementById('cards');
+ cards.innerHTML=[
+  card('users','active users',fmt(t.active_users,0),'peak '+fmt(t.peak_active,0),DEFS.active_users),
+  card('tok','aggregate tok/s',fmt(t.agg_tok_s,1),'chars/s all streams',DEFS.agg_tok_s),
+  card('p99','latency p99 (ms)',fmt(lat.p99,1),'p50 '+fmt(lat.p50,1)+' · p95 '+fmt(lat.p95,1),DEFS.latency_ms),
+  card('occ','fabric occupancy',fmt((t.fabric_occupancy||0)*100,1)+'%','busy '+fmt((t.occupancy_busy_frac||0)*100,0)+'% · fill '+fmt((t.slot_fill_frac||0)*100,0)+'%',DEFS.fabric_occupancy),
+  card('q','queue depth',fmt(t.queue_depth,0),'waiting on fabric',DEFS.queue_depth),
+  card('amp','amplification',(amp.keystrokes||0)+':'+(amp.inferences||0)+':'+(amp.blits||0),'ratio '+fmt(amp.ratio,2)+'×',DEFS.amplification),
+  card('rae','ready-at-Enter',(t.ready_at_enter==null?'—':fmt(t.ready_at_enter*100,1)+'%'),fmt(t.enters,0)+' enters',DEFS.ready_at_enter),
+  card('pwr','power (W)',fmt(t.power_w,1),'temp '+fmt(t.temp_c,1)+'°C',DEFS.power_w),
+ ].join('');
+ document.getElementById('peak').textContent=
+   'peak concurrent: '+fmt(t.peak_active,0)+
+   ' · honest metrics; percentiles not averages; occupancy is a software proxy until a hardware busy-cycle counter lands.';
+ drawCharts(d.history||[]);
+}
+
+function line(ctx,W,H,series,colors,maxOverride){
+ ctx.clearRect(0,0,W,H);
+ const n=Math.max(...series.map(s=>s.length));
+ if(n<2)return;
+ let max=maxOverride||0;
+ if(!maxOverride)for(const s of series)for(const v of s)if(v!=null&&v>max)max=v;
+ if(max<=0)max=1;
+ series.forEach((s,si)=>{
+   ctx.strokeStyle=colors[si];ctx.lineWidth=1.6;ctx.beginPath();
+   s.forEach((v,i)=>{
+     if(v==null)return;
+     const x=(i/(n-1))*W, y=H-(v/max)*(H-6)-3;
+     i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+   });
+   ctx.stroke();
+ });
+ ctx.fillStyle='#6e7681';ctx.font='10px system-ui';
+ ctx.fillText(max.toFixed(max<10?1:0),2,11);
+}
+function setup(id){const c=document.getElementById(id);const r=window.devicePixelRatio||1;
+ c.width=c.clientWidth*r;c.height=c.clientHeight*r;const ctx=c.getContext('2d');ctx.scale(r,r);
+ return [ctx,c.clientWidth,c.clientHeight];}
+function drawCharts(h){
+ const col=v=>h.map(r=>r&&r[v]);
+ const latc=k=>h.map(r=>r&&r.latency_ms&&r.latency_ms[k]);
+ let [ctx,W,H]=setup('c_rate');line(ctx,W,H,[col('agg_tok_s'),col('active_users')],['#3fb950','#58a6ff']);
+ [ctx,W,H]=setup('c_lat');line(ctx,W,H,[latc('p50'),latc('p95'),latc('p99')],['#58a6ff','#d29922','#f85149']);
+ [ctx,W,H]=setup('c_occ');line(ctx,W,H,[col('fabric_occupancy'),col('queue_depth').map(v=>v)],['#a371f7','#f85149']);
+}
+
+async function poll(){
+ try{
+   const r=await fetch('/latest',{cache:'no-store'});
+   const d=await r.json();
+   render(d);
+ }catch(e){
+   const rip=document.getElementById('rip');rip.className='dead';rip.textContent='⚰ dashboard offline';
+ }
+}
+poll();setInterval(poll,1000);
+window.addEventListener('resize',poll);
+</script></body></html>

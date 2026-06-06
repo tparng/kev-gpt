@@ -1,0 +1,38 @@
+# wrangler.toml — Cloudflare Worker for the Kevin-on-Kria load dashboard.
+#
+# Deploy (the human's job):
+#   cd webchat/demo/dashboard
+#   npx wrangler deploy
+#   # set the ingest secret the i7 server will send as a bearer token:
+#   npx wrangler secret put INGEST_TOKEN
+#
+# Then point the i7 server at it:
+#   python -m webchat.demo.server --push-url https://<worker>.workers.dev/ingest \
+#       --push-token <the-same-INGEST_TOKEN>
+#
+# The dashboard.html is bundled as a text module import (see worker.js
+# `import DASHBOARD_HTML from "./dashboard.html"`), so no separate asset upload
+# or build step is needed — wrangler bundles it.
+
+name = "kevin-kria-dashboard"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Durable Object holds the latest telemetry record + rolling history so the
+# dashboard fans out from the edge and survives the box dying.
+[[durable_objects.bindings]]
+name = "TELEMETRY"
+class_name = "TelemetryStore"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["TelemetryStore"]
+
+# Treat .html as an importable text module so worker.js can inline the dashboard.
+[[rules]]
+type = "Text"
+globs = ["**/*.html"]
+fallthrough = true
+
+# INGEST_TOKEN is a secret, set with `wrangler secret put INGEST_TOKEN` — do NOT
+# put it here. If unset, the /ingest route is open (fine for a quick local test).
