@@ -70,7 +70,17 @@ module softmax #(
     reg [40:0] rem;          // running remainder (41-bit)
     reg [20:0] quo;          // quotient r (21-bit: r in [2^12, 2^20])
     reg [5:0]  div_bit;      // counts 40..0
-    reg [20:0] recip;        // latched r for PASS3
+    reg [20:0] recip;        // latched r (divider output, final radix-8 step)
+    // recip_q: a retiming-proof FF->FF copy of `recip` that the S_NORM multiply
+    // reads. WITHOUT this stage Vivado retimes `recip`'s register forward INTO the
+    // er0 DSP A-pipeline register, so the DSP A-input is fed by the divider's
+    // *combinational* radix-8 last step (the 22-level CARRY8 chain from div_bit/quo)
+    // — that was the reported worst path div_bit_reg[2]/C -> er0/.../A[0] (WNS
+    // -0.541 @6ns). recip_q is a plain register-to-register copy with no logic, so
+    // there is nothing for the tool to retime backward through it; the long divider
+    // chain now terminates at the `recip` FF (one full period) and the DSP A-input
+    // is driven by a clean FF. dont_touch keeps the stage from being merged away.
+    (* dont_touch = "true" *) reg [20:0] recip_q;   // recip pipelined for er multiply
 
     // PASS3 pipeline
     reg [1:0]  norm_ph;
@@ -215,10 +225,18 @@ module softmax #(
                     case (norm_ph)
                         2'd0: begin                  // read expmem[j] to plain vector
                             e_v     <= expmem[j];
+                            // FF->FF copy of recip into the retiming-proof stage that
+                            // feeds the DSP. recip is stable from the divider `fin`
+                            // cycle (>=1 cycle ago); recip_q is therefore valid by the
+                            // multiply in norm_ph==1. Piggybacked on the expmem read,
+                            // so it costs ZERO extra cycles (the wait-free §18 latency
+                            // is preserved). It re-loads each element harmlessly (recip
+                            // is constant for the whole PASS3), so no extra control.
+                            recip_q <= recip;
                             norm_ph <= 2'd1;
                         end
                         2'd1: begin                  // multiply
-                            er      <= e_v * recip;  // 21*21 -> 42-bit
+                            er      <= e_v * recip_q; // 21*21 -> 42-bit (recip_q == recip)
                             norm_ph <= 2'd2;
                         end
                         2'd2: begin                  // shift + emit
