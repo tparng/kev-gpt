@@ -86,22 +86,35 @@ module layernorm_vec #(
     // var algebra temporaries
     reg signed [127:0] cterm, msq;
 
-    // ---- load reduction: per-cycle P-input partial sums (combinational) -------
+    // ---- load reduction: per-cycle P-input partial sums (PIPELINED) -----------
+    // Fmax (P=16): the 16-lane x*x products + the wide adder tree was one giant
+    // combinational cloud from x_in to psumxx_r (worst impl path at P=16). Split
+    // into two register stages: (stage A) register the per-lane squares + the
+    // sign-extended lane values; (stage B) sum the REGISTERED per-lane terms into
+    // psum_r/psumxx_r. This costs one extra cycle of load latency (folded into the
+    // existing valid skew, see lv_a -> lv1) but does NOT change the 1-row/cycle
+    // load iteration: xbank writes and wptr still advance on valid_in.
     integer lp;
-    reg signed [39:0]  psum;                    // sum of the P lanes this row
-    reg signed [71:0]  psumxx;                  // sum of x*x of the P lanes this row
-    reg signed [39:0]  psum_r;                  // registered partials (Fmax: the P
-    reg signed [71:0]  psumxx_r;                //   squares retime into DSPs)
-    reg                lv1;
+    reg signed [39:0]  xe_r   [0:P-1];           // stage-A: per-lane sign-extended x
+    reg signed [63:0]  sq_r   [0:P-1];           // stage-A: per-lane x*x (32x32 -> 64b)
+    reg signed [39:0]  psum;                     // stage-B sum of the P lanes (comb)
+    reg signed [71:0]  psumxx;                   // stage-B sum of x*x of the P lanes
+    reg signed [39:0]  psum_r;                   // registered partials (Fmax: tree
+    reg signed [71:0]  psumxx_r;                 //   retimes into DSPs / a clean add)
+    reg                lv_a, lv1;
     reg [$clog2(ROWS+1)-1:0] acnt;
     reg signed [31:0]  xl;                       // plain-vector lane copy
+    reg signed [39:0]  xej;                      // plain-vector copies (stage-B read)
+    reg signed [63:0]  sqj;
+    // stage-B: sum the REGISTERED per-lane terms (xe_r/sq_r) — a clean adder tree
     always @(*) begin
         psum   = 40'sd0;
         psumxx = 72'sd0;
         for (lp = 0; lp < P; lp = lp + 1) begin
-            xl     = x_in[lp*32 +: 32];          // packed-vector part-select (safe)
-            psum   = psum   + $signed({{8{xl[31]}}, xl});
-            psumxx = psumxx + ($signed(xl) * $signed(xl));
+            xej    = xe_r[lp];                    // plain-reg copies (iverilog-safe)
+            sqj    = sq_r[lp];
+            psum   = psum   + xej;
+            psumxx = psumxx + $signed({{8{sqj[63]}}, sqj});
         end
     end
 
@@ -150,24 +163,32 @@ module layernorm_vec #(
                 S_IDLE: begin
                     if (start) begin
                         wptr <= 0; sum <= 0; sumxx <= 0; newt <= 0;
-                        acnt <= 0; lv1 <= 1'b0;
+                        acnt <= 0; lv_a <= 1'b0; lv1 <= 1'b0;
                         state <= S_LOAD;
                     end
                 end
-                // ---- P-wide load: store P lanes; partial sums REGISTERED then folded
-                // (1-cycle skew so the P squares + tree retime into DSPs) -----------
+                // ---- P-wide load: store P lanes; partial sums REGISTERED then folded.
+                // 3-stage skew (Fmax @P=16): (A) on valid_in register per-lane squares
+                // (xe_r/sq_r); (B) on lv_a sum the registered terms into psum_r/psumxx_r;
+                // (C) on lv1 fold into sum/sumxx. Iteration is still 1 row/cycle. --------
                 S_LOAD: begin
-                    if (valid_in) begin
+                    if (valid_in) begin                       // stage A
                         for (wp = 0; wp < P; wp = wp + 1) begin
                             xbank[wp][wptr] <= x_in[wp*32 +: 32];
                             gbank[wp][wptr] <= gamma_in[wp*32 +: 32];
+                            xl              =  x_in[wp*32 +: 32];   // plain-vector copy
+                            xe_r[wp]        <= $signed({{8{xl[31]}}, xl});
+                            sq_r[wp]        <= $signed(xl) * $signed(xl);
                         end
-                        psum_r   <= psum;
-                        psumxx_r <= psumxx;
                         wptr     <= wptr + 1'b1;
                     end
-                    lv1 <= valid_in;
-                    if (lv1) begin
+                    lv_a <= valid_in;
+                    if (lv_a) begin                           // stage B
+                        psum_r   <= psum;
+                        psumxx_r <= psumxx;
+                    end
+                    lv1 <= lv_a;
+                    if (lv1) begin                            // stage C
                         sum   <= sum   + psum_r;
                         sumxx <= sumxx + psumxx_r;
                         acnt  <= acnt + 1'b1;
