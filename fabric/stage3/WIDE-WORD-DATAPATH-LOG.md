@@ -634,3 +634,41 @@ softmax-cut build closed at WNS −0.044 (best yet — the cut shortened a real
 path) and ran 103,582 cyc on silicon vs 103,879 sim: the 297-cycle SETTLE
 signature, third consecutive build. 200 MHz still fails (needs 1.61×; the
 timing campaign remains the gate to 30k+ in one step).
+
+## 19. Split-brain — 68,799 cyc / 16 tok, 38,768 tok/s @166.7 (SIM, 16/16 bit-exact)
+
+The §7607751 research play, built and gated: two fully independent N=8 cohorts
+(`cohort_engine` = sequencer_pp with one stream-group; merge/GWAIT/aq_eng
+DELETED — a cohort never shares a weight pass, so the whole desync problem
+dissolves) sharing only `weight_bank_tdp` (the §2f3ba17-proven xpm TDP-ultra
+URAM image, loader on port A at boot, cohort-1 reads port A / cohort-0 port B)
+plus ONE arbitrated LN + attention + embed (fixed priority, hold-until-done;
+LN/attn never nest → no deadlock — the §18 sharing, unchanged).
+
+**Gates (both green, iverilog):**
+- `run_gemm_sb` — GEMM-level split-brain, cohorts on DIFFERENT shapes/weight
+  bases started SKEW cycles apart (the read-port-independence proof):
+  **ALL_BITEXACT** across 6 configs (same-shape skewed, qkv-vs-proj, K=1024
+  both ways, the |acc|=2^20 corner at skew 0, all-DSP ND=8).
+- `run_sb_seq` — full 4-layer forward, every stream vs
+  `seq_ref.full_forward_signals` (x4/lnf/head/tok): **16/16 bit-exact at ND=0
+  AND ND=6/cohort** (=12 DSP-banked streams, the §18 build config; identical
+  cycles — DSP recovery rides the readback path, zero cycle change, as §18).
+- **68,799 cyc / 16 tok = 4,299 cyc/token** vs 103,879 single-engine = **1.51×**;
+  38,768 tok/s @166.7, 46,512 @200 (SIM). The ~63k research target missed by
+  ~9% — the residual is the LN/attn arbitration tax now hit by two engines
+  with no GWAIT slack to hide it (profile-led cuts remain on the table).
+
+Two gate-harness bugs found en route, RTL innocent both times: (1) tb_gemm_sb
+waited on `c0_done && c1_done` but each cohort's done is a ONE-CYCLE pulse and
+the deliberate skew guarantees the pulses never overlap → latch sticky (the
+3×30-min TB_TIMEOUTs were vvp grinding to the 5M-cycle limit; real run is
+seconds); (2) three harness configs based cohort-1's weights INSIDE cohort-0's
+G0·K0 footprint, so c1's load overwrote c0's upper groups — mismatch counts
+(1024 = 8 streams × 1 group, 4095 = 4 groups with one lucky match) fingered
+the overlap exactly. Overlap now asserted in the harness.
+
+Next: OOC fit of `sequencer_sb` (the LUT question: 2× GE FSM + dequant + gelu
+vs ONE of each shared at §18's 107.4k; ND=12 total DSP banks), then BD+impl →
+silicon. PROJECTED if the §17/18 sim→silicon pattern holds: ~38.7k tok/s
+@166.7 — past the 30k line in one step, before the timing campaign.

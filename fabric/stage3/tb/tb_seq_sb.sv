@@ -1,0 +1,169 @@
+// Testbench for sequencer_sb (SPLIT-BRAIN): N=16 = two independent N=8 cohorts.
+// Streams TOK0..TOK15 through 4 blocks + head + argmax; cohort 0 = streams 0..7,
+// cohort 1 = streams 8..15. Dumps per-stream tok_out + phase keys (x4/lnf/head)
+// vs seq_ref.full_forward_signals. Same load/dump shape as tb_seq_pp.
+`timescale 1ns / 1ps
+`ifndef TOK0
+ `define TOK0 48
+`endif
+`ifndef TOK1
+ `define TOK1 10
+`endif
+`ifndef TOK2
+ `define TOK2 100
+`endif
+`ifndef TOK3
+ `define TOK3 77
+`endif
+`ifndef TOK4
+ `define TOK4 5
+`endif
+`ifndef TOK5
+ `define TOK5 60
+`endif
+`ifndef TOK6
+ `define TOK6 120
+`endif
+`ifndef TOK7
+ `define TOK7 180
+`endif
+`ifndef TOK8
+ `define TOK8 33
+`endif
+`ifndef TOK9
+ `define TOK9 7
+`endif
+`ifndef TOK10
+ `define TOK10 150
+`endif
+`ifndef TOK11
+ `define TOK11 90
+`endif
+`ifndef TOK12
+ `define TOK12 14
+`endif
+`ifndef TOK13
+ `define TOK13 66
+`endif
+`ifndef TOK14
+ `define TOK14 111
+`endif
+`ifndef TOK15
+ `define TOK15 173
+`endif
+`ifndef PVAL
+ `define PVAL 8
+`endif
+`ifndef WROMN
+ `define WROMN 199936
+`endif
+`ifndef LVAL
+ `define LVAL 128
+`endif
+`ifndef TMAXVAL
+ `define TMAXVAL 32
+`endif
+`ifndef NVAL
+ `define NVAL 16
+`endif
+`ifndef NDVAL
+ `define NDVAL 0
+`endif
+`ifndef DBGSTOP
+ `define DBGSTOP 0
+`endif
+module tb;
+    localparam integer P     = `PVAL;
+    localparam integer LANES = `LVAL;
+    localparam integer TMAXP = `TMAXVAL;
+    localparam integer N     = `NVAL;
+    localparam integer WBITS = LANES * 4;
+    localparam integer SUBW  = WBITS / 32;
+
+    reg clk = 1'b0; always #5 clk = ~clk;
+    reg rst, go;
+    reg [N*9-1:0] toks;
+    reg [8:0] pos;
+    reg [3:0]  rstream;
+    reg [3:0]  rsel;
+    reg [10:0] raddr;
+    wire done;
+    wire [N*9-1:0] tok_outs;
+    wire signed [63:0] rdata;
+    reg wl_rst, wl_we; reg [31:0] wl_data;
+
+    sequencer_sb #(.P(P), .LANES(LANES), .N(N), .NC(N/2), .ND(`NDVAL),
+                   .TMAX(TMAXP)) dut (
+        .clk(clk), .rst(rst), .go(go), .tok_ids(toks), .pos(pos), .done(done),
+        .tok_outs(tok_outs), .rd_stream(rstream[$clog2(N)-1:0]), .rd_sel(rsel),
+        .rd_addr(raddr), .rd_data(rdata), .wl_rst(wl_rst), .wl_we(wl_we),
+        .el_we(1'b0), .wl_data(wl_data), .dbg_stop(2'd`DBGSTOP));
+
+    reg [WBITS-1:0] wimg [0:`WROMN-1];
+    reg [WBITS-1:0] wword;
+    integer i, s, f, cyc0, cyc1, b;
+
+    task dump(input [3:0] strm, input [3:0] sel, input integer n, input [255:0] fname);
+        integer k, ff;
+        begin
+            ff = $fopen(fname, "w");
+            for (k = 0; k < n; k = k + 1) begin
+                rstream = strm; rsel = sel; raddr = k[10:0];
+                @(posedge clk); @(posedge clk); #1;
+                $fwrite(ff, "%016x\n", rdata);
+            end
+            $fclose(ff);
+        end
+    endtask
+    integer tokv [0:15];
+    initial begin
+        tokv[0]=`TOK0;  tokv[1]=`TOK1;  tokv[2]=`TOK2;  tokv[3]=`TOK3;
+        tokv[4]=`TOK4;  tokv[5]=`TOK5;  tokv[6]=`TOK6;  tokv[7]=`TOK7;
+        tokv[8]=`TOK8;  tokv[9]=`TOK9;  tokv[10]=`TOK10; tokv[11]=`TOK11;
+        tokv[12]=`TOK12; tokv[13]=`TOK13; tokv[14]=`TOK14; tokv[15]=`TOK15;
+    end
+
+    reg [255:0] fn;
+    initial begin
+        rst = 1'b1; go = 1'b0; pos = 9'd0; rstream = 0; rsel = 0; raddr = 0;
+        #1; for (b = 0; b < N; b = b + 1) toks[b*9 +: 9] = tokv[b][8:0];
+        wl_rst = 1'b0; wl_we = 1'b0; wl_data = 32'b0;
+        $readmemh("wrom.mem", wimg);
+        repeat (4) @(posedge clk); #1; rst = 1'b0; @(posedge clk); #1;
+        wl_rst = 1'b1; @(posedge clk); #1; wl_rst = 1'b0;
+        for (i = 0; i < `WROMN; i = i + 1) begin
+            wword = wimg[i];
+            for (s = 0; s < SUBW; s = s + 1) begin
+                wl_we = 1'b1; wl_data = wword[s*32 +: 32]; @(posedge clk); #1;
+            end
+        end
+        wl_we = 1'b0; @(posedge clk); #1;
+        cyc0 = dbgcyc;
+        go = 1'b1; @(posedge clk); #1; go = 1'b0;
+        wait (done == 1'b1); cyc1 = dbgcyc; @(posedge clk); #1;
+        $display("FWD_CYCLES=%0d", cyc1 - cyc0);
+        f = $fopen("cyc.out", "w"); $fwrite(f, "%0d\n", cyc1 - cyc0); $fclose(f);
+        f = $fopen("tok.out", "w");
+        for (b = 0; b < N; b = b + 1) $fwrite(f, "%0d\n", tok_outs[b*9 +: 9]);
+        $fclose(f);
+        for (b = 0; b < N; b = b + 1) begin
+            $sformat(fn, "x4_%0d.out", b);   dump(b[3:0], 4'd7, 256, fn);
+            $sformat(fn, "lnf_%0d.out", b);  dump(b[3:0], 4'd0, 256, fn);
+            $sformat(fn, "head_%0d.out", b); dump(b[3:0], 4'd8, 193, fn);
+        end
+        $display("TB_DONE tok0=%0d tok8=%0d tok15=%0d",
+                 tok_outs[8:0], tok_outs[8*9 +: 9], tok_outs[15*9 +: 9]);
+        $finish;
+    end
+    integer dbgcyc = 0;
+    integer running = 0;
+    always @(posedge clk) begin
+        dbgcyc = dbgcyc + 1;
+        if (go) running = 1;
+        if (done) running = 0;
+        if (dbgcyc % 100000 == 0)
+            $display("[cyc %0d] ge0=%0d ge1=%0d nl0=%0d nl1=%0d done=%b",
+                     dbgcyc, dut.coh0.ge, dut.coh1.ge, dut.coh0.eng.nl, dut.coh1.eng.nl, done);
+    end
+    initial begin #120000000; $display("TB_TIMEOUT cyc=%0d ge0=%0d ge1=%0d", dbgcyc, dut.coh0.ge, dut.coh1.ge); $finish; end
+endmodule
