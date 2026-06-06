@@ -26,12 +26,16 @@
 `ifndef KBITS
  `define KBITS 4
 `endif
+`ifndef P
+ `define P 8
+`endif
 
 module tb;
     localparam integer NHEAD    = 4;
     localparam integer HEAD_DIM = 64;
     localparam integer KBITS    = `KBITS;
     localparam integer WORDW    = 24;
+    localparam integer P        = `P;
     localparam integer ADDRW    = 24;
     localparam integer LENW     = 16;
     localparam integer NROWS    = `NROWS;
@@ -59,7 +63,7 @@ module tb;
 
     kv_dma #(
         .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .KBITS(KBITS), .WORDW(WORDW),
-        .ADDRW(ADDRW), .LENW(LENW)
+        .P(P), .ADDRW(ADDRW), .LENW(LENW)
     ) dut (
         .clk(clk), .rst(rst), .start(start), .base_addr(base_addr),
         .busy(busy), .row_valid(row_valid),

@@ -31,6 +31,7 @@ HEAD_DIM = 64
 KBITS = 4
 VBITS = 4
 WORDW = 24                              # reconstructed Q.16 word width (full int)
+P = 8                                   # channels/cycle the wide emit reconstructs
 WMASK = (1 << WORDW) - 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -84,7 +85,7 @@ def _compile(sim_dir, nrows, ddr_depth, first_word_lat, beat_gap):
         ["iverilog", "-g2012", "-o", vvp,
          f"-DNROWS={nrows}", f"-DDDR_DEPTH={ddr_depth}",
          f"-DFIRST_WORD_LAT={first_word_lat}", f"-DBEAT_GAP={beat_gap}",
-         f"-DKBITS={KBITS}",
+         f"-DKBITS={KBITS}", f"-DP={P}",
          os.path.join(HERE, "tb", "tb_kv_dma.sv"),
          os.path.join(HERE, "rtl", "kv_dma.sv"),
          os.path.join(HERE, "rtl", "ddr_latency_model.sv")],
@@ -153,7 +154,7 @@ def run(sim_dir, npz="fabric/export/goformer.npz", prompt_len=8, seed=0,
 
     print(f"src={npz} prompt_len={prompt_len} layers={nb} rows={nrows} "
           f"row_bytes={row_bytes} (NHEAD={NHEAD} head-major, K{KBITS}/V{VBITS}) "
-          f"ddr_image={len(ddr_bytes)}B")
+          f"ddr_image={len(ddr_bytes)}B emit_P={P} (channels/cycle)")
 
     all_ok = True
     summary = []
@@ -182,7 +183,7 @@ def run(sim_dir, npz="fabric/export/goformer.npz", prompt_len=8, seed=0,
 
 
 def main():
-    sim_dir = os.path.join("C:\\kevbuild", "stage3_kv_dma")
+    sim_dir = os.path.join("C:\\kevbuild", "agent_kv4", "kv_dma")
     raise SystemExit(0 if run(sim_dir) else 1)
 
 

@@ -36,6 +36,9 @@
 `ifndef PER_HEAD_CYC
  `define PER_HEAD_CYC 1300
 `endif
+`ifndef P
+ `define P 8
+`endif
 
 module tb;
     localparam integer NHEAD    = 4;
@@ -43,6 +46,7 @@ module tb;
     localparam integer KBITS    = `KBITS;
     localparam integer TMAX     = 32;
     localparam integer WORDW    = 24;
+    localparam integer P        = `P;
     localparam integer ADDRW    = 24;
     localparam integer LENW     = 16;
     localparam integer TPOS     = `TPOS;
@@ -79,7 +83,7 @@ module tb;
 
     kv_prefetch #(
         .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .KBITS(KBITS), .TMAX(TMAX),
-        .WORDW(WORDW), .ADDRW(ADDRW), .LENW(LENW)
+        .WORDW(WORDW), .P(P), .ADDRW(ADDRW), .LENW(LENW)
     ) dut (
         .clk(clk), .rst(rst),
         .start(start), .next_win(next_win), .tcount(tcount),

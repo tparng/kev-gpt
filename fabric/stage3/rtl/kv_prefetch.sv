@@ -59,6 +59,7 @@ module kv_prefetch #(
     parameter integer KBITS    = 4,
     parameter integer TMAX     = 32,
     parameter integer WORDW    = 24,      // reconstructed Q.16 word width (matches kv_dma)
+    parameter integer P        = 8,       // channels/cycle kv_dma dequantizes (emit width)
     parameter integer ADDRW    = 24,
     parameter integer LENW     = 16
 ) (
@@ -120,7 +121,7 @@ module kv_prefetch #(
 
     kv_dma #(
         .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .KBITS(KBITS), .WORDW(WORDW),
-        .ADDRW(ADDRW), .LENW(LENW)
+        .P(P), .ADDRW(ADDRW), .LENW(LENW)
     ) u_dma (
         .clk(clk), .rst(rst),
         .start(dma_start), .base_addr(dma_base),

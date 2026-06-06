@@ -14,24 +14,36 @@
 //
 // PINNED ROW LAYOUT (head-major within a position-row):
 //   row = [ head0_hdr | head0_codes | head1_hdr | ... | head{NHEAD-1}_codes ]
-//   per head:  hdr   = lo (int16, LSB-first) || scale (uint16, LSB-first)  = 4 B
+//   per head:  hdr   = lo (int32, LSB-first) || scale (uint16, LSB-first)  = 6 B
 //              codes = HEAD_DIM codes of KBITS each, packed LSB-first       = HEAD_DIM*KBITS/8 B
-//   K4/V4: 4 + 64*4/8 = 36 B/head; NHEAD=4 -> 144 B/position.
+//   K4/V4: 6 + 64*4/8 = 38 B/head; NHEAD=4 -> 152 B/position.
 //
 // One position-row read = one INCR burst of ROW_BYTES beats. The engine streams
 // the bytes in, and as each head completes it writes one WIDE WORD of HEAD_DIM
-// reconstructed Q.16 channels into the output bank `kbuf`/`vbuf` (CLAUDE.md
-// wide-word banking rule: the variable row index is a memory ADDRESS, not a
-// per-lane mux — channel d of head h lives in bits [d*WORDW +: WORDW]).
+// reconstructed Q.16 channels into the output bank `obuf` (CLAUDE.md wide-word
+// banking rule: the variable head index is a memory ADDRESS, not a per-lane mux —
+// channel d of head h lives in bits [d*WORDW +: WORDW]).
+//
+// WIDE EMIT (P channels/cycle, KV-DDR-100K rung 4). The byte stream delivers
+// CODES_PER_BYTE codes/byte; the row-emit throughput — not DDR latency/bandwidth —
+// is the wall (rung 3 finding: 256 channel-emit cycles dominate ~420 cyc/row). So
+// the engine STAGES BYTES_PER_EMIT bytes into a plain-reg code word holding P codes
+// and dequantizes all P in ONE cycle through P parallel lanes, committing a P-wide
+// slice of word_acc. The per-channel dequant (code*scale+lo, lo32 sign-extended,
+// scale uint16) is BIT-IDENTICAL to the byte-serial version — only its parallelism
+// changes. Per head emit drops from HEAD_DIM cycles to HEAD_DIM/P group cycles.
+// Requires HEAD_DIM % P == 0 and P % CODES_PER_BYTE == 0 (P is a multiple of the
+// codes carried by one byte, so each emit group consumes a whole number of bytes).
 //
 // The host drives one read per (K|V, position): assert `start` with the byte
 // `base_addr` of the row; when `row_valid` pulses, the NHEAD wide words for that
 // row are in `obuf[0..NHEAD-1]` and may be read out (one head-word per cycle via
 // `rd_head` -> `obuf_word`). `busy` is high for the duration.
 //
-// iverilog-2012 safe: flat plain-reg part-selects only; no $readmemh into a 2D
-// row; the per-head reconstructed channels are assembled in a plain-reg shift
-// word and committed as one wide bank word per head.
+// iverilog-2012 safe: flat plain-reg part-selects only (variable base on a plain
+// reg word_acc/emit_codes, never on an unpacked-array element); no $readmemh into a
+// 2D row; the per-head reconstructed channels are assembled in a plain-reg word and
+// committed as one wide bank word per head.
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
@@ -41,6 +53,7 @@ module kv_dma #(
     parameter integer KBITS    = 4,        // bits per code (2/4/8; 8 % KBITS == 0)
     parameter integer WORDW    = 24,       // signed width of a reconstructed Q.16 word
                                            // (full code*scale+lo; ~+-350k needs >=20b)
+    parameter integer P        = 8,        // channels dequantized/emitted per cycle
     parameter integer ADDRW    = 24,
     parameter integer LENW     = 16
 ) (
@@ -71,6 +84,10 @@ module kv_dma #(
     localparam integer ROW_BYTES      = NHEAD * HEAD_BYTES;        // 152 for K4
     localparam [KBITS-1:0] CODE_MASK  = {KBITS{1'b1}};
 
+    // wide-emit geometry: P codes/group, BYTES_PER_EMIT bytes feed one group.
+    localparam integer BYTES_PER_EMIT = P / CODES_PER_BYTE;        // 4 for P=8,K4
+    localparam integer NGROUP         = HEAD_DIM / P;              // 8 for P=8,hd=64
+
     // ---- output bank: one wide word per head (HEAD_DIM channels of WORDW) ---
     // Wide-word banking: channel d in bits [d*WORDW +: WORDW]; head = row address.
     reg [HEAD_DIM*WORDW-1:0] obuf [0:NHEAD-1];
@@ -81,31 +98,40 @@ module kv_dma #(
     reg signed [31:0]        lo_se;      // full signed lo (int32, Q.16)
     reg [15:0]               scale_u;    // unsigned scale (Q.16, >=1)
     reg [23:0]               lo_lsb;     // low 24b of lo as it is read in (bytes 0..2)
-    reg [7:0]                code_byte;  // current packed byte holding codes
+    reg [P*KBITS-1:0]        emit_codes; // staged P codes (LSB-first), BYTES_PER_EMIT bytes
 
     // ---- counters ----------------------------------------------------------
     reg [$clog2(NHEAD+1)-1:0]        h;        // current head 0..NHEAD-1
-    reg [$clog2(HEAD_DIM+1)-1:0]     d;        // current channel within head
+    reg [$clog2(NGROUP+1)-1:0]       g;        // current emit group 0..NGROUP-1
     reg [2:0]                        hdr_i;    // header byte index 0..5
-    reg [$clog2(CODES_PER_BYTE+1)-1:0] sub;    // code index within current byte
+    reg [$clog2(BYTES_PER_EMIT+1)-1:0] bsub;   // byte index within current group 0..BYTES_PER_EMIT-1
 
     // ---- FSM ---------------------------------------------------------------
     localparam [2:0] S_IDLE = 3'd0,
                      S_REQ  = 3'd1,   // assert req for the row burst
-                     S_HDR  = 3'd2,   // consume 4 header bytes for head h
-                     S_GETB = 3'd3,   // accept one packed code byte (1 beat)
-                     S_EMIT = 3'd4,   // peel CODES_PER_BYTE codes from the byte
+                     S_HDR  = 3'd2,   // consume 6 header bytes for head h
+                     S_GETB = 3'd3,   // accept BYTES_PER_EMIT packed code bytes
+                     S_EMIT = 3'd4,   // dequant P codes in one cycle, commit slice
                      S_HEND = 3'd5,   // commit head word, advance head
-                     S_DONE = 3'd6;
+                     S_DONE = 3'd6;   // pulse row_valid
     reg [2:0] state;
 
-    // combinational dequant of the code currently selected by (code_byte, sub):
-    //   x_hat = code*scale + lo   (exact integer, signed Q.16)
-    // LSB-first nibble select: code index `sub` lives in bits [sub*KBITS +: KBITS].
-    wire [KBITS-1:0]           cur_code  = (code_byte >> (sub * KBITS)) & CODE_MASK;
-    wire [KBITS+16-1:0]        prod      = cur_code * scale_u;            // unsigned mul
-    wire signed [33:0]         deq_full  = $signed({1'b0, prod}) + lo_se; // + signed lo (int32)
-    wire signed [WORDW-1:0]    deq_word  = deq_full[WORDW-1:0];          // exact code*scale+lo
+    // combinational P-wide dequant of the staged codes in emit_codes.
+    //   x_hat[l] = code[l]*scale + lo   (exact integer, signed Q.16), l in 0..P-1
+    // code l lives in emit_codes[l*KBITS +: KBITS] (LSB-first, same nibble order as
+    // the byte-serial version: within a byte, sub 0 is the low nibble; bytes earlier
+    // in the stream are lower channels). Built per-lane so the arithmetic is the
+    // SAME shape (unsigned mul, +signed int32 lo, truncate to WORDW) as before.
+    wire [P*WORDW-1:0] emit_word;
+    genvar gi;
+    generate
+        for (gi = 0; gi < P; gi = gi + 1) begin : g_deq
+            wire [KBITS-1:0]        lcode = (emit_codes >> (gi*KBITS)) & CODE_MASK;
+            wire [KBITS+16-1:0]     lprod = lcode * scale_u;             // unsigned mul
+            wire signed [33:0]      lfull = $signed({1'b0, lprod}) + lo_se; // + signed lo (int32)
+            assign emit_word[gi*WORDW +: WORDW] = lfull[WORDW-1:0];      // exact code*scale+lo
+        end
+    endgenerate
 
     always @(posedge clk) begin
         // pulsed defaults
@@ -117,9 +143,9 @@ module kv_dma #(
             req       <= 1'b0;
             rd_ready  <= 1'b0;
             h         <= 0;
-            d         <= 0;
+            g         <= 0;
             hdr_i     <= 3'd0;
-            sub       <= 0;
+            bsub      <= 0;
         end else begin
             case (state)
                 // ----------------------------------------------------------
@@ -133,9 +159,9 @@ module kv_dma #(
                         req      <= 1'b1;
                         busy     <= 1'b1;
                         h        <= 0;
-                        d        <= 0;
+                        g        <= 0;
                         hdr_i    <= 3'd0;
-                        sub      <= 0;
+                        bsub     <= 0;
                         state    <= S_REQ;
                     end
                 end
@@ -164,8 +190,8 @@ module kv_dma #(
                             lo_se <= $signed({rd_data, lo_lsb[23:0]});
                             hdr_i <= 3'd4;
                         end else if (hdr_i == 3'd5) begin
-                            d        <= 0;
-                            sub      <= 0;
+                            g        <= 0;
+                            bsub     <= 0;
                             rd_ready <= 1'b1;       // ready for the first code byte
                             state    <= S_GETB;
                         end else begin
@@ -173,35 +199,39 @@ module kv_dma #(
                         end
                     end
                 end
-                // ---------------- accept one packed code byte --------------
+                // ---------------- accept BYTES_PER_EMIT packed code bytes ----
+                // Stage CODES_PER_BYTE codes per accepted byte into emit_codes at
+                // bsub*CODES_PER_BYTE (i.e. byte bsub fills bits [bsub*8 +: 8] of the
+                // P*KBITS-wide code word). Once BYTES_PER_EMIT bytes are staged, the
+                // P codes are ready for a single-cycle dequant.
                 S_GETB: begin
                     rd_ready <= 1'b1;
                     if (rd_valid) begin
-                        code_byte <= rd_data;       // latch byte; emit its codes next
-                        sub       <= 0;
-                        rd_ready  <= 1'b0;           // stall the burst while emitting
-                        state     <= S_EMIT;
+                        emit_codes[bsub*8 +: 8] <= rd_data;   // KBITS in {2,4,8} -> byte = whole codes
+                        if (bsub == BYTES_PER_EMIT-1) begin
+                            bsub     <= 0;
+                            rd_ready <= 1'b0;           // stall the burst while emitting
+                            state    <= S_EMIT;
+                        end else begin
+                            bsub     <= bsub + 1'b1;    // accept the next byte of this group
+                        end
                     end
                 end
-                // ---------------- emit CODES_PER_BYTE codes from code_byte --
-                // cur_code/deq_word are combinational in (code_byte, sub, lo_se,
-                // scale_u), all stable here -> one channel committed per cycle.
+                // ---------------- emit P codes from emit_codes in ONE cycle --
+                // emit_word is combinational in (emit_codes, lo_se, scale_u), all
+                // stable here -> commit a P-channel slice of word_acc per cycle.
                 S_EMIT: begin
-                    word_acc[d*WORDW +: WORDW] <= deq_word;
-                    if (d == HEAD_DIM-1) begin
-                        // last channel of this head -> commit the head word
+                    word_acc[g*P*WORDW +: P*WORDW] <= emit_word;
+                    if (g == NGROUP-1) begin
+                        // last group of this head -> commit the head word
                         rd_ready <= 1'b0;
                         state    <= S_HEND;
-                    end else if (sub == CODES_PER_BYTE-1) begin
-                        // byte exhausted: fetch the next code byte
-                        d        <= d + 1'b1;
-                        sub      <= 0;
+                    end else begin
+                        // fetch the next BYTES_PER_EMIT bytes for the next group
+                        g        <= g + 1'b1;
+                        bsub     <= 0;
                         rd_ready <= 1'b1;
                         state    <= S_GETB;
-                    end else begin
-                        // peel the next code from the SAME latched byte next cycle
-                        d   <= d + 1'b1;
-                        sub <= sub + 1'b1;
                     end
                 end
                 // ---------------- commit head word, advance head -----------

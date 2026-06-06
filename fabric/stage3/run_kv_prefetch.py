@@ -30,6 +30,7 @@ HEAD_DIM = 64
 KBITS = 4
 VBITS = 4
 WORDW = 24
+P = 8                                   # channels/cycle the wide emit reconstructs
 WMASK = (1 << WORDW) - 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -119,7 +120,7 @@ def _compile(sim_dir, tpos, nlayers, ddr_depth, first_word_lat, beat_gap, per_he
         ["iverilog", "-g2012", "-o", vvp,
          f"-DTPOS={tpos}", f"-DNLAYERS={nlayers}", f"-DDDR_DEPTH={ddr_depth}",
          f"-DFIRST_WORD_LAT={first_word_lat}", f"-DBEAT_GAP={beat_gap}",
-         f"-DKBITS={KBITS}", f"-DPER_HEAD_CYC={per_head_cyc}",
+         f"-DKBITS={KBITS}", f"-DPER_HEAD_CYC={per_head_cyc}", f"-DP={P}",
          os.path.join(HERE, "tb", "tb_kv_prefetch.sv"),
          os.path.join(HERE, "rtl", "kv_prefetch.sv"),
          os.path.join(HERE, "rtl", "kv_dma.sv"),
@@ -221,20 +222,31 @@ def run(sim_dir, npz="fabric/export/goformer.npz", prompt_len=12, seed=0,
         cold = stalls[0] if stalls else -1
         warm = stalls[1:] if len(stalls) > 1 else []
         warm_max = max(warm) if warm else 0
+        # fill_cyc is the whole-window fill = 2*T row reads; derive per-row cost.
+        nrows_win = 2 * tpos
+        per_row = (fill_cyc / nrows_win) if (fill_cyc and nrows_win) else -1
+        hidden = (warm_max == 0)
         print(f"  L={L:>2} first-word cyc: bitexact={ok} mismatches={mism}/{total} "
               f"bad_blocks={bad} blocks={len(rtl_blocks)}/{len(expected_blocks)} | "
-              f"fill_cyc={fill_cyc} stall/window={stalls} "
-              f"(window0={cold}, warm_max={warm_max})")
+              f"fill_cyc(2*T rows)={fill_cyc} per_row~{per_row:.1f} "
+              f"win_compute={win_compute} stall/window={stalls} "
+              f"(window0={cold}, warm_max={warm_max}, hidden={hidden})")
 
     print(f"KV_PREFETCH_VERDICT bitexact_all={all_ok} latencies={list(latencies)} "
-          f"T={tpos} layers={nlayers} per_head_cyc={per_head_cyc}")
+          f"T={tpos} layers={nlayers} per_head_cyc={per_head_cyc} emit_P={P}")
     print("KV_PREFETCH_" + ("OK" if all_ok else "FAIL"))
     return all_ok
 
 
 def main():
-    sim_dir = os.path.join("C:\\kevbuild", "agent_kv")
-    raise SystemExit(0 if run(sim_dir) else 1)
+    base = os.path.join("C:\\kevbuild", "agent_kv4", "kv_prefetch")
+    # default warm window (T=8) sanity, then the full T=32 Kevin window: prove the
+    # 2*T-row fill hides behind an ~18k-cyc token compute (per_head_cyc=4500 -> NHEAD*
+    # 4500 = 18,000-cyc compute window, the single-token compute floor).
+    ok8 = run(os.path.join(base, "t8"), tpos=8, nlayers=2)
+    print()
+    ok32 = run(os.path.join(base, "t32"), tpos=32, nlayers=2, per_head_cyc=4500)
+    raise SystemExit(0 if (ok8 and ok32) else 1)
 
 
 if __name__ == "__main__":
