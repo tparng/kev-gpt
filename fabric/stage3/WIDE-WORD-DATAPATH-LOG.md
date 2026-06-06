@@ -721,3 +721,32 @@ reps. Sweep: 125 → 27,728.0 (already a record) / 142.9 → 31,689.2 / 166.7 �
 order: the 7ns timing campaign (200 MHz at NC=7 = 44.3k — the WNS −1.876
 says LN needs another pipeline stage first), AQ-mult narrowing → NC=8
 (~38.7k @166.7), and KV-DDR for context.
+
+## 21. 46,604.4 tok/s MEASURED @200 MHz — N=16, the first 200-clean build
+
+Three timing levers, each found by retiring the previous worst path, all
+bit-exact and composed (gates: N=16 69,120 cyc 16/16; N=14 63,676 14/14;
+total cycle cost of all three: +0.46%):
+1. **LN un-retimed** (two splits): the qsh barrel-shift registered (Y0_r)
+   so it can't fuse with the Newton squarer — the WNS −1.876 impl path —
+   and the output prod*gamma DSP registered before the >>>49 shift/pack.
+   LN now has ZERO top-30 entries.
+2. **AQ-mult 32×48** (range proof, `research/aq_range_proof.py`): lnt is
+   31b by construction (|n|<√D × |gamma|<8; the LN sources are literally
+   the 32-bit Q.22 regs), GELU hard 27b, ctx observed 24b; inv_sact =
+   round(2^40/s_act) ≤ ~2^47 → [47:0] slice. Per-cohort glue 88→48 DSP;
+   **attention un-evicted** (14,062 LUT/32 DSP → 8,249/50, the pp16 shape).
+   NC=8 dropped 127,177 → 113,246 LUT (96.7%) — N=16 FITS.
+3. **Attn sc_prod operand register**: qmem/kmem read → multiply split;
+   one-product-group/cycle throughput unchanged. sc_prod gone from top-30.
+
+Composed OOC NC=8: **111,295 LUT (95.03%)**, WNS −0.541 @6ns (2 endpoints,
+both softmax `div_bit→er0` — the next lever, agent running) / −1.541 @5ns.
+Impl (BD 50s + 1h46m): **WNS −0.616** (vs −1.876 the night before).
+
+**Silicon: 125→ok, 166.7 → 38,837.0 (record for ~an hour), 200 →
+46,604.4 — match=True 3/3, 68,663 cyc (sim 68,960 − 297, the SETTLE
+signature's fifth consecutive build). 250 → match=False (softmax).**
+The 100k identity is now 16 × 250 MHz / 40k cyc: the softmax lever buys
+the clock (58.2k at this cycle count); the cycle-floor cuts buy the rest.
+
