@@ -54,7 +54,13 @@ vs the integer reference). The current state, all bit-honest:
 | Ping-pong N=8 — non-linears overlap the GEMM (75,157 cyc / 8 tokens) | 17,740.6 | MEASURED |
 | Single-pass N=8 — one weight pass serves all 8 streams (69,172 cyc / 8 tokens @166.7 MHz) | 19,275.6 | MEASURED |
 | N=16 — 12 DSP-packed banks + shared LN/attention, 106.5k LUT (110,494 cyc / 16 tokens @166.7 MHz) | **24,134.0** | MEASURED |
-| Cycle recovery (attention overhead + arbitration tax) → more streams → 250 MHz | 30–100k | research notes: `fabric/stage3/research/` |
+| + softmax latency cut (103,879 cyc / 16 tokens, 16/16 bit-exact in sim; bitstream building) | 25,671 @166.7 | SIM |
+| Cycle floor push (AQ/RB overlap → ~40k cyc) × clock (200 → 250 MHz attempt) | 30–100k | the 100k identity: 16 × 250 MHz / 40k cyc |
+
+N=16 is the **stream ceiling**: 3 INT4×INT8 MACs/DSP is provably impossible
+(27-bit port vs 28 needed; 66 bits of neuron state vs a 48-bit accumulator —
+`fabric/stage3/research/dsp3_pack_proof.py`, 1.2M-trial verified), so past 24.1k
+the levers are cycles and clock, not streams.
 
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
 CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop ~9x.

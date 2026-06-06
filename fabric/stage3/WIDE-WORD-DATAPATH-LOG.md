@@ -588,3 +588,43 @@ vs the unbuildable dual-private design) is the known next target: attention
 overhead (344 cyc/head at T=1, mostly softmax+drain latency) shrinks both the
 NL time and the collision windows. Then P=16 act/RB boundary, then more
 streams on 151-LUT/64-DSP banks, then 250 MHz.
+
+---
+
+## 18. The fit campaign + the 2.0/DSP proof + the softmax cut
+
+**The fit campaign (overnight 06-05→06, three gated steps, all committed):**
+N=16 with dual NL engines was 16/16 bit-exact in sim at 90,115 cyc — and
+needed 325k LUT on a 117k device. The receipt:
+1. **DSP eviction cascade** (366→189k): the 2-DSPs-per-packed-MACC culprit was
+   NOT the multiply (27s×9s = 1 DSP, toy-proven) — Vivado absorbed the
+   recovery SUBTRACTS into DSPs (C-A2:B2 mode), overflowing 1,248 and evicting
+   LN/attention's 32×32-class mults to fabric at ~1.1k LUT each.
+   `use_dsp="no"` on two wires.
+2. **Raw-48b drain + readback recovery** (189→152.3k): 64 pairs × 48b ==
+   128 lanes × 24b == 3,072b, so ymem/drain are encoding-transparent; recovery
+   moved to the P-wide readback path (4 pairs/cycle) with a sumact side-mem.
+   mac_bank_dsp: 5.4k → **151 LUT** each. Zero cycle change.
+3. **One shared LN + one shared attention** arbitrated between the engines
+   (fixed priority, hold-until-done; LN/attn never nest → no deadlock), freed
+   283 DSPs → 4 more streams flipped to DSP banks (ND=12): **106.5k LUT
+   (90.9%), 1,171 DSP**. Cost: arbitration tax, 90,115 → 110,791 cyc.
+Result on silicon: §17's 24,134.0.
+
+**The 2.0/DSP impossibility proof** (`research/dsp3_pack_proof.py`): 3 INT4×INT8
+MACs/DSP with a shared activation fails on two independent walls — three
+no-bleed nibbles need 28 bits against the 27-bit port, and three K=1024 neurons
+are 66 bits of state against a 48-bit accumulator (side terms are O(log K)).
+Drain windows collapse (D=0); 5-per-2-DSP dies the same way. 1.2M randomized
+K=1024 lane-products, exhaustive K=1, adversarial corners: 0 mismatches on the
+proven 2.0 scheme. **Consequence: N=16 is the stream ceiling at LANES=128**
+(L=256 needs 2,048 DSPs — also dead). The 100k identity: 16 × 250 MHz / 40k cyc.
+
+**Softmax latency cut**: dead wait-states between exp/sum/reciprocal phases
+removed (arithmetic untouched). N=16: 110,791 → **103,879 cyc** (16/16);
+N=8: 68,183 → 64,727 (8/8). Fit 107.4k LUT. 25,671 @166.7 SIM — bitstream
+building from commit 210d385 at this state.
+
+Next per the 100k chain: GE-engine profile-led cuts (AQ/RB overlap, group-gap
+fills, GE_IDLE pre-AQ) toward the ~40k floor, then the 7ns-target timing
+campaign for 200/250 MHz silicon.

@@ -1,8 +1,10 @@
-> **STATUS (2026-06-04): TARGET BROKEN.** 11,143.9 tok/s single-stream MEASURED
-> @200 MHz (3/3 bit-exact); batch GEMM N=4 = 16,969.3; ping-pong N=8 = **17,740.6
-> MEASURED** — all on silicon, all bit-exact. The chase is now 50k (single-pass N=8,
-> gating in sim) -> 70-100k (DSP packing, KV-in-DDR; research notes in
-> fabric/stage3/research/). Engineering log: fabric/stage3/WIDE-WORD-DATAPATH-LOG.md.
+> **STATUS (2026-06-06): TARGET BROKEN 2.4×.** The measured ladder: 11,143.9
+> (1 stream @200) → 16,969.3 (N=4) → 17,740.6 (ping-pong N=8) → 19,275.6
+> (single-pass N=8) → **24,134.0 tok/s aggregate MEASURED** (N=16: 12 DSP-packed
+> banks + shared LN/attention, 16/16 bit-exact 3/3 @166.7 MHz). N=16 is the
+> proven stream ceiling (3 MACs/DSP impossible — research/dsp3_pack_proof.py);
+> the chase to 100k is now cycles (103,879 → ~40k floor) × clock (200/250 MHz):
+> 16 × 250 MHz / 40k cyc = 100k. Engineering log: fabric/stage3/WIDE-WORD-DATAPATH-LOG.md §12–18.
 
 # Roadmap to 10,000 tok/s — and the honest ladder to the board's ceiling
 
