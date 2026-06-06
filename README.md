@@ -54,7 +54,7 @@ vs the integer reference). The current state, all bit-honest:
 | Ping-pong N=8 — non-linears overlap the GEMM (75,157 cyc / 8 tokens) | 17,740.6 | MEASURED |
 | Single-pass N=8 — one weight pass serves all 8 streams (69,172 cyc / 8 tokens @166.7 MHz) | 19,275.6 | MEASURED |
 | N=16 — 12 DSP-packed banks + shared LN/attention, 106.5k LUT (110,494 cyc / 16 tokens @166.7 MHz) | **24,134.0** | MEASURED |
-| + softmax latency cut (103,879 cyc / 16 tokens, 16/16 bit-exact in sim; bitstream building) | 25,671 @166.7 | SIM |
+| + softmax latency cut (103,582 cyc / 16 tokens @166.7 MHz) | **25,744.5** | MEASURED |
 | Cycle floor push (AQ/RB overlap → ~40k cyc) × clock (200 → 250 MHz attempt) | 30–100k | the 100k identity: 16 × 250 MHz / 40k cyc |
 
 N=16 is the **stream ceiling**: 3 INT4×INT8 MACs/DSP is provably impossible

@@ -628,3 +628,9 @@ building from commit 210d385 at this state.
 Next per the 100k chain: GE-engine profile-led cuts (AQ/RB overlap, group-gap
 fills, GE_IDLE pre-AQ) toward the ~40k floor, then the 7ns-target timing
 campaign for 200/250 MHz silicon.
+
+**§18 silicon addendum: 25,744.5 tok/s MEASURED @166.7 (16/16, 3/3).** The
+softmax-cut build closed at WNS −0.044 (best yet — the cut shortened a real
+path) and ran 103,582 cyc on silicon vs 103,879 sim: the 297-cycle SETTLE
+signature, third consecutive build. 200 MHz still fails (needs 1.61×; the
+timing campaign remains the gate to 30k+ in one step).
