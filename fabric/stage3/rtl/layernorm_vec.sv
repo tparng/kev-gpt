@@ -127,22 +127,35 @@ module layernorm_vec #(
             if (A[b]) msb_c = b[7:0];
     end
 
-    // ---- output pipeline (4 stages): s0 xc=(x-mean) ; s1 prod=xc*Yr ; s2 prod2=prod*gamma
-    //   ; s3 y=prod2>>>OUT_SH. Stage 2/3 split (Fmax: after the qsh->Newton fix, the worst
-    //   u_ln path is prod_reg(DSP) -> prod*gamma multiply + the wide >>>49/sign-extend net
-    //   -> y_out_reg, 19 logic levels). Register the raw product prod2_r, then do the shift
-    //   + 64b pack the next cycle — same value, one cycle later, absorbed by done/y_valid.
+    // ---- output pipeline (5 stages): s0 xc=(x-mean) ; s1 prod=xc*Yr ; s2 hi/lo partial
+    //   products of prod*gamma ; s2b combine the partials -> prod2_r ; s3 y=prod2>>>OUT_SH.
+    //   Stage 2/3 split (Fmax §21: register the raw product prod2_r then shift+pack next cyc).
+    //   NEW stage-2 split (Fmax @TMAX=16): the worst u_ln path was the 96-bit DSP output
+    //   prod -> the 96x32 prod*gamma multiply -> prod2_r (WNS -0.936, 15 logic levels,
+    //   CARRY8=4): a 96-bit operand forces a 4-DSP cascade stitched by a long CARRY8 chain,
+    //   and the source register is ALSO a DSP output (xc*Yr), so the whole wide multiply sits
+    //   in one cycle DSP->DSP. Split prod into two positional halves across a register
+    //   boundary: prod == $signed(prod[95:48])*2^48 + prod[47:0] (low 48 UNSIGNED, high 48
+    //   signed — exact two's-complement positional decomposition). Each partial is a <=48x32
+    //   multiply (short carry); register pp_hi/pp_lo, then prod2_r = (pp_hi<<<48)+pp_lo the
+    //   next cycle. prod2_r is BIT-IDENTICAL, just one LN-latency cycle later (absorbed by the
+    //   done/y_valid handshake — LN is arbitrated hold-until-done).
     reg signed [39:0]  xc     [0:P-1];
     reg signed [95:0]  prod   [0:P-1];
     reg signed [31:0]  grow_0 [0:P-1];
     reg signed [31:0]  grow_r [0:P-1];
-    reg signed [127:0] prod2_r [0:P-1];          // s2: registered raw products (DSP out)
-    reg                s0v, s1v, s2v;
+    reg signed [127:0] pp_hi  [0:P-1];           // s2: $signed(prod[95:48]) * gamma
+    reg signed [127:0] pp_lo  [0:P-1];           // s2: $unsigned(prod[47:0]) * gamma
+    reg signed [127:0] prod2_r [0:P-1];          // s2b: registered combined product
+    reg                s0v, s1v, s2v, s2bv;
     reg signed [31:0]  xo, go;                   // plain-vector copies
     reg signed [39:0]  xj;
     reg signed [95:0]  pj;
+    reg signed [47:0]  pjhi;                     // s2 plain-vector copy: prod[95:48] (signed)
+    reg        [47:0]  pjlo;                     // s2 plain-vector copy: prod[47:0] (unsigned)
     reg signed [127:0] prod2;
     reg signed [127:0] p2j;                      // s3 plain-vector copy of prod2_r[lp]
+    reg signed [127:0] hj, lj;                   // s2b plain-vector copies of pp_hi/pp_lo
 
     // ---- FSM ------------------------------------------------------------------
     localparam [3:0]
@@ -163,7 +176,7 @@ module layernorm_vec #(
     always @(posedge clk) begin
         if (rst) begin
             state <= S_IDLE; wptr <= 0; ridx <= 0; oidx <= 0;
-            y_valid <= 1'b0; done <= 1'b0; s0v <= 1'b0; s1v <= 1'b0; s2v <= 1'b0;
+            y_valid <= 1'b0; done <= 1'b0; s0v <= 1'b0; s1v <= 1'b0; s2v <= 1'b0; s2bv <= 1'b0;
             sum <= 0; sumxx <= 0; newt <= 0;
         end else begin
             y_valid <= 1'b0;
@@ -277,7 +290,7 @@ module layernorm_vec #(
                 S_NEWTC3: begin                          // -> next Yr is a plain reg
                     Yr   <= yn_r;
                     newt <= newt + 1'b1;
-                    if (newt == 2'd1) begin ridx <= 0; oidx <= 0; s0v <= 1'b0; s1v <= 1'b0; s2v <= 1'b0; state <= S_OUT; end
+                    if (newt == 2'd1) begin ridx <= 0; oidx <= 0; s0v <= 1'b0; s1v <= 1'b0; s2v <= 1'b0; s2bv <= 1'b0; state <= S_OUT; end
                     else state <= S_NEWTA;
                 end
                 // ---- P-wide pipelined output stream ----------------------------
@@ -303,18 +316,31 @@ module layernorm_vec #(
                             grow_r[lp] <= grow_0[lp];
                         end
                     end
-                    // stage 2: register the raw products prod2_r = prod*gamma (DSP out only,
-                    // no shift chained into it — Fmax: isolates the multiply from the >>>OUT_SH)
+                    // stage 2: hi/lo partial products of prod*gamma (each <=48x32, short
+                    // carry — splits the 96x32 cascade so neither half is the DSP->DSP cloud)
                     s2v <= s1v;
                     if (s1v) begin
                         for (lp = 0; lp < P; lp = lp + 1) begin
                             pj    = prod[lp];                   // plain-vector copies
                             go    = grow_r[lp];
-                            prod2_r[lp] <= pj * $signed({{96{go[31]}}, go});
+                            pjhi  = pj[95:48];                  // high half (signed)
+                            pjlo  = pj[47:0];                   // low half  (unsigned)
+                            pp_hi[lp]  <= $signed(pjhi) * $signed({{96{go[31]}}, go});
+                            pp_lo[lp]  <= $signed({1'b0, pjlo}) * $signed({{96{go[31]}}, go});
+                        end
+                    end
+                    // stage 2b: combine the partials -> prod2_r (a clean wide add, no multiply)
+                    //   prod*gamma == (pp_hi <<< 48) + pp_lo  (exact positional recombination)
+                    s2bv <= s2v;
+                    if (s2v) begin
+                        for (lp = 0; lp < P; lp = lp + 1) begin
+                            hj = pp_hi[lp];                     // plain-vector copies
+                            lj = pp_lo[lp];
+                            prod2_r[lp] <= (hj <<< 48) + lj;
                         end
                     end
                     // stage 3: P y = prod2>>>OUT_SH (the wide shift + 64b pack), one row/cycle
-                    if (s2v) begin
+                    if (s2bv) begin
                         for (lp = 0; lp < P; lp = lp + 1) begin
                             p2j = prod2_r[lp];                  // plain-vector copy
                             y_out[lp*64 +: 64] <= p2j >>> OUT_SH;
