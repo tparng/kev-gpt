@@ -37,7 +37,8 @@ module cohort_engine #(
     parameter integer LN_OUT_FRAC = 22,
     parameter integer VFRAC       = 16,
     parameter integer GELU_FRAC   = 12,
-    parameter integer ISH         = 40
+    parameter integer ISH         = 40,
+    parameter integer DBG         = 1    // 0 = tie off the board-debug readback mux
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -499,6 +500,12 @@ module cohort_engine #(
     end
 
     // ---- board readback --------------------------------------------------------
+    // DBG=1 (default, ALL sim gates): the full per-phase debug readback the
+    // run_sb_* harnesses compare against seq_ref — this is the bit-honest path.
+    // DBG=0 (bitstream builds only, set in build_bd_seq_sb.tcl): the mux tree is
+    // tied off (~1.5-2k LUT/device back). The record protocol reads ONLY
+    // tok_outs + CYCLES, never rd_data; the compute datapath is identical.
+    generate if (DBG) begin : g_dbg
     reg [LSH-1:0] rd_lane;
     reg [P*64-1:0] rw64; reg [P*32-1:0] rw32; reg is64;
     integer pp;
@@ -534,4 +541,7 @@ module cohort_engine #(
         if (is64) rd_data <= $signed(rw64[rd_lane*64 +: 64]);
         else      rd_data <= {{32{rw32[rd_lane*32 + 31]}}, rw32[rd_lane*32 +: 32]};
     end
+    end else begin : g_nodbg
+        always @(posedge clk) rd_data <= 64'd0;
+    end endgenerate
 endmodule

@@ -38,7 +38,8 @@ module sequencer_sb #(
     parameter integer LN_OUT_FRAC = 22,
     parameter integer VFRAC       = 16,
     parameter integer GELU_FRAC   = 12,
-    parameter integer ISH         = 40
+    parameter integer ISH         = 40,
+    parameter integer DBG         = 1    // 0 = tie off board-debug readback (bitstream builds)
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -250,7 +251,7 @@ module sequencer_sb #(
                     .DQ_N(DQ_N), .NSACT(NSACT), .WWORDS(WWORDS), .NLAYER(NLAYER),
                     .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .RESID_FRAC(RESID_FRAC),
                     .LN_OUT_FRAC(LN_OUT_FRAC), .VFRAC(VFRAC), .GELU_FRAC(GELU_FRAC),
-                    .ISH(ISH)) coh0 (
+                    .ISH(ISH), .DBG(DBG)) coh0 (
         .clk(clk), .rst(rst), .go(go),
         .tok_ids(tok_ids[NC*9-1:0]), .pos(pos),
         .done_o(done_o0), .tok_outs(tok_outs0),
@@ -277,7 +278,7 @@ module sequencer_sb #(
                     .DQ_N(DQ_N), .NSACT(NSACT), .WWORDS(WWORDS), .NLAYER(NLAYER),
                     .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .RESID_FRAC(RESID_FRAC),
                     .LN_OUT_FRAC(LN_OUT_FRAC), .VFRAC(VFRAC), .GELU_FRAC(GELU_FRAC),
-                    .ISH(ISH)) coh1 (
+                    .ISH(ISH), .DBG(DBG)) coh1 (
         .clk(clk), .rst(rst), .go(go),
         .tok_ids(tok_ids[N*9-1:NC*9]), .pos(pos),
         .done_o(done_o1), .tok_outs(tok_outs1),
