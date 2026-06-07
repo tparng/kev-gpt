@@ -162,8 +162,9 @@ module cohort_engine #(
     // ================================================================
     //                       GEMM  DATAPATH  (this cohort)
     // ================================================================
-    reg                gv_xrst, gv_xwe, gv_start;
+    reg                gv_xrst, gv_xwe, gv_start, gv_rowcommit;
     reg  [$clog2(N)-1:0] gv_xstream, gv_rdstream;
+    reg  [$clog2(1024/P)-1:0] gv_xrow;
     reg  [P*8-1:0]     gv_xdata;
     reg [10:0]         gv_m, gv_k;
     reg [$clog2(WWORDS)-1:0] gv_wbase;
@@ -174,7 +175,9 @@ module cohort_engine #(
     gemm_cohort_vec #(.LANES(LANES), .N(N), .ND(ND), .P(P), .MMAX(1024),
                   .KMAX(1024), .RLAT(2), .WWORDS(WWORDS)) u_gemm (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
-        .x_rst(gv_xrst), .x_we(gv_xwe), .x_stream(gv_xstream), .x_data(gv_xdata),
+        .x_rst(gv_xrst), .x_we(gv_xwe), .x_stream(gv_xstream),
+        .x_row(gv_xrow), .x_data(gv_xdata),
+        .ovl_en(1'b1), .x_rowcommit(gv_rowcommit),
         .start(gv_start), .done(gv_done),
         .rd_stream(gv_rdstream), .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),
         .waddr(waddr), .wword_rd(wword_rd));
@@ -196,9 +199,23 @@ module cohort_engine #(
     reg [2:0]  a_dst;
     localparam [$clog2(N)-1:0] glim = N-1;
 
-    reg [$clog2(N)-1:0] gbs;            // stream over ALL N
-    reg [10:0] gci, gcid, gcid1, gcid2;
+    reg [$clog2(N)-1:0] gbs;            // stream (inner loop, row-major AQ)
+    reg [10:0] grow;                    // row (outer loop, row-major AQ)
+    reg [10:0] gci;                     // GE_RB readback row walk (also reused as ge_ra row)
     reg        gciv, gciv1, gciv2;
+    // pipeline tags for the row-major AQ: each beat's (stream,row,row-last) carried
+    // 3 deep so the x-write at the gciv2 stage targets the right (stream,row) and
+    // the row-commit pulse fires when the LAST stream of a row reaches the write.
+    // 4-deep tag pipeline: the AQ shift/round/saturate cone (aq_prod_r -> gv_xdata)
+    // was THE 5ns-critical family (OOC: -0.366 @5ns, all 128 endpoints). Split it
+    // with an operand register: stage gciv2 does the 96b add + >>>62 shift into
+    // aq_sh_r; stage gciv3 saturates+packs+writes. Zero-stall, +1 AQ latency.
+    reg [$clog2(N)-1:0] gbsd, gbsd1, gbsd2, gbsd3;
+    reg [10:0] growd, growd1, growd2, growd3;
+    reg        rowl, rowl1, rowl2, rowl3; // this beat is the last stream of its row
+    reg        gciv3;
+    reg signed [31:0] aq_sh_r [0:P-1];    // registered post-shift value (feeds sat)
+    reg        gv_started;              // gv_start already pulsed for this call
     reg [2:0]  grbn;
     reg signed [63:0] lntmp_g;
     reg signed [95:0] aq_prod, aq_sh;
@@ -225,6 +242,11 @@ module cohort_engine #(
     localparam [2:0] GE_IDLE=0, GE_AQ=1, GE_AQN=2, GE_RUN=3, GE_WAIT=4, GE_RB=5, GE_RBN=6,
                      GE_DQW=7;   // waiting for the shared dq channel grant
     reg [2:0] ge;
+    // rows of cushion committed before the overlapped run is launched. The N=P=8
+    // produce/consume rates tie exactly, so the stall guard in gemm_cohort_vec is
+    // what guarantees correctness; this just keeps the run a couple rows behind AQ
+    // so it rarely stalls. (GE_AQN/GE_RUN states retired — AQ now starts the run.)
+    localparam integer AQ_START_MARGIN = 2;
 
     // dq channel request: from the cycle gv_done arrives (zero-cycle grant when
     // the channel is free) until the call's last readback beat returns to IDLE.
@@ -242,11 +264,13 @@ module cohort_engine #(
     // GE-side read address (LOCAL): board readback reuses this port while idle
     wire [10:0] rbr   = rd_stream*ROWS   + (rd_addr >> LSH);
     wire [10:0] rbrM  = rd_stream*ROWSM  + (rd_addr >> LSH);
+    // AQ beat reads (stream gbs, row grow); GE_RB reuses (gbs, gci) for its walk.
+    wire [10:0] ge_ra_row = (ge == GE_AQ) ? grow : gci;
     always @* begin
         if (ge == GE_IDLE)
             ge_ra_local = (rd_sel == 4'd5) ? rbrM : rbr;
         else
-            ge_ra_local = (a_asrc == 2'd3) ? (sGMl + gci) : (sGl + gci);
+            ge_ra_local = (a_asrc == 2'd3) ? (sGMl + ge_ra_row) : (sGl + ge_ra_row);
     end
 
     wire rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == glim)
@@ -282,9 +306,12 @@ module cohort_engine #(
     end
 
     always @(posedge clk) begin
-        gv_xrst<=0; gv_xwe<=0; gv_start<=0; dq_vin_o<=0; gl_vin_o<=0;
+        gv_xrst<=0; gv_xwe<=0; gv_start<=0; gv_rowcommit<=0; dq_vin_o<=0; gl_vin_o<=0;
         if (rst) begin
-            ge<=GE_IDLE; gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
+            ge<=GE_IDLE; gbs<=0; grow<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0; gciv3<=0;
+            gbsd<=0; gbsd1<=0; gbsd2<=0; gbsd3<=0;
+            growd<=0; growd1<=0; growd2<=0; growd3<=0;
+            rowl<=0; rowl1<=0; rowl2<=0; rowl3<=0; gv_started<=0;
             rv0<=0; rv1<=0; rv2<=0; gdor<=0; gor<=0;
         end else begin
             case (ge)
@@ -295,15 +322,35 @@ module cohort_engine #(
                         a_asrc  <= d_asrc;  a_asel  <= d_asel;
                         a_frac  <= d_frac;  a_dqrow <= d_dqrow;
                         a_dst   <= d_dst;
-                        gbs<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
+                        gbs<=0; grow<=0; gciv<=0; gciv1<=0; gciv2<=0; gciv3<=0;
+                        rowl<=0; rowl1<=0; rowl2<=0; rowl3<=0; gv_started<=0;
                         gv_xrst<=1'b1; ge<=GE_AQ;
                     end
                 end
+                // ---- ROW-MAJOR act-quantize, OVERLAPPED with the gemm run ----
+                // For each row r (0..K/P-1) walk all N streams (inner). The gemm's
+                // RUN reads row r of EVERY stream at the SAME xrd_row, so a row
+                // must be committed (all N streams written) before RUN's kc reaches
+                // r*P. We start the run after MARGIN rows commit and rely on
+                // gemm_cohort_vec's stall guard (issue gated on xrd_row <
+                // rows_committed) for the zero-margin N=P=8 rate tie. Continuous
+                // 4-deep pipeline (issue->mult->shift->write); no inter-stream gaps.
                 GE_AQ: begin
-                    gcid <= gci; gciv <= (gci != (d_k >> LSH));
-                    gcid1 <= gcid; gciv1 <= gciv;
-                    gcid2 <= gcid1; gciv2 <= gciv1;
-                    if (gci != (d_k >> LSH)) gci <= gci + 1'b1;
+                    // ---- stage 0: ISSUE (read the (gbs,grow) AQ source) ----------
+                    // a_k captured at GE_IDLE; the descriptor is held by nl_engine
+                    // through the whole call so d_k would also be stable, but a_k
+                    // decouples the AQ loop from the live bus.
+                    gciv  <= (grow != (a_k >> LSH));
+                    gbsd  <= gbs;   growd <= grow;   rowl  <= (gbs == glim);
+                    // advance the (row,stream) cursor
+                    if (grow != (a_k >> LSH)) begin
+                        if (gbs == glim) begin gbs<=0; grow<=grow+1'b1; end
+                        else gbs<=gbs+1'b1;
+                    end
+                    // ---- pipeline tags (4 deep) ---------------------------------
+                    gciv1 <= gciv;  gbsd1 <= gbsd;  growd1 <= growd;  rowl1 <= rowl;
+                    gciv2 <= gciv1; gbsd2 <= gbsd1; growd2 <= growd1; rowl2 <= rowl1;
+                    gciv3 <= gciv2; gbsd3 <= gbsd2; growd3 <= growd2; rowl3 <= rowl2;
                     if (gciv) begin
                         for (gp=0; gp<P; gp=gp+1) begin
                             case (d_asrc)
@@ -340,6 +387,7 @@ module cohort_engine #(
                             aq_neg_r[gp]  <= (lnt_r[gp] < 0);
                         end
                     end
+                    // ---- stage 2: round + shift -> register (the retimed cone) ---
                     if (gciv2) begin
                         for (gp=0; gp<P; gp=gp+1) begin
                             aq_prod = aq_prod_r[gp];
@@ -347,32 +395,42 @@ module cohort_engine #(
                                 aq_sh = (aq_prod + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH);
                             else
                                 aq_sh = -(((-aq_prod) + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH));
-                            aq_int = aq_sh[31:0];
+                            aq_sh_r[gp] <= aq_sh[31:0];   // only [31:0] feeds saturation
+                        end
+                    end
+                    // ---- stage 3: saturate + pack -> WRITE x row + commit --------
+                    if (gciv3) begin
+                        for (gp=0; gp<P; gp=gp+1) begin
+                            aq_int = aq_sh_r[gp];
                             if (aq_int>127) aq_int=127; if (aq_int<-128) aq_int=-128;
                             aqw[gp*8 +: 8] = aq_int[7:0];
                         end
-                        gv_xwe<=1'b1; gv_xdata<=aqw; gv_xstream<=sid;
-                        if (gcid2==(d_k >> LSH)-1) begin
-                            gci<=0; gciv<=0; gciv1<=0; gciv2<=0;
-                            if (gbs == glim) begin gbs<=0; ge<=GE_RUN; end
-                            else begin grbn<=0; ge<=GE_AQN; end
+                        gv_xwe<=1'b1; gv_xdata<=aqw;
+                        gv_xstream<=gbsd3; gv_xrow<=growd3[$clog2(1024/P)-1:0];
+                        // a row is fully written when its LAST stream lands -> commit
+                        if (rowl3) begin
+                            gv_rowcommit<=1'b1;
+                            // start the run once MARGIN rows have committed (this
+                            // commit makes rows_committed = growd3+1)
+                            if (!gv_started && growd3 >= AQ_START_MARGIN-1) begin
+                                gv_started<=1'b1;
+                                gv_m<=a_m; gv_k<=a_k; gv_wbase<=a_wbase[$clog2(WWORDS)-1:0];
+                                gv_start<=1'b1;
+                            end
                         end
                     end
-                end
-                GE_AQN: begin
-                    grbn <= grbn + 1'b1;
-                    // 2-cycle gap (was 4): the prior stream's last x_we already
-                    // committed (xptr at K/P) the cycle we entered AQN; gv_xrst
-                    // (registered) then resets xptr one cycle before the next
-                    // stream's first write. The AQ compute pipeline is re-armed
-                    // from gci=0 in GE_AQ, so 2 cycles is sufficient.
-                    if (grbn == 3'd1) begin
-                        gbs<=gbs+1'b1; gv_xrst<=1'b1; ge<=GE_AQ;
+                    // ---- AQ done: last x-write committed -> wait for the gemm ----
+                    if (gciv3 && rowl3 && growd3==(a_k >> LSH)-1) begin
+                        gbs<=0; grow<=0; gciv<=0; gciv1<=0; gciv2<=0; gciv3<=0;
+                        // tiny calls (K/P <= MARGIN) never hit the early-start branch
+                        // above; issue the run now so the call still completes.
+                        if (!gv_started) begin
+                            gv_started<=1'b1;
+                            gv_m<=a_m; gv_k<=a_k; gv_wbase<=a_wbase[$clog2(WWORDS)-1:0];
+                            gv_start<=1'b1;
+                        end
+                        ge<=GE_WAIT;
                     end
-                end
-                GE_RUN: begin
-                    gv_m<=a_m; gv_k<=a_k; gv_wbase<=a_wbase[$clog2(WWORDS)-1:0];
-                    gv_start<=1'b1; ge<=GE_WAIT;
                 end
                 GE_WAIT: if (gv_done) begin
                     gci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0;

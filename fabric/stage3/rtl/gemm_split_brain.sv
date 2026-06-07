@@ -35,6 +35,7 @@ module gemm_split_brain #(
     input  wire                          c0_x_rst,
     input  wire                          c0_x_we,
     input  wire [$clog2(N)-1:0]          c0_x_stream,
+    input  wire [$clog2(KMAX/P)-1:0]     c0_x_row,
     input  wire [P*8-1:0]                c0_x_data,
     input  wire                          c0_start,
     output wire                          c0_done,
@@ -48,6 +49,7 @@ module gemm_split_brain #(
     input  wire                          c1_x_rst,
     input  wire                          c1_x_we,
     input  wire [$clog2(N)-1:0]          c1_x_stream,
+    input  wire [$clog2(KMAX/P)-1:0]     c1_x_row,
     input  wire [P*8-1:0]                c1_x_data,
     input  wire                          c1_start,
     output wire                          c1_done,
@@ -70,7 +72,9 @@ module gemm_split_brain #(
                       .KMAX(KMAX), .WWORDS(WWORDS), .RLAT(RLAT), .ABITS(ABITS)) u_c0 (
         .clk(clk), .rst(rst),
         .m_count(c0_m_count), .k_count(c0_k_count), .w_base(c0_w_base),
-        .x_rst(c0_x_rst), .x_we(c0_x_we), .x_stream(c0_x_stream), .x_data(c0_x_data),
+        .x_rst(c0_x_rst), .x_we(c0_x_we), .x_stream(c0_x_stream),
+        .x_row(c0_x_row), .x_data(c0_x_data),
+        .ovl_en(1'b0), .x_rowcommit(1'b0),
         .start(c0_start), .done(c0_done),
         .rd_stream(c0_rd_stream), .rd_addr(c0_rd_addr), .y_out(c0_y_out),
         .waddr(waddr_b), .wword_rd(wword_b));
@@ -79,7 +83,9 @@ module gemm_split_brain #(
                       .KMAX(KMAX), .WWORDS(WWORDS), .RLAT(RLAT), .ABITS(ABITS)) u_c1 (
         .clk(clk), .rst(rst),
         .m_count(c1_m_count), .k_count(c1_k_count), .w_base(c1_w_base),
-        .x_rst(c1_x_rst), .x_we(c1_x_we), .x_stream(c1_x_stream), .x_data(c1_x_data),
+        .x_rst(c1_x_rst), .x_we(c1_x_we), .x_stream(c1_x_stream),
+        .x_row(c1_x_row), .x_data(c1_x_data),
+        .ovl_en(1'b0), .x_rowcommit(1'b0),
         .start(c1_start), .done(c1_done),
         .rd_stream(c1_rd_stream), .rd_addr(c1_rd_addr), .y_out(c1_y_out),
         .waddr(waddr_a), .wword_rd(wword_a));

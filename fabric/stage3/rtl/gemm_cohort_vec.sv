@@ -35,7 +35,15 @@ module gemm_cohort_vec #(
     input  wire                          x_rst,
     input  wire                          x_we,
     input  wire [$clog2(N)-1:0]          x_stream,
+    input  wire [$clog2(KMAX/P)-1:0]     x_row,      // EXPLICIT write row (row-major AQ)
     input  wire [P*8-1:0]                x_data,
+    // overlap (AQ hiding behind RUN): when ovl_en, the RUN's MAC `issue` stalls
+    // until the x row it needs is committed. x_rowcommit pulses once per fully
+    // written row (all streams) and bumps rows_committed; `issue` is gated on
+    // xrd_row < rows_committed so an under-run inserts MAC bubbles — bit-identical
+    // accumulation, only delayed. x_rst clears rows_committed; ovl_en=0 -> classic.
+    input  wire                          ovl_en,
+    input  wire                          x_rowcommit,
     // run
     input  wire                          start,
     output reg                           done,
@@ -60,11 +68,15 @@ module gemm_cohort_vec #(
     (* ram_style = "distributed" *)
     reg signed [22:0] sumact_mem [0:N*GROUPS-1];
 
-    // ---- act-write row pointer (the load assembler moved to weight_bank_tdp) ----
-    reg [$clog2(XROWS)-1:0] xptr;
+    // ---- committed-row counter for the AQ/RUN overlap stall guard ------------
+    // rows_committed = number of x rows (all streams) fully written and readable.
+    // Bumped one cycle AFTER x_rowcommit so the xm[] write that produced the row
+    // is already latched (write@T -> readable@T+1; commit registered @T+1 -> the
+    // guarded read at T+2 is always safe). x_rst clears it.
+    reg [$clog2(XROWS+1)-1:0] rows_committed;
     always @(posedge clk) begin
-        if (x_rst) xptr <= 0;
-        else if (x_we) xptr <= xptr + 1'b1;
+        if (x_rst) rows_committed <= 0;
+        else if (x_rowcommit) rows_committed <= rows_committed + 1'b1;
     end
 
     // ---- run FSM + RLAT-deep read/mac pipeline -------------------------------
@@ -78,7 +90,10 @@ module gemm_cohort_vec #(
     reg                  acc_clr;
 
     wire [$clog2(GROUPS):0] gcount = (m_count + LANES - 1) >> LSH;
-    wire                 issue   = (kc < k_count);
+    // stall the RUN's K-iteration when the x row it would read isn't committed yet
+    // (only under overlap; otherwise all rows are present before `start`).
+    wire                 row_ready = !ovl_en || (xrd_row < rows_committed);
+    wire                 issue   = (kc < k_count) && row_ready;
     assign               waddr   = grp_base + kc;
     wire [WBITS-1:0]     wword_word = wword_rd;   // 1-cycle registered (stage 0)
 
@@ -109,7 +124,7 @@ module gemm_cohort_vec #(
             reg [P*8-1:0] xr [0:RLAT-1];
             integer xi;
             always @(posedge clk) begin
-                if (x_we && x_stream == gm[$clog2(N)-1:0]) xm[xptr] <= x_data;
+                if (x_we && x_stream == gm[$clog2(N)-1:0]) xm[x_row] <= x_data;
                 xr[0] <= xm[xrd_row];
                 for (xi = 1; xi < RLAT; xi = xi + 1) xr[xi] <= xr[xi-1];
             end

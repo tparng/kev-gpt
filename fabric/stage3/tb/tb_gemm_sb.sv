@@ -58,10 +58,10 @@ module tb_gemm_sb;
     reg [31:0] w_data;
     reg c0_x_rst=0,c0_x_we=0,c0_start=0; reg [$clog2(N)-1:0] c0_x_stream,c0_rd_stream;
     reg [P*8-1:0] c0_x_data; reg [10:0] c0_m,c0_k; reg [$clog2(25600)-1:0] c0_wb;
-    reg [$clog2(1024/P)-1:0] c0_rd_addr;
+    reg [$clog2(1024/P)-1:0] c0_rd_addr; reg [$clog2(1024/P)-1:0] c0_x_row;
     reg c1_x_rst=0,c1_x_we=0,c1_start=0; reg [$clog2(N)-1:0] c1_x_stream,c1_rd_stream;
     reg [P*8-1:0] c1_x_data; reg [10:0] c1_m,c1_k; reg [$clog2(25600)-1:0] c1_wb;
-    reg [$clog2(1024/P)-1:0] c1_rd_addr;
+    reg [$clog2(1024/P)-1:0] c1_rd_addr; reg [$clog2(1024/P)-1:0] c1_x_row;
     wire c0_done,c1_done; wire [P*32-1:0] c0_y,c1_y;
     // done is a ONE-CYCLE pulse from each cohort FSM (FIN->IDLE); with the
     // deliberate SKEW the two pulses never overlap, so latch them sticky.
@@ -75,11 +75,13 @@ module tb_gemm_sb;
                        .KMAX(1024), .RLAT(2), .WWORDS(25600)) dut (
         .clk(clk), .rst(rst), .ld_rst(ld_rst), .w_we(w_we), .w_data(w_data),
         .c0_m_count(c0_m), .c0_k_count(c0_k), .c0_w_base(c0_wb),
-        .c0_x_rst(c0_x_rst), .c0_x_we(c0_x_we), .c0_x_stream(c0_x_stream), .c0_x_data(c0_x_data),
+        .c0_x_rst(c0_x_rst), .c0_x_we(c0_x_we), .c0_x_stream(c0_x_stream),
+        .c0_x_row(c0_x_row), .c0_x_data(c0_x_data),
         .c0_start(c0_start), .c0_done(c0_done),
         .c0_rd_stream(c0_rd_stream), .c0_rd_addr(c0_rd_addr), .c0_y_out(c0_y),
         .c1_m_count(c1_m), .c1_k_count(c1_k), .c1_w_base(c1_wb),
-        .c1_x_rst(c1_x_rst), .c1_x_we(c1_x_we), .c1_x_stream(c1_x_stream), .c1_x_data(c1_x_data),
+        .c1_x_rst(c1_x_rst), .c1_x_we(c1_x_we), .c1_x_stream(c1_x_stream),
+        .c1_x_row(c1_x_row), .c1_x_data(c1_x_data),
         .c1_start(c1_start), .c1_done(c1_done),
         .c1_rd_stream(c1_rd_stream), .c1_rd_addr(c1_rd_addr), .c1_y_out(c1_y));
 
@@ -110,6 +112,7 @@ module tb_gemm_sb;
             c0_x_rst <= 1; @(posedge clk); c0_x_rst <= 0; @(posedge clk);
             for (i = 0; i < XR0; i = i + 1) begin
                 c0_x_we <= 1; c0_x_stream <= s[$clog2(N)-1:0];
+                c0_x_row <= i[$clog2(1024/P)-1:0];
                 c0_x_data <= x0[s*XR0 + i]; @(posedge clk);
             end
             c0_x_we <= 0; @(posedge clk);
@@ -119,6 +122,7 @@ module tb_gemm_sb;
             c1_x_rst <= 1; @(posedge clk); c1_x_rst <= 0; @(posedge clk);
             for (i = 0; i < XR1; i = i + 1) begin
                 c1_x_we <= 1; c1_x_stream <= s[$clog2(N)-1:0];
+                c1_x_row <= i[$clog2(1024/P)-1:0];
                 c1_x_data <= x1[s*XR1 + i]; @(posedge clk);
             end
             c1_x_we <= 0; @(posedge clk);
