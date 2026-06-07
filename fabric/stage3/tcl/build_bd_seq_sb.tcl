@@ -50,6 +50,7 @@ add_files -norecurse [list \
     "$root/fabric/stage3/rtl/gelu_lut2.sv" \
     "$root/fabric/stage3/rtl/softmax.sv" \
     "$root/fabric/stage3/rtl/weight_bank_tdp.sv" \
+    "$root/fabric/stage3/rtl/embed_bank_tdp.sv" \
     "$root/fabric/stage3/rtl/gemm_cohort_vec.sv" \
     "$root/fabric/stage3/rtl/gemm_banked_resident_vec.sv"]
 
