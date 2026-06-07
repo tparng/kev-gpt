@@ -871,3 +871,26 @@ accumulators (ping-pong by group parity) — a +LUT, +1-path change to be gated 
 OOC'd as its own rung. The §22 symmetric-AQ side (GE idle during LN->AQ) remains
 the larger structural lever toward the ~40-44k floor.
 
+## 24. 56,262.7 tok/s MEASURED @200 MHz — the schedule-pipelining wave on silicon
+
+The §6431f4d→§23 cycle campaign (AQ/RUN overlap 71,441→66,285 →
+stream-granular NL readback →61,245 → vec_attn call cuts →57,149) built at
+a 5.5ns target (BD 47s + impl 1h40m, WNS −0.317). Silicon: **56,876 cyc
+(sim 57,149 − 273, the SETTLE signature), 16/16 bit-exact, 3/3 —
+46,885.6 @166.7 / 56,262.7 @200 / 250 → match=False** (needed 1.45× of the
+5.817ns effective STA; recent observed margin ~1.32×). +118% in ~30 hours
+(25,744.5 → 56,262.7).
+
+En route, two agent rungs returned honest STOPs that now bound the
+schedule space: the LN→AQ boundary is dead (the lockstep RUN consume gates
+on the slowest stream's LN — no per-stream wavefront on the consume side),
+attention→PROJ is dead for the same shape, and arbiter fairness measured
+Δ0 (the critical cohort's 5.8k attention "grant-wait" is pure serial
+throughput of the ONE shared vec_attn, not a priority artifact).
+**Schedule overlap is exhausted at this topology.** The road on is
+architectural: TMAX 32→16 (frees ~24 BRAM tiles; context to 16 positions,
+restorable later by the gated kv_prefetch DDR stack) → per-cohort vec_attn
+(+8 BRAM that doesn't fit today; kills the serial-attention wall) →
+~51-53k cyc → then the 250 corner (= 78k+) and the CTX/SCORE
+double-buffer toward the ~40-44k floor.
+
