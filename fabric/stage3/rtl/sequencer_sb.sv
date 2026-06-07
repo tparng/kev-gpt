@@ -39,7 +39,8 @@ module sequencer_sb #(
     parameter integer VFRAC       = 16,
     parameter integer GELU_FRAC   = 12,
     parameter integer ISH         = 40,
-    parameter integer DBG         = 1    // 0 = tie off board-debug readback (bitstream builds)
+    parameter integer DBG         = 1,   // 0 = tie off board-debug readback (bitstream builds)
+    parameter integer ATT2        = 1    // 1 = vec_attn per cohort; 0 = shared+arbiter (fits today)
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -130,14 +131,6 @@ module sequencer_sb #(
     wire ln_gnt0 = ln_busy && (ln_owner == 1'b0);
     wire ln_gnt1 = ln_busy && (ln_owner == 1'b1);
 
-    // Attention is NO LONGER shared: each cohort owns its own vec_attn (the
-    // §24 un-share). gnt is tied to req (a cohort always owns its own unit),
-    // so the ~5.8k attention queue/grant-wait of the critical cohort is gone
-    // and both cohorts' attention run truly in parallel. Affordable only with
-    // TMAX=16 (each vec_attn's K/V/prob caches halve).
-    wire at_gnt0 = at_req0;
-    wire at_gnt1 = at_req1;
-
     wire           sh_ln_start = ln_gnt1 ? ln_start1 : ln_start0;
     wire           sh_ln_vin   = ln_gnt1 ? ln_vin1   : ln_vin0;
     wire [P*32-1:0] sh_ln_x    = ln_gnt1 ? ln_x1     : ln_x0;
@@ -150,24 +143,65 @@ module sequencer_sb #(
         .x_in(sh_ln_x), .gamma_in(sh_ln_g),
         .y_valid(sh_ln_yv), .y_out(sh_ln_y), .done(sh_ln_done));
 
-    // ---- per-cohort attention (NOT shared) — one vec_attn per cohort ----
+    // ---- attention: ATT2=1 -> one vec_attn PER COHORT (the §24/26 un-share:
+    // kills the critical cohort's ~5.8k serial queue; needs TMAX=16 BRAM and
+    // ~+5.7k LUT — at BD level this config is currently ~1.9k LUT over the
+    // device, so bitstream builds set ATT2=0 until the embed-TDP asymmetry
+    // recovery funds it). ATT2=0 -> the proven single shared unit + arbiter.
+    // Both branches expose identical at0_*/at1_* names; cohorts are agnostic.
     wire           at0_ldready, at0_ctxv, at0_done;
     wire [6:0]     at0_ctxidx;
     wire [P*32-1:0] at0_ctxdata;
-    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attn0 (
-        .clk(clk), .rst(rst), .start(at_start0), .tcount(at_tcount0),
-        .ld_valid(at_ldv0), .ld_data(at_lddat0), .ld_ready(at0_ldready),
-        .ctx_valid(at0_ctxv), .ctx_idx(at0_ctxidx), .ctx_data(at0_ctxdata),
-        .done(at0_done));
-
     wire           at1_ldready, at1_ctxv, at1_done;
     wire [6:0]     at1_ctxidx;
     wire [P*32-1:0] at1_ctxdata;
-    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attn1 (
-        .clk(clk), .rst(rst), .start(at_start1), .tcount(at_tcount1),
-        .ld_valid(at_ldv1), .ld_data(at_lddat1), .ld_ready(at1_ldready),
-        .ctx_valid(at1_ctxv), .ctx_idx(at1_ctxidx), .ctx_data(at1_ctxdata),
-        .done(at1_done));
+    wire at_gnt0, at_gnt1;
+    generate if (ATT2) begin : g_att2
+        assign at_gnt0 = at_req0;
+        assign at_gnt1 = at_req1;
+        vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attn0 (
+            .clk(clk), .rst(rst), .start(at_start0), .tcount(at_tcount0),
+            .ld_valid(at_ldv0), .ld_data(at_lddat0), .ld_ready(at0_ldready),
+            .ctx_valid(at0_ctxv), .ctx_idx(at0_ctxidx), .ctx_data(at0_ctxdata),
+            .done(at0_done));
+        vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attn1 (
+            .clk(clk), .rst(rst), .start(at_start1), .tcount(at_tcount1),
+            .ld_valid(at_ldv1), .ld_data(at_lddat1), .ld_ready(at1_ldready),
+            .ctx_valid(at1_ctxv), .ctx_idx(at1_ctxidx), .ctx_data(at1_ctxdata),
+            .done(at1_done));
+    end else begin : g_att1
+        // the §19-23 shared unit + hold-until-done arbiter (fixed priority c0)
+        reg  at_owner, at_busy;
+        always @(posedge clk) begin
+            if (rst) begin at_busy <= 1'b0; at_owner <= 1'b0; end
+            else if (!at_busy) begin
+                if (at_req0)      begin at_busy <= 1'b1; at_owner <= 1'b0; end
+                else if (at_req1) begin at_busy <= 1'b1; at_owner <= 1'b1; end
+            end else begin
+                if ((at_owner == 1'b0 && !at_req0) || (at_owner == 1'b1 && !at_req1))
+                    at_busy <= 1'b0;
+            end
+        end
+        assign at_gnt0 = at_busy && (at_owner == 1'b0);
+        assign at_gnt1 = at_busy && (at_owner == 1'b1);
+        wire           sh_at_start = at_gnt1 ? at_start1 : at_start0;
+        wire [8:0]     sh_at_tcount= at_gnt1 ? at_tcount1: at_tcount0;
+        wire           sh_at_ldv   = at_gnt1 ? at_ldv1   : at_ldv0;
+        wire [P*32-1:0] sh_at_lddat= at_gnt1 ? at_lddat1 : at_lddat0;
+        wire           sh_at_ldready, sh_at_ctxv, sh_at_done;
+        wire [6:0]     sh_at_ctxidx;
+        wire [P*32-1:0] sh_at_ctxdata;
+        vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attn (
+            .clk(clk), .rst(rst), .start(sh_at_start), .tcount(sh_at_tcount),
+            .ld_valid(sh_at_ldv), .ld_data(sh_at_lddat), .ld_ready(sh_at_ldready),
+            .ctx_valid(sh_at_ctxv), .ctx_idx(sh_at_ctxidx), .ctx_data(sh_at_ctxdata),
+            .done(sh_at_done));
+        assign at0_ldready = sh_at_ldready; assign at1_ldready = sh_at_ldready;
+        assign at0_ctxv    = sh_at_ctxv;    assign at1_ctxv    = sh_at_ctxv;
+        assign at0_ctxidx  = sh_at_ctxidx;  assign at1_ctxidx  = sh_at_ctxidx;
+        assign at0_ctxdata = sh_at_ctxdata; assign at1_ctxdata = sh_at_ctxdata;
+        assign at0_done    = sh_at_done;    assign at1_done    = sh_at_done;
+    end endgenerate
 
     // ================================================================
     //   SHARED dequant+gelu readback channel (arbitrated 2-way)

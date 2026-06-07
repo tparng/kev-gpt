@@ -72,6 +72,9 @@
 `ifndef DBGSTOP
  `define DBGSTOP 0
 `endif
+`ifndef ATT2VAL
+ `define ATT2VAL 1
+`endif
 module tb;
     localparam integer P     = `PVAL;
     localparam integer LANES = `LVAL;
@@ -93,7 +96,7 @@ module tb;
     reg wl_rst, wl_we; reg [31:0] wl_data;
 
     sequencer_sb #(.P(P), .LANES(LANES), .N(N), .NC(N/2), .ND(`NDVAL),
-                   .TMAX(TMAXP)) dut (
+                   .TMAX(TMAXP), .ATT2(`ATT2VAL)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_ids(toks), .pos(pos), .done(done),
         .tok_outs(tok_outs), .rd_stream(rstream[$clog2(N)-1:0]), .rd_sel(rsel),
         .rd_addr(raddr), .rd_data(rdata), .wl_rst(wl_rst), .wl_we(wl_we),

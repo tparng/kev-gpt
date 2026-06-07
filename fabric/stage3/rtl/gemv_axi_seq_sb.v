@@ -23,6 +23,7 @@ module gemv_axi_seq_sb #(
     parameter integer WWORDS = 25600,
     parameter integer TMAX   = 32,
     parameter integer DBG    = 1,       // 0 = tie off debug readback (record builds)
+    parameter integer ATT2   = 1,       // 1 = per-cohort attention; 0 = shared (fits)
     parameter integer C_S_AXI_ADDR_WIDTH = 8
 ) (
     input  wire                          S_AXI_ACLK,
@@ -167,7 +168,7 @@ module gemv_axi_seq_sb #(
         end
     end
 
-    sequencer_sb #(.P(P), .LANES(LANES), .N(N), .NC(NC), .ND(ND), .DBG(DBG),
+    sequencer_sb #(.P(P), .LANES(LANES), .N(N), .NC(NC), .ND(ND), .DBG(DBG), .ATT2(ATT2),
                    .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX)) u_seq (
         .clk(clk), .rst(core_rst), .go(go_pulse),
         .tok_ids(tok_ids_all[N*9-1:0]),

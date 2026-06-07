@@ -75,7 +75,7 @@ set_property -dict [list \
 set g [create_bd_cell -type module -reference gemv_axi_seq_sb seq]
 set_property -dict [list CONFIG.P $pp CONFIG.LANES $lanes CONFIG.N $nn CONFIG.NC $nc \
     CONFIG.ND $nd CONFIG.NLAYER {4} CONFIG.WWORDS $wwords CONFIG.TMAX $tmax \
-    CONFIG.C_S_AXI_ADDR_WIDTH {8} CONFIG.DBG {0}] [get_bd_cells seq]
+    CONFIG.C_S_AXI_ADDR_WIDTH {8} CONFIG.DBG {0} CONFIG.ATT2 {0}] [get_bd_cells seq]
 
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list \
     Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
