@@ -40,7 +40,11 @@ R_TOKID = [0x08, 0x30, 0x34, 0x38, 0x50, 0x54, 0x58, 0x5C,
 R_TOKOUT = [0x24, 0x3C, 0x40, 0x44, 0x60, 0x64, 0x68, 0x6C,
             0xA0, 0xA4, 0xA8, 0xAC, 0xB0, 0xB4, 0xB8, 0xBC]
 R_EDATA = 0x4C
-TMAX = 32
+# TMAX MUST match the bitstream's TMAX generic (build_bd_seq_sb.tcl arg 5). It sets
+# how many pos_emb rows are streamed into the on-chip pos ROM via the embed loader;
+# a mismatch uploads the wrong number of pos words -> wrong embeddings. Default 16
+# = the §24 TMAX=16 build; pass --tmax 32 for an old TMAX=32 bitstream.
+TMAX_DEFAULT = 16
 RESID_FRAC = 25
 TOKS16 = "48,10,100,77,5,60,120,180,33,7,150,90,14,66,111,173"
 
@@ -69,12 +73,13 @@ def build_weight_image(intseq, lanes):
     return words
 
 
-def build_embed_chunks(intseq):
-    """tok_emb then pos_emb[:TMAX] as Q6.25 INT32 chunks, element order matching the
-    P-wide rows (the el loader assembles P*32-bit words from consecutive chunks)."""
+def build_embed_chunks(intseq, tmax):
+    """tok_emb then pos_emb[:tmax] as Q6.25 INT32 chunks, element order matching the
+    P-wide rows (the el loader assembles P*32-bit words from consecutive chunks).
+    `tmax` MUST equal the bitstream's TMAX generic (see TMAX_DEFAULT note)."""
     p = intseq.p
     tok = np.round(np.asarray(p["tok_emb"], np.float64) * (1 << RESID_FRAC)).astype(np.int64)
-    pos = np.round(np.asarray(p["pos_emb"], np.float64)[:TMAX] * (1 << RESID_FRAC)).astype(np.int64)
+    pos = np.round(np.asarray(p["pos_emb"], np.float64)[:tmax] * (1 << RESID_FRAC)).astype(np.int64)
     vals = np.concatenate([tok.reshape(-1), pos.reshape(-1)])
     return [int(v) & 0xFFFFFFFF for v in vals]
 
@@ -84,6 +89,9 @@ def main(argv=None):
     ap.add_argument("--npz", default=os.path.join(_REPO, "fabric", "export", "goformer.npz"))
     ap.add_argument("--lanes", type=int, default=128)
     ap.add_argument("--n", type=int, default=14, help="total streams (14 = NC7 build)")
+    ap.add_argument("--tmax", type=int, default=TMAX_DEFAULT,
+                    help="MUST match the bitstream's TMAX generic (build arg 5); "
+                         "default 16 = the TMAX=16 build")
     ap.add_argument("--toks", default=None, help="comma list; default = first N of the SQ16 set")
     ap.add_argument("--pos", type=int, default=0)
     ap.add_argument("--fclk", type=float, default=125e6)
@@ -122,7 +130,7 @@ def main(argv=None):
             for s in range(subw):
                 dev.wr(R_WDATA, (w >> (32 * s)) & 0xFFFFFFFF)
         print(f"[load] {len(words)*subw} chunks in {time.time()-t0:.2f}s")
-        emb = build_embed_chunks(intseq)
+        emb = build_embed_chunks(intseq, int(args.tmax))
         t0 = time.time()
         for v in emb:
             dev.wr(R_EDATA, v)

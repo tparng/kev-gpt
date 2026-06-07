@@ -14,8 +14,12 @@ if {$pp     eq ""} { set pp 8 }
 if {$lanes  eq ""} { set lanes 128 }
 if {$wwords eq ""} { set wwords 25600 }
 if {$freq   eq ""} { set freq 166.666666 }
-# TMAX=32 keeps the embed ROMs + per-stream scratch inside the BRAM budget.
-if {$tmax   eq ""} { set tmax 32 }
+# TMAX=16 (§24): halves pos_emb ROM + per-cohort attn K/V/scratch, freeing the
+# BRAM that the per-cohort (un-shared) vec_attn needs. Context is then 16 positions
+# (the record protocol runs pos=0, unaffected; KV-DDR prefetch restores context).
+# NOTE: the on-board driver (pl_seq_sb.py --tmax) MUST use the SAME tmax as this
+# build, or the pos_emb upload streams the wrong number of rows.
+if {$tmax   eq ""} { set tmax 16 }
 # ND = DSP-packed GEMM streams PER COHORT (6 -> 12 of 16 total, the SS18 DSP budget)
 if {$nd     eq ""} { set nd 6 }
 if {$bdir   eq ""} { set bdir "C:/kevbuild/stage3_seqsb_bit" }

@@ -14,7 +14,7 @@ if {$pp     eq ""} { set pp 8 }
 if {$lanes  eq ""} { set lanes 128 }
 if {$period eq ""} { set period 6.0 }
 if {$wwords eq ""} { set wwords 25600 }
-if {$tmax   eq ""} { set tmax 32 }
+if {$tmax   eq ""} { set tmax 16 }
 # ND = DSP-packed GEMM streams PER COHORT (6 -> 12 of 16 total, the SS18 config)
 if {$nd     eq ""} { set nd 6 }
 # NC = streams per cohort (8 -> N=16; 7 -> N=14, the -2-LUT-bank fit variant)

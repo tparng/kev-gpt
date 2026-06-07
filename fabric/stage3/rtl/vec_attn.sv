@@ -118,9 +118,13 @@ module vec_attn #(
     reg signed [63:0] score_acc;
     reg signed [63:0] score_q88;
 
-    // ctx accumulation: P parallel lane accumulators
-    reg signed [95:0] ctx_acc [0:P-1];
-    reg [8:0]  pj;            // position index within ctx sum
+    // ctx accumulation: P parallel lane accumulators, DOUBLE-BUFFERED by group
+    // parity (Cut 3: cross-group streaming). At most two dim-groups are in flight
+    // at once (group g+1 entering stage A while group g drains stage C), so two
+    // banks suffice; bank = grp[0]. The first position of a group OVERWRITES its
+    // bank (no pre-zero needed -> no clear-timing hazard), later positions add.
+    reg signed [95:0] ctx_acc [0:2*P-1];   // [parity*P + lane]
+    reg [8:0]  pj;            // position index within ctx sum (stage-A counter)
     reg [6:0]  emit_idx;      // which lane is being emitted in S_CTX_EMIT
 
     // pipeline registers: products registered before accumulate (Fmax)
@@ -136,7 +140,14 @@ module vec_attn #(
     reg [20:0]        cp_preg;            // operand stage: prob[pj] (Q1.20, unsigned)
     reg signed [31:0] cp_vreg  [0:P-1];   // operand stage: v lanes
     reg               cp_opv;             // ctx operand-stage valid
-    reg [8:0]         cx_nacc;            // count of accumulated product-groups (0..T-1)
+    reg [8:0]         cx_nacc;            // (legacy, unused after Cut 3 stream rewrite)
+    // ctx-stream tags carried down the pipeline so stage C knows which group/bank a
+    // product belongs to and whether it is the first/last position of that group
+    // (Cut 3). Mirrors the (grp,pj) of stage A through B into C.
+    reg               cp_first, cp_last;  // operand-stage: pj==0 / pj==T-1
+    reg [6:0]         cp_grp;             // operand-stage: which dim group
+    reg               cx_first, cx_last;  // product-stage tags (1 cyc behind cp_*)
+    reg [6:0]         cx_grp;
 
     integer lane;
 
@@ -300,74 +311,81 @@ module vec_attn #(
                         ji <= ji + 9'd1;
                     end
                     if (sm_done && !vld_active) begin
-                        // start ctx: group of P dims, base dim = 0
+                        // start ctx as one CONTINUOUS stream over (grp,pj): stage A
+                        // emits one operand/cycle, never draining between groups
+                        // (Cut 3). No accumulator pre-zero (first position of each
+                        // group overwrites its bank).
                         grp     <= 9'd0;
                         pj      <= 9'd0;
                         cp_opv  <= 1'b0;
                         cx_v    <= 1'b0;
-                        cx_nacc <= 9'd0;
-                        for (lane = 0; lane < P; lane = lane + 1)
-                            ctx_acc[lane] <= 96'sd0;
                         st  <= S_CTX;
                     end
                 end
 
                 // ---- ctx: accumulate prob[pj]*v_pj[d] for P dims (d = grp*P+lane) ----
-                // 3-stage pipeline (one position/cycle streaming, throughput unchanged;
-                // latency +1 per dim-group, absorbed). Mirrors S_SCORE exactly:
-                //   A operand-reg: latch prob[pj] + v lanes selected by `pj` (breaks the
-                //                  pj -> mem-read -> ctx_prod DSP critical cone)
-                //   B product-reg: multiply the registered operands -> ctx_prod
-                //   C accumulate : sum delayed products -> ctx_acc
+                // Cut 3 — CROSS-GROUP STREAMING. The old S_CTX drained the 3-stage
+                // pipeline at every dim-group boundary (2-cyc fill x NGRP groups =
+                // the bulk of AT_CTX 24/call at T=1). Now stage A emits ONE operand
+                // every cycle as a single continuous stream over (grp,pj) — it does
+                // NOT stall between groups — so the fill is paid ONCE per head-call,
+                // not once per group. The accumulator is double-buffered by group
+                // parity (bank = grp[0]) because up to two groups are in flight; the
+                // first position of a group OVERWRITES its bank (no pre-zero), later
+                // positions add. Each product carries its (grp,first,last) tag down
+                // the pipeline so stage C accumulates into the right bank and emits
+                // on the last position. Per-dim accumulation order is unchanged
+                // (pos 0..T-1 added in sequence) -> BIT-IDENTICAL to the reference.
+                //   A operand-reg: read prob[pj]+v[pj,grp]; advance the (grp,pj) stream
+                //   B product-reg: multiply registered operands -> ctx_prod (+ tag)
+                //   C accum/emit : add into ctx_acc[bank] (or overwrite if first);
+                //                  on last, emit ctx_acc[bank]+prod COMBINATIONALLY.
                 S_CTX: begin
-                    // --- stage A: read prob/v words for `pj`, register operand lanes ---
+                    // --- stage A: read prob/v for (grp,pj), register operands + tags ---
                     p_v  = probmem[(pj < T) ? pj[4:0] : 5'd0];
-                    vw   = vmem[((pj < T) ? pj : 9'd0)*NGRP + grp];
+                    vw   = vmem[((pj < T) ? pj : 9'd0)*NGRP + ((grp < NGRP) ? grp : 9'd0)];
                     cp_preg <= p_v;
                     for (lane = 0; lane < P; lane = lane + 1)
                         cp_vreg[lane] <= vw[lane*32 +: 32];
-                    cp_opv <= (pj != T);
-                    if (pj != T) pj <= pj + 9'd1;
+                    cp_opv   <= (grp != NGRP);          // stream still producing
+                    cp_first <= (pj == 9'd0);
+                    cp_last  <= (pj == T-1);
+                    cp_grp   <= grp[6:0];
+                    // advance the (grp,pj) stream: pj 0..T-1, then pj=0 & grp++
+                    if (grp != NGRP) begin
+                        if (pj == T-1) begin
+                            pj  <= 9'd0;
+                            grp <= grp + 9'd1;
+                        end else begin
+                            pj  <= pj + 9'd1;
+                        end
+                    end
 
-                    // --- stage B: multiply registered operands ---
+                    // --- stage B: multiply registered operands, forward the tags ---
                     // prob[pj] zero-extended (unsigned Q1.20), v sign-extended.
                     for (lane = 0; lane < P; lane = lane + 1)
                         ctx_prod[lane] <= $signed({75'd0, cp_preg})
                                         * $signed({{64{cp_vreg[lane][31]}}, cp_vreg[lane]});
-                    cx_v <= cp_opv;
+                    cx_v     <= cp_opv;
+                    cx_first <= cp_first;
+                    cx_last  <= cp_last;
+                    cx_grp   <= cp_grp;
 
-                    // --- stage C: accumulate the delayed products ---
+                    // --- stage C: accumulate into the parity bank / emit on last ---
+                    // bank = cx_grp[0] (two groups max in flight). first position
+                    // overwrites (acc base 0); last position emits the rounded sum
+                    // COMBINATIONALLY (ctx_acc[bank]+ctx_prod -> rsh_round -> ctx_data).
                     if (cx_v) begin
-                        if (cx_nacc == T-1) begin
-                            // FINAL position of this group. Round + emit the COMPLETE
-                            // sum (ctx_acc + this product) COMBINATIONALLY in the same
-                            // cycle the old code took an extra S_CTX_EMIT state to do —
-                            // bit-identical (same total, read as a wire instead of one
-                            // cycle later). Cut 2: removes the dedicated emit cycle per
-                            // group (NGRP*calls). New combinational path:
-                            // ctx_acc + ctx_prod -> rsh_round -> ctx_data (flag for OOC).
-                            for (lane = 0; lane < P; lane = lane + 1) begin
-                                ca_v = ctx_acc[lane] + ctx_prod[lane];
-                                ctx_data[lane*32 +: 32] <= rsh_round(ca_v, CTX_SH);
-                            end
-                            ctx_idx   <= grp[6:0];
+                        for (lane = 0; lane < P; lane = lane + 1) begin
+                            ca_v = (cx_first ? 96'sd0
+                                             : ctx_acc[cx_grp[0]*P + lane]) + ctx_prod[lane];
+                            if (cx_last) ctx_data[lane*32 +: 32] <= rsh_round(ca_v, CTX_SH);
+                            else         ctx_acc[cx_grp[0]*P + lane] <= ca_v;
+                        end
+                        if (cx_last) begin
+                            ctx_idx   <= cx_grp;
                             ctx_valid <= 1'b1;
-                            pj        <= 9'd0;
-                            cp_opv    <= 1'b0;
-                            cx_v      <= 1'b0;
-                            cx_nacc   <= 9'd0;
-                            if (grp == NGRP-1) begin
-                                st <= S_DONE;
-                            end else begin
-                                grp <= grp + 9'd1;
-                                for (lane = 0; lane < P; lane = lane + 1)
-                                    ctx_acc[lane] <= 96'sd0;
-                                st  <= S_CTX;
-                            end
-                        end else begin
-                            for (lane = 0; lane < P; lane = lane + 1)
-                                ctx_acc[lane] <= ctx_acc[lane] + ctx_prod[lane];
-                            cx_nacc <= cx_nacc + 9'd1;
+                            if (cx_grp == NGRP-1) st <= S_DONE;
                         end
                     end
                 end

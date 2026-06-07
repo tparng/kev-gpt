@@ -211,12 +211,13 @@ module tb;
             // dq grant-wait already captured by GE_DQW; track separately too
             if (dut.coh0.ge==7) dqw0 = dqw0 + 1;
             if (dut.coh1.ge==7) dqw1 = dqw1 + 1;
-            // ---- vec_attn shared unit per-state residency ----
-            at_st_cnt[dut.u_attn.st] = at_st_cnt[dut.u_attn.st] + 1;
-            sm_st_cnt[dut.u_attn.u_sm.state] = sm_st_cnt[dut.u_attn.u_sm.state] + 1;
-            if (dut.u_attn.st != 0) at_busy_cyc = at_busy_cyc + 1;
-            // unit idle but a cohort is asking (handoff latency only)
-            if (dut.u_attn.st == 0 && (dut.at_req0 || dut.at_req1))
+            // ---- vec_attn per-cohort unit per-state residency (observe coh1,
+            // the critical cohort; attention is now un-shared, one unit/cohort) ----
+            at_st_cnt[dut.u_attn1.st] = at_st_cnt[dut.u_attn1.st] + 1;
+            sm_st_cnt[dut.u_attn1.u_sm.state] = sm_st_cnt[dut.u_attn1.u_sm.state] + 1;
+            if (dut.u_attn1.st != 0) at_busy_cyc = at_busy_cyc + 1;
+            // with gnt==req there is no handoff latency; kept for format parity
+            if (dut.u_attn1.st == 0 && dut.at_req1)
                 at_idle_want_cyc = at_idle_want_cyc + 1;
         end
         if (dbgcyc % 100000 == 0)
@@ -253,7 +254,7 @@ module tb;
             $display("NL_RES1(12)  c0=%8d  c1=%8d", nl_cnt0[12], nl_cnt1[12]);
             $display("NL_RES2(17)  c0=%8d  c1=%8d", nl_cnt0[17], nl_cnt1[17]);
             $display("NL_ARG(20)   c0=%8d  c1=%8d", nl_cnt0[20], nl_cnt1[20]);
-            $display("---- SHARED vec_attn per-state residency (total, both cohorts) ----");
+            $display("---- per-cohort vec_attn (u_attn1, cohort 1) per-state residency ----");
             $display("AT_IDLE       %8d", at_st_cnt[0]);
             $display("AT_LD_Q       %8d", at_st_cnt[1]);
             $display("AT_LD_K       %8d", at_st_cnt[2]);
@@ -266,7 +267,7 @@ module tb;
             $display("AT_DONE       %8d", at_st_cnt[9]);
             $display("AT_BUSY(st!=IDLE)        %8d", at_busy_cyc);
             $display("AT_IDLE_WHILE_WANTED     %8d", at_idle_want_cyc);
-            $display("---- softmax (inside shared attn) per-state residency ----");
+            $display("---- softmax (inside u_attn1) per-state residency ----");
             $display("SM_IDLE  %8d  SM_LOAD %8d  SM_EXP %8d", sm_st_cnt[0], sm_st_cnt[1], sm_st_cnt[2]);
             $display("SM_RECIP %8d  SM_NORM %8d  SM_DONE %8d", sm_st_cnt[3], sm_st_cnt[4], sm_st_cnt[5]);
             $display("==== END PROFILE ====");

@@ -894,3 +894,88 @@ restorable later by the gated kv_prefetch DDR stack) → per-cohort vec_attn
 ~51-53k cyc → then the 250 corner (= 78k+) and the CTX/SCORE
 double-buffer toward the ~40-44k floor.
 
+## 25. The CTX cross-group stream — 57,149 -> 53,565 cyc, 16/16 bit-exact
+
+The §23 "next wedge" cashed in. The fresh per-state attn profile (`run_sb_attnprof`,
+ND=6) at the 57,149 baseline confirmed the wedge map exactly (256 head-calls = 16
+streams x 4 layers x 4 heads): AT_SCORE 2,560 (=10/call), AT_SM_COLL 7,680 (=30/call),
+**AT_CTX 6,144 (=24/call)**, AT_BUSY 20,992 (=82/call). The two non-CTX wedges were
+checked and rejected honestly:
+
+- **SCORE 10/call** is 8 real adder-tree passes (the 64-wide q.k over NGRP=8 groups)
+  + a 2-cyc pipeline fill. At T=1 there is only ONE score, so the fill is paid once
+  per call (~512 cyc total) — below the 1.5k bar, and the 8 passes are real work.
+- **SM_COLL 30/call** is the `S_SM_COLL` wait on softmax: internally SM_LOAD 11 +
+  SM_EXP 3 + **SM_RECIP 21** + SM_NORM 3 (the profiler's SM_* residency). RECIP is
+  the radix-4 divider (forbidden) and the rest is softmax-internal latency, not a
+  vec_attn loop with a slack iteration bound — `S_SM_COLL` is a pure wait, nothing
+  in vec_attn to trim without touching softmax.sv. Rejected.
+
+**The cut (CTX 24 -> 10/call): cross-group streaming.** The old `S_CTX` ran a
+3-stage pipeline (A operand-read, B multiply, C accumulate) but **drained and
+refilled it at every dim-group boundary** — resetting pj/cp_opv/cx_v/cx_nacc and
+re-zeroing the accumulator between each of the NGRP=8 groups. At T=1 that is
+1 position + 2-cyc fill per group = 3 cyc x 8 = 24. The fix makes stage A emit ONE
+operand every cycle as a **single continuous stream over (grp,pj)** that never
+stalls between groups, so the fill is paid ONCE per head-call. Because up to two
+dim-groups are then in flight at once (group g+1 entering A while group g drains C),
+the lane accumulators are **double-buffered by group parity** (`ctx_acc[grp[0]*P +
+lane]`, 2*P entries). The first position of a group OVERWRITES its bank (the carried
+`cp_first`/`cx_first` tag), so no pre-zero and no clear-timing hazard; the last
+position (`cx_last`) emits `ctx_acc[bank] + ctx_prod` rounded COMBINATIONALLY (the
+§23 fused emit, kept). Each product carries its (grp,first,last) tag down B into C.
+**Per-dim accumulation order is unchanged** (pos 0..T-1 added in sequence for each
+output dim; different dims are independent accumulators) -> provably bit-identical
+to `seq_ref._attn_step`.
+
+**Measured (SIM):** AT_CTX 6,144 -> **2,560** (= -3,584 = 14/call x 256), exactly
+the predicted 14 cyc/call. AT_BUSY 20,992 -> 17,408; NL_ACL attention-wait shrank
+7,552 -> 5,760/cohort (vec_attn returns `done` 14 cyc sooner/call). The cut is
+fully on the attention critical path: the N=16 total moved by **exactly** the
+AT_CTX delta.
+
+**Gates (all green):** `run_vec_attn` **0/768** bit-exact T in {1,8,16,32};
+`run_softmax` **0/7127** (softmax.sv untouched); `run_sb_seq --nd 6` (N=16)
+**16/16 bit-exact, 57,149 -> 53,565 cyc** (-3,584, -6.3%, 1.067x) = **49,794 tok/s
+@166.7 / 59,741 @200**; 14-token (N=14, NC=7) **14/14, 52,541 -> 49,791 cyc**
+(-2,750 = 14 x 14 x ~14 attn calls; 46,872 @166.7 / 56,235 @200).
+
+**OOC corner (SYNTH, 5ns, tclargs `8 128 5.0 25600 32 6 8`, from the sb16 .mem
+dir):** **WNS = +0.074 ns MET — IDENTICAL to the baseline corner**, and the worst
+path is unchanged: `u_dq/LANE[6].dq_shv_r_reg -> dq_out_reg` (the vec_dequant
+shift->out cone), NOT attention — the top-30 paths are all `u_dq`, Cut 3's emit path
+`ctx_acc[bank]+ctx_prod -> rsh_round -> ctx_data` (the same §23 path, now bank-
+indexed) is nowhere near critical. **CLB LUTs 110,723 (vs 109,638 = +1,085, +0.99%)**
+— the cost of the 2x-deeper `ctx_acc` (16x96b vs 8x96b) plus the (grp,first,last)
+tag pipeline; LUT-as-Logic 103,417, LUT-as-Memory 7,306. BRAM 141/144 (97.9%),
+URAM 64/64, DSP 1171/1248 — all in budget, no overflow. The 200 MHz builds' timing
+corner stays closed (the new path is named and non-critical); the modest +1% LUT is
+the only area cost.
+
+**Next wedge (unchanged):** SCORE's 2-cyc/score fill (~512 cyc, below the bar at
+T=1) and SM_COLL=30 (RECIP 21 fixed + softmax-internal latency) are both honest
+STOPs at this topology. The serial-attention wall (ONE shared vec_attn,
+AT_IDLE_WHILE_WANTED 780, the 5.8k grant-wait) remains architectural: per-cohort
+vec_attn (+8 BRAM that doesn't fit until TMAX 32->16 frees ~24 tiles) is the road on.
+
+
+## 26. The architectural wave composed — 51,892 cyc / 16 tok (16/16), TMAX=16
+
+Three coupled changes merged and regated together on main:
+1. **TMAX 32->16** (cycle-neutral at pos=0; frees 7 BRAM tiles; context to 16
+   positions — an explicit documented trade, restorable by the gated
+   kv_prefetch DDR stack; the bit-honest record protocol at pos=0 unchanged).
+   Also fixed a load-bearing literal: sequencer_sb instantiated vec_attn with
+   .TMAX(32) hardcoded — now .TMAX(TMAX) — and the board driver pl_seq_sb
+   gained --tmax (default 16): the embed upload MUST match the build TMAX or
+   pos>0 embeddings corrupt.
+2. **Per-cohort vec_attn (the un-share)**: at_* arbiter deleted (gnt==req);
+   each cohort owns its attention. -3,465 cyc alone (53,684). Affordable only
+   with TMAX=16's BRAM. OOC standalone: 115,284 LUT (98.43%), BRAM 142, DSP
+   1,215, 5ns MET +0.074, worst path still u_dq.
+3. **CTX cross-group stream** (SS25): -3,584 on the shared baseline.
+
+Composed: **57,149 -> 51,892 cyc (16/16 bit-exact; N=14 48,716 14/14)** —
+sub-additive by ~1.4k (the un-share and the CTX cut overlap on the attention
+critical path; honest). 61,667 @200 / 77,090 @250 SIM. Cycle march since the
+46.6k record build: 68,960 -> 51,892 = -24.7%.
