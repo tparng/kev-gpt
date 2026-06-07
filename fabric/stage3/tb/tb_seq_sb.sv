@@ -151,19 +151,90 @@ module tb;
             $sformat(fn, "lnf_%0d.out", b);  dump(b[3:0], 4'd0, 256, fn);
             $sformat(fn, "head_%0d.out", b); dump(b[3:0], 4'd8, 193, fn);
         end
+        prof_report;
         $display("TB_DONE tok0=%0d tok8=%0d tok15=%0d",
                  tok_outs[8:0], tok_outs[8*9 +: 9], tok_outs[15*9 +: 9]);
         $finish;
     end
     integer dbgcyc = 0;
     integer running = 0;
+    // ---------------- profiling counters (observer only — no DUT timing change) --
+    // GE-state cycle counts per cohort: index = ge state (0..7)
+    //   0 GE_IDLE 1 GE_AQ 2 GE_AQN 3 GE_RUN 4 GE_WAIT 5 GE_RB 6 GE_RBN 7 GE_DQW
+    integer ge_cnt0 [0:7];
+    integer ge_cnt1 [0:7];
+    // nl-state cycle counts per cohort (0..22)
+    integer nl_cnt0 [0:22];
+    integer nl_cnt1 [0:22];
+    // grant-wait sub-counts (req asserted but not yet granted by the shared unit)
+    integer lnw0, lnw1, atw0, atw1, dqw0, dqw1;
+    // GE_IDLE split: idle WAITING for a descriptor (g_req low) vs idle truly done
+    integer ge_idle_nordesc0, ge_idle_nordesc1;
+    integer gi;
+    initial begin
+        for (gi=0; gi<8;  gi=gi+1) begin ge_cnt0[gi]=0; ge_cnt1[gi]=0; end
+        for (gi=0; gi<23; gi=gi+1) begin nl_cnt0[gi]=0; nl_cnt1[gi]=0; end
+        lnw0=0; lnw1=0; atw0=0; atw1=0; dqw0=0; dqw1=0;
+        ge_idle_nordesc0=0; ge_idle_nordesc1=0;
+    end
     always @(posedge clk) begin
         dbgcyc = dbgcyc + 1;
         if (go) running = 1;
         if (done) running = 0;
+        if (running && !done) begin
+            ge_cnt0[dut.coh0.ge] = ge_cnt0[dut.coh0.ge] + 1;
+            ge_cnt1[dut.coh1.ge] = ge_cnt1[dut.coh1.ge] + 1;
+            nl_cnt0[dut.coh0.eng.nl] = nl_cnt0[dut.coh0.eng.nl] + 1;
+            nl_cnt1[dut.coh1.eng.nl] = nl_cnt1[dut.coh1.eng.nl] + 1;
+            // GE_IDLE with no pending descriptor request (handoff latency / true end)
+            if (dut.coh0.ge==0 && !dut.coh0.g_req) ge_idle_nordesc0 = ge_idle_nordesc0 + 1;
+            if (dut.coh1.ge==0 && !dut.coh1.g_req) ge_idle_nordesc1 = ge_idle_nordesc1 + 1;
+            // LN grant-wait: in NL_LGAM (2), req high, no grant
+            if (dut.coh0.eng.nl==2 && !dut.ln_gnt0) lnw0 = lnw0 + 1;
+            if (dut.coh1.eng.nl==2 && !dut.ln_gnt1) lnw1 = lnw1 + 1;
+            // attn grant-wait: in NL_AST (7), no grant
+            if (dut.coh0.eng.nl==7 && !dut.at_gnt0) atw0 = atw0 + 1;
+            if (dut.coh1.eng.nl==7 && !dut.at_gnt1) atw1 = atw1 + 1;
+            // dq grant-wait already captured by GE_DQW; track separately too
+            if (dut.coh0.ge==7) dqw0 = dqw0 + 1;
+            if (dut.coh1.ge==7) dqw1 = dqw1 + 1;
+        end
         if (dbgcyc % 100000 == 0)
             $display("[cyc %0d] ge0=%0d ge1=%0d nl0=%0d nl1=%0d done=%b",
                      dbgcyc, dut.coh0.ge, dut.coh1.ge, dut.coh0.eng.nl, dut.coh1.eng.nl, done);
     end
+    task prof_report;
+        integer j;
+        reg [8*8-1:0] gname [0:7];
+        begin
+            gname[0]="IDLE"; gname[1]="AQ"; gname[2]="AQN"; gname[3]="RUN";
+            gname[4]="WAIT"; gname[5]="RB"; gname[6]="RBN"; gname[7]="DQW";
+            $display("==== PROFILE (per-cohort GE-state cycles, running window) ====");
+            for (j=0; j<8; j=j+1)
+                $display("GE_%0s        c0=%8d  c1=%8d", gname[j], ge_cnt0[j], ge_cnt1[j]);
+            $display("  (GE_IDLE no-descriptor: c0=%0d c1=%0d)", ge_idle_nordesc0, ge_idle_nordesc1);
+            $display("---- nl_engine GEMM-wait + grant-wait ----");
+            $display("NL_WQKV(6)   c0=%8d  c1=%8d", nl_cnt0[6],  nl_cnt1[6]);
+            $display("NL_WPROJ(11) c0=%8d  c1=%8d", nl_cnt0[11], nl_cnt1[11]);
+            $display("NL_WFC(14)   c0=%8d  c1=%8d", nl_cnt0[14], nl_cnt1[14]);
+            $display("NL_WMP(16)   c0=%8d  c1=%8d", nl_cnt0[16], nl_cnt1[16]);
+            $display("NL_WHEAD(19) c0=%8d  c1=%8d", nl_cnt0[19], nl_cnt1[19]);
+            $display("LN grant-wait(NL_LGAM,!gnt) c0=%8d c1=%8d", lnw0, lnw1);
+            $display("AT grant-wait(NL_AST,!gnt)  c0=%8d c1=%8d", atw0, atw1);
+            $display("DQ grant-wait(GE_DQW)       c0=%8d c1=%8d", dqw0, dqw1);
+            $display("---- nl_engine compute states (non-wait, sample) ----");
+            $display("NL_EMB(1)    c0=%8d  c1=%8d", nl_cnt0[1],  nl_cnt1[1]);
+            $display("NL_LGAM(2)   c0=%8d  c1=%8d", nl_cnt0[2],  nl_cnt1[2]);
+            $display("NL_LFEED(3)  c0=%8d  c1=%8d", nl_cnt0[3],  nl_cnt1[3]);
+            $display("NL_LCOLL(4)  c0=%8d  c1=%8d", nl_cnt0[4],  nl_cnt1[4]);
+            $display("NL_AST(7)    c0=%8d  c1=%8d", nl_cnt0[7],  nl_cnt1[7]);
+            $display("NL_ALD(8)    c0=%8d  c1=%8d", nl_cnt0[8],  nl_cnt1[8]);
+            $display("NL_ACL(9)    c0=%8d  c1=%8d", nl_cnt0[9],  nl_cnt1[9]);
+            $display("NL_RES1(12)  c0=%8d  c1=%8d", nl_cnt0[12], nl_cnt1[12]);
+            $display("NL_RES2(17)  c0=%8d  c1=%8d", nl_cnt0[17], nl_cnt1[17]);
+            $display("NL_ARG(20)   c0=%8d  c1=%8d", nl_cnt0[20], nl_cnt1[20]);
+            $display("==== END PROFILE ====");
+        end
+    endtask
     initial begin #120000000; $display("TB_TIMEOUT cyc=%0d ge0=%0d ge1=%0d", dbgcyc, dut.coh0.ge, dut.coh1.ge); $finish; end
 endmodule

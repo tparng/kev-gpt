@@ -361,7 +361,12 @@ module cohort_engine #(
                 end
                 GE_AQN: begin
                     grbn <= grbn + 1'b1;
-                    if (grbn == 3'd3) begin
+                    // 2-cycle gap (was 4): the prior stream's last x_we already
+                    // committed (xptr at K/P) the cycle we entered AQN; gv_xrst
+                    // (registered) then resets xptr one cycle before the next
+                    // stream's first write. The AQ compute pipeline is re-armed
+                    // from gci=0 in GE_AQ, so 2 cycles is sufficient.
+                    if (grbn == 3'd1) begin
                         gbs<=gbs+1'b1; gv_xrst<=1'b1; ge<=GE_AQ;
                     end
                 end
@@ -397,22 +402,29 @@ module cohort_engine #(
                         if (a_dst != 3'd2 && gdor==((a_m + P-1) >> LSH)-1) begin
                             gci<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
                             if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end
-                            else begin grbn<=0; ge<=GE_RBN; end
+                            // advance the stream pointer + gemm read-port AT RBN ENTRY so
+                            // gv_rdstream is stable through the inter-stream gap (the gemm
+                            // readback's 3-stage pipeline then refills during the rv0/1/2
+                            // re-arm in GE_RB). The write side (dwr) is gated on dq_vout,
+                            // which stays low until RB re-arms, so the early gbs bump is
+                            // hazard-free. Gap shortened 8->4 (the readback latency).
+                            else begin grbn<=0; gbs<=gbs+1'b1; gv_rdstream<=gbs+1'b1; ge<=GE_RBN; end
                         end else gdor<=gdor+1'b1;
                     end
                     if (gl_vout) begin
                         if (gor==ROWSM-1) begin
                             gci<=0; gor<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
                             if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end
-                            else begin grbn<=0; ge<=GE_RBN; end
+                            else begin grbn<=0; gbs<=gbs+1'b1; gv_rdstream<=gbs+1'b1; ge<=GE_RBN; end
                         end else gor<=gor+1'b1;
                     end
                 end
                 GE_RBN: begin
                     grbn <= grbn + 1'b1;
-                    if (grbn == 3'd7) begin
-                        gbs<=gbs+1'b1; gv_rdstream<=gbs+1'b1; ge<=GE_RB;
-                    end
+                    if (grbn == 3'd1) ge<=GE_RB;   // gbs/gv_rdstream already advanced at entry;
+                                                   // the gemm-readback pipeline (3 deep) refills
+                                                   // during the rv0/1/2 re-arm in GE_RB, so a
+                                                   // 2-cycle gap is sufficient (was 8).
                 end
                 default: ge<=GE_IDLE;
             endcase

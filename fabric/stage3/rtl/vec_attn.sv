@@ -121,6 +121,11 @@ module vec_attn #(
     reg [8:0]         sc_nacc;            // count of accumulated product-groups (0..NGRP)
     reg signed [95:0] ctx_prod [0:P-1];   // prob*v lane products
     reg               cx_v;
+    // ctx operand stage (breaks pj -> mem-read -> ctx_prod DSP cone), mirrors sc_*:
+    reg [20:0]        cp_preg;            // operand stage: prob[pj] (Q1.20, unsigned)
+    reg signed [31:0] cp_vreg  [0:P-1];   // operand stage: v lanes
+    reg               cp_opv;             // ctx operand-stage valid
+    reg [8:0]         cx_nacc;            // count of accumulated product-groups (0..T-1)
 
     integer lane;
 
@@ -275,9 +280,11 @@ module vec_attn #(
                     end
                     if (sm_done) begin
                         // start ctx: group of P dims, base dim = 0
-                        grp  <= 9'd0;
-                        pj   <= 9'd0;
-                        cx_v <= 1'b0;
+                        grp     <= 9'd0;
+                        pj      <= 9'd0;
+                        cp_opv  <= 1'b0;
+                        cx_v    <= 1'b0;
+                        cx_nacc <= 9'd0;
                         for (lane = 0; lane < P; lane = lane + 1)
                             ctx_acc[lane] <= 96'sd0;
                         st  <= S_CTX;
@@ -285,25 +292,42 @@ module vec_attn #(
                 end
 
                 // ---- ctx: accumulate prob[pj]*v_pj[d] for P dims (d = grp*P+lane) ----
-                // 2-stage: prob*v lane products registered, accumulate one cycle behind.
+                // 3-stage pipeline (one position/cycle streaming, throughput unchanged;
+                // latency +1 per dim-group, absorbed). Mirrors S_SCORE exactly:
+                //   A operand-reg: latch prob[pj] + v lanes selected by `pj` (breaks the
+                //                  pj -> mem-read -> ctx_prod DSP critical cone)
+                //   B product-reg: multiply the registered operands -> ctx_prod
+                //   C accumulate : sum delayed products -> ctx_acc
                 S_CTX: begin
-                    // prob[pj] zero-extended (unsigned Q1.20)
+                    // --- stage A: read prob/v words for `pj`, register operand lanes ---
                     p_v  = probmem[(pj < T) ? pj[4:0] : 5'd0];
                     vw   = vmem[((pj < T) ? pj : 9'd0)*NGRP + grp];
-                    for (lane = 0; lane < P; lane = lane + 1) begin
-                        v_l = vw[lane*32 +: 32];
-                        ctx_prod[lane] <= $signed({75'd0, p_v}) * $signed({{64{v_l[31]}}, v_l});
-                    end
-                    cx_v <= (pj != T);
+                    cp_preg <= p_v;
+                    for (lane = 0; lane < P; lane = lane + 1)
+                        cp_vreg[lane] <= vw[lane*32 +: 32];
+                    cp_opv <= (pj != T);
                     if (pj != T) pj <= pj + 9'd1;
+
+                    // --- stage B: multiply registered operands ---
+                    // prob[pj] zero-extended (unsigned Q1.20), v sign-extended.
+                    for (lane = 0; lane < P; lane = lane + 1)
+                        ctx_prod[lane] <= $signed({75'd0, cp_preg})
+                                        * $signed({{64{cp_vreg[lane][31]}}, cp_vreg[lane]});
+                    cx_v <= cp_opv;
+
+                    // --- stage C: accumulate the delayed products ---
                     if (cx_v) begin
                         for (lane = 0; lane < P; lane = lane + 1)
                             ctx_acc[lane] <= ctx_acc[lane] + ctx_prod[lane];
-                        if (pj == T) begin
+                        if (cx_nacc == T-1) begin
                             pj       <= 9'd0;
+                            cp_opv   <= 1'b0;
                             cx_v     <= 1'b0;
+                            cx_nacc  <= 9'd0;
                             emit_idx <= 7'd0;
                             st       <= S_CTX_EMIT;
+                        end else begin
+                            cx_nacc <= cx_nacc + 9'd1;
                         end
                     end
                 end
@@ -319,8 +343,11 @@ module vec_attn #(
                     if (grp == NGRP-1) begin
                         st <= S_DONE;
                     end else begin
-                        grp <= grp + 9'd1;
-                        pj  <= 9'd0;
+                        grp     <= grp + 9'd1;
+                        pj      <= 9'd0;
+                        cp_opv  <= 1'b0;
+                        cx_v    <= 1'b0;
+                        cx_nacc <= 9'd0;
                         for (lane = 0; lane < P; lane = lane + 1)
                             ctx_acc[lane] <= 96'sd0;
                         st  <= S_CTX;
