@@ -101,6 +101,17 @@ module vec_attn #(
     reg [8:0]  T;             // latched tcount
     reg [15:0] ld_cnt;        // generic load counter
 
+    // ---- background V-loader (Cut 1: overlap LD_V with score+softmax) ----------
+    // V is only consumed in S_CTX (after softmax), but the host streams Q,K,V
+    // back-to-back. So once K is loaded we leave ld_ready high, jump straight to
+    // S_SCORE, and absorb the T*NGRP V words into vmem CONCURRENTLY with the score
+    // accumulate + the (much longer) softmax. vmem is written here only; S_SCORE/
+    // S_CTX read kmem/vmem on independent paths (no write-port conflict). The
+    // S_SM_COLL->S_CTX transition is fenced on !vld_active so CTX never reads a
+    // V word that has not yet landed (guard is free: softmax >> V-load for all T).
+    reg        vld_active;     // high while still absorbing V load words
+    reg [15:0] vld_cnt;        // V-load word counter (0..T*NGRP-1)
+
     // score accumulation
     reg [8:0]  ji;            // current key index
     reg [8:0]  grp;           // adder-tree pass / dim-group index
@@ -152,9 +163,19 @@ module vec_attn #(
         done        <= 1'b0;
 
         if (rst) begin
-            st       <= S_IDLE;
-            ld_ready <= 1'b0;
+            st         <= S_IDLE;
+            ld_ready   <= 1'b0;
+            vld_active <= 1'b0;
         end else begin
+            // ---- background V-loader: runs in parallel with S_SCORE/EMIT/SM_COLL.
+            // Writes vmem only; independent of `st`. Started when LD_K completes.
+            if (vld_active && ld_valid) begin
+                vmem[vld_cnt] <= ld_data;
+                if (vld_cnt == (T*NGRP) - 1) begin
+                    vld_active <= 1'b0;
+                    ld_ready   <= 1'b0;   // V fully absorbed; stop accepting loads
+                end else vld_cnt <= vld_cnt + 16'd1;
+            end
             case (st)
                 S_IDLE: begin
                     ld_ready <= 1'b0;
@@ -179,34 +200,29 @@ module vec_attn #(
                 end
 
                 // ---- load K cache: T*HEAD_DIM/P wide words ----
+                // On the LAST K word: kick off softmax + the score pipeline AND arm
+                // the background V-loader (ld_ready stays high). The V words now
+                // stream into vmem concurrently with SCORE/SM_COLL instead of in a
+                // serial S_LD_V phase (Cut 1).
                 S_LD_K: begin
                     ld_ready <= 1'b1;
                     if (ld_valid) begin
                         kmem[ld_cnt] <= ld_data;
                         if (ld_cnt == (T*NGRP) - 1) begin
-                            ld_cnt <= 16'd0;
-                            st     <= S_LD_V;
-                        end else ld_cnt <= ld_cnt + 16'd1;
-                    end
-                end
-
-                // ---- load V cache: T*HEAD_DIM/P wide words ----
-                S_LD_V: begin
-                    ld_ready <= 1'b1;
-                    if (ld_valid) begin
-                        vmem[ld_cnt] <= ld_data;
-                        if (ld_cnt == (T*NGRP) - 1) begin
-                            ld_ready  <= 1'b0;
+                            ld_cnt     <= 16'd0;
+                            // arm background V-loader (vmem fills during score/softmax)
+                            vld_active <= 1'b1;
+                            vld_cnt    <= 16'd0;
                             // kick off softmax for T scores
-                            sm_tcount <= T;
-                            sm_start  <= 1'b1;
-                            ji        <= 9'd0;
-                            grp       <= 9'd0;
-                            score_acc <= 64'sd0;
-                            sc_opv    <= 1'b0;
-                            sc_v      <= 1'b0;
-                            sc_nacc   <= 9'd0;
-                            st        <= S_SCORE;
+                            sm_tcount  <= T;
+                            sm_start   <= 1'b1;
+                            ji         <= 9'd0;
+                            grp        <= 9'd0;
+                            score_acc  <= 64'sd0;
+                            sc_opv     <= 1'b0;
+                            sc_v       <= 1'b0;
+                            sc_nacc    <= 9'd0;
+                            st         <= S_SCORE;
                         end else ld_cnt <= ld_cnt + 16'd1;
                     end
                 end
@@ -273,12 +289,17 @@ module vec_attn #(
                 end
 
                 // ---- collect softmax probs into probmem ----
+                // Wait for softmax done AND the background V-loader to have landed
+                // every V word (Cut 1 fence). softmax (>=28 cyc) always outlasts the
+                // T*NGRP V-load for the host's back-to-back stream, so !vld_active is
+                // already true here for every T — the fence costs 0 cyc but makes the
+                // overlap provably safe even if a slow producer ever stalled V.
                 S_SM_COLL: begin
                     if (sm_out_valid) begin
                         probmem[ji[4:0]] <= sm_prob;
                         ji <= ji + 9'd1;
                     end
-                    if (sm_done) begin
+                    if (sm_done && !vld_active) begin
                         // start ctx: group of P dims, base dim = 0
                         grp     <= 9'd0;
                         pj      <= 9'd0;
@@ -317,40 +338,37 @@ module vec_attn #(
 
                     // --- stage C: accumulate the delayed products ---
                     if (cx_v) begin
-                        for (lane = 0; lane < P; lane = lane + 1)
-                            ctx_acc[lane] <= ctx_acc[lane] + ctx_prod[lane];
                         if (cx_nacc == T-1) begin
-                            pj       <= 9'd0;
-                            cp_opv   <= 1'b0;
-                            cx_v     <= 1'b0;
-                            cx_nacc  <= 9'd0;
-                            emit_idx <= 7'd0;
-                            st       <= S_CTX_EMIT;
+                            // FINAL position of this group. Round + emit the COMPLETE
+                            // sum (ctx_acc + this product) COMBINATIONALLY in the same
+                            // cycle the old code took an extra S_CTX_EMIT state to do —
+                            // bit-identical (same total, read as a wire instead of one
+                            // cycle later). Cut 2: removes the dedicated emit cycle per
+                            // group (NGRP*calls). New combinational path:
+                            // ctx_acc + ctx_prod -> rsh_round -> ctx_data (flag for OOC).
+                            for (lane = 0; lane < P; lane = lane + 1) begin
+                                ca_v = ctx_acc[lane] + ctx_prod[lane];
+                                ctx_data[lane*32 +: 32] <= rsh_round(ca_v, CTX_SH);
+                            end
+                            ctx_idx   <= grp[6:0];
+                            ctx_valid <= 1'b1;
+                            pj        <= 9'd0;
+                            cp_opv    <= 1'b0;
+                            cx_v      <= 1'b0;
+                            cx_nacc   <= 9'd0;
+                            if (grp == NGRP-1) begin
+                                st <= S_DONE;
+                            end else begin
+                                grp <= grp + 9'd1;
+                                for (lane = 0; lane < P; lane = lane + 1)
+                                    ctx_acc[lane] <= 96'sd0;
+                                st  <= S_CTX;
+                            end
                         end else begin
+                            for (lane = 0; lane < P; lane = lane + 1)
+                                ctx_acc[lane] <= ctx_acc[lane] + ctx_prod[lane];
                             cx_nacc <= cx_nacc + 9'd1;
                         end
-                    end
-                end
-
-                // ---- round + emit ALL P ctx lanes of this group in one cycle ----
-                S_CTX_EMIT: begin
-                    for (lane = 0; lane < P; lane = lane + 1) begin
-                        ca_v = ctx_acc[lane];
-                        ctx_data[lane*32 +: 32] <= rsh_round(ca_v, CTX_SH);
-                    end
-                    ctx_idx   <= grp[6:0];
-                    ctx_valid <= 1'b1;
-                    if (grp == NGRP-1) begin
-                        st <= S_DONE;
-                    end else begin
-                        grp     <= grp + 9'd1;
-                        pj      <= 9'd0;
-                        cp_opv  <= 1'b0;
-                        cx_v    <= 1'b0;
-                        cx_nacc <= 9'd0;
-                        for (lane = 0; lane < P; lane = lane + 1)
-                            ctx_acc[lane] <= 96'sd0;
-                        st  <= S_CTX;
                     end
                 end
 

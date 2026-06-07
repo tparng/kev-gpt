@@ -813,3 +813,61 @@ continues. It is the larger, GE-FSM-invasive change (row-major AQ walks all
 streams per row, so the gate is per-row-per-stream); to be taken bit-honest,
 gated phase-by-phase, as its own rung.
 
+## 23. The vec_attn per-call cut — 61,245 -> 57,149 cyc, 16/16 bit-exact
+
+The §22 residual named the ONE shared vec_attn as the serial-throughput wall:
+AT_BUSY = 25,088 cyc over 256 head-calls (= 16 streams x 4 layers x 4 heads) =
+**98 cyc/head-call at T=1**, with the critical cohort's GE idling ~16k cyc
+behind it. Arbitration is irrelevant (RR measured d0), a 2nd unit is BRAM-blocked
+(+8 tiles, 3 free), so the only free lever is cutting the 98 cyc/call itself.
+
+**Per-state profile (`run_sb_attnprof`, T=1, per head-call), the wedge map:**
+LD_Q 8 + LD_K 8 + LD_V 8 + SCORE 10 + SCORE_EMIT 1 + SM_COLL 30 + CTX 24 +
+CTX_EMIT 8 + DONE 1 = 98. SM_COLL=30 is softmax compute (RECIP 21 fixed, radix-4,
+untouched) and irreducible. The two structural-overhead targets, both bit-honest
+and both helping T>1:
+
+**Cut 1 — overlap the V-load with score+softmax (LD_V 8 -> 0).** V is only read in
+S_CTX (after softmax), but the host streams Q,K,V back-to-back into the load port.
+A background V-loader (`vld_active`/`vld_cnt`) now absorbs the T*NGRP V words into
+vmem CONCURRENTLY with S_SCORE/S_SM_COLL: on the last K word we leave ld_ready
+high, arm the V-loader, and jump straight to S_SCORE (the serial S_LD_V phase is
+gone). vmem is single-write (loader only); S_CTX reads it on an independent port.
+The S_SM_COLL->S_CTX edge is fenced on `!vld_active` so CTX never reads an
+un-landed V (free guard: softmax >= 28 cyc always outlasts the V-load for every T).
+Scales with T (V-load is T*8, fully hidden behind score+softmax which also grow).
+
+**Cut 2 — fold the ctx emit into the final-accumulate cycle (CTX_EMIT 8 -> 0).**
+The old S_CTX_EMIT spent a dedicated cycle/group rounding the REGISTERED ctx_acc
+one cycle after the last add landed. Now the final position of each group rounds
+`ctx_acc[lane] + ctx_prod[lane]` (the sum being written) COMBINATIONALLY in the
+same cycle and emits — bit-identical (same total, read as a wire instead of one
+cycle later), removing one state cycle per dim-group (NGRP=8 x 256 calls).
+
+**Composition: 98 -> 82 cyc/head-call (AT_BUSY 25,088 -> 20,992, -16.3%).**
+Per-state after (profiler): AT_LD_V 2,048 -> 0, AT_CTX_EMIT 2,048 -> 0; the nl-side
+NL_ACL attention-wait shrank 9,600 -> 7,552 (vec_attn returns `done` 16 cyc sooner
+per call). Each cut's wedge is exactly NGRP-per-call * 256 calls = 2,048, additive.
+
+**Gates (all green):** `run_vec_attn` 0/768 bit-exact T in {1,8,16,32};
+`run_softmax` 0/7127 (softmax.sv untouched); `run_sb_seq --nd 6` (N=16) **16/16
+bit-exact, 61,245 -> 57,149 cyc** (-4,096, -6.7%, 1.072x) = **46,671 tok/s @166.7 /
+55,994 @200**; 14-token (N=14, NC=7) **14/14, 56,125 -> 52,541 cyc** (-3,584 = 14
+streams x 16 x 16; 44,419 @166.7).
+
+**OOC-relevant note (no Vivado run — box is mid-impl, per the task):** Cut 1 adds
+no combinational path (pure schedule/FSM). Cut 2 adds ONE new path inside vec_attn:
+`ctx_acc[lane] (96b) + ctx_prod[lane] (96b) -> rsh_round (>>>11 with round/neg) ->
+ctx_data`, i.e. a 96-bit adder now feeds the existing CTX rounder that previously
+read a register. Low fanout, attention unit (not the LN/dequant critical family),
+so unlikely to be the worst path — but it should be checked in the next
+`ooc_seq_sb` for the @5ns/@200 builds. The unused S_CTX_EMIT state and `emit_idx`
+reg are left defined (harmless dead code; can be pruned later).
+
+**Next wedge:** the residual AT_BUSY is now SCORE 10 + SM_COLL 30 + CTX 24 (=64 of
+the 82), of which SM_COLL is the radix-4 divider (fixed) and CTX/SCORE still pay a
+2-cyc pipeline fill per group/score. Collapsing that fill needs double-buffered
+accumulators (ping-pong by group parity) — a +LUT, +1-path change to be gated and
+OOC'd as its own rung. The §22 symmetric-AQ side (GE idle during LN->AQ) remains
+the larger structural lever toward the ~40-44k floor.
+
