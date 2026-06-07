@@ -26,7 +26,14 @@
 `timescale 1ns / 1ps
 
 module softmax #(
-    parameter integer TMAX = 256
+    parameter integer TMAX = 256,
+    // DIV_STEPS = restoring-division steps unrolled per S_RECIP cycle (the divider
+    // radix exponent). 3 = radix-8 (3 restoring steps/cycle, 14 cycles, the deepest
+    // CARRY8 family and the 5ns critical path); 2 = radix-4 (2 steps/cycle, 21 cycles,
+    // ~2/3 the logic depth). The emitted quotient bit sequence (b40..b0 with one
+    // leading discarded pad) is IDENTICAL for any DIV_STEPS — only the cycle count and
+    // the per-cycle combinational depth change. Default 3 preserves the shipped radix-8.
+    parameter integer DIV_STEPS = 2
 ) (
     input  wire                clk,
     input  wire                rst,        // sync reset
@@ -166,52 +173,58 @@ module softmax #(
                 end
                 // ---------------- reciprocal: r = floor(2^40 / sum) --------------
                 // Restoring long division of dividend 2^40 (bit 40 set) by `sum`,
-                // UNROLLED 3 restoring steps per cycle (radix-8). Each inner step is
-                // bit-identical to the old 1-bit step (shift rem<<1, OR in this
-                // position's dividend bit = (pos==40), compare/subtract sum, shift a
-                // quotient bit in), so the final quotient is unchanged; only the cycle
-                // count drops from 41 to ceil(41/3)=14. div_bit is the NEXT dividend
-                // position to consume (40..0); we consume up to 3 per cycle.
-                // Bit-budget note: there are 41 dividend positions (40..0). We append
-                // exactly 3 quotient bits/cycle via {quo[17:0],qb}, so 14 cycles emit
-                // 42 bits. To keep the kept low-21 bits identical to the old 41-bit
-                // result, the FIRST cycle does only 2 real restoring steps (pos 40,39)
-                // plus 1 leading PAD bit; the remaining 13 cycles do 3 steps each
-                // (2 + 13*3 = 41 real bits). The pad lands above bit 20 (r <= 2^20, so
-                // the top quotient bits are 0) and is discarded — quotient unchanged.
+                // UNROLLED DIV_STEPS restoring steps per cycle (radix-2^DIV_STEPS).
+                // Each inner step is bit-identical to the old 1-bit step (shift rem<<1,
+                // OR in this position's dividend bit = (pos==40), compare/subtract sum,
+                // shift a quotient bit in), so the final quotient is unchanged for ANY
+                // DIV_STEPS; only the cycle count and per-cycle combinational depth
+                // change. div_bit is the NEXT dividend position to consume (40..0); we
+                // consume up to DIV_STEPS per cycle.
+                // Bit-budget: 41 dividend positions (40..0). We append exactly DIV_STEPS
+                // quotient bits/cycle via {quo, qb}, NCYC = ceil((41+PAD)/DIV_STEPS)
+                // cycles. PAD = (DIV_STEPS - 41%DIV_STEPS)%DIV_STEPS leading discarded
+                // bits (DIV_STEPS=3 -> PAD=1, 14 cyc; DIV_STEPS=2 -> PAD=1, 21 cyc;
+                // DIV_STEPS=1 -> PAD=0, 41 cyc). To keep the kept low-21 bits identical,
+                // the FIRST cycle does (DIV_STEPS-PAD) real steps then PAD leading pad
+                // bits; every later cycle does DIV_STEPS real steps. The pads land in
+                // the top emitted bits (r <= 2^20, top quotient bits 0) and are
+                // discarded — the emitted real sequence b40..b0 is bit-identical.
                 S_RECIP: begin : div_step
+                    localparam integer PAD = (DIV_STEPS - (41 % DIV_STEPS)) % DIV_STEPS;
                     reg [41:0] sh;
                     reg [40:0] r_w;
-                    reg [2:0]  qb;        // 3 quotient bits produced this cycle
-                    reg [5:0]  pos;       // current dividend position
-                    reg        fin;       // cycle-local: position 0 consumed this cycle
-                    reg [1:0]  nstep;     // real steps to perform this cycle (2 or 3)
+                    reg [DIV_STEPS-1:0] qb;   // DIV_STEPS quotient bits this cycle
+                    reg [5:0]  pos;           // current dividend position
+                    reg        fin;           // cycle-local: position 0 consumed this cycle
+                    reg [2:0]  nstep;         // real steps to perform this cycle
                     integer    s;
                     r_w   = rem;
-                    qb    = 3'd0;
+                    qb    = {DIV_STEPS{1'b0}};
                     pos   = div_bit;
                     fin   = 1'b0;
-                    nstep = (div_bit == 6'd40) ? 2'd2 : 2'd3;   // first cycle: 2 + pad
-                    for (s = 0; s < 3; s = s + 1) begin
+                    // first cycle (div_bit still == 40) emits PAD leading pad bits, so it
+                    // performs only DIV_STEPS-PAD real steps; all later cycles do DIV_STEPS.
+                    nstep = (div_bit == 6'd40) ? (DIV_STEPS - PAD) : DIV_STEPS;
+                    for (s = 0; s < DIV_STEPS; s = s + 1) begin
                         if (s < nstep && !fin) begin
                             sh = {r_w, (pos == 6'd40)};   // (r_w<<1) | dividend_bit
                             if (sh >= {13'd0, sum}) begin
                                 r_w = sh[40:0] - {12'd0, sum};
-                                qb  = {qb[1:0], 1'b1};
+                                qb  = {qb[DIV_STEPS-2:0], 1'b1};
                             end else begin
                                 r_w = sh[40:0];
-                                qb  = {qb[1:0], 1'b0};
+                                qb  = {qb[DIV_STEPS-2:0], 1'b0};
                             end
                             if (pos == 6'd0) fin = 1'b1;   // last position consumed
                             else             pos = pos - 6'd1;
                         end else begin
-                            qb = {qb[1:0], 1'b0};          // PAD / already finished
+                            qb = {qb[DIV_STEPS-2:0], 1'b0}; // PAD / already finished
                         end
                     end
                     rem <= r_w;
-                    quo <= {quo[17:0], qb};                // append the 3 bits
+                    quo <= {quo[20-DIV_STEPS:0], qb};      // append the DIV_STEPS bits
                     if (fin) begin
-                        recip   <= {quo[17:0], qb};        // final 21-bit quotient
+                        recip   <= {quo[20-DIV_STEPS:0], qb};  // final 21-bit quotient
                         i       <= 9'd0;
                         j       <= 9'd0;
                         norm_ph <= 2'd0;

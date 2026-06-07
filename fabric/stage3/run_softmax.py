@@ -258,8 +258,11 @@ def _token_stream_gate(npz, exp_lut, n_gen=60, prompt_len=8, seed=0):
 
 
 def main():
-    sim_dir = os.path.join("C:\\kevbuild", "stage3_softmax")
-    raise SystemExit(0 if run(sim_dir) else 1)
+    import argparse
+    ap = argparse.ArgumentParser(prog="fabric.stage3.run_softmax")
+    ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_softmax"))
+    a = ap.parse_args()
+    raise SystemExit(0 if run(a.dir) else 1)
 
 
 if __name__ == "__main__":
