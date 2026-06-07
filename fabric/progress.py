@@ -65,6 +65,8 @@ LADDER = [
      "the LN qsh/output paths + the DSP famine (attn un-evicted; 68,663 cyc / 16 tok; 16/16 bit-exact 3/3; 250 fails)"),
     ("+ schedule pipelining: AQ/RUN overlap,\nstream-granular NL, attn call cuts", 56262.7, "MEASURED",
      "the GE/nl ping-pong + per-call attn overhead (56,876 cyc / 16 tok @200; 16/16 bit-exact 3/3; 250 fails)"),
+    ("+ TMAX=16 + per-cohort attn + CTX stream\n+ LN prod*gamma split", 59965.5, "MEASURED",
+     "the shared-attn wall + LN critical path (53,364 cyc / 16 tok @200; 16/16 bit-exact 3/3; 250 hangs)"),
     ("+ cycle floor push\n(AQ/RB overlap -> ~40k cyc)", 80000.0, "PROJECTED",
      "GE-engine idle: AQ/RB serialization, group gaps (the solid case)"),
     ("x 250 MHz silicon\n(16 x 250MHz / 40k cyc)", 100000.0, "PROJECTED",

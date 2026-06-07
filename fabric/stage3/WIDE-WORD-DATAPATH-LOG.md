@@ -979,3 +979,27 @@ Composed: **57,149 -> 51,892 cyc (16/16 bit-exact; N=14 48,716 14/14)** —
 sub-additive by ~1.4k (the un-share and the CTX cut overlap on the attention
 critical path; honest). 61,667 @200 / 77,090 @250 SIM. Cycle march since the
 46.6k record build: 68,960 -> 51,892 = -24.7%.
+
+## 27. 59,965.5 tok/s MEASURED @200 MHz — the TMAX=16 architectural wave on silicon
+
+The §26 wave (TMAX 32->16, per-cohort attention OFF for fit / shared+arbiter
+ON via ATT2=0, CTX cross-group stream) + the §-LN prod*gamma split, built at
+6.0ns after a 5.5ns route DIVERGED (overlaps climbed 295k->339k at 98% BD
+density — killed at 2h, the density tax). 6.0ns routed clean: WNS -0.702,
+impl 1h43m. Silicon: **53,364 cyc (sim 53,637 - 273 SETTLE, sixth build),
+16/16 bit-exact, 3/3 — 49,971.3 @166.7 / 59,965.5 @200. 250 -> TIMEOUT**
+(hangs, not corrupt; the 6.0ns target gives ~1.6x silicon margin, 250 needs
+2.0x). New record, +6.6% on 56,262.7.
+
+Two build-system fixes en route: the b4f2d29 embed-TDP merge added
+embed_bank_tdp.sv to the iverilog list but NOT build_bd_seq_sb's add_files
+(synth "module not found" — fixed cc628a1); and pl_seq_sb on the board was
+stale (no --tmax) — the TMAX=16 bitstream needs the driver to upload 16
+pos_emb rows or pos>0 corrupts.
+
+The 250 path is now clear: the LN split took OOC -0.936 -> -0.128 @5ns, so a
+5ns-TARGET build would close post-route IF it routes — but 5.5ns already
+diverged at this density. The next lever is the named embed->residual cone
+(u_embank URAM -> xres_bank add) AND a density cut (the ATT2=1 un-share is
+~1.9k over; recovering it would also let the router breathe). 250 silicon
+remains the gate between 60k and 75k+.
