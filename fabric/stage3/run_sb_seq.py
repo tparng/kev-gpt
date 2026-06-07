@@ -70,6 +70,7 @@ def run(sim_dir, toks, P, lanes=128, tmax=32, nd=0, att2=1,
                          os.path.join(RTL, "gelu_lut2.sv"),
                          os.path.join(RTL, "softmax.sv"),
                          os.path.join(RTL, "weight_bank_tdp.sv"),
+                         os.path.join(RTL, "embed_bank_tdp.sv"),
                          os.path.join(RTL, "gemm_cohort_vec.sv"),
                          os.path.join(RTL, "gemm_banked_resident_vec.sv")],
                         capture_output=True, text=True)

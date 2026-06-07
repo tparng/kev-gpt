@@ -74,12 +74,11 @@ module sequencer_sb #(
         .raddr_a(waddr1), .rword_a(wword1));    // cohort 1 -> port A
 
     // ================================================================
-    //         SHARED embed/pos image + loader + read arbiter
+    //   SHARED embed/pos image + loader + DUAL-PORT read (embed_bank_tdp)
+    //   Each cohort gets a REAL embed read port (TDP UltraRAM, free in
+    //   hardware): gnt==req for BOTH cohorts -> both nl_engines const-prop
+    //   their embed-wait identically (no coh1/coh0 asymmetry, no arb stall).
     // ================================================================
-    (* ram_style = "ultra" *) reg [P*32-1:0] emb_w [0:VOCAB*EROWS-1];
-`ifndef SYNTHESIS
-    initial begin $readmemh("tok_emb_w.mem", emb_w); end
-`endif
     localparam integer ESUB = (P*32)/32;
     reg [$clog2((VOCAB+TMAX)*EROWS):0] el_word;
     reg [$clog2(ESUB)-1:0]   el_sub;
@@ -93,21 +92,27 @@ module sequencer_sb #(
         end
     end
     wire el_commit = el_we && (el_sub == ESUB-1);
-    always @(posedge clk)
-        if (el_commit && el_word < VOCAB*EROWS) emb_w[el_word] <= el_next;
 
+    // embed write to the TDP bank (boot only; el_word in [0, VOCAB*EROWS))
+    wire        emb_we   = el_commit && (el_word < VOCAB*EROWS);
+    wire [$clog2(VOCAB*EROWS)-1:0] emb_waddr = el_word[$clog2(VOCAB*EROWS)-1:0];
+
+    // pos_emb broadcast write (past VOCAB*EROWS) — path identical to before.
     wire        pw_we   = el_commit && (el_word >= VOCAB*EROWS);
     wire [$clog2(TMAX*EROWS)-1:0] pw_addr = el_word - VOCAB*EROWS;
     wire [P*32-1:0] pw_data = el_next;
 
-    // embed read arbiter (cohort 0 priority)
+    // per-cohort embed read ports: gnt==req (no arbitration), own emb_q each.
     wire        emb_req0, emb_req1;
     wire [$clog2(VOCAB*EROWS)-1:0] emb_addr0, emb_addr1;
     wire        emb_gnt0 = emb_req0;
-    wire        emb_gnt1 = emb_req1 && !emb_req0;
-    reg  [P*32-1:0] emb_q;
-    always @(posedge clk)
-        emb_q <= emb_w[emb_gnt0 ? emb_addr0 : emb_addr1];
+    wire        emb_gnt1 = emb_req1;
+    wire [P*32-1:0] emb_q0, emb_q1;
+    embed_bank_tdp #(.P(P), .VOCAB(VOCAB), .EROWS(EROWS)) u_embank (
+        .clk(clk),
+        .w_we(emb_we), .w_addr(emb_waddr), .w_data(el_next),
+        .raddr_b(emb_addr0), .rword_b(emb_q0),     // cohort 0 -> port B
+        .raddr_a(emb_addr1), .rword_a(emb_q1));     // cohort 1 -> port A
 
     // ================================================================
     //         SHARED LayerNorm + Attention (arbitrated 2-way)
@@ -292,7 +297,7 @@ module sequencer_sb #(
         .rd_stream(rd_stream[CSH-1:0]), .rd_sel(rd_sel), .rd_addr(rd_addr),
         .rd_data(rd_data0),                  // global stream < NC == local
         .waddr(waddr0), .wword_rd(wword0),
-        .emb_req(emb_req0), .emb_addr(emb_addr0), .emb_gnt(emb_gnt0), .emb_q(emb_q),
+        .emb_req(emb_req0), .emb_addr(emb_addr0), .emb_gnt(emb_gnt0), .emb_q(emb_q0),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
         .ln_req(ln_req0), .ln_start_o(ln_start0), .ln_vin_o(ln_vin0),
         .ln_x_o(ln_x0), .ln_g_o(ln_g0),
@@ -319,7 +324,7 @@ module sequencer_sb #(
         .rd_stream(rd_local1[CSH-1:0]), .rd_sel(rd_sel), .rd_addr(rd_addr),
         .rd_data(rd_data1),                  // local = global - NC (any NC)
         .waddr(waddr1), .wword_rd(wword1),
-        .emb_req(emb_req1), .emb_addr(emb_addr1), .emb_gnt(emb_gnt1), .emb_q(emb_q),
+        .emb_req(emb_req1), .emb_addr(emb_addr1), .emb_gnt(emb_gnt1), .emb_q(emb_q1),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
         .ln_req(ln_req1), .ln_start_o(ln_start1), .ln_vin_o(ln_vin1),
         .ln_x_o(ln_x1), .ln_g_o(ln_g1),
