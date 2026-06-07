@@ -137,6 +137,7 @@ module cohort_engine #(
         .clk(clk), .rst(rst), .go(go),
         .tok_ids(tok_ids), .pos(pos),
         .served(g_done_p),
+        .s_done(g_sdone), .s_done_idx(g_sdone_idx),
         .emb_gnt(emb_gnt), .emb_q(emb_q), .emb_req(emb_req), .emb_addr(emb_addr),
         .dw_we(dwr_we), .dw_dst(dwr_dst), .dw_addr(dwr_addr), .dw_data(dwr_data),
         .dwm_we(dwmr_we), .dwm_addr(dwmr_addr), .dwm_data(dwmr_data),
@@ -276,6 +277,14 @@ module cohort_engine #(
     wire rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == glim)
                                    : (dq_vout && gdor == ((a_m + P-1) >> LSH) - 1 && gbs == glim);
     assign g_done_p = (ge == GE_RB) && rb_last;
+
+    // STREAM-GRANULAR completion: pulse when ANY stream gbs's last readback row
+    // commits (dst 0/1/3/4 — the dq path that writes qkv/attn/mlp/head banks; FC's
+    // dst=2 mlpbuf path has NO nl post-processing so it is intentionally excluded).
+    // Same alignment as g_done_p: combinational on the last-row commit of stream gbs.
+    wire g_sdone = (ge == GE_RB) && (a_dst != 3'd2) && dq_vout &&
+                   (gdor == ((a_m + P-1) >> LSH) - 1);
+    wire [$clog2(N)-1:0] g_sdone_idx = gbs;
 
     always @* begin
         dword = {(P*32){1'b0}}; mword = {(P*16){1'b0}};

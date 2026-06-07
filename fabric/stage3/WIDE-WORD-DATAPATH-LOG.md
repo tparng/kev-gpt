@@ -750,3 +750,66 @@ signature's fifth consecutive build). 250 → match=False (softmax).**
 The 100k identity is now 16 × 250 MHz / 40k cyc: the softmax lever buys
 the clock (58.2k at this cycle count); the cycle-floor cuts buy the rest.
 
+## 22. Stream-granular NL/GEMM overlap (readback side) — 66,285 -> 61,245 cyc, 16/16 bit-exact
+
+The cycle-floor lever from §21. PROFILE (`run_sb_attnprof`, ND=6, the committed
+b40b0ed observer) showed GE-active and nl-serial are **additive**, not
+overlapped: per cohort GE-active (GE_AQ 7,492 + GE_WAIT 19,097 + GE_RB 10,360 +
+RBN 238) ~= 37,187; nl serial post-call work (attn 18,733, LN 6,696, residual
+2,112, embed/argmax 1,332) ~= 28,9k. The GE engine idled in GE_IDLE (c1 28,934)
+waiting for nl to issue the next descriptor; nl idled in NL_W* waiting for the
+WHOLE batched GEMM call to drain (`served` = the LAST stream's last readback
+row). They ping-pong at CALL granularity.
+
+**The change (readback side, schedule-only, arithmetic BIT-IDENTICAL):** the GE
+readback already drains streams 0..7 in order and writes each stream's results
+into the nl banks long before the last stream finishes. So give nl a
+**per-stream** completion pulse instead of only the whole-call `served`:
+`cohort_engine` emits `g_sdone`/`g_sdone_idx` combinationally on each stream's
+last-row commit (the existing `gdor==last` boundary, dst 0/1/3/4 — the dq path
+that fills qkv/attn/mlp/head; FC's dst=2 mlpbuf has no nl post-processing so it
+is excluded). `nl_engine` latches these into `rb_rdy[s]` (cleared at each new
+descriptor boundary) and gates the **start** of every per-stream post loop on
+`rb_rdy[bs]` rather than `!req`: NL_AST/ALD/ACL (attention), NL_RES1, NL_RES2,
+NL_ARG. nl now post-processes stream s while GE keeps draining s+1.., and the
+shared attn unit is requested per-stream (`at_req <= sready`) so a not-yet-ready
+stream releases it to the other cohort instead of stalling holding it.
+
+**Hazards analysed + respected.** (1) qkv_bank is single-write-site (GE dwr) and
+nl only READS it for attention — GE writing stream s+1 while nl reads stream s
+hits different bank rows on independent R/W ports: no hazard. (2) ctxv (nl
+writes) is read by GE only on the NEXT call's PROJ-AQ — the descriptor handshake
+stays call-granular, so the next call's AQ never starts before nl finishes the
+current call's per-stream prep; the overlap is purely WITHIN the current call's
+drain. (3) the GE-side `ge_ra` AQ-feed port reads lnout/ctx/mlpbuf, never the
+qkv/attn/mlp/head banks nl reads during overlap — no new read-port contention.
+(4) per-stream `at_req` toggling is a strict subset of the old hold-until-done
+behaviour (arbiter releases cleanly on `!at_req`); LN/attn never nest -> no
+deadlock. iverilog-2012 traps honoured (plain-reg gates, no new array
+part-selects).
+
+**Gates (both green):** `run_sb_seq --nd 6` (N=16) **16/16 bit-exact, 66,285 ->
+61,245 cyc** (-5,040, -7.6%, 1.082x) = 43,550 tok/s @166.7 / 52,249 @200.
+`run_sb_seq --nd 6 --toks <14>` **14/14 bit-exact, 56,125 cyc**. New profile: the
+idle moved exactly where predicted — GE_IDLE c1 28,934 -> 23,962 (-4,972),
+NL_WQKV c1 10,007 -> 7,095 (attention now rides the QKV drain). The residual gap
+is NOT readback-side: NL_WFC c1 13,248 + NL_WMP c1 8,568 are nl genuinely idle
+during the big FC/MP (1024-wide) GEMMs, which have NO nl post-processing to
+overlap, plus GE_WAIT 19,097 (irreducible MAC compute).
+
+**OOC (`ooc_seq_sb` 8 128 5.0 25600 32 6 8, from sb16, 6.5 min): 109,296 LUT
+(93.32%, +193 over the 109,103 baseline), WNS @5ns +0.074 MET (IDENTICAL to
+baseline)** — the worst path stays the u_dq dequant family; rb_rdy/sready added
+no critical path. BRAM 141, URAM 64, DSP 1171 — unchanged. The 250 MHz build is
+preserved.
+
+**Next wedge (the symmetric AQ side).** The remaining additive cost is the GE
+sitting IDLE while nl runs LN1->QKV-AQ and LN2->FC-AQ serially per layer (the
+hard LN->GEMM dependency). The mirror of this change — a per-stream "input
+ready" pulse from nl to the GE AQ loop so QKV-AQ starts for stream 0 while LN1
+collects streams 1..7 (and FC-AQ behind LN2) — hides the ~6.7k/layer LN behind
+the AQ and is where the path from 61k toward the ~40-44k floor (= 91-95k @250)
+continues. It is the larger, GE-FSM-invasive change (row-major AQ walks all
+streams per row, so the gate is per-row-per-stream); to be taken bit-honest,
+gated phase-by-phase, as its own rung.
+

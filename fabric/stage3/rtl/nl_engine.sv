@@ -46,6 +46,15 @@ module nl_engine #(
     input  wire [G*9-1:0] tok_ids,
     input  wire [8:0]  pos,
     input  wire        served,        // GE acknowledges THIS engine's in-flight call
+    // STREAM-GRANULAR readback completion: s_done pulses when stream s_done_idx's
+    // readback fully commits into this engine's banks (qkv/attn/mlp/head, NOT FC->
+    // mlpbuf which has no nl post-processing). Lets the per-stream post-call loops
+    // (attn / RES1 / RES2 / argmax) begin for stream s while the GE engine is still
+    // draining streams s+1.. — the stream-granular NL/GEMM overlap. Arithmetic is
+    // UNCHANGED; only the start-gate of each per-stream loop moves from `!req`
+    // (whole-call done) to rb_rdy[bs] (this stream's readback done).
+    input  wire        s_done,
+    input  wire [$clog2(G)-1:0] s_done_idx,
     // shared embed read (sequencer_pp owns the URAM emb_w + arbiter)
     input  wire        emb_gnt,       // 1 when this engine holds the emb read port
     input  wire [P*32-1:0] emb_q,     // registered emb_w[emb_addr], 1-cycle latency
@@ -199,6 +208,13 @@ module nl_engine #(
     reg [1:0]  lnphase;             // 0 = LN1->QKV, 1 = LN2->FC, 2 = LNF->HEAD
 
     reg [GSH-1:0] bs;               // LOCAL stream counter 0..G-1
+    // STREAM-GRANULAR overlap: rb_rdy[s]=1 once stream s's readback for the CURRENT
+    // GEMM call has committed into the banks. Set by s_done; cleared en-masse when a
+    // NEW descriptor is issued (the call boundary). The per-stream post loops gate
+    // their start on rb_rdy[bs], so nl works stream s while GE drains s+1..G-1.
+    reg [G-1:0] rb_rdy;
+    reg         rb_clr;                  // pulse: clear rb_rdy at a new call boundary
+    wire        sready = rb_rdy[bs];
     reg [10:0] ci, cid;  reg civ;
     reg [$clog2(ROWSM+1)-1:0] fr, frd, orow;  reg frv;
     reg [$clog2(ARROWS+1)-1:0] ar, ard, amd, ad1;
@@ -284,10 +300,11 @@ module nl_engine #(
 
     always @(posedge clk) begin
         ln_start_o<=1'b0; ln_vin_o<=1'b0; at_start_o<=1'b0; at_ldv_o<=1'b0;
+        rb_clr = 1'b0;                          // default: keep accumulating rb_rdy
         if (rst) begin
             nl<=NL_IDLE; bs<=0; req<=0; done_o<=0; lnphase<=0;
             fr<=0; frv<=0; civ<=0; arv<=0; av1<=0; amv<=0;
-            ln_req<=0; at_req<=0;
+            ln_req<=0; at_req<=0; rb_rdy<=0;
         end else begin
             if (go) begin
                 nl<=NL_EMB; blkg<=0; lnphase<=0; done_o<=0;
@@ -351,12 +368,18 @@ module nl_engine #(
                     d_wbase<=blkg*GW_BLK + WB_QKV; d_m<=D3[10:0]; d_k<=D[10:0];
                     d_asrc<=2'd0; d_asel<=blkg*4 + 6'd0; d_frac<=7'd16;
                     d_dqrow<=blkg*DQB_P + DR_QKV[11:0]; d_dst<=3'd0;
-                    req<=1'b1; nl<=NL_WQKV;
+                    req<=1'b1; rb_clr=1'b1; hh<=0; bs<=0; nl<=NL_WQKV;
                 end
-                NL_WQKV: if (!req) begin hh<=0; bs<=0; nl <= NL_AST; end
+                // overlap: enter the attention loop as soon as stream 0's qkv
+                // readback commits (rb_rdy[0]) — GE keeps draining streams 1..G-1
+                // while attention for stream 0 runs. NL_AST is per-stream; its
+                // own rb_rdy[bs] gate (via at_req) stalls if a later stream isn't
+                // committed yet. (req is cleared call-granularly by `served`.)
+                NL_WQKV: if (rb_rdy[0]) begin hh<=0; bs<=0; nl <= NL_AST; end
                 NL_AST: begin
-                    at_req <= 1'b1;                 // request the shared attn unit (held)
-                    if (at_gnt) begin             // idle-wait here until granted
+                    at_req <= sready;              // only grab the shared attn unit
+                                                  // once THIS stream's qkv is ready
+                    if (sready && at_gnt) begin   // idle-wait until ready AND granted
                         at_start_o<=1'b1; at_tcount_o<=9'd1; wi<=9'd0; wic<=9'd0; nl<=NL_ALD;
                     end
                 end
@@ -382,10 +405,12 @@ module nl_engine #(
                     d_wbase<=blkg*GW_BLK + WB_PROJ; d_m<=D[10:0]; d_k<=D[10:0];
                     d_asrc<=2'd1; d_asel<=blkg*4 + 6'd1; d_frac<=7'd25;
                     d_dqrow<=blkg*DQB_P + DR_PROJ[11:0]; d_dst<=3'd1;
-                    req<=1'b1; nl<=NL_WPROJ;
+                    req<=1'b1; rb_clr=1'b1; nl<=NL_WPROJ;
                 end
-                NL_WPROJ: if (!req) begin ci<=0; civ<=0; nl <= NL_RES1; end
-                NL_RES1: begin
+                // overlap: start residual-1 for stream 0 as soon as its proj (attn
+                // bank) readback commits; per-stream sready gate stalls later streams.
+                NL_WPROJ: if (rb_rdy[0]) begin ci<=0; civ<=0; bs<=0; nl <= NL_RES1; end
+                NL_RES1: if (sready) begin
                     cid <= ci; civ <= (ci != ROWS[10:0]);
                     if (ci != ROWS[10:0]) ci <= ci + 1'b1;
                     if (civ) begin
@@ -405,17 +430,19 @@ module nl_engine #(
                     d_wbase<=blkg*GW_BLK + WB_FC; d_m<=D_MLP[10:0]; d_k<=D[10:0];
                     d_asrc<=2'd2; d_asel<=blkg*4 + 6'd2; d_frac<=7'd12;
                     d_dqrow<=blkg*DQB_P + DR_FC[11:0]; d_dst<=3'd2;
-                    req<=1'b1; nl<=NL_WFC;
+                    req<=1'b1; rb_clr=1'b1; nl<=NL_WFC;
                 end
                 NL_WFC: if (!req) nl <= NL_MP;
                 NL_MP: begin
                     d_wbase<=blkg*GW_BLK + WB_MP; d_m<=D[10:0]; d_k<=D_MLP[10:0];
                     d_asrc<=2'd3; d_asel<=blkg*4 + 6'd3; d_frac<=7'd25;
                     d_dqrow<=blkg*DQB_P + DR_MP[11:0]; d_dst<=3'd3;
-                    req<=1'b1; nl<=NL_WMP;
+                    req<=1'b1; rb_clr=1'b1; nl<=NL_WMP;
                 end
-                NL_WMP: if (!req) begin ci<=0; civ<=0; nl <= NL_RES2; end
-                NL_RES2: begin
+                // overlap: start residual-2 for stream 0 as soon as its mlp readback
+                // commits; per-stream sready gate stalls later streams.
+                NL_WMP: if (rb_rdy[0]) begin ci<=0; civ<=0; bs<=0; nl <= NL_RES2; end
+                NL_RES2: if (sready) begin
                     cid <= ci; civ <= (ci != ROWS[10:0]);
                     if (ci != ROWS[10:0]) ci <= ci + 1'b1;
                     if (civ) begin
@@ -441,17 +468,19 @@ module nl_engine #(
                     d_wbase<=WB_HEAD[19:0]; d_m<=VOCAB[10:0]; d_k<=D[10:0];
                     d_asrc<=2'd0; d_asel<=4*NLAYER; d_frac<=7'd25;
                     d_dqrow<=DR_HEAD[11:0]; d_dst<=3'd4;
-                    req<=1'b1;
+                    req<=1'b1; rb_clr=1'b1; bs<=0;
                     best_val<=32'sh80000000; best_idx<=0; ar<=0; arv<=0; av1<=0; amv<=0;
                     nl<=NL_WHEAD;
                 end
-                NL_WHEAD: if (!req) begin
+                // overlap: start argmax for stream 0 as soon as its head readback
+                // commits; per-stream sready gate stalls later streams.
+                NL_WHEAD: if (rb_rdy[0]) begin
                     // re-arm argmax scratch on entry (matches pre-split behaviour)
-                    best_val<=32'sh80000000; best_idx<=0;
+                    best_val<=32'sh80000000; best_idx<=0; bs<=0;
                     ar<=0; arv<=0; av1<=0; amv<=0;
                     nl <= NL_ARG;
                 end
-                NL_ARG: begin
+                NL_ARG: if (sready) begin
                     ard <= ar; arv <= (ar != ARROWS[$clog2(ARROWS+1)-1:0]);
                     if (ar != ARROWS[$clog2(ARROWS+1)-1:0]) ar <= ar + 1'b1;
                     hw_r <= head_r; ad1 <= ard; av1 <= arv;
@@ -498,6 +527,13 @@ module nl_engine #(
                 default: nl <= NL_IDLE;
             endcase
             if (xr_we) xres_bank[xr_wa] <= xr_wd;   // the bank's ONLY write site
+            // ---- stream-granular readback-ready tracker ----------------------
+            // Clear at a fresh call boundary (descriptor just issued); otherwise
+            // latch each stream's completion pulse. Clear dominates set: a new
+            // descriptor's issue cannot coincide with a prior call's last commit
+            // (the loop that consumes the prior call must finish first).
+            if (rb_clr)        rb_rdy <= {G{1'b0}};
+            else if (s_done)   rb_rdy[s_done_idx] <= 1'b1;
         end
     end
 endmodule
