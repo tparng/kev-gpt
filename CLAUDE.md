@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 "Kevin on Kria" — running a tiny telegraphic INT4 language model entirely inside the FPGA
 fabric of a Xilinx Kria KV260, with weights baked into on-chip BRAM/URAM so they never touch
-DDR. It is **both** a design-argument (five numbered `.md` docs) **and** a real implementation
+DDR. It is **both** a design-argument (numbered `.md` docs `0`–`6`) **and** a real implementation
 (Python + SystemVerilog/Verilog). When a task says "work on the code," it usually means one of:
 editing the RTL/Python under `fabric/` or `model/`, keeping the cross-document argument
 consistent, or running the bit-honest gate ladder. Do not invent commands/files that the docs
@@ -27,8 +27,10 @@ Three code pillars feed the hardware, plus the design docs:
   is where current work lives: RTL cores (`rtl/*.sv,*.v`), Python **gate harnesses** (`run_*.py`),
   the per-phase reference (`seq_ref.py`), Vivado scripts (`tcl/`), testbenches (`tb/`), and
   on-board drivers (`board/pl_*.py`).
-- **Design docs** `0-master.md`…`4-live-chatbot.md` (read in numeric order; `0-master.md` is the
-  through-line). Plus `README.md`, `ROADMAP-10K.md`, `BUILD-LOG.md`, `DEPLOYMENT.md`, `GLOSSARY.md`.
+- **Design docs** `0-master.md`…`6-past-the-stream-ceiling.md` (read in numeric order; `0-master.md`
+  is the through-line). `5-demo-prd.md` is the live-demo PRD; `6-past-the-stream-ceiling.md` is the
+  speed campaign past the N=16 stream ceiling (split-brain + worst-path retirement toward 100k).
+  Plus `README.md`, `ROADMAP-10K.md`, `BUILD-LOG.md`, `DEPLOYMENT.md`, `GLOSSARY.md`.
 
 ## The core thesis (keep all edits consistent with it)
 
@@ -138,6 +140,10 @@ python -m fabric.stage3.board.pl_seq_vec --lanes 128 --tok 48 --fclk 40e6
 (HLS/RTL systolic GEMV, on-chip weights, fabric-native softmax/RMSNorm). `3-kevin-on-kria.md` =
 the fusion (train doc-2's model on a doc-1 corpus). `4-live-chatbot.md` = the public stress test
 (web front end behind a Cloudflare Tunnel). `webchat/app.py` is the live chat server.
+`5-demo-prd.md` = the speculative-typing chat + load-dashboard PRD. `6-past-the-stream-ceiling.md`
+= the speed campaign (split-brain on the dual-ported URAM, the cycle/clock lever campaign, the
+KV-DDR context-restore path, the 100k identity) — read it before touching `fabric/stage3` to know
+which levers are live vs proven-dead.
 
 ## The Keviniser implementation (doc 1 → `keviniser/`)
 
@@ -168,7 +174,19 @@ Uses spaCy with `en_core_web_sm`. Design decisions to preserve if you touch it:
 ## The build order (stages 0–4, each ships something demonstrable)
 
 (0) A53 baseline proving it's bandwidth bound · (1) raw on-chip matmul throughput · (2) the
-measured heterogeneous ping-pong tax · (3) full zero-DRAM uplift + crossover plot (current work:
-the P-wide sequencer toward 10k) · (4) live chatbot under load with two ceilings (inference vs.
-serving). The data track runs alongside: Keviniser on TinyStories → train (Brevitas INT4 QAT) →
-validate vs goformer → wire into stage 3.
+measured heterogeneous ping-pong tax · (3) full zero-DRAM uplift + crossover plot · (4) live
+chatbot under load with two ceilings (inference vs. serving). The data track runs alongside:
+Keviniser on TinyStories → train (Brevitas INT4 QAT) → validate vs goformer → wire into stage 3.
+
+**Current work (the post-stage-3 speed era, doc 6):** the model has long been running fully in
+fabric; the optimisation is now *cycles and clock*, not getting it on-chip. The MEASURED record is
+**56,262.7 tok/s @ 200 MHz** (split-brain N=16, 16/16 bit-exact, 3/3). The live design is
+`sequencer_sb` (two N=8 cohorts on the true-dual-port URAM, parameterized: `ATT2` = per-cohort vs
+shared attention, `TMAX` = on-chip KV window, `DBG` = board-debug readback on/off; bitstream builds
+set `DBG=0`/`ATT2=0` for fit). The target is the **100k identity: 16 streams × 250 MHz / 40k cyc** —
+streams are maxed (N=16, `dsp3_pack_proof.py`), cycles are ~53k gated heading to ~40k, and 250 MHz
+needs a post-route-MET 5ns build so silicon's ~1.3× margin covers it. KV-to-DDR (`kv_dma` +
+`kv_prefetch`, sim-complete, bit-exact) is the context-restore path once the on-chip window is too
+small. Before proposing a stage-3 cycle/timing lever, check doc 6 / the log §19–26 for whether it's
+already proven dead (the LN→AQ and attention→PROJ schedule overlaps are; the shared-attention serial
+cost is not fixable by arbitration).

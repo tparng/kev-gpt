@@ -105,8 +105,9 @@ prompt." Everything else in the PRD is conventional software.
 
 ## Gap 1: the fabric computes single tokens, not completions
 
-Today's record design (25,744.5 tok/s aggregate) runs **single-position
-forwards**: one token in, next-token logits out, no K/V persists between calls.
+Today's record design (56,262.7 tok/s aggregate @200 MHz — split-brain N=16; see
+doc 6) runs **single-position forwards**: one token in, next-token logits out, no
+K/V persists between calls.
 A completion needs multi-token KV decode in fabric: per-stream K/V caches
 across layers, attention over T>1, a position loop, and per-stream completion
 state (streams finish at different lengths). The bit-true reference exists

@@ -31,6 +31,8 @@ data tool and the model) for that project.
 | [`2-llm-on-kria.md`](2-llm-on-kria.md) | **the platform** — on-chip systolic GEMV, fabric-native softmax/RMSNorm |
 | [`3-kevin-on-kria.md`](3-kevin-on-kria.md) | **the fusion** — train doc 2's model on doc 1's corpus |
 | [`4-live-chatbot.md`](4-live-chatbot.md) | **the stress test** — serve it behind a Cloudflare Tunnel, link on HN |
+| [`5-demo-prd.md`](5-demo-prd.md) | **the demo PRD** — speculative-typing chat + live load dashboard |
+| [`6-past-the-stream-ceiling.md`](6-past-the-stream-ceiling.md) | **the speed campaign** — split-brain + worst-path retirement past the stream ceiling, toward 100k |
 
 ## Code
 
@@ -49,21 +51,25 @@ vs the integer reference). The current state, all bit-honest:
 
 | What | tok/s | Tag |
 |---|---|---|
-| KV260 sequencer, 1 stream @ 200 MHz (17,931 cyc/token) | 11,143.9 | MEASURED |
-| Batch GEMM N=4 — 4 streams share one weight pass | 16,969.3 | MEASURED |
-| Ping-pong N=8 — non-linears overlap the GEMM (75,157 cyc / 8 tokens) | 17,740.6 | MEASURED |
 | Single-pass N=8 — one weight pass serves all 8 streams (69,172 cyc / 8 tokens @166.7 MHz) | 19,275.6 | MEASURED |
-| N=16 — 12 DSP-packed banks + shared LN/attention, 106.5k LUT (110,494 cyc / 16 tokens @166.7 MHz) | **24,134.0** | MEASURED |
-| + softmax latency cut (103,582 cyc / 16 tokens @166.7 MHz) | **25,744.5** | MEASURED |
-| Cycle floor push (AQ/RB overlap → ~40k cyc) × clock (200 → 250 MHz attempt) | 30–100k | the 100k identity: 16 × 250 MHz / 40k cyc |
+| N=16 — 12 DSP-packed banks + shared LN/attention (110,494 cyc / 16 tokens @166.7 MHz) | 24,134.0 | MEASURED |
+| + softmax latency cut (103,582 cyc / 16 tokens @166.7 MHz) — **the stream ceiling** | 25,744.5 | MEASURED |
+| **Split-brain** N=14 — two cohorts on the dual-ported URAM (63,113 cyc / 14 tokens @166.7 MHz) | 36,970.7 | MEASURED |
+| N=16 @ **200 MHz** — first 200-clean build (LN un-retime + AQ 32×48 range-proof) | 46,604.4 | MEASURED |
+| + schedule-pipelining wave (AQ/RUN overlap, stream-granular NL, attn call cuts; 56,876 cyc @200 MHz) | **56,262.7** | MEASURED |
+| Cycle floor (~53k → ~40k cyc) × 250 MHz silicon | →100k | the 100k identity: 16 × 250 MHz / 40k cyc, PROJECTED |
 
-N=16 is the **stream ceiling**: 3 INT4×INT8 MACs/DSP is provably impossible
-(27-bit port vs 28 needed; 66 bits of neuron state vs a 48-bit accumulator —
-`fabric/stage3/research/dsp3_pack_proof.py`, 1.2M-trial verified), so past 24.1k
-the levers are cycles and clock, not streams.
+Past 25.7k, **N=16 is the stream ceiling**: 3 INT4×INT8 MACs/DSP is provably
+impossible (27-bit port vs 28 needed; 66 bits of neuron state vs a 48-bit
+accumulator — `fabric/stage3/research/dsp3_pack_proof.py`, 1.2M-trial verified),
+so the levers became **cycles and clock, not streams** — the second era, documented
+in [`6-past-the-stream-ceiling.md`](6-past-the-stream-ceiling.md): split-brain
+(two N=8 cohorts on the true-dual-port URAM) plus a systematic worst-path-retirement
+campaign. **56,262.7 is the current MEASURED record** (16/16 bit-exact, 3/3); 100k
+is PROJECTED and needs both the cycle floor *and* 250 MHz on silicon.
 
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
-CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop ~9x.
+CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop GPU ~78×.
 
 ## What works today
 
@@ -92,13 +98,20 @@ CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop ~9x.
   bandwidth-wall proof).
 
 - **Stage 3 on silicon**: the full forward (4 blocks + LN_f + head + argmax) runs
-  inside the PL with zero DRAM in the token loop — weights in URAM (60 banks),
-  activations and KV in BRAM. Bit-honest gate ladder: every RTL block is iverilog
-  bit-exact vs `seq_ref` before silicon, and tok/s claims need 3/3 bit-exact runs.
-  Engineering log: `fabric/stage3/WIDE-WORD-DATAPATH-LOG.md`. Batch GEMM N=4
-  (4 keystroke-speculative streams share one resident-weight pass) fits at 70 % LUT
-  and is bit-exact ×4 in sim. Speculative typing: every keypress forks a stream;
-  Enter blits the precomputed answer.
+  inside the PL with zero DRAM in the token loop — weights in URAM, activations and
+  KV in BRAM. Bit-honest gate ladder: every RTL block is iverilog bit-exact vs
+  `seq_ref` before silicon, and tok/s claims need 3/3 bit-exact runs. Engineering
+  log: `fabric/stage3/WIDE-WORD-DATAPATH-LOG.md`; the narrative is doc 6. The current
+  design is **split-brain N=16**: two independent 8-stream cohorts each read the
+  resident weight image through their own true-dual-port URAM port, sharing only the
+  weight image and arbitrated non-linears — 56,262.7 tok/s @ 200 MHz, 16/16 streams
+  bit-exact, 3/3. The 16 streams double as keystroke-speculative completions (every
+  keypress forks a stream; Enter blits the precomputed answer — doc 5).
+- **KV-to-DDR (sim-complete, bit-exact)**: `kv_dma` + `kv_prefetch` move the KV cache
+  off-chip with double-buffered burst prefetch that fully hides DDR latency, restoring
+  the context the on-chip window gives up. At K4/V4 quantized KV the read budget for
+  100k aggregate tok/s is ~3.89 GB/s (DERIVED) — under the ~6–7.5 GB/s sustained HP
+  ceiling, so DDR is not the binding wall.
 
 ## Quickstart
 
