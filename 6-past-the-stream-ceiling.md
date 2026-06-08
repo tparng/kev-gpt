@@ -121,34 +121,48 @@ short Kevin context. The thesis survives intact: telegraphic Kevin-speak keeps r
 small windows, which is exactly what keeps the KV traffic affordable. The dumbness is still the
 optimisation.
 
-## The 100k identity, honestly
+## The 100k identity, and the floor that caps it
 
-The target factors cleanly: **100,000 tok/s = 16 streams × 250 MHz / 40,000 cyc.** Three knobs,
-each with an honest status:
+The target factors cleanly: **100,000 tok/s = 16 streams × 250 MHz / 40,000 cyc.** Three knobs.
+Two are now measured to the wall, and the third has a hard floor:
 
-- **Streams: maxed at 16, proven.** The 2.0/DSP packing is the wall (§18); nothing more to get here.
-- **Cycles: 53,565 gated in sim (§25), 51,892 with the architectural wave composed (§26).** The
-  path to ~40k is designed and profiled, not walked. The irreducible floor is GE_WAIT, ~19k cycles
-  of MAC compute that cannot be removed. The rest of the gap is shrinking readback and the last
-  attention residue — both mapped, neither built to silicon yet.
-- **Clock: 200 MHz MEASURED (§21, §24); 250 MHz is the open question.** Reaching it needs a
-  post-route-MET 5 ns build so silicon's observed ~1.3× margin covers the 1.25× ask. Not guaranteed.
+- **Streams: maxed at 16, proven.** The 2.0/DSP packing is the wall (§18); nothing more here.
+- **Clock: 200 MHz MEASURED; 250 MHz now unlocked in timing.** The campaign retired the worst
+  paths one at a time — LayerNorm (§21, then a second `prod*gamma` split), the attention score and
+  context multiplies, the softmax recip/divider, and finally the embed→residual URAM cone — until a
+  5 ns OOC corner closes MET (+0.074, zero failing). With silicon's observed ~1.3× margin that is a
+  genuine 250 MHz / ~75–78k shot; the remaining risk is the route closing at 98% LUT density, not
+  the timing model.
+- **Cycles: the floor is ~51,100, NOT 40,000.** This is the load-bearing finding, and it is
+  measured. The GE engine is a strictly serial FSM — RUN → readback → idle, one state per cycle —
+  and the per-state profile reconciles exactly to the gated 53,637: RUN (the irreducible MAC at
+  LANES=128) = **25,088 cyc** (DERIVED from the GEMM shapes), readback = 10,360 (irreducible at
+  P=8; widening needs a P=16 dequant that busts the LUT budget — proven dead), and the rest is the
+  LN→attention→residual serial chain that the lockstep GEMM consume will not let fully hide (the
+  §22/24 STOPs). Drive GE_IDLE to its physical minimum and the floor is **~51,100 cyc silicon**.
 
-State it plainly: **56,262.7 tok/s @200 MHz is MEASURED and current. 100k is PROJECTED** and needs
-*both* the cycle floor near 40k *and* 250 MHz silicon — two uncertainties, neither guaranteed, both
-mapped. 100k is not done, and this doc does not claim it.
+So the honest arithmetic: at the ~51,100-cyc floor, **200 MHz gives ~62.6k and 250 MHz gives
+~78.3k.** 40,000 cyc — and therefore 100k — is **not reachable at LANES=128/P=8.** It is off by
+~11,000 cycles even if every idle were hidden, because the serial RUN+readback floor alone is
+~37,000 and the un-hideable non-linear chain sits on top.
+
+**What 100k actually needs is the model, not the schedule.** The cycle floor is MAC-bound on the
+GEMM dimensions, so it scales with model size. LANES=256 would halve RUN — but it needs 2,048 DSPs
+the KV260 does not have (§18). The other halving is **a smaller model**: fewer parameters → smaller
+GEMMs → fewer RUN cycles → the floor drops toward 40k and 100k @250 comes into range. Which is the
+thesis closing on itself. The whole project rests on the claim that being dumb and being fast are
+the same property; the cycle floor says it again, quantitatively — the last lever to 100k on this
+chip is not a cleverer datapath, it is a *dumber Kevin*. Few word do trick, all the way up.
 
 ## Where it stands, what is left
 
 The model runs entirely in fabric, CPU out of the loop, generating bit-exact Kevin-speak across 16
-concurrent streams at **56,262.7 tok/s @200 MHz, MEASURED** — about +118% over the 25,744.5 record
-in roughly thirty hours of the lever campaign, and far past where doc 2's plan stopped. The stream
-ceiling is hit and proven; the remaining road is cycles and clock, both inside the same bit-honest
-gate ladder that got us here.
+concurrent streams at **59,965.5 tok/s @200 MHz, MEASURED** (16/16, 3/3) — about +133% over the
+25,744.5 stream-ceiling record across the lever campaign, and far past where doc 2's plan stopped.
 
-Two genuine uncertainties remain, and they are the whole of the gap to 100k. First, **250 MHz on
-silicon** — the cycle records that reach it in PROJECTED tok/s all assume a 250 MHz build the timing
-campaign has not yet produced clean. Second, **the last ~13k cycles** from the 53,565 gated floor
-down toward ~40k, which is designed and profiled but not yet built to a bitstream. Both are mapped;
-neither is walked. That is the honest line: the stream ceiling is behind us, the cycle and clock
-floors are in front, and 56.3k is the number that is actually true today.
+The honest close: the stream ceiling is behind us, the clock is unlocked in timing and one routable
+build away from the 250 MHz / ~78k shot, and the cycle floor is **measured at ~51,100** — which puts
+the realistic ceiling of *this architecture on this chip* at **~78k tok/s, not 100k.** 100k is real,
+but it is a different size of problem: LANES=256 (a bigger device) or a smaller model (the thesis,
+taken one rung further). The number that is actually true today is 59,965.5; the number this chip
+can reach is ~78k; and 100k is the next chip, or the next, dumber, model.
