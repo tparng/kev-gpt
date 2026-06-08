@@ -3,48 +3,51 @@
 The honest plan to make **100,000 tok/s the headline** on the KV260 — without a bigger
 chip and without a dumber Kevin. This is the one lever left that breaks the MAC floor.
 
-## ⏯ RESUME HERE (state as of 2026-06-08 ~14:00)
+## ⏯ RESUME HERE (state as of 2026-06-08 ~17:00)
 
 **Banked & pushed:** record **59,965.5 tok/s @200 MHz MEASURED** (N=16 split-brain,
 bitstream `C:/kevbuild/stage3_seqsb16_60b`, board `gemv_seqsb_53k.bit.bin`); single-clock
-**250 MHz proven dead** (4 builds, route-congestion-bound); **double-pump Stage 0 = GO**
-(`mac_bank_dp` bit-exact + ~393 MHz OOC, `0e0f7e1`).
+**250 MHz proven dead**; **double-pump Stage 0 = GO** (`mac_bank_dp` ~393 MHz OOC, `0e0f7e1`).
 
-**✅ Stage 1a (the LUT double-pump, sim) — DONE & pushed (`b4229c7`, `5d1abb8`, `9a9b469`).**
-The whole LUT path is double-pumped end-to-end and gated bit-exact, behind a `DP` parameter
-(default 0 = byte-identical single-pump; `DP=1` = `mac_bank_dp`, 2 K-steps/clk, `clk2x`
-threaded from the top). Gates all green:
-- `run_gemm16 --lut-only` → `GEMM16_DP_VERDICT ALL_BITEXACT` (N=8/16, K=256/1024, 2²⁰ corner)
-- `run_gemm_sb --lut-only` → `GEMM_SB_DP_VERDICT ALL_BITEXACT` (5 shapes/bases/skews + corner)
-- `run_sb_seq --nd 0 --tmax 16 --att2 0 --dp 1` → **16/16 ALL=True, `cyc_total` 53,745 → 46,525**
-  (DP=0→DP=1), i.e. **59,540 → 68,780 tok/s @200 MHz (sim, +15.5%)**. DP=0 regressions all
-  still `ALL_BITEXACT` (single-pump unbroken).
+**✅ Stage 1 (the FULL MAC double-pump + AQ feed, SIM) — DONE & pushed** (`b4229c7`,
+`5d1abb8`, `9a9b469`, `ca022c8`, `7ea16ed`). All bit-exact, behind a `DP` parameter
+(default 0 = byte-identical single-pump). The clk2x MAC + 2-wide AQ feed in SIM project:
 
-**The honest result:** the drop is **−7,220 cyc, not the −12,544 naive RUN halving.** With
-`ovl_en=1` the overlapped RUN's FIRST group of each GEMM is **AQ-bound** — activation
-production is 1 row / N=8 clks, which exactly ties the *single-pump* consume rate; the
-double-pump consumes 2× faster and stalls on it (the `row_ready` guard keeps it bit-exact,
-just bubbled). The MAC halving only fully lands on the MAC-bound group *tails* (later groups
-reuse the already-committed activations). So **Stage 1a LUT alone ≈ 68.8k projected, not ~78k.**
+| config (run_sb_seq --nd 0 --tmax 16) | cyc_total | tok/s @200 | note |
+|---|---|---|---|
+| `--att2 0 --dp 0` | 53,633 | 59,665 | baseline (also the MEASURED config) |
+| `--att2 0 --dp 1` | 44,161 | 72,462 | clk2x MAC + 2-wide AQ |
+| **`--att2 1 --dp 1`** | **39,577** | **80,855** | **+ per-cohort attention — the stack** |
+
+All 16/16 bit-exact (tok + x4 + lnf + head, every stream). **80,855 tok/s @200 MHz
+projected (sim)** — past the ~78k Stage 1 target. Pieces, each gated:
+- **MAC double-pump (LUT + DSP).** `mac_bank_dp` (LUT) and `mac_bank_dsp_dp` (the WP487
+  packed-pair leaf, 2 K-steps/clk into the clk2x DSP P-register, sum_act 2/clk). Gates:
+  `run_gemm16 --lut-only`/`--dp-full`, `run_gemm_sb --lut-only`/`--dp-dsp`, `run_sb_seq
+  --nd 6 --dp 1` — all ALL_BITEXACT.
+- **2-wide AQ feed.** The double-pumped MAC consumes 2 K-steps/clk; the AQ producer fed
+  1 stream-row/clk → group-0 AQ-bound (the −7,220-not-−12,544 gap). Fixed: nl_engine 2nd
+  AQ-feed read port (`ge_ra2`→`lnout1_r2`…), gemm_cohort_vec 2nd xm write port
+  (`x_we2`…), cohort_engine GE_AQ processes a stream PAIR/clk (commit in N/2=4 beats).
+  Drop grew −7,220 → −9,472.
 
 **THE NEXT STEPS, in order:**
-1. **The real unlock to ~78k: double-pump the dequant/AQ feed** so the MAC isn't
-   activation-starved. (This is "Stage 2" in the ladder below, but it now gates Stage 1's own
-   number — bring it forward.) Double-pump `vec_dequant` (the u_dq drain) + the `cohort_engine`
-   AQ row producer to 2 rows/clk; gate `run_sb_seq --dp 1` bit-exact, re-measure (target ~41k).
-2. **DSP-packed double-pump** — a `mac_bank_dsp_dp` twin of `mac_bank_dsp` for the `ND`
-   streams; gate `run_gemm16`/`run_gemm_sb`/`run_sb_seq` with `--nd 6`. Same clk2x structure;
-   the DSP P-register IS the clk2x accumulator, `sum_act` advances 2/clk.
-3. **Stage 1b (Vivado):** BD MMCM emits `clk2x` (400 MHz, phase-locked 2× of 200); the
-   `weight_bank_tdp` SYNTHESIS branch needs the real clk2x dual-beat read (today stubbed 0 —
-   see its `g_w` SYNTHESIS comment); Pblock the MAC island off the congested fabric; impl;
-   board `--fclk 200 --fclk2x 400` sweep → MEASURED.
+1. **Readback/dequant double-pump (RB, ~10,360 cyc) → ~92k.** GE_RB reads `gv_yout` 1
+   row/clk, dequants (`vec_dequant`, already 1/clk), writes NL banks (`dwr`) 1/clk. Mirror
+   the AQ widen: 2nd readback port on `gemm_cohort_vec` ymem + 2 `vec_dequant` lanes + 2nd
+   write port on the nl_engine qkv/attn/mlp/head banks. Gate `run_sb_seq --dp 1`, re-measure
+   (39,577 → ~34,500 target). Then idle/SETTLE trims toward 32,000 cyc = 100k @200.
+2. **Stage 1b (Vivado) — the silicon GO/NO-GO.** BD MMCM emits `clk2x` (400 MHz, phase-
+   locked 2× of 200); the `weight_bank_tdp` SYNTHESIS branch needs the real clk2x dual-beat
+   read (today stubbed 0 — its `g_w` SYNTHESIS comment); the nl_engine/xm 2nd ports map to
+   TDP BRAM; Pblock the MAC island off the congested fabric; impl; board `--fclk 200
+   --fclk2x 400` sweep → MEASURED. **This is the campaign's real GO/NO-GO** (does clk2x=400
+   close + run bit-exact on silicon). Spend-limited — one Vivado run at a time.
 
-**Key files:** `rtl/mac_bank_dp.sv` (proven leaf) + `tb/tb_macdp.sv` (the clk/clk2x convention
-— `always #5 clk`, `#2.5` quarter-shifted `clk2x`). The `DP` param + `clk2x` port now run
-through `gemm_banked_resident_vec`, `gemm_cohort_vec`, `weight_bank_tdp`, `gemm_split_brain`,
-`cohort_engine`, `sequencer_sb` and all three TBs. **Caution:** spend limit was hit
-2026-06-08 — keep Vivado runs one-at-a-time.
+**Key files:** `rtl/mac_bank_dp.sv` + `rtl/mac_bank_dsp_dp.sv` + `tb/tb_macdp.sv` (clk/clk2x
+convention: `always #5 clk`, `#2.5` quarter-shifted `clk2x`). `DP`+`clk2x` thread through
+`gemm_banked_resident_vec`, `gemm_cohort_vec`, `weight_bank_tdp`, `gemm_split_brain`,
+`cohort_engine`, `sequencer_sb`, `nl_engine` (2nd AQ read port) + all TBs.
 
 ## Why this, and why now
 
