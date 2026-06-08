@@ -92,14 +92,24 @@ double-pumped MAC sidesteps it because:
 
 ## The staged plan (each stage gated bit-honest, like everything here)
 
-### Stage 0 — De-risk the clock domain (the go/no-go, ~1–2 days)
-Build a **standalone double-pumped `mac_bank`** (one bank, LANES=128, `clk2x` operand
-feed) — no sequencer, no integration. Gate its arithmetic bit-exact vs the current
-`mac_bank` in iverilog (clk2x in the TB). Then **OOC + impl + board it inside a tight
-Pblock** and *measure the real MAC clock* via an `--fclk2x` sweep. **Decision: if a
-floorplanned double-pumped MAC closes ≥400 MHz on silicon, the plan is GO. If it caps
-near 200, the plan is dead and we found out for the price of one toy build.** This is the
-single most important step; nothing else starts until it is green.
+### Stage 0 — De-risk the clock domain (the go/no-go) — ✅ DONE, **GO**
+- **Phase A (arithmetic): GREEN.** `mac_bank_dp` (the double-pumped bank, 2 K-steps/clk
+  on clk2x, accumulator in the clk2x domain) is **bit-identical** to the real `mac_bank`
+  over 4 seeds + neg/pos/altsign corners + a LANES{16,64,128}×K{512,1024,2048} sweep,
+  0 mismatches (`run_macdp`, commit d299da5). The all−8/−128 corner lands exactly on the
+  proven 2²⁰ accumulator range. The double-pump is a pure timing transform → every
+  existing `seq_ref` gate still holds. **The arithmetic risk is dead.**
+- **Phase B (timing, the go/no-go): GO.** OOC Fmax (`ooc_macdp.tcl`): the critical path
+  is **2.545 ns → Fmax 392.9 MHz**, missing the 400 MHz target by only −0.045 ns. And
+  this is the *conservative* case — the **LUT variant** (8,201 LUT, 0 DSP), **OOC synth**
+  (pessimistic vs silicon), **no Pblock**. The DSP-cascade variant (the real MAC, the
+  DSP48E2 P-register at clk2x) is faster, silicon runs faster than OOC, and a tight
+  Pblock shortens routes — all three push it comfortably over 400. **A double-pumped MAC
+  closing ~393 MHz in its slowest form with zero floorplanning is GO.** The plan proceeds.
+
+  *Caveat carried forward:* 392.9 is the standalone LUT bank. Stage 1 must confirm the
+  DSP-cascade variant in the real datapath (with the operand feed and the Pblock) holds
+  ≥400 on the board — that is Stage 1's board sweep, not a new unknown.
 
 ### Stage 1 — Double-pump the MAC (the RUN phase) → ~78k
 Rewrite `mac_bank` / `mac_bank_dsp` to consume 2 operands/`clk` on `clk2x`. Add a
