@@ -28,9 +28,18 @@
 module weight_bank_tdp #(
     parameter integer LANES  = 128,
     parameter integer WWORDS = 25600,
+    // DOUBLE-PUMP-100K Stage 1: DP=1 each cohort consumes 2 weight words/clk, so
+    // each read port serves raddr AND raddr+1. In sim (Stage 1a) this is modelled
+    // as a second behavioral read of the same array (the plan-authorised "two
+    // reads of the URAM" model). On silicon (Stage 1b) it is the SAME URAM port
+    // clocked at clk2x — one word per clk2x edge — NOT a second physical port
+    // (TDP UltraRAM has only two ports, both already used). The SYNTHESIS branch
+    // here is unchanged (single read); the clk2x dual-beat read lands in Stage 1b.
+    parameter integer DP     = 0,
     parameter integer WBITS  = LANES*4
 ) (
     input  wire                          clk,
+    input  wire                          clk2x,    // 2x clk (DP=1 silicon; unused in sim model)
     // ---- boot load (drives port A writes) ----
     input  wire                          ld_rst,
     input  wire                          w_we,
@@ -38,9 +47,11 @@ module weight_bank_tdp #(
     // ---- port B read (cohort 0) ----
     input  wire [$clog2(WWORDS)-1:0]     raddr_b,
     output wire [WBITS-1:0]              rword_b,
+    output wire [WBITS-1:0]              rword1_b,   // DP: word at raddr_b+1 (phase 1)
     // ---- port A read (cohort 1) — only sampled at runtime (loader idle) ----
     input  wire [$clog2(WWORDS)-1:0]     raddr_a,
-    output wire [WBITS-1:0]              rword_a
+    output wire [WBITS-1:0]              rword_a,
+    output wire [WBITS-1:0]              rword1_a    // DP: word at raddr_a+1 (phase 1)
 );
     localparam integer WAW  = $clog2(WWORDS);
     localparam integer SUBW = WBITS / 32;
@@ -71,10 +82,16 @@ module weight_bank_tdp #(
 
     // port A address: write address at boot, cohort-1 read address at runtime.
     wire [WAW-1:0] aaddr = wcommit ? wword : raddr_a;
+    // DP phase-1 read addresses (raddr+1). Port A's +1 is don't-care during a
+    // boot write (the loader never reads); at runtime aaddr==raddr_a.
+    wire [WAW-1:0] aaddr1 = aaddr   + 1'b1;
+    wire [WAW-1:0] baddr1 = raddr_b + 1'b1;
 
-    wire [WPAD-1:0] rpad_a, rpad_b;
-    assign rword_a = rpad_a[WBITS-1:0];
-    assign rword_b = rpad_b[WBITS-1:0];
+    wire [WPAD-1:0] rpad_a, rpad_b, rpad1_a, rpad1_b;
+    assign rword_a  = rpad_a[WBITS-1:0];
+    assign rword_b  = rpad_b[WBITS-1:0];
+    assign rword1_a = rpad1_a[WBITS-1:0];
+    assign rword1_b = rpad1_b[WBITS-1:0];
 
     genvar gb;
     generate
@@ -112,6 +129,11 @@ module weight_bank_tdp #(
             );
             assign rpad_a[gb*BANKW +: BANKW] = douta;
             assign rpad_b[gb*BANKW +: BANKW] = doutb;
+            // DP phase-1 read: Stage 1b implements this as the SAME port clocked
+            // at clk2x (a second beat), NOT a third XPM port. Stubbed 0 here so
+            // the synth view still elaborates; no synth build happens in Stage 1a.
+            assign rpad1_a[gb*BANKW +: BANKW] = {BANKW{1'b0}};
+            assign rpad1_b[gb*BANKW +: BANKW] = {BANKW{1'b0}};
 `else
             // behavioral 2-port (sim): independent registered reads, one write
             // site on port A. Both reads are 1-cycle = the cohort pipeline stage 0.
@@ -124,6 +146,20 @@ module weight_bank_tdp #(
             end
             assign rpad_a[gb*BANKW +: BANKW] = rd_a;
             assign rpad_b[gb*BANKW +: BANKW] = rd_b;
+            // DP: second behavioral read at raddr+1, same 1-cycle latency (the
+            // plan-authorised "two reads of the URAM" sim model). DP=0 -> 0.
+            if (DP != 0) begin : g_rd2
+                reg [BANKW-1:0] rd1_a, rd1_b;
+                always @(posedge clk) begin
+                    rd1_a <= mem[aaddr1];
+                    rd1_b <= mem[baddr1];
+                end
+                assign rpad1_a[gb*BANKW +: BANKW] = rd1_a;
+                assign rpad1_b[gb*BANKW +: BANKW] = rd1_b;
+            end else begin : g_no_rd2
+                assign rpad1_a[gb*BANKW +: BANKW] = {BANKW{1'b0}};
+                assign rpad1_b[gb*BANKW +: BANKW] = {BANKW{1'b0}};
+            end
 `endif
         end
     endgenerate

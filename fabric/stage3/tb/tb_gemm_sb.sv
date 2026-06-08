@@ -51,8 +51,17 @@ module tb_gemm_sb;
     localparam integer NW = (WB1 + G1*K1 > WB0 + G0*K0) ? (WB1 + G1*K1) : (WB0 + G0*K0);
     localparam integer XR0 = K0/P, XR1 = K1/P;
 
+    // DOUBLE-PUMP-100K Stage 1: -DDPUMP exercises the double-pumped cohort path
+    // (DP=1, 2 K-steps/clk). clk2x quarter-shifted per the tb_macdp convention.
+`ifdef DPUMP
+    localparam integer DPV = 1;
+`else
+    localparam integer DPV = 0;
+`endif
     reg clk = 0, rst = 1;
-    always #5 clk = ~clk;
+    always #5 clk = ~clk;                 // 10 ns period, posedges at 5,15,...
+    reg clk2x = 0;
+    initial begin #2.5 forever #2.5 clk2x = ~clk2x; end   // rising at 2.5,7.5,...
 
     reg ld_rst=0, w_we=0;
     reg [31:0] w_data;
@@ -72,8 +81,8 @@ module tb_gemm_sb;
     end
 
     gemm_split_brain #(.LANES(LANES), .N(N), .ND(ND), .P(P), .MMAX(1024),
-                       .KMAX(1024), .RLAT(2), .WWORDS(25600)) dut (
-        .clk(clk), .rst(rst), .ld_rst(ld_rst), .w_we(w_we), .w_data(w_data),
+                       .KMAX(1024), .RLAT(2), .WWORDS(25600), .DP(DPV)) dut (
+        .clk(clk), .clk2x(clk2x), .rst(rst), .ld_rst(ld_rst), .w_we(w_we), .w_data(w_data),
         .c0_m_count(c0_m), .c0_k_count(c0_k), .c0_w_base(c0_wb),
         .c0_x_rst(c0_x_rst), .c0_x_we(c0_x_we), .c0_x_stream(c0_x_stream),
         .c0_x_row(c0_x_row), .c0_x_data(c0_x_data),

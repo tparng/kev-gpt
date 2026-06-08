@@ -24,9 +24,16 @@ module gemm_cohort_vec #(
     parameter integer KMAX   = 1024,
     parameter integer WWORDS = 25600,
     parameter integer RLAT   = 2,
+    // DOUBLE-PUMP-100K Stage 1: DP=1 runs the RUN MAC at 2 K-steps/clk via
+    // mac_bank_dp. Identical mechanism to gemm_banked_resident_vec.DP; the only
+    // difference is the weights are external — the shared weight_bank_tdp serves
+    // the phase-1 word (wword1_rd, addr waddr+1) alongside wword_rd. DP=1 is
+    // ND=0-only until the DSP leaf is double-pumped (the --nd 6 step).
+    parameter integer DP     = 0,
     parameter integer ABITS  = 24
 ) (
     input  wire                          clk,
+    input  wire                          clk2x,   // 2x clk, 0-deg aligned (DP=1 only)
     input  wire                          rst,
     input  wire [$clog2(MMAX+1)-1:0]     m_count,
     input  wire [$clog2(KMAX+1)-1:0]     k_count,
@@ -53,7 +60,8 @@ module gemm_cohort_vec #(
     output wire [P*32-1:0]               y_out,
     // ---- shared weight bank read interface (replaces the in-core URAM) ----
     output wire [$clog2(WWORDS)-1:0]     waddr,        // read addr to weight_bank_tdp
-    input  wire [LANES*4-1:0]            wword_rd      // registered word (1-cyc latency)
+    input  wire [LANES*4-1:0]            wword_rd,     // registered word (1-cyc latency)
+    input  wire [LANES*4-1:0]            wword1_rd     // DP: word at waddr+1 (phase 1)
 );
     localparam integer WBITS  = LANES*4;
     localparam integer YBITS  = LANES*ABITS;
@@ -89,23 +97,30 @@ module gemm_cohort_vec #(
     reg [$clog2(N):0]    db;
     reg                  acc_clr;
 
+    localparam integer   STEP    = (DP != 0) ? 2 : 1;   // K-steps/clk
     wire [$clog2(GROUPS):0] gcount = (m_count + LANES - 1) >> LSH;
     // stall the RUN's K-iteration when the x row it would read isn't committed yet
     // (only under overlap; otherwise all rows are present before `start`).
     wire                 row_ready = !ovl_en || (xrd_row < rows_committed);
-    wire                 issue   = (kc < k_count) && row_ready;
+    wire                 issue   = (kc < k_count) && row_ready;       // phase-0 valid
+    wire                 issue1  = (DP != 0) && ((kc + 1) < k_count) && row_ready;
     assign               waddr   = grp_base + kc;
-    wire [WBITS-1:0]     wword_word = wword_rd;   // 1-cycle registered (stage 0)
+    wire [WBITS-1:0]     wword_word  = wword_rd;    // 1-cycle registered (stage 0)
+    wire [WBITS-1:0]     wword1_word = wword1_rd;   // DP: phase-1 word (addr waddr+1)
 
-    reg [WBITS-1:0]      word_p [0:RLAT-2];
-    reg [LSHP-1:0]       xl_p   [0:RLAT-1];
-    reg                  v_p    [0:RLAT-1];
+    reg [WBITS-1:0]      word_p  [0:RLAT-2];
+    reg [WBITS-1:0]      word1_p [0:RLAT-2];   // DP: second weight word (phase 1)
+    reg [LSHP-1:0]       xl_p    [0:RLAT-1];
+    reg                  v_p     [0:RLAT-1];
+    reg                  v1_p    [0:RLAT-1];   // DP: phase-1 valid (odd-K tail mask)
     integer i, b;
     wire [$clog2(XROWS)-1:0] xrd_row = kc[$clog2(KMAX)-1:0] >> LSHP;
 
-    wire                 mac_v = v_p[RLAT-1];
+    wire                 mac_v  = v_p[RLAT-1];
+    wire                 mac_v1 = v1_p[RLAT-1];
 
-    wire [WBITS-1:0] wsel = word_p[RLAT-2];
+    wire [WBITS-1:0] wsel  = word_p[RLAT-2];
+    wire [WBITS-1:0] wsel1 = word1_p[RLAT-2];
 `ifdef SYNTHESIS
     wire [4*YBITS-1:0] acc_q0, acc_q1, acc_q2, acc_q3;
     reg  [YBITS-1:0] sel_q0, sel_q1, sel_q2, sel_q3;
@@ -129,14 +144,26 @@ module gemm_cohort_vec #(
                 for (xi = 1; xi < RLAT; xi = xi + 1) xr[xi] <= xr[xi-1];
             end
             wire [P*8-1:0]    xrow = xr[RLAT-1];
-            wire signed [7:0] xsel = xrow[xl_p[RLAT-1]*8 +: 8];
+            wire [LSHP-1:0]   xl0  = xl_p[RLAT-1];               // base (even) lane
+            wire signed [7:0] xsel = xrow[xl0*8 +: 8];          // phase-0 act (and DP=0/DSP)
+            // DP phase-1 act = next lane (xl0+1 in-row since xl0 even <= P-2);
+            // masked to 0 on the odd-K tail so the phase-1 accumulate no-ops.
+            wire signed [7:0] x1raw = xrow[(xl0 + 1'b1)*8 +: 8];
+            wire signed [7:0] xsel1 = mac_v1 ? x1raw : 8'sd0;
             wire [YBITS-1:0] acc_bank;
             if (gm < N - ND) begin : g_lut
-                mac_bank #(.LANES(LANES), .ABITS(ABITS)) u_mac (
-                    .clk(clk), .clr(rst || acc_clr), .en(mac_v),
-                    .w(wsel), .x(xsel), .acc(acc_bank));
+                if (DP != 0) begin : g_dpump
+                    mac_bank_dp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
+                        .clk(clk), .clk2x(clk2x), .clr(rst || acc_clr), .en(mac_v),
+                        .w0(wsel), .w1(wsel1), .x0(xsel), .x1(xsel1), .acc(acc_bank));
+                end else begin : g_single
+                    mac_bank #(.LANES(LANES), .ABITS(ABITS)) u_mac (
+                        .clk(clk), .clr(rst || acc_clr), .en(mac_v),
+                        .w(wsel), .x(xsel), .acc(acc_bank));
+                end
                 assign sa_str[gm] = 23'sd0;
             end else begin : g_dsp
+                // single-pump DSP leaf (NOT yet double-pumped); ND>0 only.
                 mac_bank_dsp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
                     .clk(clk), .clr(rst || acc_clr), .en(mac_v),
                     .w(wsel), .x(xsel), .acc(acc_bank),
@@ -159,14 +186,19 @@ module gemm_cohort_vec #(
     endgenerate
 
     always @(posedge clk) begin
-        word_p[0] <= wword_word;
-        xl_p[0]   <= kc[LSHP-1:0];
-        v_p[0]    <= (state == RUN) && issue;
-        for (i = 1; i < RLAT-1; i = i + 1)
-            word_p[i] <= word_p[i-1];
+        word_p[0]  <= wword_word;
+        word1_p[0] <= wword1_word;                  // DP (dead/trimmed when DP=0)
+        xl_p[0]    <= kc[LSHP-1:0];
+        v_p[0]     <= (state == RUN) && issue;
+        v1_p[0]    <= (state == RUN) && issue1;
+        for (i = 1; i < RLAT-1; i = i + 1) begin
+            word_p[i]  <= word_p[i-1];
+            word1_p[i] <= word1_p[i-1];
+        end
         for (i = 1; i < RLAT; i = i + 1) begin
             xl_p[i]   <= xl_p[i-1];
             v_p[i]    <= v_p[i-1];
+            v1_p[i]   <= v1_p[i-1];
         end
 
         acc_clr <= 1'b0;
@@ -174,7 +206,7 @@ module gemm_cohort_vec #(
             state <= IDLE; done <= 1'b0;
             g <= 0; kc <= 0; kmac <= 0; grp_base <= 0; db <= 0;
             acc_clr <= 1'b1;
-            for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+            for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v1_p[i] <= 1'b0; end
         end else begin
             case (state)
                 IDLE: begin
@@ -183,13 +215,15 @@ module gemm_cohort_vec #(
                         g <= 0; kc <= 0; kmac <= 0;
                         acc_clr <= 1'b1;
                         grp_base <= w_base;
-                        for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+                        for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v1_p[i] <= 1'b0; end
                         state <= RUN;
                     end
                 end
                 RUN: begin
-                    if (issue) kc <= kc + 1'b1;
-                    if (mac_v) kmac <= kmac + 1'b1;
+                    if (issue) kc <= kc + STEP;
+                    // phase 0 (+1) and, under DP, phase 1 (+1) unless masked on
+                    // the odd-K tail -> +2 or +1.
+                    if (mac_v) kmac <= kmac + (mac_v1 ? 2'd2 : 2'd1);
 `ifdef SYNTHESIS
                     if (kmac == k_count) begin db <= 0; state <= DRAIN; end
 `else
@@ -252,7 +286,7 @@ module gemm_cohort_vec #(
                         else begin
                             g <= g + 1'b1; kc <= 0; kmac <= 0;
                             grp_base <= grp_base + k_count;
-                            for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+                            for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v1_p[i] <= 1'b0; end
                             state <= RUN;
                         end
                     end else db <= db + 1'b1;

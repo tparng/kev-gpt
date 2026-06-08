@@ -67,18 +67,21 @@ def write_case(d, lanes, n, M0, K0, WB0, M1, K1, WB1, seed, corner=False):
     return y0, y1
 
 
-def run_cfg(d, lanes, n, nd, M0, K0, WB0, M1, K1, WB1, skew, seed, corner):
+def run_cfg(d, lanes, n, nd, M0, K0, WB0, M1, K1, WB1, skew, seed, corner, dpump=False):
     os.makedirs(d, exist_ok=True)
     y0, y1 = write_case(d, lanes, n, M0, K0, WB0, M1, K1, WB1, seed, corner)
     vvp = os.path.join(d, "sim.vvp")
     defs = [f"-DLANES={lanes}", f"-DNSTR={n}", f"-DNDSP={nd}",
             f"-DM0={M0}", f"-DK0={K0}", f"-DWB0={WB0}",
             f"-DM1={M1}", f"-DK1={K1}", f"-DWB1={WB1}", f"-DSKEW={skew}"]
+    if dpump:
+        defs.append("-DDPUMP")
     cc = subprocess.run(["iverilog", "-g2012", "-o", vvp, *defs, TB,
                          os.path.join(RTL, "gemm_split_brain.sv"),
                          os.path.join(RTL, "gemm_cohort_vec.sv"),
                          os.path.join(RTL, "weight_bank_tdp.sv"),
-                         os.path.join(RTL, "gemm_banked_resident_vec.sv")],
+                         os.path.join(RTL, "gemm_banked_resident_vec.sv"),
+                         os.path.join(RTL, "mac_bank_dp.sv")],
                         capture_output=True, text=True)
     if cc.returncode != 0:
         print("IVERILOG_COMPILE_FAIL"); print(cc.stdout); print(cc.stderr); return False
@@ -94,7 +97,8 @@ def run_cfg(d, lanes, n, nd, M0, K0, WB0, M1, K1, WB1, skew, seed, corner):
                                dtype=np.int64)
             bad += int(np.sum(got[:M] != ys[:, s]))
     tag = "corner" if corner else f"seed{seed}"
-    print(f"GEMM_SB N={n} ND={nd} c0=({M0},{K0})@{WB0} c1=({M1},{K1})@{WB1} "
+    dp = "DP " if dpump else ""
+    print(f"GEMM_SB {dp}N={n} ND={nd} c0=({M0},{K0})@{WB0} c1=({M1},{K1})@{WB1} "
           f"skew={skew} {tag}: mismatches={bad}/{(M0+M1)*n} "
           f"{'OK' if bad == 0 else 'FAIL'}")
     return bad == 0
@@ -104,6 +108,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="fabric.stage3.run_gemm_sb")
     p.add_argument("--lanes", type=int, default=128)
     p.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_gemm_sb"))
+    p.add_argument("--lut-only", action="store_true",
+                   help="DOUBLE-PUMP Stage 1a: gate the double-pumped cohort path "
+                        "(DP=1) on the ND=0 cases only (DSP not yet double-pumped).")
     a = p.parse_args(argv)
 
     # (M0,K0,WB0, M1,K1,WB1, skew, seed, corner)
@@ -114,6 +121,18 @@ def main(argv=None):
         (256, 1024, 0,  256, 1024, 2048, 0, 4, True),   # |acc|=2^20 corner, no skew
         (1024, 256, 0,  768, 256, 2048, 11, 5, False),  # mlp1 vs qkv (c0 G0*K0=2048)
     ]
+    if a.lut_only:
+        # DP=1 cohort beachhead — the same ND=0 cases (shapes, bases, skew, the
+        # 2^20 corner), double-pumped. The desync (skew) still proves the two
+        # read ports are independent while each runs 2 K-steps/clk.
+        ok = True
+        for (M0, K0, WB0, M1, K1, WB1, skew, seed, corner) in cases:
+            d = os.path.join(a.dir, f"dp_c{M0}x{K0}_{M1}x{K1}_s{seed}")
+            ok &= run_cfg(d, a.lanes, 8, 0, M0, K0, WB0, M1, K1, WB1, skew, seed,
+                          corner, dpump=True)
+        print("GEMM_SB_DP_VERDICT " + ("ALL_BITEXACT" if ok else "FAIL"))
+        return 0 if ok else 1
+
     ok = True
     for (M0, K0, WB0, M1, K1, WB1, skew, seed, corner) in cases:
         d = os.path.join(a.dir, f"c{M0}x{K0}_{M1}x{K1}_s{seed}")

@@ -20,9 +20,11 @@ module gemm_split_brain #(
     parameter integer KMAX   = 1024,
     parameter integer WWORDS = 25600,
     parameter integer RLAT   = 2,
+    parameter integer DP     = 0,         // DOUBLE-PUMP-100K Stage 1: 2 K-steps/clk
     parameter integer ABITS  = 24
 ) (
     input  wire                          clk,
+    input  wire                          clk2x,   // 2x clk, 0-deg aligned (DP=1 only)
     input  wire                          rst,
     // ---- one-time shared weight load ----
     input  wire                          ld_rst,
@@ -61,32 +63,33 @@ module gemm_split_brain #(
 
     wire [$clog2(WWORDS)-1:0] waddr_b, waddr_a;
     wire [WBITS-1:0]          wword_b, wword_a;
+    wire [WBITS-1:0]          wword1_b, wword1_a;     // DP: phase-1 words (addr+1)
 
-    weight_bank_tdp #(.LANES(LANES), .WWORDS(WWORDS)) u_wbank (
-        .clk(clk),
+    weight_bank_tdp #(.LANES(LANES), .WWORDS(WWORDS), .DP(DP)) u_wbank (
+        .clk(clk), .clk2x(clk2x),
         .ld_rst(ld_rst), .w_we(w_we), .w_data(w_data),
-        .raddr_b(waddr_b), .rword_b(wword_b),
-        .raddr_a(waddr_a), .rword_a(wword_a));
+        .raddr_b(waddr_b), .rword_b(wword_b), .rword1_b(wword1_b),
+        .raddr_a(waddr_a), .rword_a(wword_a), .rword1_a(wword1_a));
 
     gemm_cohort_vec #(.LANES(LANES), .N(N), .ND(ND), .P(P), .MMAX(MMAX),
-                      .KMAX(KMAX), .WWORDS(WWORDS), .RLAT(RLAT), .ABITS(ABITS)) u_c0 (
-        .clk(clk), .rst(rst),
+                      .KMAX(KMAX), .WWORDS(WWORDS), .RLAT(RLAT), .DP(DP), .ABITS(ABITS)) u_c0 (
+        .clk(clk), .clk2x(clk2x), .rst(rst),
         .m_count(c0_m_count), .k_count(c0_k_count), .w_base(c0_w_base),
         .x_rst(c0_x_rst), .x_we(c0_x_we), .x_stream(c0_x_stream),
         .x_row(c0_x_row), .x_data(c0_x_data),
         .ovl_en(1'b0), .x_rowcommit(1'b0),
         .start(c0_start), .done(c0_done),
         .rd_stream(c0_rd_stream), .rd_addr(c0_rd_addr), .y_out(c0_y_out),
-        .waddr(waddr_b), .wword_rd(wword_b));
+        .waddr(waddr_b), .wword_rd(wword_b), .wword1_rd(wword1_b));
 
     gemm_cohort_vec #(.LANES(LANES), .N(N), .ND(ND), .P(P), .MMAX(MMAX),
-                      .KMAX(KMAX), .WWORDS(WWORDS), .RLAT(RLAT), .ABITS(ABITS)) u_c1 (
-        .clk(clk), .rst(rst),
+                      .KMAX(KMAX), .WWORDS(WWORDS), .RLAT(RLAT), .DP(DP), .ABITS(ABITS)) u_c1 (
+        .clk(clk), .clk2x(clk2x), .rst(rst),
         .m_count(c1_m_count), .k_count(c1_k_count), .w_base(c1_w_base),
         .x_rst(c1_x_rst), .x_we(c1_x_we), .x_stream(c1_x_stream),
         .x_row(c1_x_row), .x_data(c1_x_data),
         .ovl_en(1'b0), .x_rowcommit(1'b0),
         .start(c1_start), .done(c1_done),
         .rd_stream(c1_rd_stream), .rd_addr(c1_rd_addr), .y_out(c1_y_out),
-        .waddr(waddr_a), .wword_rd(wword_a));
+        .waddr(waddr_a), .wword_rd(wword_a), .wword1_rd(wword1_a));
 endmodule
