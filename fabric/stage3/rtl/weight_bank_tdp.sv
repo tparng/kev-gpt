@@ -118,9 +118,15 @@ module weight_bank_tdp #(
                     .BYTE_WRITE_WIDTH_A(BANKW), .BYTE_WRITE_WIDTH_B(BANKW),
                     .CLOCKING_MODE("common_clock"),
                     .MEMORY_PRIMITIVE("ultra"),
+                    // CASCADE_HEIGHT=2: cap the URAM cascade so the 400 MHz read
+                    // doesn't chain ~7 CAS_IN->CAS_OUT hops (the -2.368ns crit path);
+                    // shallow cascades + a final mux are faster than the deep chain.
+                    .CASCADE_HEIGHT(2),
                     .MEMORY_SIZE(BANKW*WWORDS),
                     .READ_DATA_WIDTH_A(BANKW), .READ_DATA_WIDTH_B(BANKW),
-                    .READ_LATENCY_A(1), .READ_LATENCY_B(1),
+                    // +1 pipeline register in the URAM cascade (Vivado 8-6057): the
+                    // 400 MHz read needs it. READ_LATENCY=3 -> dout 3 clk2x after addr.
+                    .READ_LATENCY_A(3), .READ_LATENCY_B(3),
                     .WRITE_DATA_WIDTH_A(BANKW), .WRITE_DATA_WIDTH_B(BANKW),
                     .WRITE_MODE_A("no_change"), .WRITE_MODE_B("no_change")
                 ) u_tdp (
