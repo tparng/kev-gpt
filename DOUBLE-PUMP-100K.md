@@ -9,56 +9,48 @@ chip and without a dumber Kevin. This is the one lever left that breaks the MAC 
 bitstream `C:/kevbuild/stage3_seqsb16_60b`, board `gemv_seqsb_53k.bit.bin`); single-clock
 **250 MHz proven dead**; **double-pump Stage 0 = GO** (`mac_bank_dp` ~393 MHz OOC, `0e0f7e1`).
 
-**✅ Stage 1 (the FULL MAC double-pump + AQ feed, SIM) — DONE & pushed** (`b4229c7`,
-`5d1abb8`, `9a9b469`, `ca022c8`, `7ea16ed`). All bit-exact, behind a `DP` parameter
-(default 0 = byte-identical single-pump). The clk2x MAC + 2-wide AQ feed in SIM project:
+**✅ Stage 1 + Stage 2 (the FULL double-pump: MAC + AQ feed + RB/dequant, SIM) — DONE &
+pushed** (`b4229c7`…`01169cf`). All bit-exact, behind a `DP` parameter (default 0 =
+byte-identical single-pump). The clk2x MAC + 2-wide AQ + 2-wide RB in SIM project:
 
 | config (run_sb_seq --nd 0 --tmax 16) | cyc_total | tok/s @200 | note |
 |---|---|---|---|
 | `--att2 0 --dp 0` | 53,633 | 59,665 | baseline (also the MEASURED config) |
-| `--att2 0 --dp 1` | 44,161 | 72,462 | clk2x MAC + 2-wide AQ |
-| **`--att2 1 --dp 1`** | **39,577** | **80,855** | **+ per-cohort attention — the stack** |
+| `--att2 0 --dp 1` | 38,256 | 83,647 | clk2x MAC + 2-wide AQ + 2-wide RB |
+| **`--att2 1 --dp 1`** | **36,179** | **88,449** | **+ per-cohort attention — the stack** |
 
-All 16/16 bit-exact (tok + x4 + lnf + head, every stream). **80,855 tok/s @200 MHz
-projected (sim)** — past the ~78k Stage 1 target. Pieces, each gated:
-- **MAC double-pump (LUT + DSP).** `mac_bank_dp` (LUT) and `mac_bank_dsp_dp` (the WP487
-  packed-pair leaf, 2 K-steps/clk into the clk2x DSP P-register, sum_act 2/clk). Gates:
-  `run_gemm16 --lut-only`/`--dp-full`, `run_gemm_sb --lut-only`/`--dp-dsp`, `run_sb_seq
-  --nd 6 --dp 1` — all ALL_BITEXACT.
-- **2-wide AQ feed.** The double-pumped MAC consumes 2 K-steps/clk; the AQ producer fed
-  1 stream-row/clk → group-0 AQ-bound (the −7,220-not-−12,544 gap). Fixed: nl_engine 2nd
-  AQ-feed read port (`ge_ra2`→`lnout1_r2`…), gemm_cohort_vec 2nd xm write port
-  (`x_we2`…), cohort_engine GE_AQ processes a stream PAIR/clk (commit in N/2=4 beats).
-  Drop grew −7,220 → −9,472.
+All 16/16 bit-exact (tok + x4 + lnf + head, every stream). **88,449 tok/s @200 MHz
+projected (sim)** — 4,179 cyc from 100k @200. Pieces, each gated:
+- **MAC double-pump (LUT + DSP).** `mac_bank_dp` (LUT) + `mac_bank_dsp_dp` (WP487 pair,
+  2 K-steps/clk into the clk2x DSP P-register, sum_act 2/clk). Gates: `run_gemm16
+  --lut-only`/`--dp-full`, `run_gemm_sb --lut-only`/`--dp-dsp`, `run_sb_seq --nd 6 --dp 1`.
+- **2-wide AQ feed.** nl_engine 2nd AQ read port (`ge_ra2`→`lnout1_r2`…), gemm_cohort_vec
+  2nd xm write port, cohort_engine GE_AQ pair/clk (commit in N/2=4 beats).
+- **2-wide RB/dequant.** gemm_cohort_vec `y_out2` (free 2nd row); sequencer_sb 2nd shared
+  lane `u_dq2`/`u_gelu2` + `sh_dq_ra+1` ROM read; cohort_engine GE_RB pair-walk (gci/gdor/
+  gor +2, parity-safe for the odd head rb_rows=25); nl_engine 2nd `dw`/`dwm` write port.
 
 **THE NEXT STEPS, in order:**
-1. **Readback/dequant double-pump (RB, ~10,360 cyc) → ~92k. STEP 1 DONE (`ab2cdd3`).**
-   `gemm_cohort_vec` now emits `y_out2` = the 2nd readback row (free: the next P-group of
-   the already-read group word; full LUT+DSP recovery duplicated; non-regressing). **Remaining
-   (the bulk, a shared-resource surgery):**
-   - **`sequencer_sb` shared NL feed → 2-wide.** The dequant AND gelu are each ONE shared,
-     arbitrated unit (`u_dq`/`u_gelu`) + shared `dqm_w`/`dqe_w` ROMs. Add a 2nd lane: `u_dq2`
-     (gemvy2 = the granted cohort's `dq_gemvy_o2`, mant/exp from `sh_dq_ra+1`), `u_gelu2`,
-     and broadcast `sh_dq_vout2`/`sh_dq_out2` (+ gl) to both cohorts.
-   - **`cohort_engine` GE_RB → 2-wide.** Verified semantics: `LSH=clog2(P)=3`, so GE_RB walks
-     `m/P` rows/stream (every layer dim is a multiple of 16 → even → pairs clean). The issue
-     counter `gci` and the write counter `gdor` are DECOUPLED by the dq pipeline latency — both
-     advance by 2. Read `gv_yout`+`gv_yout2`, feed both dq/gl lanes, write 2 `dwr`/clk.
-   - **`nl_engine` 2nd `dw` write port** on the qkv/attn/mlp/head banks (`dw_we2`/`dw_addr2`/
-     `dw_data2`) + the `mlpbuf`/gl write.
-   Gate `run_sb_seq --dp 1`, re-measure (39,577 → ~34,500). Then idle/SETTLE trims → 32,000
-   cyc = 100k @200. **This is its own focused session (5-file shared-resource surgery).**
+1. **Close the last 4,179 cyc to 100k SIM (idle/SETTLE/inter-stream trims).** Candidates: the
+   `gemm_cohort_vec` SETTLE drain (4 cyc/call, sim-only — silicon skips it, so the board cyc
+   is already lower than sim), the GE_RBN inter-stream gap (2 cyc × N streams × calls), the
+   per-call IDLE→RUN/FIN handshake. Measure each; gate bit-exact. (Note: 100k @200 needs
+   32,000 cyc; silicon also gets the ~1.3× overclock margin on top, so the board may reach
+   100k before the sim does.)
 2. **Stage 1b (Vivado) — the silicon GO/NO-GO.** BD MMCM emits `clk2x` (400 MHz, phase-
    locked 2× of 200); the `weight_bank_tdp` SYNTHESIS branch needs the real clk2x dual-beat
-   read (today stubbed 0 — its `g_w` SYNTHESIS comment); the nl_engine/xm 2nd ports map to
-   TDP BRAM; Pblock the MAC island off the congested fabric; impl; board `--fclk 200
-   --fclk2x 400` sweep → MEASURED. **This is the campaign's real GO/NO-GO** (does clk2x=400
-   close + run bit-exact on silicon). Spend-limited — one Vivado run at a time.
+   read (today stubbed 0 — its `g_w` SYNTHESIS comment); the nl_engine/xm/dw 2nd ports map to
+   TDP BRAM (2-write may need a replica); Pblock the MAC island off the congested fabric;
+   impl; board `--fclk 200 --fclk2x 400` sweep → MEASURED. **This is the campaign's real
+   GO/NO-GO** (does clk2x=400 close + run bit-exact on silicon). Spend-limited — one at a time.
 
 **Key files:** `rtl/mac_bank_dp.sv` + `rtl/mac_bank_dsp_dp.sv` + `tb/tb_macdp.sv` (clk/clk2x
 convention: `always #5 clk`, `#2.5` quarter-shifted `clk2x`). `DP`+`clk2x` thread through
 `gemm_banked_resident_vec`, `gemm_cohort_vec`, `weight_bank_tdp`, `gemm_split_brain`,
-`cohort_engine`, `sequencer_sb`, `nl_engine` (2nd AQ read port) + all TBs.
+`cohort_engine`, `sequencer_sb`, `nl_engine` + all TBs. The AQ 2-wide (nl_engine `ge_ra2`,
+gemm_cohort_vec `x_we2`, cohort_engine GE_AQ) and the RB 2-wide (gemm_cohort_vec `y_out2`,
+sequencer_sb `u_dq2`/`u_gelu2`, cohort_engine GE_RB, nl_engine `dw_we2`) are ALWAYS-on
+(correctness-neutral at DP=0), gated via `run_sb_seq --dp {0,1}`.
 
 ## Why this, and why now
 
