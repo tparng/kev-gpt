@@ -163,11 +163,17 @@ module gemm_cohort_vec #(
                 end
                 assign sa_str[gm] = 23'sd0;
             end else begin : g_dsp
-                // single-pump DSP leaf (NOT yet double-pumped); ND>0 only.
-                mac_bank_dsp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
-                    .clk(clk), .clr(rst || acc_clr), .en(mac_v),
-                    .w(wsel), .x(xsel), .acc(acc_bank),
-                    .sum_act_o(sa_str[gm]));
+                if (DP != 0) begin : g_dsp_dp
+                    mac_bank_dsp_dp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
+                        .clk(clk), .clk2x(clk2x), .clr(rst || acc_clr), .en(mac_v),
+                        .w0(wsel), .w1(wsel1), .x0(xsel), .x1(xsel1),
+                        .acc(acc_bank), .sum_act_o(sa_str[gm]));
+                end else begin : g_dsp_sp
+                    mac_bank_dsp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
+                        .clk(clk), .clr(rst || acc_clr), .en(mac_v),
+                        .w(wsel), .x(xsel), .acc(acc_bank),
+                        .sum_act_o(sa_str[gm]));
+                end
             end
 `ifdef SYNTHESIS
             if (gm/4 == 0) begin : g_q0

@@ -81,7 +81,8 @@ def run_cfg(d, lanes, n, nd, M0, K0, WB0, M1, K1, WB1, skew, seed, corner, dpump
                          os.path.join(RTL, "gemm_cohort_vec.sv"),
                          os.path.join(RTL, "weight_bank_tdp.sv"),
                          os.path.join(RTL, "gemm_banked_resident_vec.sv"),
-                         os.path.join(RTL, "mac_bank_dp.sv")],
+                         os.path.join(RTL, "mac_bank_dp.sv"),
+                         os.path.join(RTL, "mac_bank_dsp_dp.sv")],
                         capture_output=True, text=True)
     if cc.returncode != 0:
         print("IVERILOG_COMPILE_FAIL"); print(cc.stdout); print(cc.stderr); return False
@@ -110,7 +111,10 @@ def main(argv=None):
     p.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_gemm_sb"))
     p.add_argument("--lut-only", action="store_true",
                    help="DOUBLE-PUMP Stage 1a: gate the double-pumped cohort path "
-                        "(DP=1) on the ND=0 cases only (DSP not yet double-pumped).")
+                        "(DP=1) on the ND=0 cases only.")
+    p.add_argument("--dp-dsp", action="store_true",
+                   help="DOUBLE-PUMP: gate DP=1 with ND=8 cohorts (mac_bank_dsp_dp), "
+                        "two desynced all-DSP cohorts incl the 2^20 corner.")
     a = p.parse_args(argv)
 
     # (M0,K0,WB0, M1,K1,WB1, skew, seed, corner)
@@ -131,6 +135,17 @@ def main(argv=None):
             ok &= run_cfg(d, a.lanes, 8, 0, M0, K0, WB0, M1, K1, WB1, skew, seed,
                           corner, dpump=True)
         print("GEMM_SB_DP_VERDICT " + ("ALL_BITEXACT" if ok else "FAIL"))
+        return 0 if ok else 1
+
+    if a.dp_dsp:
+        # DP=1 with all-DSP cohorts (ND=8) — gates mac_bank_dsp_dp through the
+        # split-brain (two desynced cohorts), incl shapes/bases/skew + the corner.
+        ok = True
+        for (M0, K0, WB0, M1, K1, WB1, skew, seed, corner) in cases:
+            d = os.path.join(a.dir, f"dpdsp_c{M0}x{K0}_{M1}x{K1}_s{seed}")
+            ok &= run_cfg(d, a.lanes, 8, 8, M0, K0, WB0, M1, K1, WB1, skew, seed,
+                          corner, dpump=True)
+        print("GEMM_SB_DPDSP_VERDICT " + ("ALL_BITEXACT" if ok else "FAIL"))
         return 0 if ok else 1
 
     ok = True

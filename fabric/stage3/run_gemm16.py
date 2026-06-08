@@ -21,7 +21,8 @@ from .pack_banked import pack_transposed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RTL = os.path.join(HERE, "rtl", "gemm_banked_resident_vec.sv")
-MAC_DP = os.path.join(HERE, "rtl", "mac_bank_dp.sv")   # double-pumped LUT leaf (DP=1)
+MAC_DP = os.path.join(HERE, "rtl", "mac_bank_dp.sv")       # double-pumped LUT leaf (DP=1)
+MAC_DSP_DP = os.path.join(HERE, "rtl", "mac_bank_dsp_dp.sv")  # double-pumped DSP leaf (DP=1, ND>0)
 TB = os.path.join(HERE, "tb", "tb_gemm16.sv")
 P = 8
 
@@ -60,7 +61,8 @@ def run_cfg(d, M, K, lanes, n, nd, seed, corner, dpump=False):
             f"-DMVAL={M}", f"-DKVAL={K}"]
     if dpump:
         defs.append("-DDPUMP")
-    cc = subprocess.run(["iverilog", "-g2012", "-o", vvp] + defs + [TB, RTL, MAC_DP],
+    cc = subprocess.run(["iverilog", "-g2012", "-o", vvp] + defs +
+                        [TB, RTL, MAC_DP, MAC_DSP_DP],
                         capture_output=True, text=True)
     if cc.returncode != 0:
         print("IVERILOG_COMPILE_FAIL"); print(cc.stdout); print(cc.stderr)
@@ -89,8 +91,10 @@ def main(argv=None):
     p.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_gemm16"))
     p.add_argument("--lut-only", action="store_true",
                    help="DOUBLE-PUMP Stage 1a: gate the double-pumped LUT path "
-                        "(DP=1) on ND=0 cases only — the DSP path is not yet "
-                        "double-pumped (the --nd 6 step).")
+                        "(DP=1) on ND=0 cases only.")
+    p.add_argument("--dp-full", action="store_true",
+                   help="DOUBLE-PUMP: gate DP=1 over the FULL case list incl the "
+                        "DSP-packed leaves (mac_bank_dsp_dp), ND=8/16 + 2^20 corner.")
     a = p.parse_args(argv)
 
     if a.lut_only:
@@ -120,6 +124,16 @@ def main(argv=None):
         (256, 1024, 16, 8, 5, True),      # |acc| = 2^20 range-proof corner
         (256, 256, 16, 16, 6, False),     # all-DSP sanity
     ]
+    if a.dp_full:
+        # DP=1 over the mixed/all-DSP cases — gates mac_bank_dsp_dp (the packed-pair
+        # leaf at 2 K-steps/clk) incl the 2^20 corner and the all-DSP ND=16 case.
+        ok = True
+        for M, K, n, nd, seed, corner in cases:
+            d = os.path.join(a.dir, f"dpf_n{n}_nd{nd}_m{M}_k{K}_{'c' if corner else seed}")
+            ok &= run_cfg(d, M, K, a.lanes, n, nd, seed, corner, dpump=True)
+        print("GEMM16_DPFULL_VERDICT " + ("ALL_BITEXACT" if ok else "FAIL"))
+        return 0 if ok else 1
+
     ok = True
     for M, K, n, nd, seed, corner in cases:
         d = os.path.join(a.dir, f"n{n}_nd{nd}_m{M}_k{K}_{'c' if corner else seed}")
