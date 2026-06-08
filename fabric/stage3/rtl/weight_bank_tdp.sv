@@ -93,12 +93,66 @@ module weight_bank_tdp #(
     assign rword1_a = rpad1_a[WBITS-1:0];
     assign rword1_b = rpad1_b[WBITS-1:0];
 
+    // DOUBLE-PUMP-100K Stage 1b: at DP=1 the XPM runs in the clk2x domain so each
+    // port serves TWO words/clk (the same physical port, a 2nd beat — NOT a 3rd
+    // port: TDP UltraRAM has only two). The read address is phase-muxed by the clk
+    // LEVEL (clk high = the even K-step raddr; clk low = the odd K-step raddr+1),
+    // exactly the phase anchoring mac_bank_dp uses. The two beats' results are
+    // captured into clk-stable rpad/rpad1 (1-clk latency = the behavioral model).
+    // The behavioral (iverilog) side stays the plain 2-read model; this XPM side
+    // is the board-validated path (the codebase convention).
+    localparam integer URCLK_DP = (DP != 0) ? 1 : 0;
     genvar gb;
     generate
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
 `ifdef SYNTHESIS
-            // PROVEN: xpm_memory_tdpram ultra, both ports independent.
-            // Port A = write(boot)/read(cohort1); Port B = read(cohort0).
+            if (URCLK_DP) begin : g_clk2x
+                // ---- clk2x-clocked port: 2 beats/clk per port -------------------
+                // beat addresses by clk level (held stable across the clk period):
+                wire [WAW-1:0] addrb_2x = clk ? raddr_b : baddr1;     // even / odd K-step
+                wire [WAW-1:0] addra_rd = clk ? raddr_a : aaddr1;
+                wire [WAW-1:0] addra_2x = wcommit ? wword : addra_rd; // boot write idempotent @2x
+                wire [BANKW-1:0] douta, doutb;
+                xpm_memory_tdpram #(
+                    .ADDR_WIDTH_A(WAW), .ADDR_WIDTH_B(WAW),
+                    .BYTE_WRITE_WIDTH_A(BANKW), .BYTE_WRITE_WIDTH_B(BANKW),
+                    .CLOCKING_MODE("common_clock"),
+                    .MEMORY_PRIMITIVE("ultra"),
+                    .MEMORY_SIZE(BANKW*WWORDS),
+                    .READ_DATA_WIDTH_A(BANKW), .READ_DATA_WIDTH_B(BANKW),
+                    .READ_LATENCY_A(1), .READ_LATENCY_B(1),
+                    .WRITE_DATA_WIDTH_A(BANKW), .WRITE_DATA_WIDTH_B(BANKW),
+                    .WRITE_MODE_A("no_change"), .WRITE_MODE_B("no_change")
+                ) u_tdp (
+                    .clka(clk2x), .clkb(clk2x),
+                    .rsta(1'b0), .rstb(1'b0),
+                    .ena(1'b1), .enb(1'b1),
+                    .regcea(1'b1), .regceb(1'b1),
+                    .wea(wcommit), .web(1'b0),
+                    .addra(addra_2x), .addrb(addrb_2x),
+                    .dina(wnext_pad[gb*BANKW +: BANKW]), .dinb({BANKW{1'b0}}),
+                    .douta(douta), .doutb(doutb),
+                    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+                    .injectsbiterrb(1'b0), .injectdbiterrb(1'b0),
+                    .sbiterra(), .dbiterra(), .sbiterrb(), .dbiterrb(),
+                    .sleep(1'b0)
+                );
+                // capture: dout at clk2x edge E = read of the addr from E-1, whose
+                // phase was clk(E-1). Tag dout with clk delayed 1 clk2x, demux into
+                // the even-K (rpad) and odd-K (rpad1) holding regs.
+                reg clk_d1;
+                reg [BANKW-1:0] capb0, capb1, capa0, capa1;
+                always @(posedge clk2x) begin
+                    clk_d1 <= clk;
+                    if (clk_d1) begin capb0 <= doutb; capa0 <= douta; end  // even K-step
+                    else        begin capb1 <= doutb; capa1 <= douta; end  // odd  K-step
+                end
+                assign rpad_a[gb*BANKW +: BANKW]  = capa0;
+                assign rpad_b[gb*BANKW +: BANKW]  = capb0;
+                assign rpad1_a[gb*BANKW +: BANKW] = capa1;
+                assign rpad1_b[gb*BANKW +: BANKW] = capb1;
+            end else begin : g_clk1x
+            // ---- DP=0: PROVEN single-beat clk read (rpad1 unused) ---------------
             wire [BANKW-1:0] douta, doutb;
             xpm_memory_tdpram #(
                 .ADDR_WIDTH_A(WAW), .ADDR_WIDTH_B(WAW),
@@ -109,9 +163,6 @@ module weight_bank_tdp #(
                 .READ_DATA_WIDTH_A(BANKW), .READ_DATA_WIDTH_B(BANKW),
                 .READ_LATENCY_A(1), .READ_LATENCY_B(1),
                 .WRITE_DATA_WIDTH_A(BANKW), .WRITE_DATA_WIDTH_B(BANKW),
-                // TDP UltraRAM REQUIRES no_change (XPM_MEMORY 40-14) — and it is
-                // what the proven uram_dual experiment used. Runtime-identical to
-                // the behavioral model: the loader is idle (wea=0) once boot ends.
                 .WRITE_MODE_A("no_change"), .WRITE_MODE_B("no_change")
             ) u_tdp (
                 .clka(clk), .clkb(clk),
@@ -129,11 +180,9 @@ module weight_bank_tdp #(
             );
             assign rpad_a[gb*BANKW +: BANKW] = douta;
             assign rpad_b[gb*BANKW +: BANKW] = doutb;
-            // DP phase-1 read: Stage 1b implements this as the SAME port clocked
-            // at clk2x (a second beat), NOT a third XPM port. Stubbed 0 here so
-            // the synth view still elaborates; no synth build happens in Stage 1a.
             assign rpad1_a[gb*BANKW +: BANKW] = {BANKW{1'b0}};
             assign rpad1_b[gb*BANKW +: BANKW] = {BANKW{1'b0}};
+            end
 `else
             // behavioral 2-port (sim): independent registered reads, one write
             // site on port A. Both reads are 1-cycle = the cohort pipeline stage 0.
