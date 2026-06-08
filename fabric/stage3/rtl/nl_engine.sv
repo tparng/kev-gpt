@@ -336,28 +336,37 @@ module nl_engine #(
         mlpbuf_r2 <= ge_ra2[0] ? mlpbuf_o[ge_ra2>>1] : mlpbuf_e[ge_ra2>>1];
     end
 
-    // GE drain writes — parity-routed into the even/odd split sub-banks. The RB
-    // pair (dw_addr, dw_addr2=dw_addr+1) is consecutive, so the two writes always
-    // hit opposite-parity sub-banks (1 write each).
+    // GE drain writes — each split sub-bank gets EXACTLY ONE write statement (BRAM
+    // inference requires it). Pre-mux the RB pair (dw/dw2, always one even + one odd
+    // address) into an even-bank write and an odd-bank write; the masked odd-K tail
+    // (dw_we without dw_we2) just leaves the unused side's WE low.
+    wire        we_e = (dw_we && !dw_addr[0]) || (dw_we2 && !dw_addr2[0]);
+    wire [10:0] wa_e = (dw_we && !dw_addr[0]) ? (dw_addr>>1) : (dw_addr2>>1);
+    wire [P*32-1:0] wd_e = (dw_we && !dw_addr[0]) ? dw_data : dw_data2;
+    wire        we_o = (dw_we &&  dw_addr[0]) || (dw_we2 &&  dw_addr2[0]);
+    wire [10:0] wa_o = (dw_we &&  dw_addr[0]) ? (dw_addr>>1) : (dw_addr2>>1);
+    wire [P*32-1:0] wd_o = (dw_we &&  dw_addr[0]) ? dw_data : dw_data2;
+    wire        wm_e = (dwm_we && !dwm_addr[0]) || (dwm_we2 && !dwm_addr2[0]);
+    wire [10:0] wma_e = (dwm_we && !dwm_addr[0]) ? (dwm_addr>>1) : (dwm_addr2>>1);
+    wire [P*16-1:0] wmd_e = (dwm_we && !dwm_addr[0]) ? dwm_data : dwm_data2;
+    wire        wm_o = (dwm_we &&  dwm_addr[0]) || (dwm_we2 &&  dwm_addr2[0]);
+    wire [10:0] wma_o = (dwm_we &&  dwm_addr[0]) ? (dwm_addr>>1) : (dwm_addr2>>1);
+    wire [P*16-1:0] wmd_o = (dwm_we &&  dwm_addr[0]) ? dwm_data : dwm_data2;
     always @(posedge clk) begin
-        if (dw_we) begin
-            case (dw_dst)
-                3'd0: if (dw_addr[0]) qkv_o [dw_addr>>1] <= dw_data; else qkv_e [dw_addr>>1] <= dw_data;
-                3'd1: if (dw_addr[0]) attn_o[dw_addr>>1] <= dw_data; else attn_e[dw_addr>>1] <= dw_data;
-                3'd3: if (dw_addr[0]) mlp_o [dw_addr>>1] <= dw_data; else mlp_e [dw_addr>>1] <= dw_data;
-                default: if (dw_addr[0]) head_o[dw_addr>>1] <= dw_data; else head_e[dw_addr>>1] <= dw_data;
-            endcase
-        end
-        if (dw_we2) begin                   // 2nd row of the readback pair (same dst)
-            case (dw_dst)
-                3'd0: if (dw_addr2[0]) qkv_o [dw_addr2>>1] <= dw_data2; else qkv_e [dw_addr2>>1] <= dw_data2;
-                3'd1: if (dw_addr2[0]) attn_o[dw_addr2>>1] <= dw_data2; else attn_e[dw_addr2>>1] <= dw_data2;
-                3'd3: if (dw_addr2[0]) mlp_o [dw_addr2>>1] <= dw_data2; else mlp_e [dw_addr2>>1] <= dw_data2;
-                default: if (dw_addr2[0]) head_o[dw_addr2>>1] <= dw_data2; else head_e[dw_addr2>>1] <= dw_data2;
-            endcase
-        end
-        if (dwm_we)  begin if (dwm_addr[0])  mlpbuf_o[dwm_addr>>1]  <= dwm_data;  else mlpbuf_e[dwm_addr>>1]  <= dwm_data;  end
-        if (dwm_we2) begin if (dwm_addr2[0]) mlpbuf_o[dwm_addr2>>1] <= dwm_data2; else mlpbuf_e[dwm_addr2>>1] <= dwm_data2; end
+        if (we_e) case (dw_dst)
+            3'd0: qkv_e [wa_e] <= wd_e;
+            3'd1: attn_e[wa_e] <= wd_e;
+            3'd3: mlp_e [wa_e] <= wd_e;
+            default: head_e[wa_e] <= wd_e;
+        endcase
+        if (we_o) case (dw_dst)
+            3'd0: qkv_o [wa_o] <= wd_o;
+            3'd1: attn_o[wa_o] <= wd_o;
+            3'd3: mlp_o [wa_o] <= wd_o;
+            default: head_o[wa_o] <= wd_o;
+        endcase
+        if (wm_e) mlpbuf_e[wma_e] <= wmd_e;
+        if (wm_o) mlpbuf_o[wma_o] <= wmd_o;
     end
 
     always @(posedge clk) begin
