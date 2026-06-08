@@ -3,7 +3,7 @@
 The honest plan to make **100,000 tok/s the headline** on the KV260 — without a bigger
 chip and without a dumber Kevin. This is the one lever left that breaks the MAC floor.
 
-## ⏯ RESUME HERE (state as of 2026-06-08 ~17:00)
+## ⏯ RESUME HERE (state as of 2026-06-08 ~21:00)
 
 **Banked & pushed:** record **59,965.5 tok/s @200 MHz MEASURED** (N=16 split-brain,
 bitstream `C:/kevbuild/stage3_seqsb16_60b`, board `gemv_seqsb_53k.bit.bin`); single-clock
@@ -30,19 +30,45 @@ projected (sim)** — 4,179 cyc from 100k @200. Pieces, each gated:
   lane `u_dq2`/`u_gelu2` + `sh_dq_ra+1` ROM read; cohort_engine GE_RB pair-walk (gci/gdor/
   gor +2, parity-safe for the odd head rb_rows=25); nl_engine 2nd `dw`/`dwm` write port.
 
-**THE NEXT STEPS, in order:**
-1. **Close the last 4,179 cyc to 100k SIM (idle/SETTLE/inter-stream trims).** Candidates: the
-   `gemm_cohort_vec` SETTLE drain (4 cyc/call, sim-only — silicon skips it, so the board cyc
-   is already lower than sim), the GE_RBN inter-stream gap (2 cyc × N streams × calls), the
-   per-call IDLE→RUN/FIN handshake. Measure each; gate bit-exact. (Note: 100k @200 needs
-   32,000 cyc; silicon also gets the ~1.3× overclock margin on top, so the board may reach
-   100k before the sim does.)
-2. **Stage 1b (Vivado) — the silicon GO/NO-GO.** BD MMCM emits `clk2x` (400 MHz, phase-
-   locked 2× of 200); the `weight_bank_tdp` SYNTHESIS branch needs the real clk2x dual-beat
-   read (today stubbed 0 — its `g_w` SYNTHESIS comment); the nl_engine/xm/dw 2nd ports map to
-   TDP BRAM (2-write may need a replica); Pblock the MAC island off the congested fabric;
-   impl; board `--fclk 200 --fclk2x 400` sweep → MEASURED. **This is the campaign's real
-   GO/NO-GO** (does clk2x=400 close + run bit-exact on silicon). Spend-limited — one at a time.
+**✅ Stage 1b (silicon synth/fit/timing) — DONE in OOC, pushed (`bd9dce7`, `3994837`).**
+The full DP=1 sequencer **fits the KV260 and CLOSES TIMING at 200/400 OOC**, both clocks
+MET, 0 failing endpoints (clk 200MHz WNS +0.070, clk2x 400MHz WNS +0.074). So **~88,400
+tok/s @200/400 is now TIMING-VALIDATED**, not just projected. The two synth blockers found
++ fixed (each sim-bit-exact, NO board-only-validated logic on the weight path):
+- **Bank ports (Synth 8-3391).** The AQ/RB 2nd ports made nl_engine banks 3-4 access; HW
+  BRAM has 2. Fixed by DATA LAYOUT: AQ-read banks (lnout1/lnout2/ctxv) → `ram_style=
+  distributed` (LUTRAM multi-read); RB-write banks (qkv/attn/mlp/head) + mlpbuf → split
+  even/odd by global-addr parity (`addr>>1` index, mux by `addr[0]`; one write stmt/bank via
+  the pre-muxed we_e/we_o). `395bccb`, `c888f8f`.
+- **clk2x URAM read was timing-DEAD** (the 25600-deep cascade = 6 CAS hops, ~205 MHz). Fixed
+  by the **2-K-WIDE COLUMN-PARITY weight feed** (`bd9dce7`): even columns (kc) in mem_e, odd
+  (kc+1) in mem_o, each half-depth; read BOTH at `raddr>>1` in ONE **clk** (200 MHz) cycle.
+  The URAM stays at the slow clock; only the MAC accumulator runs at clk2x. grp_base/k_count
+  always even → every pair is one even + one odd column. 1-cyc latency = original, so the
+  cohort/MAC are UNCHANGED. weight_bank_tdp's clk2x read is GONE — the board only validates
+  the MAC's clk2x phase (unavoidable). This is the deliberate choice for autonomous bring-up:
+  no slow board-latency ping-pong.
+
+**THE NEXT STEPS, in order (the run-to-MEASURED):**
+1. **MMCM block design** — `tcl/build_bd_seq_sb_dp.tcl` (written): one Clocking Wizard fans
+   `pl_clk0` → `clk_out1`=clk (2×fin, AXI/fabric) + `clk_out2`=clk2x (4×fin), both 0-deg from
+   ONE MMCM (true alignment). `seq.DP=1`, AXI on clk_out1, `seq.clk2x`←clk_out2.
+   `gemv_axi_seq_sb` now has the clk2x port + DP param (`3994837`).
+2. **impl → bitstream** (`impl_seq_sb.tcl` analog). Fabric is at 200 (not the dead 250) so
+   expect it to close in 1-2 runs. A MAC-island Pblock is optional (clk2x closed OOC w/o one).
+3. **Board** — over **tailscale `<kria-ip>` (key ssh, no pw)**: scp the .bit.bin, fpgautil
+   -b, force `fclk0` (clk=2×fclk0, clk2x=4×fclk0; fclk0=100 → 200/400), run `pl_seq_sb.py`,
+   read tok/s. The whole loop is AUTONOMOUS. Sweep fclk0 up for the 100k stretch (clk=226 →
+   fclk0=113), against the fabric's ~200 wall.
+4. **(optional sim refinement)** close the last 4,179 cyc to 100k-in-sim via idle/SETTLE/GE_RBN
+   trims — but silicon's overclock margin may reach 100k first, so do this only if the board
+   sweep stalls below 100k.
+
+**Honest estimate to 88k MEASURED:** ~1 day (mostly Vivado wait + 1-2 impl iterations); the
+only real risk left is the MAC's clk2x phase on silicon (board-first-validated). ~88k central;
+90-95k if impl holds margin; 100k needs the fabric past ~200 (stretch). If clk2x can't hold
+400 on silicon, clk2x caps the fabric to ~half and the gain is negated (~60k) — but OOC +0.07
+margin + silicon ~1.3× makes that unlikely.
 
 **Key files:** `rtl/mac_bank_dp.sv` + `rtl/mac_bank_dsp_dp.sv` + `tb/tb_macdp.sv` (clk/clk2x
 convention: `always #5 clk`, `#2.5` quarter-shifted `clk2x`). `DP`+`clk2x` thread through
