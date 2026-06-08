@@ -230,6 +230,21 @@ module nl_engine #(
     reg              xr_we;
     reg [10:0]       xr_wa;
     reg [P*32-1:0]   xr_wd;
+    // 250 GATE: pipeline register splitting the embed->residual cone (OOC worst
+    // path: u_embank URAM emb_q -> (emb_q+pemb_r) adder -> coh*/eng/xres_bank).
+    // The NL_EMB residual add (tok_emb + pos_emb) is registered here so the long
+    // URAM-read -> add -> BRAM-write cone becomes two short paths: URAM->FF and
+    // FF->BRAM. Embed is consumed ONCE/token/stream (NL_EMB only), so this adds
+    // ~1 cyc/stream/pass (a few cyc per 16-token pass), not a per-cycle loop tax.
+    // Arithmetic is BIT-IDENTICAL: the same emb_q+pemb_r reaches xres_bank, one
+    // cycle later, with its write-address/enable delayed to match.
+    reg              emb_we_p;     // delayed-by-1 embed xres write enable
+    reg [10:0]       emb_wa_p;     // delayed-by-1 embed xres write address
+    reg [P*32-1:0]   emb_wd_p;     // registered embed residual add (emb_q+pemb_r)
+    // single-write-port fold (keeps xres_bank a clean BRAM): embed pipe + residual
+    reg              x_we_w;
+    reg [10:0]       x_wa_w;
+    reg [P*32-1:0]   x_wd_w;
     reg [3:0] lgam;
     integer pp;
 
@@ -300,6 +315,7 @@ module nl_engine #(
 
     always @(posedge clk) begin
         ln_start_o<=1'b0; ln_vin_o<=1'b0; at_start_o<=1'b0; at_ldv_o<=1'b0;
+        emb_we_p <= 1'b0;                       // default: embed-write pipe reg idle
         rb_clr = 1'b0;                          // default: keep accumulating rb_rdy
         if (rst) begin
             nl<=NL_IDLE; bs<=0; req<=0; done_o<=0; lnphase<=0;
@@ -319,10 +335,14 @@ module nl_engine #(
                     frd <= fr; frv <= (fr != ROWS[$clog2(ROWSM+1)-1:0]);
                     if (fr != ROWS[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
                     if (frv) begin
+                        // 250 GATE: register the residual add (emb_q+pemb_r) into
+                        // the embed-write pipe instead of writing xres_bank this
+                        // cycle. The add output is now a flop fed straight by the
+                        // URAM read; the FF->xres_bank write happens next cycle.
                         for (pp=0; pp<P; pp=pp+1)
-                            ww[pp*32 +: 32] = $signed(emb_q[pp*32 +: 32])
-                                            + $signed(pemb_r[pp*32 +: 32]);
-                        xr_we = 1'b1; xr_wa = sN + frd; xr_wd = ww;
+                            emb_wd_p[pp*32 +: 32] <= $signed(emb_q[pp*32 +: 32])
+                                                   + $signed(pemb_r[pp*32 +: 32]);
+                        emb_we_p <= 1'b1; emb_wa_p <= sN + frd;
                         if (frd==ROWS-1) begin
                             fr<=0; frv<=0;
                             if (bs == G-1) begin
@@ -526,7 +546,20 @@ module nl_engine #(
                 NL_DONE: ;       // hold (done_o stays high until next go)
                 default: nl <= NL_IDLE;
             endcase
-            if (xr_we) xres_bank[xr_wa] <= xr_wd;   // the bank's ONLY write site
+            // xres_bank's ONE write port. Two producers fold into a single
+            // enable/address/data BEFORE the write so the bank stays a clean
+            // single-write-port BRAM (a two-branch if/else-if write makes
+            // ram_style="block" "infeasible" and Vivado spills it to LUTRAM):
+            //  - the embed residual (NL_EMB) arrives via the registered emb_*_p
+            //    pipe one cycle late (the 250-gate URAM->add->BRAM cone split);
+            //  - the residual adds (NL_RES1/RES2) drive xr_* combinationally.
+            // They never coincide (different FSM states; the trailing embed write
+            // lands during NL_LGAM's idle-wait, well before NL_LFEED reads back),
+            // so embed-priority is exact and bit-identical.
+            x_we_w = emb_we_p | xr_we;
+            x_wa_w = emb_we_p ? emb_wa_p : xr_wa;
+            x_wd_w = emb_we_p ? emb_wd_p : xr_wd;
+            if (x_we_w) xres_bank[x_wa_w] <= x_wd_w;     // the bank's ONLY write site
             // ---- stream-granular readback-ready tracker ----------------------
             // Clear at a fresh call boundary (descriptor just issued); otherwise
             // latch each stream's completion pulse. Clear dominates set: a new
