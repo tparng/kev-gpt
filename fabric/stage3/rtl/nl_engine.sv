@@ -181,14 +181,26 @@ module nl_engine #(
 
     // ---- stream-flattened scratch (row = stream*ROWS + r) at G-stream depth ------
     (* ram_style = "block" *) reg [P*32-1:0] xres_bank  [0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] lnout1_bank[0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] lnout2_bank[0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] qkv_bank   [0:BD_Q-1];
-    (* ram_style = "block" *) reg [P*32-1:0] ctxv_bank  [0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] attn_bank  [0:BD_S-1];
-    (* ram_style = "block" *) reg [P*16-1:0] mlpbuf_bank[0:BD_M-1];
-    (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:BD_S-1];
-    (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:BD_H-1];
+    // DOUBLE-PUMP-100K Stage 1b — synth-ready bank ports (BRAM/LUTRAM have 2 ports):
+    //  * AQ-read banks (1 nl write + 2 AQ reads ge_ra/ge_ra2): LUTRAM (multi-read).
+    //  * RB-write banks (2 RB writes dw/dw2 + 1 nl read) and mlpbuf (2W + 2R): split
+    //    even/odd by GLOBAL-ADDRESS parity — the RB pair is consecutive addresses so
+    //    the two writes always land in different sub-banks (1 write each); reads mux
+    //    by addr[0]. Index = addr>>1 for both halves (uniform, odd dims OK). Sim-
+    //    identical (same data, same addresses), so all run_sb_* gates still hold.
+    (* ram_style = "distributed" *) reg [P*32-1:0] lnout1_bank[0:BD_S-1];
+    (* ram_style = "distributed" *) reg [P*32-1:0] lnout2_bank[0:BD_S-1];
+    (* ram_style = "distributed" *) reg [P*32-1:0] ctxv_bank  [0:BD_S-1];
+    (* ram_style = "block" *) reg [P*32-1:0] qkv_e [0:(BD_Q+1)/2-1];
+    (* ram_style = "block" *) reg [P*32-1:0] qkv_o [0:(BD_Q+1)/2-1];
+    (* ram_style = "block" *) reg [P*32-1:0] attn_e[0:(BD_S+1)/2-1];
+    (* ram_style = "block" *) reg [P*32-1:0] attn_o[0:(BD_S+1)/2-1];
+    (* ram_style = "block" *) reg [P*32-1:0] mlp_e [0:(BD_S+1)/2-1];
+    (* ram_style = "block" *) reg [P*32-1:0] mlp_o [0:(BD_S+1)/2-1];
+    (* ram_style = "block" *) reg [P*32-1:0] head_e[0:(BD_H+1)/2-1];
+    (* ram_style = "block" *) reg [P*32-1:0] head_o[0:(BD_H+1)/2-1];
+    (* ram_style = "distributed" *) reg [P*16-1:0] mlpbuf_e[0:(BD_M+1)/2-1];
+    (* ram_style = "distributed" *) reg [P*16-1:0] mlpbuf_o[0:(BD_M+1)/2-1];
 
     reg [P*32-1:0] pemb_r, gam_r;
 
@@ -298,10 +310,11 @@ module nl_engine #(
 
     always @(posedge clk) begin
         xres_r <= xres_bank[xres_ra];
-        qkv_r  <= qkv_bank [qkv_ra];
-        attn_r <= attn_bank[attn_ra];
-        mlp_r  <= mlp_bank [mlp_ra];
-        head_r <= head_bank[head_ra];
+        // split banks: read both halves, mux by addr[0] (each half = one BRAM read)
+        qkv_r  <= qkv_ra[0]  ? qkv_o [qkv_ra >>1] : qkv_e [qkv_ra >>1];
+        attn_r <= attn_ra[0] ? attn_o[attn_ra>>1] : attn_e[attn_ra>>1];
+        mlp_r  <= mlp_ra[0]  ? mlp_o [mlp_ra >>1] : mlp_e [mlp_ra >>1];
+        head_r <= head_ra[0] ? head_o[head_ra>>1] : head_e[head_ra>>1];
         gam_r  <= gamma_w[lgam*EROWS + fr];
     end
     // pos_w: runtime write from the embed loader (broadcast) + engine-local read
@@ -312,37 +325,39 @@ module nl_engine #(
 
     // GE-side registered reads at ge_ra (mlpbuf only meaningful for FC dst)
     always @(posedge clk) begin
-        lnout1_r <= lnout1_bank[ge_ra];
+        lnout1_r <= lnout1_bank[ge_ra];     // LUTRAM (1W2R): plain reads
         lnout2_r <= lnout2_bank[ge_ra];
         ctxv_g   <= ctxv_bank  [ge_ra];
-        mlpbuf_r <= mlpbuf_bank[ge_ra];
-        // 2nd AQ-feed port (TDP read): the pair's 2nd stream's row.
+        mlpbuf_r <= ge_ra[0]  ? mlpbuf_o[ge_ra >>1] : mlpbuf_e[ge_ra >>1];
+        // 2nd AQ-feed port: the pair's 2nd stream's row.
         lnout1_r2 <= lnout1_bank[ge_ra2];
         lnout2_r2 <= lnout2_bank[ge_ra2];
         ctxv_g2   <= ctxv_bank  [ge_ra2];
-        mlpbuf_r2 <= mlpbuf_bank[ge_ra2];
+        mlpbuf_r2 <= ge_ra2[0] ? mlpbuf_o[ge_ra2>>1] : mlpbuf_e[ge_ra2>>1];
     end
 
-    // GE drain writes (one write site per bank + the DOUBLE-PUMP 2nd row)
+    // GE drain writes — parity-routed into the even/odd split sub-banks. The RB
+    // pair (dw_addr, dw_addr2=dw_addr+1) is consecutive, so the two writes always
+    // hit opposite-parity sub-banks (1 write each).
     always @(posedge clk) begin
         if (dw_we) begin
             case (dw_dst)
-                3'd0: qkv_bank [dw_addr] <= dw_data;
-                3'd1: attn_bank[dw_addr] <= dw_data;
-                3'd3: mlp_bank [dw_addr] <= dw_data;
-                default: head_bank[dw_addr] <= dw_data;
+                3'd0: if (dw_addr[0]) qkv_o [dw_addr>>1] <= dw_data; else qkv_e [dw_addr>>1] <= dw_data;
+                3'd1: if (dw_addr[0]) attn_o[dw_addr>>1] <= dw_data; else attn_e[dw_addr>>1] <= dw_data;
+                3'd3: if (dw_addr[0]) mlp_o [dw_addr>>1] <= dw_data; else mlp_e [dw_addr>>1] <= dw_data;
+                default: if (dw_addr[0]) head_o[dw_addr>>1] <= dw_data; else head_e[dw_addr>>1] <= dw_data;
             endcase
         end
         if (dw_we2) begin                   // 2nd row of the readback pair (same dst)
             case (dw_dst)
-                3'd0: qkv_bank [dw_addr2] <= dw_data2;
-                3'd1: attn_bank[dw_addr2] <= dw_data2;
-                3'd3: mlp_bank [dw_addr2] <= dw_data2;
-                default: head_bank[dw_addr2] <= dw_data2;
+                3'd0: if (dw_addr2[0]) qkv_o [dw_addr2>>1] <= dw_data2; else qkv_e [dw_addr2>>1] <= dw_data2;
+                3'd1: if (dw_addr2[0]) attn_o[dw_addr2>>1] <= dw_data2; else attn_e[dw_addr2>>1] <= dw_data2;
+                3'd3: if (dw_addr2[0]) mlp_o [dw_addr2>>1] <= dw_data2; else mlp_e [dw_addr2>>1] <= dw_data2;
+                default: if (dw_addr2[0]) head_o[dw_addr2>>1] <= dw_data2; else head_e[dw_addr2>>1] <= dw_data2;
             endcase
         end
-        if (dwm_we)  mlpbuf_bank[dwm_addr]  <= dwm_data;
-        if (dwm_we2) mlpbuf_bank[dwm_addr2] <= dwm_data2;
+        if (dwm_we)  begin if (dwm_addr[0])  mlpbuf_o[dwm_addr>>1]  <= dwm_data;  else mlpbuf_e[dwm_addr>>1]  <= dwm_data;  end
+        if (dwm_we2) begin if (dwm_addr2[0]) mlpbuf_o[dwm_addr2>>1] <= dwm_data2; else mlpbuf_e[dwm_addr2>>1] <= dwm_data2; end
     end
 
     always @(posedge clk) begin
