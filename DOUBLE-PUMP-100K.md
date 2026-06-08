@@ -3,6 +3,33 @@
 The honest plan to make **100,000 tok/s the headline** on the KV260 — without a bigger
 chip and without a dumber Kevin. This is the one lever left that breaks the MAC floor.
 
+## ⏯ RESUME HERE (state as of 2026-06-08 ~08:30)
+
+**Banked & pushed:** record **59,965.5 tok/s @200 MHz MEASURED** (N=16 split-brain,
+bitstream `C:/kevbuild/stage3_seqsb16_60b`, board `gemv_seqsb_53k.bit.bin`); single-clock
+**250 MHz proven dead** (4 builds, route-congestion-bound); **doc 6** has the ~78k cycle
+ceiling; **double-pump Stage 0 = GO** (`mac_bank_dp` bit-exact + ~393 MHz OOC, commit
+`0e0f7e1`); **Stage 1 mechanism fully specified** below (commit `0ce6853`). Tree clean.
+
+**THE NEXT STEP — execute Stage 1a (sim, iverilog, no Vivado).** The design is decided
+(see "Stage 1" §); execution is mechanical. In order, each gated bit-exact:
+1. Double-pump the LUT MAC in `fabric/stage3/rtl/gemm_banked_resident_vec.sv` (the RUN
+   kc-loop: `kc += 2`, two weight words + two act lanes/clk into `mac_bank_dp`, RLAT
+   pipeline doubled, `kmac += 2`, odd-K tail masks phase 1). FSM stays single-domain
+   at `clk` — do NOT split it. Gate `python -m fabric.stage3.run_banked` (add `clk2x`
+   at 2× `clk` to `tb/tb_gemv_banked.sv`, quarter-shifted per `tb/tb_macdp.sv`).
+2. Same in the split-brain core `fabric/stage3/rtl/gemm_cohort_vec.sv`; gate
+   `run_gemm_sb` ALL_BITEXACT.
+3. `run_sb_seq --nd 0 --tmax 16 --att2 0` → 16/16, and **report `cyc_total`: it must
+   drop 53,637 → ~41k.** That drop, bit-exact, is the Stage 1a win (~78k projected).
+   Then the DSP-cascade `mac_bank_dsp` double-pump for `--nd 6`.
+
+**Key files:** the proven double-pumped bank `rtl/mac_bank_dp.sv` + its gate
+`run_macdp.py`/`tb/tb_macdp.sv` (reuse its exact clk/clk2x convention); the OOC Fmax
+`tcl/ooc_macdp.tcl`. **Then Stage 1b** (Vivado): BD MMCM `clk2x` + Pblock the MAC island
++ board sweep → ~78k MEASURED. **Caution:** spend limit was hit 2026-06-08 — Stage 1a is
+a focused multi-hour RTL task; run it as one dedicated session, not rushed inline.
+
 ## Why this, and why now
 
 The speed campaign hit a measured ceiling: **59,965.5 tok/s @200 MHz, MEASURED** (N=16
