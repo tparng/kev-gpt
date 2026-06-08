@@ -15,14 +15,12 @@ set nc     [lindex $argv 7]
 if {$pp     eq ""} { set pp 8 }
 if {$lanes  eq ""} { set lanes 128 }
 if {$wwords eq ""} { set wwords 25600 }
-if {$fin    eq ""} { set fin 100.0 }      ;# MMCM input (pl_clk0); clk=2x, clk2x=4x
+if {$fin    eq ""} { set fin 200.0 }      ;# pl_clk0 = clk (fabric/AXI); clk2x = 2x
 if {$tmax   eq ""} { set tmax 16 }
 if {$nd     eq ""} { set nd 0 }
 if {$bdir   eq ""} { set bdir "C:/kevbuild/stage3_seqsb_dp_bit" }
 if {$nc     eq ""} { set nc 8 }
 set nn [expr {2 * $nc}]
-set clkmhz  [expr {2.0 * $fin}]           ;# clk_out1 (fabric/AXI)
-set clk2mhz [expr {4.0 * $fin}]           ;# clk_out2 (clk2x)
 
 set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"
@@ -70,30 +68,36 @@ set_property -dict [list \
     CONFIG.PSU__USE__M_AXI_GP2 {0} CONFIG.PSU__FPGA_PL0_ENABLE {1} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $fin] [get_bd_cells ps]
 
-# ---- Clocking Wizard (MMCM): pl_clk0 -> clk (2x) + clk2x (4x), both 0-deg ----
+# ---- Clocking Wizard (MMCM): pl_clk0 (=clk) -> clk2x (2x, 0-deg aligned) --------
+# The fabric/AXI clock stays pl_clk0 (exactly like the record build). The MMCM only
+# makes clk2x = 2x pl_clk0, phase-aligned to its input via the feedback path -> clk2x
+# is aligned to clk (both reference pl_clk0). Read pl_clk0's actual FREQ_HZ (the PS
+# rounds $fin, e.g. 199.998 for 200) so the wizard input freq matches (BD 41-238).
 set cw [create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:* clk_wiz]
+connect_bd_net [get_bd_pins ps/pl_clk0]    [get_bd_pins clk_wiz/clk_in1]
+connect_bd_net [get_bd_pins ps/pl_resetn0] [get_bd_pins clk_wiz/resetn]
+set in_hz  [get_property CONFIG.FREQ_HZ [get_bd_pins clk_wiz/clk_in1]]
+set in_mhz [expr {$in_hz / 1.0e6}]
+set out2x  [expr {2.0 * $in_mhz}]
 set_property -dict [list \
     CONFIG.PRIMITIVE {MMCM} \
-    CONFIG.PRIM_IN_FREQ $fin \
-    CONFIG.CLKOUT1_USED {true}  CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $clkmhz  CONFIG.CLKOUT1_REQUESTED_PHASE {0.000} \
-    CONFIG.CLKOUT2_USED {true}  CONFIG.CLKOUT2_REQUESTED_OUT_FREQ $clk2mhz CONFIG.CLKOUT2_REQUESTED_PHASE {0.000} \
+    CONFIG.PRIM_IN_FREQ $in_mhz \
+    CONFIG.CLKOUT1_USED {true} CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $out2x CONFIG.CLKOUT1_REQUESTED_PHASE {0.000} \
     CONFIG.USE_LOCKED {true} CONFIG.USE_RESET {true} CONFIG.RESET_TYPE {ACTIVE_LOW} \
-    CONFIG.NUM_OUT_CLKS {2}] [get_bd_cells clk_wiz]
-connect_bd_net [get_bd_pins ps/pl_clk0]      [get_bd_pins clk_wiz/clk_in1]
-connect_bd_net [get_bd_pins ps/pl_resetn0]   [get_bd_pins clk_wiz/resetn]
+    CONFIG.NUM_OUT_CLKS {1}] [get_bd_cells clk_wiz]
+puts "CLKWIZ in=${in_mhz}MHz -> clk2x=${out2x}"
 
 set g [create_bd_cell -type module -reference gemv_axi_seq_sb seq]
 set_property -dict [list CONFIG.P $pp CONFIG.LANES $lanes CONFIG.N $nn CONFIG.NC $nc \
     CONFIG.ND $nd CONFIG.NLAYER {4} CONFIG.WWORDS $wwords CONFIG.TMAX $tmax \
     CONFIG.C_S_AXI_ADDR_WIDTH {8} CONFIG.DBG {0} CONFIG.ATT2 {0} CONFIG.DP {1}] [get_bd_cells seq]
 
-# AXI on clk_out1 (the fabric clock); clk2x from clk_out2.
+# AXI clocked by pl_clk0 (Auto) — same as the single-clock build.
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list \
-    Clk_master {/clk_wiz/clk_out1 (200 MHz)} Clk_slave {/clk_wiz/clk_out1 (200 MHz)} \
-    Clk_xbar {/clk_wiz/clk_out1 (200 MHz)} \
+    Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
     Master {/ps/M_AXI_HPM0_FPD} Slave {/seq/S_AXI} \
     intc_ip {New AXI SmartConnect} master_apm {0}] [get_bd_intf_pins /seq/S_AXI]
-connect_bd_net [get_bd_pins clk_wiz/clk_out2] [get_bd_pins seq/clk2x]
+connect_bd_net [get_bd_pins clk_wiz/clk_out1] [get_bd_pins seq/clk2x]
 
 assign_bd_address
 catch { set_property offset 0xA0000000 [get_bd_addr_segs */seq/*] }
@@ -104,4 +108,4 @@ make_wrapper -files [get_files design_1.bd] -top -import
 set_property top design_1_wrapper [current_fileset]
 generate_target all [get_files design_1.bd]
 update_compile_order -fileset sources_1
-puts "BD_BUILD_SB_DP_OK p=$pp lanes=$lanes wwords=$wwords fin=$fin clk=$clkmhz clk2x=$clk2mhz tmax=$tmax nd=$nd n=$nn nc=$nc"
+puts "BD_BUILD_SB_DP_OK p=$pp lanes=$lanes wwords=$wwords clk=${in_mhz} clk2x=${out2x} tmax=$tmax nd=$nd n=$nn nc=$nc"
