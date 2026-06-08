@@ -75,15 +75,18 @@ set_property -dict [list \
 # rounds $fin, e.g. 199.998 for 200) so the wizard input freq matches (BD 41-238).
 set cw [create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:* clk_wiz]
 connect_bd_net [get_bd_pins ps/pl_clk0]    [get_bd_pins clk_wiz/clk_in1]
-connect_bd_net [get_bd_pins ps/pl_resetn0] [get_bd_pins clk_wiz/resetn]
-set in_hz  [get_property CONFIG.FREQ_HZ [get_bd_pins clk_wiz/clk_in1]]
+# Read pl_clk0's ACTUAL freq (the PS rounds 200 -> 199.998001 MHz); the wizard input
+# must match it exactly or validate_bd_design fails BD 41-238.
+set in_hz  [get_property CONFIG.FREQ_HZ [get_bd_pins ps/pl_clk0]]
 set in_mhz [expr {$in_hz / 1.0e6}]
 set out2x  [expr {2.0 * $in_mhz}]
+# No reset (free-running MMCM, locks on power-up) and no LOCKED port -> only clk_in1
+# + clk_out1 pins, so the net connects can't miss a pin.
 set_property -dict [list \
     CONFIG.PRIMITIVE {MMCM} \
     CONFIG.PRIM_IN_FREQ $in_mhz \
     CONFIG.CLKOUT1_USED {true} CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $out2x CONFIG.CLKOUT1_REQUESTED_PHASE {0.000} \
-    CONFIG.USE_LOCKED {true} CONFIG.USE_RESET {true} CONFIG.RESET_TYPE {ACTIVE_LOW} \
+    CONFIG.USE_LOCKED {false} CONFIG.USE_RESET {false} \
     CONFIG.NUM_OUT_CLKS {1}] [get_bd_cells clk_wiz]
 puts "CLKWIZ in=${in_mhz}MHz -> clk2x=${out2x}"
 
