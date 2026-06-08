@@ -34,7 +34,7 @@ def _read_hex(path):
     return out
 
 
-def run(sim_dir, toks, P, lanes=128, tmax=32, nd=0, att2=1,
+def run(sim_dir, toks, P, lanes=128, tmax=32, nd=0, att2=1, dp=0,
         npz="fabric/export/goformer.npz"):
     os.makedirs(sim_dir, exist_ok=True)
     p, cfg = seq_ref.build(npz)
@@ -55,10 +55,13 @@ def run(sim_dir, toks, P, lanes=128, tmax=32, nd=0, att2=1,
 
     vvp = os.path.join(sim_dir, "sim.vvp")
     defs = [f"-DTOK{i}={int(t)}" for i, t in enumerate(toks)]
+    if dp:
+        defs.append("-DDPUMP")
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
                          *defs, f"-DPVAL={P}", f"-DNVAL={len(toks)}", f"-DNDVAL={nd}", f"-DATT2VAL={att2}",
                          f"-DLVAL={lanes}", f"-DWROMN={wrom_n}", f"-DTMAXVAL={tmax}",
                          TB,
+                         os.path.join(RTL, "mac_bank_dp.sv"),
                          os.path.join(RTL, "sequencer_sb.sv"),
                          os.path.join(RTL, "cohort_engine.sv"),
                          os.path.join(RTL, "nl_engine.sv"),
@@ -112,7 +115,7 @@ def run(sim_dir, toks, P, lanes=128, tmax=32, nd=0, att2=1,
     except Exception:
         pass
     n = len(toks)
-    print(f"SEQ_SB_FULL N={n} ND={nd} P={P} L={lanes} TMAX={tmax} ATT2={att2} " + " ".join(parts) +
+    print(f"SEQ_SB_FULL N={n} ND={nd} P={P} L={lanes} TMAX={tmax} ATT2={att2} DP={dp} " + " ".join(parts) +
           f" ALL={all_ok} cyc_total={cyc} cyc/token={(cyc or 0)//n}")
     if cyc:
         print(f"SEQ_SB_TOKS/S @166.7={166.7e6*n/cyc:,.0f}  @200={200e6*n/cyc:,.0f}")
@@ -131,10 +134,13 @@ def main(argv=None):
     ap.add_argument("--tmax", type=int, default=32)
     ap.add_argument("--att2", type=int, default=1,
                     help="1 = per-cohort vec_attn; 0 = shared+arbiter (the fitting BD config)")
+    ap.add_argument("--dp", type=int, default=0,
+                    help="DOUBLE-PUMP-100K Stage 1: 1 = run the MAC at 2 K-steps/clk "
+                         "(clk2x). Use with --nd 0 (DSP path not yet double-pumped).")
     ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_seq_sb"))
     a = ap.parse_args(argv)
     toks = [int(t) for t in a.toks.split(",")]
-    ok = run(a.dir, toks, a.p, a.lanes, a.tmax, a.nd, a.att2)
+    ok = run(a.dir, toks, a.p, a.lanes, a.tmax, a.nd, a.att2, a.dp)
     raise SystemExit(0 if ok else 1)
 
 

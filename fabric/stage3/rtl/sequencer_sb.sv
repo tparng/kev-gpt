@@ -40,9 +40,11 @@ module sequencer_sb #(
     parameter integer GELU_FRAC   = 12,
     parameter integer ISH         = 40,
     parameter integer DBG         = 1,   // 0 = tie off board-debug readback (bitstream builds)
-    parameter integer ATT2        = 1    // 1 = vec_attn per cohort; 0 = shared+arbiter (fits today)
+    parameter integer ATT2        = 1,   // 1 = vec_attn per cohort; 0 = shared+arbiter (fits today)
+    parameter integer DP          = 0    // DOUBLE-PUMP-100K Stage 1: MAC at 2 K-steps/clk
 ) (
     input  wire        clk,
+    input  wire        clk2x,   // 2x clk, 0-deg aligned (DP=1 only)
     input  wire        rst,
     input  wire        go,
     input  wire [N*9-1:0] tok_ids,
@@ -67,11 +69,12 @@ module sequencer_sb #(
     // ================================================================
     wire [$clog2(WWORDS)-1:0] waddr0, waddr1;
     wire [LANES*4-1:0]        wword0, wword1;
-    weight_bank_tdp #(.LANES(LANES), .WWORDS(WWORDS)) u_wbank (
-        .clk(clk),
+    wire [LANES*4-1:0]        wwp1_0, wwp1_1;   // DP: phase-1 words (addr+1) per cohort
+    weight_bank_tdp #(.LANES(LANES), .WWORDS(WWORDS), .DP(DP)) u_wbank (
+        .clk(clk), .clk2x(clk2x),
         .ld_rst(wl_rst), .w_we(wl_we), .w_data(wl_data),
-        .raddr_b(waddr0), .rword_b(wword0),     // cohort 0 -> port B
-        .raddr_a(waddr1), .rword_a(wword1));    // cohort 1 -> port A
+        .raddr_b(waddr0), .rword_b(wword0), .rword1_b(wwp1_0),   // cohort 0 -> port B
+        .raddr_a(waddr1), .rword_a(wword1), .rword1_a(wwp1_1));  // cohort 1 -> port A
 
     // ================================================================
     //   SHARED embed/pos image + loader + DUAL-PORT read (embed_bank_tdp)
@@ -290,13 +293,13 @@ module sequencer_sb #(
                     .DQ_N(DQ_N), .NSACT(NSACT), .WWORDS(WWORDS), .NLAYER(NLAYER),
                     .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .RESID_FRAC(RESID_FRAC),
                     .LN_OUT_FRAC(LN_OUT_FRAC), .VFRAC(VFRAC), .GELU_FRAC(GELU_FRAC),
-                    .ISH(ISH), .DBG(DBG)) coh0 (
-        .clk(clk), .rst(rst), .go(go),
+                    .ISH(ISH), .DBG(DBG), .DP(DP)) coh0 (
+        .clk(clk), .clk2x(clk2x), .rst(rst), .go(go),
         .tok_ids(tok_ids[NC*9-1:0]), .pos(pos),
         .done_o(done_o0), .tok_outs(tok_outs0),
         .rd_stream(rd_stream[CSH-1:0]), .rd_sel(rd_sel), .rd_addr(rd_addr),
         .rd_data(rd_data0),                  // global stream < NC == local
-        .waddr(waddr0), .wword_rd(wword0),
+        .waddr(waddr0), .wword_rd(wword0), .wword1_rd(wwp1_0),
         .emb_req(emb_req0), .emb_addr(emb_addr0), .emb_gnt(emb_gnt0), .emb_q(emb_q0),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
         .ln_req(ln_req0), .ln_start_o(ln_start0), .ln_vin_o(ln_vin0),
@@ -317,13 +320,13 @@ module sequencer_sb #(
                     .DQ_N(DQ_N), .NSACT(NSACT), .WWORDS(WWORDS), .NLAYER(NLAYER),
                     .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .RESID_FRAC(RESID_FRAC),
                     .LN_OUT_FRAC(LN_OUT_FRAC), .VFRAC(VFRAC), .GELU_FRAC(GELU_FRAC),
-                    .ISH(ISH), .DBG(DBG)) coh1 (
-        .clk(clk), .rst(rst), .go(go),
+                    .ISH(ISH), .DBG(DBG), .DP(DP)) coh1 (
+        .clk(clk), .clk2x(clk2x), .rst(rst), .go(go),
         .tok_ids(tok_ids[N*9-1:NC*9]), .pos(pos),
         .done_o(done_o1), .tok_outs(tok_outs1),
         .rd_stream(rd_local1[CSH-1:0]), .rd_sel(rd_sel), .rd_addr(rd_addr),
         .rd_data(rd_data1),                  // local = global - NC (any NC)
-        .waddr(waddr1), .wword_rd(wword1),
+        .waddr(waddr1), .wword_rd(wword1), .wword1_rd(wwp1_1),
         .emb_req(emb_req1), .emb_addr(emb_addr1), .emb_gnt(emb_gnt1), .emb_q(emb_q1),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
         .ln_req(ln_req1), .ln_start_o(ln_start1), .ln_vin_o(ln_vin1),

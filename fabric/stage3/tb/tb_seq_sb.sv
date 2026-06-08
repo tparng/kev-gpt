@@ -82,8 +82,16 @@ module tb;
     localparam integer N     = `NVAL;
     localparam integer WBITS = LANES * 4;
     localparam integer SUBW  = WBITS / 32;
+    // DOUBLE-PUMP-100K Stage 1: -DDPUMP runs the MAC at 2 K-steps/clk (DP=1).
+`ifdef DPUMP
+    localparam integer DPV = 1;
+`else
+    localparam integer DPV = 0;
+`endif
 
-    reg clk = 1'b0; always #5 clk = ~clk;
+    reg clk = 1'b0; always #5 clk = ~clk;     // 10 ns period, posedges at 5,15,...
+    reg clk2x = 1'b0;
+    initial begin #2.5 forever #2.5 clk2x = ~clk2x; end   // 2x, quarter-shifted (tb_macdp)
     reg rst, go;
     reg [N*9-1:0] toks;
     reg [8:0] pos;
@@ -96,8 +104,8 @@ module tb;
     reg wl_rst, wl_we; reg [31:0] wl_data;
 
     sequencer_sb #(.P(P), .LANES(LANES), .N(N), .NC(N/2), .ND(`NDVAL),
-                   .TMAX(TMAXP), .ATT2(`ATT2VAL)) dut (
-        .clk(clk), .rst(rst), .go(go), .tok_ids(toks), .pos(pos), .done(done),
+                   .TMAX(TMAXP), .ATT2(`ATT2VAL), .DP(DPV)) dut (
+        .clk(clk), .clk2x(clk2x), .rst(rst), .go(go), .tok_ids(toks), .pos(pos), .done(done),
         .tok_outs(tok_outs), .rd_stream(rstream[$clog2(N)-1:0]), .rd_sel(rsel),
         .rd_addr(raddr), .rd_data(rdata), .wl_rst(wl_rst), .wl_we(wl_we),
         .el_we(1'b0), .wl_data(wl_data), .dbg_stop(2'd`DBGSTOP));

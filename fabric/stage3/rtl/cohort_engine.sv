@@ -38,9 +38,11 @@ module cohort_engine #(
     parameter integer VFRAC       = 16,
     parameter integer GELU_FRAC   = 12,
     parameter integer ISH         = 40,
-    parameter integer DBG         = 1    // 0 = tie off the board-debug readback mux
+    parameter integer DBG         = 1,   // 0 = tie off the board-debug readback mux
+    parameter integer DP          = 0    // DOUBLE-PUMP-100K Stage 1: MAC at 2 K-steps/clk
 ) (
     input  wire        clk,
+    input  wire        clk2x,            // 2x clk, 0-deg aligned (DP=1 only)
     input  wire        rst,
     input  wire        go,
     input  wire [N*9-1:0] tok_ids,
@@ -55,6 +57,7 @@ module cohort_engine #(
     // ---- shared weight bank read port (to weight_bank_tdp) ----
     output wire [$clog2(WWORDS)-1:0] waddr,
     input  wire [LANES*4-1:0]        wword_rd,
+    input  wire [LANES*4-1:0]        wword1_rd,   // DP: phase-1 word (addr waddr+1)
     // ---- shared embed read port (arbitrated in sequencer_sb) ----
     output wire        emb_req,
     output wire [$clog2(VOCAB*(D/P))-1:0] emb_addr,
@@ -175,14 +178,14 @@ module cohort_engine #(
     wire [P*32-1:0]    gv_yout;
     (* keep_hierarchy = "yes" *)
     gemm_cohort_vec #(.LANES(LANES), .N(N), .ND(ND), .P(P), .MMAX(1024),
-                  .KMAX(1024), .RLAT(2), .WWORDS(WWORDS)) u_gemm (
-        .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
+                  .KMAX(1024), .RLAT(2), .WWORDS(WWORDS), .DP(DP)) u_gemm (
+        .clk(clk), .clk2x(clk2x), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .x_rst(gv_xrst), .x_we(gv_xwe), .x_stream(gv_xstream),
         .x_row(gv_xrow), .x_data(gv_xdata),
         .ovl_en(1'b1), .x_rowcommit(gv_rowcommit),
         .start(gv_start), .done(gv_done),
         .rd_stream(gv_rdstream), .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),
-        .waddr(waddr), .wword_rd(wword_rd));
+        .waddr(waddr), .wword_rd(wword_rd), .wword1_rd(wword1_rd));
 
     // dq/gelu live in sequencer_sb (shared channel); this cohort's beats are
     // gated on its grant so the other cohort's traffic is invisible here.
