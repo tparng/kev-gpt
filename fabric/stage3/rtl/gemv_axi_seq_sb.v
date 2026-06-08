@@ -24,9 +24,13 @@ module gemv_axi_seq_sb #(
     parameter integer TMAX   = 32,
     parameter integer DBG    = 1,       // 0 = tie off debug readback (record builds)
     parameter integer ATT2   = 1,       // 1 = per-cohort attention; 0 = shared (fits)
+    parameter integer DP     = 0,       // DOUBLE-PUMP-100K: 1 = MAC at 2 K-steps/clk
     parameter integer C_S_AXI_ADDR_WIDTH = 8
 ) (
     input  wire                          S_AXI_ACLK,
+    // DOUBLE-PUMP: 2x clk, 0-deg phase-aligned (from the BD MMCM). Only the MAC
+    // accumulator uses it; tie to S_AXI_ACLK when DP=0 (unused).
+    input  wire                          clk2x,
     input  wire                          S_AXI_ARESETN,
     input  wire [C_S_AXI_ADDR_WIDTH-1:0] S_AXI_AWADDR,
     input  wire [2:0]                    S_AXI_AWPROT,
@@ -169,8 +173,8 @@ module gemv_axi_seq_sb #(
     end
 
     sequencer_sb #(.P(P), .LANES(LANES), .N(N), .NC(NC), .ND(ND), .DBG(DBG), .ATT2(ATT2),
-                   .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX)) u_seq (
-        .clk(clk), .rst(core_rst), .go(go_pulse),
+                   .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX), .DP(DP)) u_seq (
+        .clk(clk), .clk2x(clk2x), .rst(core_rst), .go(go_pulse),
         .tok_ids(tok_ids_all[N*9-1:0]),
         .pos(pos),
         .done(core_done_w), .tok_outs(tok_outs),
