@@ -103,7 +103,13 @@ module cohort_engine #(
     output reg         gl_vin_o,
     output reg  [P*16-1:0] gl_x_o,
     input  wire        gl_vout_i,
-    input  wire [P*16-1:0] gl_y_i
+    input  wire [P*16-1:0] gl_y_i,
+    // DOUBLE-PUMP-100K: 2nd readback lane (the pair's 2nd row). vin/vout/frac are
+    // SHARED (both lanes valid together); only the data buses double.
+    output reg  [P*32-1:0] dq_gemvy_o2,
+    input  wire [P*32-1:0] dq_out_i2,
+    output reg  [P*16-1:0] gl_x_o2,
+    input  wire [P*16-1:0] gl_y_i2
 );
     localparam integer ROWS  = D    / P;
     localparam integer ROWS3 = D3   / P;
@@ -133,6 +139,9 @@ module cohort_engine #(
     wire        g_done_p;            // pulse: current GEMM call fully drained
     reg         dwr_we;  reg [2:0] dwr_dst; reg [10:0] dwr_addr; reg [P*32-1:0] dwr_data;
     reg         dwmr_we; reg [10:0] dwmr_addr; reg [P*16-1:0] dwmr_data;
+    // DOUBLE-PUMP-100K: 2nd readback lane drain writes (same dst as dwr_dst)
+    reg         dwr_we2;  reg [10:0] dwr_addr2; reg [P*32-1:0] dwr_data2;
+    reg         dwmr_we2; reg [10:0] dwmr_addr2; reg [P*16-1:0] dwmr_data2;
     reg  [10:0] ge_ra_local;
     reg  [10:0] ge_ra_local2;        // DOUBLE-PUMP: 2nd AQ-feed read address (stream gbs+1)
 
@@ -148,6 +157,8 @@ module cohort_engine #(
         .emb_gnt(emb_gnt), .emb_q(emb_q), .emb_req(emb_req), .emb_addr(emb_addr),
         .dw_we(dwr_we), .dw_dst(dwr_dst), .dw_addr(dwr_addr), .dw_data(dwr_data),
         .dwm_we(dwmr_we), .dwm_addr(dwmr_addr), .dwm_data(dwmr_data),
+        .dw_we2(dwr_we2), .dw_addr2(dwr_addr2), .dw_data2(dwr_data2),
+        .dwm_we2(dwmr_we2), .dwm_addr2(dwmr_addr2), .dwm_data2(dwmr_data2),
         .ge_ra(ge_ra_local), .ge_ra2(ge_ra_local2),
         .dbg_stream(rd_stream), .dbg_addr(rd_addr),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
@@ -186,6 +197,7 @@ module cohort_engine #(
     wire               gv_done;
     reg [10:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
+    wire [P*32-1:0]    gv_yout2;        // DOUBLE-PUMP: 2nd readback row (rd_addr+1)
     (* keep_hierarchy = "yes" *)
     gemm_cohort_vec #(.LANES(LANES), .N(N), .ND(ND), .P(P), .MMAX(1024),
                   .KMAX(1024), .RLAT(2), .WWORDS(WWORDS), .DP(DP)) u_gemm (
@@ -195,15 +207,18 @@ module cohort_engine #(
         .x_we2(gv_xwe2), .x_stream2(gv_xstream2), .x_row2(gv_xrow2), .x_data2(gv_xdata2),
         .ovl_en(1'b1), .x_rowcommit(gv_rowcommit),
         .start(gv_start), .done(gv_done),
-        .rd_stream(gv_rdstream), .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),
+        .rd_stream(gv_rdstream), .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]),
+        .y_out(gv_yout), .y_out2(gv_yout2),
         .waddr(waddr), .wword_rd(wword_rd), .wword1_rd(wword1_rd));
 
     // dq/gelu live in sequencer_sb (shared channel); this cohort's beats are
     // gated on its grant so the other cohort's traffic is invisible here.
     wire              dq_vout = dq_vout_i && dq_gnt;
     wire [P*32-1:0]   dq_out  = dq_out_i;
+    wire [P*32-1:0]   dq_out2 = dq_out_i2;       // DOUBLE-PUMP: 2nd lane dequant result
     wire              gl_vout = gl_vout_i && dq_gnt;
     wire [P*16-1:0]   gl_y    = gl_y_i;
+    wire [P*16-1:0]   gl_y2   = gl_y_i2;         // DOUBLE-PUMP: 2nd lane gelu result
 
     // active call context (no merge: one engine, all N streams)
     reg [19:0] a_wbase;
@@ -264,6 +279,8 @@ module cohort_engine #(
     reg [P*8-1:0]   aqw2;
     reg [P*16-1:0]  mword;
     reg [P*32-1:0]  dword;
+    reg [P*16-1:0]  mword2;        // DOUBLE-PUMP: 2nd readback lane (pair's odd row)
+    reg [P*32-1:0]  dword2;
     reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
     reg [$clog2(ROWSM+1)-1:0] gdor, gor;
     integer gp;
@@ -309,43 +326,67 @@ module cohort_engine #(
         ge_ra_local2 = (a_asrc == 2'd3) ? (sGMl2 + ge_ra_row) : (sGl2 + ge_ra_row);
     end
 
-    wire rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == glim)
-                                   : (dq_vout && gdor == ((a_m + P-1) >> LSH) - 1 && gbs == glim);
+    // DOUBLE-PUMP-100K: readback walks in PAIRS (gdor/gor +2). The last write of a
+    // stream is the 2nd row of the last pair: gdor==rows-2 (rows even -> last pair
+    // base). Completion fires on that pair's commit (both rows written this clk).
+    wire [10:0] rb_rows  = (a_m + P-1) >> LSH;
+    wire        rb_pair2 = (gdor + 1'b1 < rb_rows);   // 2nd (odd) row in range?
+    // pair walk steps gdor/gor by 2; the LAST pair base is the largest even < rows
+    // (odd rows -> the head's rb_rows=25 has a masked tail row). End when the next
+    // base would pass rows: gdor+2 >= rows.
+    wire rb_last = (a_dst == 3'd2) ? (gl_vout && (gor + 2'd2 >= ROWSM)  && gbs == glim)
+                                   : (dq_vout && (gdor + 2'd2 >= rb_rows) && gbs == glim);
     assign g_done_p = (ge == GE_RB) && rb_last;
 
-    // STREAM-GRANULAR completion: pulse when ANY stream gbs's last readback row
-    // commits (dst 0/1/3/4 — the dq path that writes qkv/attn/mlp/head banks; FC's
-    // dst=2 mlpbuf path has NO nl post-processing so it is intentionally excluded).
-    // Same alignment as g_done_p: combinational on the last-row commit of stream gbs.
+    // STREAM-GRANULAR completion: pulse when ANY stream gbs's last readback pair
+    // commits (dst 0/1/3/4).
     wire g_sdone = (ge == GE_RB) && (a_dst != 3'd2) && dq_vout &&
-                   (gdor == ((a_m + P-1) >> LSH) - 1);
+                   (gdor + 2'd2 >= rb_rows);
     wire [$clog2(N)-1:0] g_sdone_idx = gbs;
 
     always @* begin
         dword = {(P*32){1'b0}}; mword = {(P*16){1'b0}};
+        dword2 = {(P*32){1'b0}}; mword2 = {(P*16){1'b0}};
         for (gp=0; gp<P; gp=gp+1) begin
             dqv = dq_out[gp*32 +: 32];
             dword[gp*32 +: 32] = dqv;
             if      ($signed(dqv) >  32'sd32767)  mword[gp*16 +: 16] = 16'sd32767;
             else if ($signed(dqv) < -32'sd32768)  mword[gp*16 +: 16] = -16'sd32768;
             else    mword[gp*16 +: 16] = dqv[15:0];
+            // 2nd lane (the pair's odd row)
+            dqv = dq_out2[gp*32 +: 32];
+            dword2[gp*32 +: 32] = dqv;
+            if      ($signed(dqv) >  32'sd32767)  mword2[gp*16 +: 16] = 16'sd32767;
+            else if ($signed(dqv) < -32'sd32768)  mword2[gp*16 +: 16] = -16'sd32768;
+            else    mword2[gp*16 +: 16] = dqv[15:0];
         end
     end
 
     always @* begin
         dwr_we = 1'b0; dwr_dst = 3'd0; dwr_addr = 11'd0; dwr_data = dword;
         dwmr_we = 1'b0; dwmr_addr = 11'd0; dwmr_data = gl_y;
+        // 2nd lane drain (the pair's odd row at +1); dst follows dwr_dst.
+        dwr_we2 = 1'b0; dwr_addr2 = 11'd0; dwr_data2 = dword2;
+        dwmr_we2 = 1'b0; dwmr_addr2 = 11'd0; dwmr_data2 = gl_y2;
         if (ge == GE_RB) begin
+            // mask the pair's 2nd (odd) row when it is out of range (odd rb_rows tail)
             if (dq_vout) begin
                 case (a_dst)
-                    3'd0: begin dwr_we = 1'b1; dwr_dst = 3'd0; dwr_addr = sG3l + gdor; end
-                    3'd1: begin dwr_we = 1'b1; dwr_dst = 3'd1; dwr_addr = sGl  + gdor; end
+                    3'd0: begin dwr_we = 1'b1; dwr_dst = 3'd0; dwr_addr = sG3l + gdor;
+                                dwr_we2 = rb_pair2; dwr_addr2 = sG3l + gdor + 1'b1; end
+                    3'd1: begin dwr_we = 1'b1; dwr_dst = 3'd1; dwr_addr = sGl  + gdor;
+                                dwr_we2 = rb_pair2; dwr_addr2 = sGl  + gdor + 1'b1; end
                     3'd2: ;
-                    3'd3: begin dwr_we = 1'b1; dwr_dst = 3'd3; dwr_addr = sGl  + gdor; end
-                    default: begin dwr_we = 1'b1; dwr_dst = 3'd4; dwr_addr = sGAl + gdor; end
+                    3'd3: begin dwr_we = 1'b1; dwr_dst = 3'd3; dwr_addr = sGl  + gdor;
+                                dwr_we2 = rb_pair2; dwr_addr2 = sGl  + gdor + 1'b1; end
+                    default: begin dwr_we = 1'b1; dwr_dst = 3'd4; dwr_addr = sGAl + gdor;
+                                dwr_we2 = rb_pair2; dwr_addr2 = sGAl + gdor + 1'b1; end
                 endcase
             end
-            if (gl_vout) begin dwmr_we = 1'b1; dwmr_addr = sGMl + gor; end
+            if (gl_vout) begin
+                dwmr_we = 1'b1; dwmr_addr = sGMl + gor;
+                dwmr_we2 = (gor + 1'b1 < ROWSM); dwmr_addr2 = sGMl + gor + 1'b1;
+            end
         end
     end
 
@@ -525,38 +566,36 @@ module cohort_engine #(
                 end
                 GE_DQW: if (dq_gnt) ge<=GE_RB;
                 GE_RB: begin
-                    if (gci < ((a_m + P-1) >> LSH)) begin
-                        gv_rdaddr<=gci; rb0<=gci; gci<=gci+1'b1;
-                    end else gv_rdaddr <= ((a_m + P-1) >> LSH) - 1'b1;
+                    // DOUBLE-PUMP-100K: read a PAIR of rows/clk (gv_yout + gv_yout2),
+                    // dequant both (shared u_dq/u_dq2), write 2 dwr/clk. gci/gdor +2.
+                    if (gci < rb_rows) begin
+                        gv_rdaddr<=gci; rb0<=gci; gci<=gci+2'd2;
+                    end else gv_rdaddr <= rb_rows - 2'd2;
                     rb1<=rb0; rb2<=rb1;
-                    rv0<=(gci < ((a_m + P-1) >> LSH)); rv1<=rv0; rv2<=rv1;
+                    rv0<=(gci < rb_rows); rv1<=rv0; rv2<=rv1;
                     if (rv2) begin
                         dq_vin_o<=1'b1; dq_frac_o<=a_frac;
-                        dq_gemvy_o <= gv_yout;
-                        // mant/exp ride the shared side's free-running 2-stage
-                        // ROM fetch at dq_raddr_o — same alignment as the old
-                        // local mwr/ewr -> dq_mant/dq_exp registers.
+                        dq_gemvy_o  <= gv_yout;
+                        dq_gemvy_o2 <= gv_yout2;     // 2nd lane (odd row of the pair)
                     end
                     if (dq_vout) begin
-                        if (a_dst == 3'd2) begin gl_vin_o<=1'b1; gl_x_o<=mword; end
-                        if (a_dst != 3'd2 && gdor==((a_m + P-1) >> LSH)-1) begin
+                        if (a_dst == 3'd2) begin
+                            gl_vin_o<=1'b1; gl_x_o<=mword; gl_x_o2<=mword2;
+                        end
+                        if (a_dst != 3'd2 && (gdor + 2'd2 >= rb_rows)) begin
                             gci<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
                             if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end
-                            // advance the stream pointer + gemm read-port AT RBN ENTRY so
-                            // gv_rdstream is stable through the inter-stream gap (the gemm
-                            // readback's 3-stage pipeline then refills during the rv0/1/2
-                            // re-arm in GE_RB). The write side (dwr) is gated on dq_vout,
-                            // which stays low until RB re-arms, so the early gbs bump is
-                            // hazard-free. Gap shortened 8->4 (the readback latency).
+                            // advance stream pointer + gemm read-port at RBN entry
+                            // (gv_rdstream stable through the gap; dwr gated on dq_vout).
                             else begin grbn<=0; gbs<=gbs+1'b1; gv_rdstream<=gbs+1'b1; ge<=GE_RBN; end
-                        end else gdor<=gdor+1'b1;
+                        end else gdor<=gdor+2'd2;
                     end
                     if (gl_vout) begin
-                        if (gor==ROWSM-1) begin
+                        if (gor + 2'd2 >= ROWSM) begin
                             gci<=0; gor<=0; gdor<=0; rv0<=0; rv1<=0; rv2<=0;
                             if (gbs == glim) begin gbs<=0; ge<=GE_IDLE; end
                             else begin grbn<=0; gbs<=gbs+1'b1; gv_rdstream<=gbs+1'b1; ge<=GE_RBN; end
-                        end else gor<=gor+1'b1;
+                        end else gor<=gor+2'd2;
                     end
                 end
                 GE_RBN: begin

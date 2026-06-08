@@ -231,6 +231,9 @@ module sequencer_sb #(
     wire signed [6:0] dq_frac0, dq_frac1;
     wire [P*32-1:0] dq_gemvy0, dq_gemvy1;
     wire [P*16-1:0] gl_x0, gl_x1;
+    // DOUBLE-PUMP-100K: 2nd readback lane (the pair's odd row) from each cohort
+    wire [P*32-1:0] dq_gemvy0_2, dq_gemvy1_2;
+    wire [P*16-1:0] gl_x0_2, gl_x1_2;
 
     reg  dq_owner, dq_busy;
     always @(posedge clk) begin
@@ -251,32 +254,54 @@ module sequencer_sb #(
     // dq_mant/dq_exp input register. vin/gemvy are registered cohort-side at
     // the rv2 stage, so all vec_dequant inputs stay cycle-aligned.
     wire [11:0] sh_dq_ra = dq_gnt1 ? dq_ra1 : dq_ra0;
-    reg [P*24-1:0] mwr_sh, mant_sh;
-    reg [P*8-1:0]  ewr_sh, exp_sh;
+    wire [11:0] sh_dq_ra2 = sh_dq_ra + 1'b1;          // DOUBLE-PUMP: 2nd row's ROM addr
+    reg [P*24-1:0] mwr_sh, mant_sh, mwr_sh2, mant_sh2;
+    reg [P*8-1:0]  ewr_sh, exp_sh, ewr_sh2, exp_sh2;
     always @(posedge clk) begin
         mwr_sh  <= dqm_w[sh_dq_ra];
         ewr_sh  <= dqe_w[sh_dq_ra];
         mant_sh <= mwr_sh;
         exp_sh  <= ewr_sh;
+        // 2nd lane mant/exp (2nd read port of the shared ROMs)
+        mwr_sh2  <= dqm_w[sh_dq_ra2];
+        ewr_sh2  <= dqe_w[sh_dq_ra2];
+        mant_sh2 <= mwr_sh2;
+        exp_sh2  <= ewr_sh2;
     end
 
     wire           sh_dq_vin   = (dq_vin0 && dq_gnt0) || (dq_vin1 && dq_gnt1);
     wire signed [6:0] sh_dq_frac = dq_gnt1 ? dq_frac1  : dq_frac0;
     wire [P*32-1:0] sh_dq_gemvy = dq_gnt1 ? dq_gemvy1 : dq_gemvy0;
+    wire [P*32-1:0] sh_dq_gemvy2 = dq_gnt1 ? dq_gemvy1_2 : dq_gemvy0_2;
     wire           sh_dq_vout;
     wire [P*32-1:0] sh_dq_out;
     vec_dequant #(.P(P)) u_dq (
         .clk(clk), .rst(rst), .in_valid(sh_dq_vin), .frac(sh_dq_frac),
         .gemvy(sh_dq_gemvy), .mant(mant_sh), .exp(exp_sh),
         .out_valid(sh_dq_vout), .dq_out(sh_dq_out));
+    // DOUBLE-PUMP: 2nd dequant lane (the pair's odd row). Same vin/frac; out
+    // broadcast to both cohorts as dq_out_i2. (vout aligned with sh_dq_vout.)
+    wire           sh_dq_vout2;
+    wire [P*32-1:0] sh_dq_out2;
+    vec_dequant #(.P(P)) u_dq2 (
+        .clk(clk), .rst(rst), .in_valid(sh_dq_vin), .frac(sh_dq_frac),
+        .gemvy(sh_dq_gemvy2), .mant(mant_sh2), .exp(exp_sh2),
+        .out_valid(sh_dq_vout2), .dq_out(sh_dq_out2));
 
     wire           sh_gl_vin = (gl_vin0 && dq_gnt0) || (gl_vin1 && dq_gnt1);
     wire [P*16-1:0] sh_gl_x  = dq_gnt1 ? gl_x1 : gl_x0;
+    wire [P*16-1:0] sh_gl_x2 = dq_gnt1 ? gl_x1_2 : gl_x0_2;
     wire           sh_gl_vout;
     wire [P*16-1:0] sh_gl_y;
     vec_gelu #(.P(P)) u_gelu (
         .clk(clk), .in_valid(sh_gl_vin), .x(sh_gl_x),
         .out_valid(sh_gl_vout), .y(sh_gl_y));
+    // DOUBLE-PUMP: 2nd gelu lane (the pair's odd row)
+    wire           sh_gl_vout2;
+    wire [P*16-1:0] sh_gl_y2;
+    vec_gelu #(.P(P)) u_gelu2 (
+        .clk(clk), .in_valid(sh_gl_vin), .x(sh_gl_x2),
+        .out_valid(sh_gl_vout2), .y(sh_gl_y2));
 
     // ================================================================
     //                       COHORT ENGINES (x2)
@@ -313,7 +338,9 @@ module sequencer_sb #(
         .dq_vin_o(dq_vin0), .dq_frac_o(dq_frac0), .dq_gemvy_o(dq_gemvy0),
         .dq_vout_i(sh_dq_vout), .dq_out_i(sh_dq_out),
         .gl_vin_o(gl_vin0), .gl_x_o(gl_x0),
-        .gl_vout_i(sh_gl_vout), .gl_y_i(sh_gl_y));
+        .gl_vout_i(sh_gl_vout), .gl_y_i(sh_gl_y),
+        .dq_gemvy_o2(dq_gemvy0_2), .dq_out_i2(sh_dq_out2),
+        .gl_x_o2(gl_x0_2), .gl_y_i2(sh_gl_y2));
 
     cohort_engine #(.D(D), .D3(D3), .D_MLP(D_MLP), .P(P), .LANES(LANES), .N(NC),
                     .ND(ND), .VOCAB(VOCAB), .TMAX(TMAX), .GAMMA_N(GAMMA_N),
@@ -340,7 +367,9 @@ module sequencer_sb #(
         .dq_vin_o(dq_vin1), .dq_frac_o(dq_frac1), .dq_gemvy_o(dq_gemvy1),
         .dq_vout_i(sh_dq_vout), .dq_out_i(sh_dq_out),
         .gl_vin_o(gl_vin1), .gl_x_o(gl_x1),
-        .gl_vout_i(sh_gl_vout), .gl_y_i(sh_gl_y));
+        .gl_vout_i(sh_gl_vout), .gl_y_i(sh_gl_y),
+        .dq_gemvy_o2(dq_gemvy1_2), .dq_out_i2(sh_dq_out2),
+        .gl_x_o2(gl_x1_2), .gl_y_i2(sh_gl_y2));
 
     assign tok_outs = {tok_outs1, tok_outs0};
 

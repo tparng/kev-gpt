@@ -68,6 +68,15 @@ module nl_engine #(
     input  wire        dwm_we,
     input  wire [10:0] dwm_addr,      // LOCAL mlpbuf row address
     input  wire [P*16-1:0] dwm_data,
+    // DOUBLE-PUMP-100K: 2nd GE drain write (the readback pair's 2nd row). Same
+    // dst as dw_dst (one call); a 2nd write port on the qkv/attn/mlp/head + mlpbuf
+    // banks (behavioral here; synth maps to a 2-write BRAM / replica in Stage 1b).
+    input  wire        dw_we2,
+    input  wire [10:0] dw_addr2,
+    input  wire [P*32-1:0] dw_data2,
+    input  wire        dwm_we2,
+    input  wire [10:0] dwm_addr2,
+    input  wire [P*16-1:0] dwm_data2,
     // GE-side AQ feed reads (registered, 1-cycle): ge_ra is LOCAL + final
     input  wire [10:0] ge_ra,
     // DOUBLE-PUMP-100K: 2nd AQ-feed read port so the GE_AQ producer can quantize
@@ -314,7 +323,7 @@ module nl_engine #(
         mlpbuf_r2 <= mlpbuf_bank[ge_ra2];
     end
 
-    // GE drain writes (one write site per bank)
+    // GE drain writes (one write site per bank + the DOUBLE-PUMP 2nd row)
     always @(posedge clk) begin
         if (dw_we) begin
             case (dw_dst)
@@ -324,7 +333,16 @@ module nl_engine #(
                 default: head_bank[dw_addr] <= dw_data;
             endcase
         end
-        if (dwm_we) mlpbuf_bank[dwm_addr] <= dwm_data;
+        if (dw_we2) begin                   // 2nd row of the readback pair (same dst)
+            case (dw_dst)
+                3'd0: qkv_bank [dw_addr2] <= dw_data2;
+                3'd1: attn_bank[dw_addr2] <= dw_data2;
+                3'd3: mlp_bank [dw_addr2] <= dw_data2;
+                default: head_bank[dw_addr2] <= dw_data2;
+            endcase
+        end
+        if (dwm_we)  mlpbuf_bank[dwm_addr]  <= dwm_data;
+        if (dwm_we2) mlpbuf_bank[dwm_addr2] <= dwm_data2;
     end
 
     always @(posedge clk) begin
