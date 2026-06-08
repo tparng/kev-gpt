@@ -35,6 +35,9 @@ module embed_bank_tdp #(
     parameter integer P     = 8,
     parameter integer VOCAB = 193,
     parameter integer EROWS = 32,
+    // DOUBLE-PUMP-100K: DP=1 maps embed to BRAM (block) instead of URAM, freeing
+    // the 8 URAM the 2-K-wide weight image needs to fit the 64-URAM budget.
+    parameter integer DP    = 0,
     parameter integer EBITS = P*32
 ) (
     input  wire                          clk,
@@ -51,6 +54,8 @@ module embed_bank_tdp #(
 );
     localparam integer WORDS = VOCAB*EROWS;
     localparam integer EAW   = $clog2(WORDS);
+    // URAM for the single-pump record; BRAM for the double-pump (frees URAM).
+    localparam EPRIM = (DP != 0) ? "block" : "ultra";
 
     // URAM-native banking (72b) above 512 bits; EBITS=256 (P=8) keeps one word.
     localparam integer BANKW = (EBITS > 512) ? 72 : EBITS;
@@ -90,7 +95,7 @@ module embed_bank_tdp #(
                 .ADDR_WIDTH_A(EAW), .ADDR_WIDTH_B(EAW),
                 .BYTE_WRITE_WIDTH_A(BANKW), .BYTE_WRITE_WIDTH_B(BANKW),
                 .CLOCKING_MODE("common_clock"),
-                .MEMORY_PRIMITIVE("ultra"),
+                .MEMORY_PRIMITIVE(EPRIM),
                 .MEMORY_SIZE(BANKW*WORDS),
                 .READ_DATA_WIDTH_A(BANKW), .READ_DATA_WIDTH_B(BANKW),
                 .READ_LATENCY_A(1), .READ_LATENCY_B(1),

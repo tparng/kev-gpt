@@ -111,7 +111,7 @@ module sequencer_sb #(
     wire        emb_gnt0 = emb_req0;
     wire        emb_gnt1 = emb_req1;
     wire [P*32-1:0] emb_q0, emb_q1;
-    embed_bank_tdp #(.P(P), .VOCAB(VOCAB), .EROWS(EROWS)) u_embank (
+    embed_bank_tdp #(.P(P), .VOCAB(VOCAB), .EROWS(EROWS), .DP(DP)) u_embank (
         .clk(clk),
         .w_we(emb_we), .w_addr(emb_waddr), .w_data(el_next),
         .raddr_b(emb_addr0), .rword_b(emb_q0),     // cohort 0 -> port B

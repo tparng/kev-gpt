@@ -82,13 +82,19 @@ set in_mhz [expr {$in_hz / 1.0e6}]
 set out2x  [expr {2.0 * $in_mhz}]
 # No reset (free-running MMCM, locks on power-up) and no LOCKED port -> only clk_in1
 # + clk_out1 pins, so the net connects can't miss a pin.
+# clk2x phase 180deg (of clk2x = 90deg of clk) -> clk2x rising edges land in the
+# MIDDLE of clk half-periods, NOT coincident with clk edges. This matches the sim's
+# quarter-shifted clk2x convention (tb_macdp) so mac_bank_dp's phase=~clk samples a
+# STABLE clk level on silicon (no 0-deg coincident-edge race). Override via tclarg 9.
+set ph2x [lindex $argv 8]
+if {$ph2x eq ""} { set ph2x 180.000 }
 set_property -dict [list \
     CONFIG.PRIMITIVE {MMCM} \
     CONFIG.PRIM_IN_FREQ $in_mhz \
-    CONFIG.CLKOUT1_USED {true} CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $out2x CONFIG.CLKOUT1_REQUESTED_PHASE {0.000} \
+    CONFIG.CLKOUT1_USED {true} CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $out2x CONFIG.CLKOUT1_REQUESTED_PHASE $ph2x \
     CONFIG.USE_LOCKED {false} CONFIG.USE_RESET {false} \
     CONFIG.NUM_OUT_CLKS {1}] [get_bd_cells clk_wiz]
-puts "CLKWIZ in=${in_mhz}MHz -> clk2x=${out2x}"
+puts "CLKWIZ in=${in_mhz}MHz -> clk2x=${out2x} phase=${ph2x}"
 
 set g [create_bd_cell -type module -reference gemv_axi_seq_sb seq]
 set_property -dict [list CONFIG.P $pp CONFIG.LANES $lanes CONFIG.N $nn CONFIG.NC $nc \
