@@ -32,11 +32,22 @@ projected (sim)** — past the ~78k Stage 1 target. Pieces, each gated:
   Drop grew −7,220 → −9,472.
 
 **THE NEXT STEPS, in order:**
-1. **Readback/dequant double-pump (RB, ~10,360 cyc) → ~92k.** GE_RB reads `gv_yout` 1
-   row/clk, dequants (`vec_dequant`, already 1/clk), writes NL banks (`dwr`) 1/clk. Mirror
-   the AQ widen: 2nd readback port on `gemm_cohort_vec` ymem + 2 `vec_dequant` lanes + 2nd
-   write port on the nl_engine qkv/attn/mlp/head banks. Gate `run_sb_seq --dp 1`, re-measure
-   (39,577 → ~34,500 target). Then idle/SETTLE trims toward 32,000 cyc = 100k @200.
+1. **Readback/dequant double-pump (RB, ~10,360 cyc) → ~92k. STEP 1 DONE (`ab2cdd3`).**
+   `gemm_cohort_vec` now emits `y_out2` = the 2nd readback row (free: the next P-group of
+   the already-read group word; full LUT+DSP recovery duplicated; non-regressing). **Remaining
+   (the bulk, a shared-resource surgery):**
+   - **`sequencer_sb` shared NL feed → 2-wide.** The dequant AND gelu are each ONE shared,
+     arbitrated unit (`u_dq`/`u_gelu`) + shared `dqm_w`/`dqe_w` ROMs. Add a 2nd lane: `u_dq2`
+     (gemvy2 = the granted cohort's `dq_gemvy_o2`, mant/exp from `sh_dq_ra+1`), `u_gelu2`,
+     and broadcast `sh_dq_vout2`/`sh_dq_out2` (+ gl) to both cohorts.
+   - **`cohort_engine` GE_RB → 2-wide.** Verified semantics: `LSH=clog2(P)=3`, so GE_RB walks
+     `m/P` rows/stream (every layer dim is a multiple of 16 → even → pairs clean). The issue
+     counter `gci` and the write counter `gdor` are DECOUPLED by the dq pipeline latency — both
+     advance by 2. Read `gv_yout`+`gv_yout2`, feed both dq/gl lanes, write 2 `dwr`/clk.
+   - **`nl_engine` 2nd `dw` write port** on the qkv/attn/mlp/head banks (`dw_we2`/`dw_addr2`/
+     `dw_data2`) + the `mlpbuf`/gl write.
+   Gate `run_sb_seq --dp 1`, re-measure (39,577 → ~34,500). Then idle/SETTLE trims → 32,000
+   cyc = 100k @200. **This is its own focused session (5-file shared-resource surgery).**
 2. **Stage 1b (Vivado) — the silicon GO/NO-GO.** BD MMCM emits `clk2x` (400 MHz, phase-
    locked 2× of 200); the `weight_bank_tdp` SYNTHESIS branch needs the real clk2x dual-beat
    read (today stubbed 0 — its `g_w` SYNTHESIS comment); the nl_engine/xm 2nd ports map to
