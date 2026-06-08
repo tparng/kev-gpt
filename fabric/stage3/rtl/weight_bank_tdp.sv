@@ -93,70 +93,72 @@ module weight_bank_tdp #(
     assign rword1_a = rpad1_a[WBITS-1:0];
     assign rword1_b = rpad1_b[WBITS-1:0];
 
-    // DOUBLE-PUMP-100K Stage 1b: at DP=1 the XPM runs in the clk2x domain so each
-    // port serves TWO words/clk (the same physical port, a 2nd beat — NOT a 3rd
-    // port: TDP UltraRAM has only two). The read address is phase-muxed by the clk
-    // LEVEL (clk high = the even K-step raddr; clk low = the odd K-step raddr+1),
-    // exactly the phase anchoring mac_bank_dp uses. The two beats' results are
-    // captured into clk-stable rpad/rpad1 (1-clk latency = the behavioral model).
-    // The behavioral (iverilog) side stays the plain 2-read model; this XPM side
-    // is the board-validated path (the codebase convention).
-    localparam integer URCLK_DP = (DP != 0) ? 1 : 0;
+    // DOUBLE-PUMP-100K Stage 1b: at DP=1 the weights are COLUMN-PARITY SPLIT so the
+    // cohort gets BOTH K-steps of a pair (col kc + col kc+1) from ONE clk read. The
+    // URAM stays in the SLOW clk domain (its deep read cascade cannot run at 400 —
+    // OOC-proven dead); only the MAC accumulator runs at clk2x. Even columns (kc)
+    // live in mem_e, odd (kc+1) in mem_o, each HALF-depth (shorter cascade, closes
+    // 5ns easily); read both at raddr>>1. grp_base and k_count are ALWAYS even, so a
+    // pair (waddr, waddr+1) is always exactly one even + one odd column -> one read
+    // gives both. Fully behavioral / sim-validated (no clk2x-domain read, no capture,
+    // no board-only latency) -> the board run only has to validate the MAC's clk2x
+    // phase, which is unavoidable. The boot loader/assembler is unchanged; only the
+    // per-bank write target + read split by column parity here.
+    localparam integer WHALF = WWORDS/2;
+    localparam integer WAW2  = (WHALF > 1) ? $clog2(WHALF) : 1;
+    wire [WAW2-1:0] ra_b2 = raddr_b[WAW-1:1];     // physical (pair) index, cohort 0
+    wire [WAW2-1:0] ra_a2 = raddr_a[WAW-1:1];     //                        cohort 1
+    wire [WAW2-1:0] ww2   = wword[WAW-1:1];        // physical write index (column>>1)
+    wire            wpar  = wword[0];              // 0 -> even-col bank, 1 -> odd
+    wire [WAW2-1:0] aa2   = wcommit ? ww2 : ra_a2; // port A: boot-write addr / cohort1 read
     genvar gb;
     generate
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
 `ifdef SYNTHESIS
-            if (URCLK_DP) begin : g_clk2x
-                // ---- clk2x-clocked port: 2 beats/clk per port -------------------
-                // beat addresses by clk level (held stable across the clk period):
-                wire [WAW-1:0] addrb_2x = clk ? raddr_b : baddr1;     // even / odd K-step
-                wire [WAW-1:0] addra_rd = clk ? raddr_a : aaddr1;
-                wire [WAW-1:0] addra_2x = wcommit ? wword : addra_rd; // boot write idempotent @2x
-                wire [BANKW-1:0] douta, doutb;
+            if (DP != 0) begin : g_2kw
+                // even-column URAM (cols kc): A=boot-write(!wpar)/cohort1-read, B=cohort0-read
+                wire [BANKW-1:0] dea_a, dea_b, doa_a, doa_b;
                 xpm_memory_tdpram #(
-                    .ADDR_WIDTH_A(WAW), .ADDR_WIDTH_B(WAW),
+                    .ADDR_WIDTH_A(WAW2), .ADDR_WIDTH_B(WAW2),
                     .BYTE_WRITE_WIDTH_A(BANKW), .BYTE_WRITE_WIDTH_B(BANKW),
-                    .CLOCKING_MODE("common_clock"),
-                    .MEMORY_PRIMITIVE("ultra"),
-                    // CASCADE_HEIGHT=2: cap the URAM cascade so the 400 MHz read
-                    // doesn't chain ~7 CAS_IN->CAS_OUT hops (the -2.368ns crit path);
-                    // shallow cascades + a final mux are faster than the deep chain.
-                    .CASCADE_HEIGHT(2),
-                    .MEMORY_SIZE(BANKW*WWORDS),
+                    .CLOCKING_MODE("common_clock"), .MEMORY_PRIMITIVE("ultra"),
+                    .MEMORY_SIZE(BANKW*WHALF),
                     .READ_DATA_WIDTH_A(BANKW), .READ_DATA_WIDTH_B(BANKW),
-                    // +1 pipeline register in the URAM cascade (Vivado 8-6057): the
-                    // 400 MHz read needs it. READ_LATENCY=3 -> dout 3 clk2x after addr.
-                    .READ_LATENCY_A(3), .READ_LATENCY_B(3),
+                    .READ_LATENCY_A(1), .READ_LATENCY_B(1),
                     .WRITE_DATA_WIDTH_A(BANKW), .WRITE_DATA_WIDTH_B(BANKW),
                     .WRITE_MODE_A("no_change"), .WRITE_MODE_B("no_change")
-                ) u_tdp (
-                    .clka(clk2x), .clkb(clk2x),
-                    .rsta(1'b0), .rstb(1'b0),
-                    .ena(1'b1), .enb(1'b1),
-                    .regcea(1'b1), .regceb(1'b1),
-                    .wea(wcommit), .web(1'b0),
-                    .addra(addra_2x), .addrb(addrb_2x),
+                ) u_e (
+                    .clka(clk), .clkb(clk), .rsta(1'b0), .rstb(1'b0), .ena(1'b1), .enb(1'b1),
+                    .regcea(1'b1), .regceb(1'b1), .wea(wcommit && !wpar), .web(1'b0),
+                    .addra(aa2), .addrb(ra_b2),
                     .dina(wnext_pad[gb*BANKW +: BANKW]), .dinb({BANKW{1'b0}}),
-                    .douta(douta), .doutb(doutb),
+                    .douta(dea_a), .doutb(dea_b),
                     .injectsbiterra(1'b0), .injectdbiterra(1'b0),
                     .injectsbiterrb(1'b0), .injectdbiterrb(1'b0),
-                    .sbiterra(), .dbiterra(), .sbiterrb(), .dbiterrb(),
-                    .sleep(1'b0)
-                );
-                // capture: dout at clk2x edge E = read of the addr from E-1, whose
-                // phase was clk(E-1). Tag dout with clk delayed 1 clk2x, demux into
-                // the even-K (rpad) and odd-K (rpad1) holding regs.
-                reg clk_d1;
-                reg [BANKW-1:0] capb0, capb1, capa0, capa1;
-                always @(posedge clk2x) begin
-                    clk_d1 <= clk;
-                    if (clk_d1) begin capb0 <= doutb; capa0 <= douta; end  // even K-step
-                    else        begin capb1 <= doutb; capa1 <= douta; end  // odd  K-step
-                end
-                assign rpad_a[gb*BANKW +: BANKW]  = capa0;
-                assign rpad_b[gb*BANKW +: BANKW]  = capb0;
-                assign rpad1_a[gb*BANKW +: BANKW] = capa1;
-                assign rpad1_b[gb*BANKW +: BANKW] = capb1;
+                    .sbiterra(), .dbiterra(), .sbiterrb(), .dbiterrb(), .sleep(1'b0));
+                // odd-column URAM (cols kc+1)
+                xpm_memory_tdpram #(
+                    .ADDR_WIDTH_A(WAW2), .ADDR_WIDTH_B(WAW2),
+                    .BYTE_WRITE_WIDTH_A(BANKW), .BYTE_WRITE_WIDTH_B(BANKW),
+                    .CLOCKING_MODE("common_clock"), .MEMORY_PRIMITIVE("ultra"),
+                    .MEMORY_SIZE(BANKW*WHALF),
+                    .READ_DATA_WIDTH_A(BANKW), .READ_DATA_WIDTH_B(BANKW),
+                    .READ_LATENCY_A(1), .READ_LATENCY_B(1),
+                    .WRITE_DATA_WIDTH_A(BANKW), .WRITE_DATA_WIDTH_B(BANKW),
+                    .WRITE_MODE_A("no_change"), .WRITE_MODE_B("no_change")
+                ) u_o (
+                    .clka(clk), .clkb(clk), .rsta(1'b0), .rstb(1'b0), .ena(1'b1), .enb(1'b1),
+                    .regcea(1'b1), .regceb(1'b1), .wea(wcommit && wpar), .web(1'b0),
+                    .addra(aa2), .addrb(ra_b2),
+                    .dina(wnext_pad[gb*BANKW +: BANKW]), .dinb({BANKW{1'b0}}),
+                    .douta(doa_a), .doutb(doa_b),
+                    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+                    .injectsbiterrb(1'b0), .injectdbiterrb(1'b0),
+                    .sbiterra(), .dbiterra(), .sbiterrb(), .dbiterrb(), .sleep(1'b0));
+                assign rpad_a[gb*BANKW +: BANKW]  = dea_a;   // col raddr_a   (even)
+                assign rpad_b[gb*BANKW +: BANKW]  = dea_b;
+                assign rpad1_a[gb*BANKW +: BANKW] = doa_a;   // col raddr_a+1 (odd)
+                assign rpad1_b[gb*BANKW +: BANKW] = doa_b;
             end else begin : g_clk1x
             // ---- DP=0: PROVEN single-beat clk read (rpad1 unused) ---------------
             wire [BANKW-1:0] douta, doutb;
@@ -190,28 +192,34 @@ module weight_bank_tdp #(
             assign rpad1_b[gb*BANKW +: BANKW] = {BANKW{1'b0}};
             end
 `else
-            // behavioral 2-port (sim): independent registered reads, one write
-            // site on port A. Both reads are 1-cycle = the cohort pipeline stage 0.
-            reg [BANKW-1:0] mem [0:WWORDS-1];
-            reg [BANKW-1:0] rd_a, rd_b;
-            always @(posedge clk) begin
-                if (wcommit) mem[wword] <= wnext_pad[gb*BANKW +: BANKW];
-                rd_a <= mem[raddr_a];
-                rd_b <= mem[raddr_b];
-            end
-            assign rpad_a[gb*BANKW +: BANKW] = rd_a;
-            assign rpad_b[gb*BANKW +: BANKW] = rd_b;
-            // DP: second behavioral read at raddr+1, same 1-cycle latency (the
-            // plan-authorised "two reads of the URAM" sim model). DP=0 -> 0.
-            if (DP != 0) begin : g_rd2
-                reg [BANKW-1:0] rd1_a, rd1_b;
+            if (DP != 0) begin : g_2kw_beh
+                // behavioral column-parity split (mirrors the synth even/odd URAMs)
+                reg [BANKW-1:0] mem_e [0:WHALF-1];
+                reg [BANKW-1:0] mem_o [0:WHALF-1];
+                reg [BANKW-1:0] rd_a, rd_b, rd1_a, rd1_b;
                 always @(posedge clk) begin
-                    rd1_a <= mem[aaddr1];
-                    rd1_b <= mem[baddr1];
+                    if (wcommit) begin
+                        if (wpar) mem_o[ww2] <= wnext_pad[gb*BANKW +: BANKW];
+                        else      mem_e[ww2] <= wnext_pad[gb*BANKW +: BANKW];
+                    end
+                    rd_b  <= mem_e[ra_b2];  rd1_b <= mem_o[ra_b2];   // col raddr_b, raddr_b+1
+                    rd_a  <= mem_e[ra_a2];  rd1_a <= mem_o[ra_a2];
                 end
+                assign rpad_a[gb*BANKW +: BANKW]  = rd_a;
+                assign rpad_b[gb*BANKW +: BANKW]  = rd_b;
                 assign rpad1_a[gb*BANKW +: BANKW] = rd1_a;
                 assign rpad1_b[gb*BANKW +: BANKW] = rd1_b;
-            end else begin : g_no_rd2
+            end else begin : g_beh1
+                // DP=0 behavioral: single 512b store, one read (rpad1 unused).
+                reg [BANKW-1:0] mem [0:WWORDS-1];
+                reg [BANKW-1:0] rd_a, rd_b;
+                always @(posedge clk) begin
+                    if (wcommit) mem[wword] <= wnext_pad[gb*BANKW +: BANKW];
+                    rd_a <= mem[raddr_a];
+                    rd_b <= mem[raddr_b];
+                end
+                assign rpad_a[gb*BANKW +: BANKW] = rd_a;
+                assign rpad_b[gb*BANKW +: BANKW] = rd_b;
                 assign rpad1_a[gb*BANKW +: BANKW] = {BANKW{1'b0}};
                 assign rpad1_b[gb*BANKW +: BANKW] = {BANKW{1'b0}};
             end
