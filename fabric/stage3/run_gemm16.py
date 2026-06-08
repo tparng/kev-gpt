@@ -21,6 +21,7 @@ from .pack_banked import pack_transposed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RTL = os.path.join(HERE, "rtl", "gemm_banked_resident_vec.sv")
+MAC_DP = os.path.join(HERE, "rtl", "mac_bank_dp.sv")   # double-pumped LUT leaf (DP=1)
 TB = os.path.join(HERE, "tb", "tb_gemm16.sv")
 P = 8
 
@@ -51,13 +52,15 @@ def write_case(d, M, K, lanes, n, seed, corner=False):
     return ys
 
 
-def run_cfg(d, M, K, lanes, n, nd, seed, corner):
+def run_cfg(d, M, K, lanes, n, nd, seed, corner, dpump=False):
     os.makedirs(d, exist_ok=True)
     ys = write_case(d, M, K, lanes, n, seed, corner)
     vvp = os.path.join(d, "sim.vvp")
-    cc = subprocess.run(["iverilog", "-g2012", "-o", vvp,
-                         f"-DLANES={lanes}", f"-DNSTR={n}", f"-DNDSP={nd}",
-                         f"-DMVAL={M}", f"-DKVAL={K}", TB, RTL],
+    defs = [f"-DLANES={lanes}", f"-DNSTR={n}", f"-DNDSP={nd}",
+            f"-DMVAL={M}", f"-DKVAL={K}"]
+    if dpump:
+        defs.append("-DDPUMP")
+    cc = subprocess.run(["iverilog", "-g2012", "-o", vvp] + defs + [TB, RTL, MAC_DP],
                         capture_output=True, text=True)
     if cc.returncode != 0:
         print("IVERILOG_COMPILE_FAIL"); print(cc.stdout); print(cc.stderr)
@@ -74,7 +77,8 @@ def run_cfg(d, M, K, lanes, n, nd, seed, corner):
                            dtype=np.int64)
         bad += int(np.sum(got[:M] != ys[:, s]))
     tag = "corner" if corner else f"seed{seed}"
-    print(f"GEMM16 N={n} ND={nd} M={M} K={K} {tag}: mismatches={bad}/{M*n} "
+    dp = "DP " if dpump else ""
+    print(f"GEMM16 {dp}N={n} ND={nd} M={M} K={K} {tag}: mismatches={bad}/{M*n} "
           f"{'OK' if bad == 0 else 'FAIL'}")
     return bad == 0
 
@@ -83,7 +87,29 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="fabric.stage3.run_gemm16")
     p.add_argument("--lanes", type=int, default=128)
     p.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_gemm16"))
+    p.add_argument("--lut-only", action="store_true",
+                   help="DOUBLE-PUMP Stage 1a: gate the double-pumped LUT path "
+                        "(DP=1) on ND=0 cases only — the DSP path is not yet "
+                        "double-pumped (the --nd 6 step).")
     a = p.parse_args(argv)
+
+    if a.lut_only:
+        # double-pump (DP=1) LUT-only beachhead. ND=0 => the g_dsp branch makes
+        # zero instances, so these are complete. K is always a multiple of P=8
+        # (even) here, so the odd-K phase-1 mask is exercised only defensively.
+        cases = [
+            # (M, K, N, ND, seed, corner)
+            (256, 256, 8, 0, 1, False),       # shipping N=8 all-LUT, double-pumped
+            (1024, 256, 16, 0, 3, False),     # N=16 all-LUT, mlp1 shape
+            (256, 1024, 16, 0, 4, False),     # K=1024 reduction, all-LUT
+            (256, 1024, 8, 0, 5, True),       # |acc| = 2^20 range-proof corner
+        ]
+        ok = True
+        for M, K, n, nd, seed, corner in cases:
+            d = os.path.join(a.dir, f"dp_n{n}_nd{nd}_m{M}_k{K}_{'c' if corner else seed}")
+            ok &= run_cfg(d, M, K, a.lanes, n, nd, seed, corner, dpump=True)
+        print("GEMM16_DP_VERDICT " + ("ALL_BITEXACT" if ok else "FAIL"))
+        return 0 if ok else 1
 
     cases = [
         # (M, K, N, ND, seed, corner)

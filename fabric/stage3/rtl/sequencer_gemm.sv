@@ -173,7 +173,7 @@ module sequencer_gemm #(
     wire [P*32-1:0]    gv_yout;
     gemm_banked_resident_vec #(.LANES(LANES), .N(N), .P(P), .MMAX(1024), .KMAX(1024),
                   .RLAT(2), .WWORDS(WWORDS)) u_gemm (
-        .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
+        .clk(clk), .clk2x(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
         .x_rst(gv_xrst), .x_we(gv_xwe), .x_stream(gv_xstream), .x_data(gv_xdata),
         .start(gv_start), .done(gv_done),

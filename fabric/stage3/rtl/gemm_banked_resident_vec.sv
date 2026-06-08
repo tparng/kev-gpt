@@ -28,12 +28,22 @@ module gemm_banked_resident_vec #(
     parameter integer KMAX   = 1024,      // max reduction length of any single layer
     parameter integer WWORDS = 25600,     // resident capacity in wide words
     parameter integer RLAT   = 2,         // read->mac pipeline depth (cycles)
+    // DOUBLE-PUMP-100K Stage 1: DP=1 runs the RUN MAC at 2 K-steps/clk via the
+    // proven mac_bank_dp (accumulator in the clk2x domain). DP=0 is the original
+    // single-pump core, byte-identical to before (the legacy sequencer_gemm /
+    // sequencer_pp instantiations stay unchanged; they tie clk2x to clk, unused).
+    // NOTE: the DSP-packed path (mac_bank_dsp, the ND streams) is NOT yet
+    // double-pumped under DP=1 — gate DP=1 only with ND=0 until the DSP leaf's
+    // own double-pump lands (the --nd 6 step). At ND=0 the g_dsp branch makes
+    // zero instances, so DP=1/ND=0 is correct and complete.
+    parameter integer DP     = 0,
     // accumulator width: |acc| <= 8*128*1024 = 2^20 exactly (w=-8, x=-128,
     // k=1024 corner), so 24 bits holds every partial sum with 3 bits margin.
     // y_out stays P*32 (sign-extended) so the sequencer interface is unchanged.
     parameter integer ABITS  = 24
 ) (
     input  wire                          clk,
+    input  wire                          clk2x,   // 2x clk, 0-deg aligned (DP=1 only)
     input  wire                          rst,
     input  wire [$clog2(MMAX+1)-1:0]     m_count,
     input  wire [$clog2(KMAX+1)-1:0]     k_count,
@@ -108,9 +118,16 @@ module gemm_banked_resident_vec #(
     end
 
     // ---- per-bank URAM arrays + registered read (= pipeline stage 0) ------------
+    // DP=1 needs TWO weight words/clk (K-steps 2j and 2j+1). Modelled here as a
+    // second registered read of the SAME bank array (waddr1 = waddr+1) — a true
+    // dual-port read the URAM supports natively (Stage 1b clocks the second read
+    // off clk2x; the values are identical, so this sim model is bit-faithful).
+    // DP=0 keeps exactly one read port (synth-identical to before).
     wire [$clog2(WWORDS)-1:0] waddr;
     wire [WPAD-1:0] wword_pad;
-    wire [WBITS-1:0] wword_rd = wword_pad[WBITS-1:0];
+    wire [WPAD-1:0] wword1_pad;
+    wire [WBITS-1:0] wword_rd  = wword_pad[WBITS-1:0];
+    wire [WBITS-1:0] wword1_rd = wword1_pad[WBITS-1:0];
     genvar gb;
     generate
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
@@ -121,6 +138,11 @@ module gemm_banked_resident_vec #(
                 rd <= mem[waddr];
             end
             assign wword_pad[gb*BANKW +: BANKW] = rd;
+            if (DP != 0) begin : g_rd2
+                reg [BANKW-1:0] rd1;
+                always @(posedge clk) rd1 <= mem[waddr1];
+                assign wword1_pad[gb*BANKW +: BANKW] = rd1;
+            end
         end
     endgenerate
 
@@ -134,28 +156,37 @@ module gemm_banked_resident_vec #(
     reg [$clog2(N):0]    db;                 // ymem drain stream counter
     reg                  acc_clr;            // broadcast accumulator clear
 
+    // DP=1: advance 2 K-steps/clk; DP=0: 1/clk (the original).
+    localparam integer   STEP    = (DP != 0) ? 2 : 1;
     wire [$clog2(GROUPS):0] gcount = (m_count + LANES - 1) >> LSH;
-    wire                 issue   = (kc < k_count);
-    assign               waddr   = grp_base + kc;
+    wire                 issue   = (kc < k_count);             // phase-0 valid
+    wire                 issue1  = (DP != 0) && ((kc + 1) < k_count);  // phase-1 valid
+    assign               waddr   = grp_base + kc;              // even K-step (phase 0)
+    wire [WAW-1:0]       waddr1  = grp_base + kc + 1'b1;       // odd  K-step (phase 1, DP)
 
     // pipeline: weight word (stage 0 = the per-bank URAM read reg) + acts + valid.
     // Per-stream act pipelines live INSIDE g_mac (per-stream xm memories +
     // their own xr stages) — one xmem with N read ports made Vivado replicate
     // at N=8 and refuse at N=16; per-stream 1W/1R SDPs are the natural shape.
-    reg [WBITS-1:0]      word_p [0:RLAT-2];
-    reg [LSHP-1:0]       xl_p   [0:RLAT-1];
-    reg                  v_p    [0:RLAT-1];
+    reg [WBITS-1:0]      word_p  [0:RLAT-2];
+    reg [WBITS-1:0]      word1_p [0:RLAT-2];   // DP: second weight word (phase 1)
+    reg [LSHP-1:0]       xl_p    [0:RLAT-1];   // base (phase-0, even) act lane index
+    reg                  v_p     [0:RLAT-1];   // phase-0 valid
+    reg                  v1_p    [0:RLAT-1];   // DP: phase-1 valid (odd-K tail mask)
     integer i, b;
+    // kc is even under DP, so K-steps kc and kc+1 share one P-wide act row.
     wire [$clog2(XROWS)-1:0] xrd_row = kc[$clog2(KMAX)-1:0] >> LSHP;
 
-    wire                 mac_v = v_p[RLAT-1];
+    wire                 mac_v  = v_p[RLAT-1];
+    wire                 mac_v1 = v1_p[RLAT-1];   // DP: phase-1 valid at MAC stage
 
     // ---- N MAC banks (generate: each accumulator is its own plain reg, so the
     // per-lane variable part-select hits a PLAIN reg, never an array element —
     // accb[b][L*32 +: 32] reads/writes X under iverilog). wsel must be a WIRE:
     // an always@* copy made Vivado trim the URAM read register to 4 bits and
     // fall back to ~400k LUTRAM.
-    wire [WBITS-1:0] wsel = word_p[RLAT-2];
+    wire [WBITS-1:0] wsel  = word_p[RLAT-2];      // phase-0 weight word (and DP=0/DSP)
+    wire [WBITS-1:0] wsel1 = word1_p[RLAT-2];      // DP: phase-1 weight word
     // per-stream wires: one flat N*YBITS concat wraps iverilog's 16-bit index
     // space at stream 4 (bit 16384) � streams 4..7 would read stream 0..3.
 `ifdef SYNTHESIS
@@ -192,7 +223,12 @@ module gemm_banked_resident_vec #(
             // unpacked element to a plain wire BEFORE the variable part-select
             // (the iverilog X rule).
             wire [P*8-1:0]    xrow = xr[RLAT-1];
-            wire signed [7:0] xsel = xrow[xl_p[RLAT-1]*8 +: 8];
+            wire [LSHP-1:0]   xl0  = xl_p[RLAT-1];               // base (even) lane
+            wire signed [7:0] xsel = xrow[xl0*8 +: 8];          // phase-0 act (and DP=0/DSP)
+            // DP phase-1 act = next lane (xl0+1, always in-row since xl0 even <= P-2);
+            // masked to 0 on the odd-K tail so mac_bank_dp's phase-1 accumulate no-ops.
+            wire signed [7:0] x1raw = xrow[(xl0 + 1'b1)*8 +: 8];
+            wire signed [7:0] xsel1 = mac_v1 ? x1raw : 8'sd0;
             // one accumulator per lane: all weight indexing is genvar-CONSTANT —
             // a runtime-L loop made Vivado fail to unroll and trim wsel to 4 bits
             // (the URAM read died, weights fell back to ~400k LUTRAM).
@@ -206,11 +242,20 @@ module gemm_banked_resident_vec #(
             // same weight word, same interface, recovered y values out.
             wire [YBITS-1:0] acc_bank;
             if (gm < N - ND) begin : g_lut
-                mac_bank #(.LANES(LANES), .ABITS(ABITS)) u_mac (
-                    .clk(clk), .clr(rst || acc_clr), .en(mac_v),
-                    .w(wsel), .x(xsel), .acc(acc_bank));
+                if (DP != 0) begin : g_dpump
+                    // double-pumped LUT bank: 2 K-steps/clk into the clk2x acc.
+                    mac_bank_dp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
+                        .clk(clk), .clk2x(clk2x), .clr(rst || acc_clr), .en(mac_v),
+                        .w0(wsel), .w1(wsel1), .x0(xsel), .x1(xsel1), .acc(acc_bank));
+                end else begin : g_single
+                    mac_bank #(.LANES(LANES), .ABITS(ABITS)) u_mac (
+                        .clk(clk), .clr(rst || acc_clr), .en(mac_v),
+                        .w(wsel), .x(xsel), .acc(acc_bank));
+                end
                 assign sa_str[gm] = 23'sd0;        // LUT streams: no recovery
             end else begin : g_dsp
+                // single-pump DSP leaf — NOT yet double-pumped. Only instantiated
+                // at ND>0; gate DP=1 with ND=0 until the DSP double-pump lands.
                 mac_bank_dsp #(.LANES(LANES), .ABITS(ABITS)) u_mac (
                     .clk(clk), .clr(rst || acc_clr), .en(mac_v),
                     .w(wsel), .x(xsel), .acc(acc_bank),
@@ -233,14 +278,19 @@ module gemm_banked_resident_vec #(
     endgenerate
 
     always @(posedge clk) begin
-        word_p[0] <= wword_rd;
-        xl_p[0]   <= kc[LSHP-1:0];
-        v_p[0]    <= (state == RUN) && issue;
-        for (i = 1; i < RLAT-1; i = i + 1)
-            word_p[i] <= word_p[i-1];
+        word_p[0]  <= wword_rd;
+        word1_p[0] <= wword1_rd;                    // DP (dead/trimmed when DP=0)
+        xl_p[0]    <= kc[LSHP-1:0];
+        v_p[0]     <= (state == RUN) && issue;
+        v1_p[0]    <= (state == RUN) && issue1;
+        for (i = 1; i < RLAT-1; i = i + 1) begin
+            word_p[i]  <= word_p[i-1];
+            word1_p[i] <= word1_p[i-1];
+        end
         for (i = 1; i < RLAT; i = i + 1) begin
             xl_p[i]   <= xl_p[i-1];
             v_p[i]    <= v_p[i-1];
+            v1_p[i]   <= v1_p[i-1];
         end
 
         acc_clr <= 1'b0;
@@ -248,7 +298,7 @@ module gemm_banked_resident_vec #(
             state <= IDLE; done <= 1'b0;
             g <= 0; kc <= 0; kmac <= 0; grp_base <= 0; db <= 0;
             acc_clr <= 1'b1;
-            for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+            for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v1_p[i] <= 1'b0; end
         end else begin
             case (state)
                 IDLE: begin
@@ -257,13 +307,15 @@ module gemm_banked_resident_vec #(
                         g <= 0; kc <= 0; kmac <= 0;
                         acc_clr <= 1'b1;
                         grp_base <= w_base;
-                        for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+                        for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v1_p[i] <= 1'b0; end
                         state <= RUN;
                     end
                 end
                 RUN: begin
-                    if (issue) kc <= kc + 1'b1;
-                    if (mac_v) kmac <= kmac + 1'b1;
+                    if (issue) kc <= kc + STEP;
+                    // each MAC clk retires phase 0 (+1) and, under DP, phase 1
+                    // too (+1) unless masked on the odd-K tail -> +2 or +1.
+                    if (mac_v) kmac <= kmac + (mac_v1 ? 2'd2 : 2'd1);
 `ifdef SYNTHESIS
                     // straight to DRAIN — the exact FSM of the URAM-clean
                     // a783c4a build. SETTLE is a sim-only mechanism (y_lat
@@ -337,7 +389,7 @@ module gemm_banked_resident_vec #(
                         else begin
                             g <= g + 1'b1; kc <= 0; kmac <= 0;
                             grp_base <= grp_base + k_count;
-                            for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+                            for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v1_p[i] <= 1'b0; end
                             state <= RUN;
                         end
                     end else db <= db + 1'b1;

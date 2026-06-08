@@ -33,8 +33,19 @@ module tb_gemm16;
     localparam integer NW    = GROUPS*K;
     localparam integer XR    = K/P;
 
+    // DOUBLE-PUMP-100K Stage 1: -DDPUMP exercises the double-pumped LUT path
+    // (DP=1, mac_bank_dp at 2 K-steps/clk). clk2x is 2x clk, quarter-shifted so
+    // its two rising edges per clk period sample distinct clk levels with NO
+    // coincident-edge race — the exact convention proven by tb_macdp.
+`ifdef DPUMP
+    localparam integer DPV = 1;
+`else
+    localparam integer DPV = 0;
+`endif
     reg clk = 0, rst = 1;
-    always #5 clk = ~clk;
+    always #5 clk = ~clk;                 // 10 ns period, posedges at 5,15,...
+    reg clk2x = 0;
+    initial begin #2.5 forever #2.5 clk2x = ~clk2x; end   // rising at 2.5,7.5,...
 
     reg                     ld_rst = 0, w_we = 0, x_rst = 0, x_we = 0, start = 0;
     reg  [31:0]             w_data;
@@ -48,8 +59,8 @@ module tb_gemm16;
 
     gemm_banked_resident_vec #(.LANES(LANES), .N(N), .ND(ND), .P(P),
                                .MMAX(1024), .KMAX(1024), .RLAT(2),
-                               .WWORDS(25600)) dut (
-        .clk(clk), .rst(rst), .m_count(m_count), .k_count(k_count),
+                               .WWORDS(25600), .DP(DPV)) dut (
+        .clk(clk), .clk2x(clk2x), .rst(rst), .m_count(m_count), .k_count(k_count),
         .w_base(w_base), .ld_rst(ld_rst), .w_we(w_we), .w_data(w_data),
         .x_rst(x_rst), .x_we(x_we), .x_stream(x_stream), .x_data(x_data),
         .start(start), .done(done),
