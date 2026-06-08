@@ -66,6 +66,10 @@ module gemm_cohort_vec #(
     input  wire [$clog2(N)-1:0]          rd_stream,
     input  wire [$clog2(MMAX/P)-1:0]     rd_addr,
     output wire [P*32-1:0]               y_out,
+    // DOUBLE-PUMP-100K: 2nd readback row (rd_addr+1) so GE_RB can dequant 2 rows
+    // /clk. rd_addr is the pair base (even); rd_addr+1 shares the same group word
+    // (PPG even), so it's a free 2nd P-group select off the SAME ymem read.
+    output wire [P*32-1:0]               y_out2,
     // ---- shared weight bank read interface (replaces the in-core URAM) ----
     output wire [$clog2(WWORDS)-1:0]     waddr,        // read addr to weight_bank_tdp
     input  wire [LANES*4-1:0]            wword_rd,     // registered word (1-cyc latency)
@@ -317,12 +321,16 @@ module gemm_cohort_vec #(
     reg [YBITS-1:0]        rd_word;
     reg [$clog2(PPG)-1:0]  rd_off;
     reg [P*ABITS-1:0]      y_raw;
+    reg [P*ABITS-1:0]      y_raw2;       // DOUBLE-PUMP: 2nd P-group (rd_off+1), same word
     reg signed [22:0]      sa_rd, sa_pipe;
     reg                    dsp0, dsp1;
     always @(posedge clk) begin
         rd_word <= ymem[rd_stream*GROUPS + rd_addr / PPG];
         rd_off  <= rd_addr % PPG;
         y_raw   <= rd_word[rd_off*(P*ABITS) +: P*ABITS];
+        // 2nd row of the pair: next P-group of the SAME group word (rd_off even,
+        // PPG even -> rd_off+1 is in-word; same sum_act/group, same 2-cyc latency).
+        y_raw2  <= rd_word[(rd_off + 1'b1)*(P*ABITS) +: P*ABITS];
         sa_rd   <= sumact_mem[rd_stream*GROUPS + rd_addr / PPG];
         sa_pipe <= sa_rd;
         dsp0    <= (rd_stream >= (N - ND));
@@ -331,12 +339,14 @@ module gemm_cohort_vec #(
     wire signed [25:0] sa8 = {sa_pipe, 3'b000};
     genvar gy, gp;
     generate
-        wire [P*32-1:0] y_lut;
+        wire [P*32-1:0] y_lut, y_lut2;
         for (gy = 0; gy < P; gy = gy + 1) begin : g_yext
             assign y_lut[gy*32 +: 32] =
                 {{(32-ABITS){y_raw[gy*ABITS + ABITS-1]}}, y_raw[gy*ABITS +: ABITS]};
+            assign y_lut2[gy*32 +: 32] =
+                {{(32-ABITS){y_raw2[gy*ABITS + ABITS-1]}}, y_raw2[gy*ABITS +: ABITS]};
         end
-        wire [P*32-1:0] y_dsp;
+        wire [P*32-1:0] y_dsp, y_dsp2;
         for (gp = 0; gp < P/2; gp = gp + 1) begin : g_rec
             wire [47:0]        a     = y_raw[gp*48 +: 48];
             wire [21:0]        y0m   = a[21:0] - sa8[21:0];
@@ -346,7 +356,17 @@ module gemm_cohort_vec #(
             wire signed [31:0] y1    = $signed(a[47:22]) - sa8 - carry;
             assign y_dsp[(2*gp)  *32 +: 32] = y0;
             assign y_dsp[(2*gp+1)*32 +: 32] = y1;
+            // 2nd P-group recovery (same shared sum_act)
+            wire [47:0]        a_2    = y_raw2[gp*48 +: 48];
+            wire [21:0]        y0m_2  = a_2[21:0] - sa8[21:0];
+            wire signed [31:0] y0_2   = {{10{y0m_2[21]}}, y0m_2};
+            wire signed [27:0] hsum_2 = y0_2 + sa8;
+            wire signed [5:0]  carry_2= hsum_2 >>> 22;
+            wire signed [31:0] y1_2   = $signed(a_2[47:22]) - sa8 - carry_2;
+            assign y_dsp2[(2*gp)  *32 +: 32] = y0_2;
+            assign y_dsp2[(2*gp+1)*32 +: 32] = y1_2;
         end
-        assign y_out = dsp1 ? y_dsp : y_lut;
+        assign y_out  = dsp1 ? y_dsp  : y_lut;
+        assign y_out2 = dsp1 ? y_dsp2 : y_lut2;
     endgenerate
 endmodule
