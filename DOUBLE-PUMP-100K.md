@@ -112,12 +112,47 @@ double-pumped MAC sidesteps it because:
   ≥400 on the board — that is Stage 1's board sweep, not a new unknown.
 
 ### Stage 1 — Double-pump the MAC (the RUN phase) → ~78k
-Rewrite `mac_bank` / `mac_bank_dsp` to consume 2 operands/`clk` on `clk2x`. Add a
-`clk2x` read port to `weight_bank_tdp` (2 weight words/`clk`) and to the per-stream
-activation memory. The run FSM advances `kc` by 2 per `clk`. Gate: every existing
-`run_banked` / `run_gemm_sb` / `run_sb_seq` bit-exact (the math is unchanged; the TB
-adds `clk2x`). Build with the MAC island Pblocked at `clk2x` from the MMCM; board sweep
-`clk`=200, `clk2x`=400. Target: RUN 25,088 → 12,544, **~78,400 tok/s MEASURED**.
+
+**The exact mechanism (decided — Stage 0 settled it).** The RUN kc-loop datapath runs
+in the `clk2x` domain; the FSM stays at `clk`. Concretely, in `gemm_banked_resident_vec`
+(and its split-brain twin `gemm_cohort_vec`):
+
+- **Keep the FSM single-domain at `clk`.** The IDLE/RUN/DRAIN/SETTLE/FIN state machine,
+  the group loop `g`, the drain counter `db`, `start`/`done`, and the `ymem` write/readback
+  all stay on `posedge clk`. No FSM split, no async CDC — this is the key simplification.
+- **Feed 2 K-steps per `clk` into `mac_bank_dp`.** In the RUN state, `kc += 2` per `clk`
+  (was +1). Read TWO weight words (`grp_base+kc`, `grp_base+kc+1`) and TWO activation
+  lanes per `clk`, and present them as `(w0,w1)`/`(x0,x1)` to `mac_bank_dp` (the proven
+  Stage-0 bank), which does both accumulates across its two `clk2x` edges. The RLAT
+  pipeline (`word_p`/`xl_p`/`v_p`) doubles to carry both lanes. `kmac += 2`; RUN ends at
+  `kmac >= k_count`. RUN halves in `clk` cycles → 25,088 → 12,544.
+- **Odd-K tail:** when `k_count` is odd, the last `clk` issues one valid + one masked
+  step (`v1=0`) — `mac_bank_dp` already no-ops a disabled phase.
+- **The weight 2-read is the only non-trivial part.** In sim (Stage 1a) model it as two
+  reads of the URAM array. On silicon (Stage 1b) it is the URAM port clocked at `clk2x`
+  (one word per `clk2x` edge = 2/`clk`) — URAM closes 400 MHz; `weight_bank_tdp`/`g_w`
+  gets a `clk2x` read. The per-stream `xm` likewise reads at `clk2x`.
+- **DSP-packed streams** (`mac_bank_dsp`, the `ND` streams): need the matching
+  double-pump (the DSP P-register accumulator IS the `clk2x` accumulator, PCIN/PCOUT
+  cascade at 2×, `sum_act` advancing 2/`clk`). Do the **LUT path first** (`--nd 0` gate,
+  the beachhead), then the DSP-cascade variant — same scoping as Stage 0.
+
+**Stage 1a (sim, iverilog, NO Vivado) — the bit-exact cycle drop:**
+1. Beachhead: double-pump `gemv_banked.sv` / `gemm_banked_resident_vec.sv` LUT path,
+   gate `run_banked` bit-exact (TB drives `clk2x` at 2× `clk`, quarter-shifted per the
+   `tb_macdp` convention that killed the coincident-edge race).
+2. Split-brain core `gemm_cohort_vec.sv`, gate `run_gemm_sb` ALL_BITEXACT.
+3. Full sequencer: `run_sb_seq --nd 0 --tmax 16 --att2 0` → 16/16, and report `cyc_total`
+   — it must DROP from 53,637 toward ~41k (the −12,544 RUN halving). **That drop, with
+   bit-exactness, is the Stage 1a win.** Then the DSP path (`--nd 6`).
+
+**Stage 1b (Vivado):** BD MMCM emits `clk2x` (400 MHz, phase-locked 2× of the 200 MHz
+`clk`); Pblock the MAC island against the DSP/URAM columns; impl; board sweep `clk`=200,
+`clk2x`=400. Target: **~78,400 tok/s MEASURED**.
+
+*Status: Stage 0 GO banked. Stage 1a is the next execution step — a focused multi-hour
+RTL task across the GEMV cores, best run as one dedicated session with the spec above
+(the design is now fully decided; execution is mechanical).*
 
 ### Stage 2 — Double-pump the readback dequant (the RB phase) → ~90k
 The dequant drain (`vec_dequant`, the u_dq path — already pipelined, arithmetic-heavy)
