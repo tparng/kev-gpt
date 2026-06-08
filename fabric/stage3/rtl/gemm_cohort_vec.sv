@@ -44,6 +44,14 @@ module gemm_cohort_vec #(
     input  wire [$clog2(N)-1:0]          x_stream,
     input  wire [$clog2(KMAX/P)-1:0]     x_row,      // EXPLICIT write row (row-major AQ)
     input  wire [P*8-1:0]                x_data,
+    // DOUBLE-PUMP-100K: 2nd activation write port so the AQ can write TWO streams
+    // /clk (a pair). Each per-stream xm is a separate array, so two writes to two
+    // DIFFERENT streams are independent ports (the AQ never writes the same stream
+    // twice in a clk). Tie x_we2=0 when unused.
+    input  wire                          x_we2,
+    input  wire [$clog2(N)-1:0]          x_stream2,
+    input  wire [$clog2(KMAX/P)-1:0]     x_row2,
+    input  wire [P*8-1:0]                x_data2,
     // overlap (AQ hiding behind RUN): when ovl_en, the RUN's MAC `issue` stalls
     // until the x row it needs is committed. x_rowcommit pulses once per fully
     // written row (all streams) and bumps rows_committed; `issue` is gated on
@@ -139,7 +147,8 @@ module gemm_cohort_vec #(
             reg [P*8-1:0] xr [0:RLAT-1];
             integer xi;
             always @(posedge clk) begin
-                if (x_we && x_stream == gm[$clog2(N)-1:0]) xm[x_row] <= x_data;
+                if (x_we  && x_stream  == gm[$clog2(N)-1:0]) xm[x_row]  <= x_data;
+                if (x_we2 && x_stream2 == gm[$clog2(N)-1:0]) xm[x_row2] <= x_data2;
                 xr[0] <= xm[xrd_row];
                 for (xi = 1; xi < RLAT; xi = xi + 1) xr[xi] <= xr[xi-1];
             end

@@ -126,12 +126,15 @@ module cohort_engine #(
     wire [19:0] d_wbase; wire [10:0] d_m, d_k; wire [1:0] d_asrc; wire [5:0] d_asel;
     wire signed [6:0] d_frac; wire [11:0] d_dqrow; wire [2:0] d_dst; wire g_req;
     wire [P*32-1:0] lnout1_r, lnout2_r, ctxv_g; wire [P*16-1:0] mlpbuf_r;
+    // DOUBLE-PUMP-100K: 2nd AQ-feed read port (pair's 2nd stream, gbs+1)
+    wire [P*32-1:0] lnout1_r2, lnout2_r2, ctxv_g2; wire [P*16-1:0] mlpbuf_r2;
     wire [P*32-1:0] xres_r, qkv_r, attn_r, mlp_r, head_r;
 
     wire        g_done_p;            // pulse: current GEMM call fully drained
     reg         dwr_we;  reg [2:0] dwr_dst; reg [10:0] dwr_addr; reg [P*32-1:0] dwr_data;
     reg         dwmr_we; reg [10:0] dwmr_addr; reg [P*16-1:0] dwmr_data;
     reg  [10:0] ge_ra_local;
+    reg  [10:0] ge_ra_local2;        // DOUBLE-PUMP: 2nd AQ-feed read address (stream gbs+1)
 
     nl_engine #(.D(D), .D3(D3), .D_MLP(D_MLP), .P(P), .LANES(LANES), .G(N),
                 .VOCAB(VOCAB), .TMAX(TMAX), .GAMMA_N(GAMMA_N), .NLAYER(NLAYER),
@@ -145,7 +148,7 @@ module cohort_engine #(
         .emb_gnt(emb_gnt), .emb_q(emb_q), .emb_req(emb_req), .emb_addr(emb_addr),
         .dw_we(dwr_we), .dw_dst(dwr_dst), .dw_addr(dwr_addr), .dw_data(dwr_data),
         .dwm_we(dwmr_we), .dwm_addr(dwmr_addr), .dwm_data(dwmr_data),
-        .ge_ra(ge_ra_local),
+        .ge_ra(ge_ra_local), .ge_ra2(ge_ra_local2),
         .dbg_stream(rd_stream), .dbg_addr(rd_addr),
         .pw_we(pw_we), .pw_addr(pw_addr), .pw_data(pw_data),
         .ln_req(ln_req), .ln_start_o(ln_start_o), .ln_vin_o(ln_vin_o),
@@ -161,6 +164,8 @@ module cohort_engine #(
         .tok_outs_g(tok_outs),
         .lnout1_r(lnout1_r), .lnout2_r(lnout2_r), .ctxv_g(ctxv_g),
         .mlpbuf_r(mlpbuf_r),
+        .lnout1_r2(lnout1_r2), .lnout2_r2(lnout2_r2), .ctxv_g2(ctxv_g2),
+        .mlpbuf_r2(mlpbuf_r2),
         .xres_r(xres_r), .qkv_r(qkv_r), .attn_r(attn_r),
         .mlp_r(mlp_r), .head_r(head_r));
 
@@ -171,6 +176,11 @@ module cohort_engine #(
     reg  [$clog2(N)-1:0] gv_xstream, gv_rdstream;
     reg  [$clog2(1024/P)-1:0] gv_xrow;
     reg  [P*8-1:0]     gv_xdata;
+    // DOUBLE-PUMP-100K: 2nd AQ write port (the pair's 2nd stream, gbs+1)
+    reg                gv_xwe2;
+    reg  [$clog2(N)-1:0] gv_xstream2;
+    reg  [$clog2(1024/P)-1:0] gv_xrow2;
+    reg  [P*8-1:0]     gv_xdata2;
     reg [10:0]         gv_m, gv_k;
     reg [$clog2(WWORDS)-1:0] gv_wbase;
     wire               gv_done;
@@ -182,6 +192,7 @@ module cohort_engine #(
         .clk(clk), .clk2x(clk2x), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .x_rst(gv_xrst), .x_we(gv_xwe), .x_stream(gv_xstream),
         .x_row(gv_xrow), .x_data(gv_xdata),
+        .x_we2(gv_xwe2), .x_stream2(gv_xstream2), .x_row2(gv_xrow2), .x_data2(gv_xdata2),
         .ovl_en(1'b1), .x_rowcommit(gv_rowcommit),
         .start(gv_start), .done(gv_done),
         .rd_stream(gv_rdstream), .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),
@@ -238,6 +249,19 @@ module cohort_engine #(
     reg signed [31:0] cbg, dqv;
     reg signed [15:0] mbg;
     reg [P*8-1:0]   aqw;
+    // DOUBLE-PUMP-100K: the pair's 2nd stream (gbs+1) — a full duplicate of the AQ
+    // datapath so the GE_AQ producer emits TWO stream-rows/clk (row commits in N/2
+    // beats), matching the double-pumped MAC's 2-K-steps/clk consume rate.
+    reg signed [31:0] aq_sh_r_b   [0:P-1];
+    reg signed [95:0] aq_prod_r_b [0:P-1];
+    reg               aq_neg_r_b  [0:P-1];
+    reg signed [31:0] lnt_r_b     [0:P-1];
+    reg signed [63:0] lntmp_g_b;
+    reg signed [95:0] aq_prod_b, aq_sh_b;
+    reg signed [31:0] aq_int_b;
+    reg signed [31:0] cbg_b;
+    reg signed [15:0] mbg_b;
+    reg [P*8-1:0]   aqw2;
     reg [P*16-1:0]  mword;
     reg [P*32-1:0]  dword;
     reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
@@ -265,6 +289,10 @@ module cohort_engine #(
     wire [10:0] sG3l = sid * ROWS3;
     wire [10:0] sGMl = sid * ROWSM;
     wire [10:0] sGAl = sid * ARROWS;
+    // DOUBLE-PUMP-100K: the pair's 2nd stream (gbs+1) AQ-source addressing
+    wire [$clog2(N)-1:0] sid2 = gbs + 1'b1;
+    wire [10:0] sGl2  = sid2 * ROWS;
+    wire [10:0] sGMl2 = sid2 * ROWSM;
 
     // GE-side read address (LOCAL): board readback reuses this port while idle
     wire [10:0] rbr   = rd_stream*ROWS   + (rd_addr >> LSH);
@@ -276,6 +304,9 @@ module cohort_engine #(
             ge_ra_local = (rd_sel == 4'd5) ? rbrM : rbr;
         else
             ge_ra_local = (a_asrc == 2'd3) ? (sGMl + ge_ra_row) : (sGl + ge_ra_row);
+        // 2nd AQ-feed read: the pair's 2nd stream (gbs+1), same row. Only consumed
+        // in GE_AQ (lnout*_r2); harmless elsewhere.
+        ge_ra_local2 = (a_asrc == 2'd3) ? (sGMl2 + ge_ra_row) : (sGl2 + ge_ra_row);
     end
 
     wire rb_last = (a_dst == 3'd2) ? (gl_vout && gor == ROWSM-1 && gbs == glim)
@@ -319,7 +350,7 @@ module cohort_engine #(
     end
 
     always @(posedge clk) begin
-        gv_xrst<=0; gv_xwe<=0; gv_start<=0; gv_rowcommit<=0; dq_vin_o<=0; gl_vin_o<=0;
+        gv_xrst<=0; gv_xwe<=0; gv_xwe2<=0; gv_start<=0; gv_rowcommit<=0; dq_vin_o<=0; gl_vin_o<=0;
         if (rst) begin
             ge<=GE_IDLE; gbs<=0; grow<=0; gci<=0; gciv<=0; gciv1<=0; gciv2<=0; gciv3<=0;
             gbsd<=0; gbsd1<=0; gbsd2<=0; gbsd3<=0;
@@ -349,16 +380,20 @@ module cohort_engine #(
                 // rows_committed) for the zero-margin N=P=8 rate tie. Continuous
                 // 4-deep pipeline (issue->mult->shift->write); no inter-stream gaps.
                 GE_AQ: begin
-                    // ---- stage 0: ISSUE (read the (gbs,grow) AQ source) ----------
-                    // a_k captured at GE_IDLE; the descriptor is held by nl_engine
-                    // through the whole call so d_k would also be stable, but a_k
-                    // decouples the AQ loop from the live bus.
+                    // ---- DOUBLE-PUMP-100K: 2-WIDE row-major act-quantize ----------
+                    // Each clk processes a PAIR of streams (gbs = A, gbs+1 = B) so a
+                    // row (all N streams) commits in N/2 beats — matching the
+                    // double-pumped MAC's 2-K-steps/clk consume rate. A uses the
+                    // lnout*_r / ge_ra_local read port; B uses lnout*_r2 / ge_ra_local2.
+                    // gbsd carries the A-stream id; B = gbsd+1. N is even, so every
+                    // pair is full and the row's LAST stream (glim) is always a B.
+                    // ---- stage 0: ISSUE (read the (gbs/gbs+1, grow) AQ sources) ---
                     gciv  <= (grow != (a_k >> LSH));
-                    gbsd  <= gbs;   growd <= grow;   rowl  <= (gbs == glim);
-                    // advance the (row,stream) cursor
+                    gbsd  <= gbs;   growd <= grow;   rowl  <= (gbs == glim - 1'b1);
+                    // advance the cursor by a PAIR (2 streams/clk)
                     if (grow != (a_k >> LSH)) begin
-                        if (gbs == glim) begin gbs<=0; grow<=grow+1'b1; end
-                        else gbs<=gbs+1'b1;
+                        if (gbs == glim - 1'b1) begin gbs<=0; grow<=grow+1'b1; end
+                        else gbs<=gbs+2'd2;
                     end
                     // ---- pipeline tags (4 deep) ---------------------------------
                     gciv1 <= gciv;  gbsd1 <= gbsd;  growd1 <= growd;  rowl1 <= rowl;
@@ -366,6 +401,7 @@ module cohort_engine #(
                     gciv3 <= gciv2; gbsd3 <= gbsd2; growd3 <= growd2; rowl3 <= rowl2;
                     if (gciv) begin
                         for (gp=0; gp<P; gp=gp+1) begin
+                            // --- stream A (gbs) ---
                             case (d_asrc)
                                 2'd0: begin
                                     cbg = lnout1_r[gp*32 +: 32];
@@ -388,16 +424,39 @@ module cohort_engine #(
                                 end
                             endcase
                             lnt_r[gp] <= lntmp_g;
+                            // --- stream B (gbs+1): same algebra on the _r2 read port ---
+                            case (d_asrc)
+                                2'd0: begin
+                                    cbg_b = lnout1_r2[gp*32 +: 32];
+                                    lntmp_g_b = {{32{cbg_b[31]}}, cbg_b};
+                                end
+                                2'd1: begin
+                                    cbg_b = ctxv_g2[gp*32 +: 32];
+                                    if ($signed({{32{cbg_b[31]}}, cbg_b}) >= 0)
+                                        lntmp_g_b = ($signed({{32{cbg_b[31]}}, cbg_b}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC);
+                                    else
+                                        lntmp_g_b = -((-$signed({{32{cbg_b[31]}}, cbg_b}) + 64'sd4) >>> (RESID_FRAC-LN_OUT_FRAC));
+                                end
+                                2'd2: begin
+                                    cbg_b = lnout2_r2[gp*32 +: 32];
+                                    lntmp_g_b = {{32{cbg_b[31]}}, cbg_b};
+                                end
+                                default: begin
+                                    mbg_b = mlpbuf_r2[gp*16 +: 16];
+                                    lntmp_g_b = $signed({{48{mbg_b[15]}}, mbg_b}) <<< (LN_OUT_FRAC - GELU_FRAC);
+                                end
+                            endcase
+                            lnt_r_b[gp] <= lntmp_g_b;
                         end
                     end
                     if (gciv1) begin
                         for (gp=0; gp<P; gp=gp+1) begin
-                            // 32x48 signed multiply (was 64x64). Operand widths PROVEN in
-                            // research/aq_range_proof.py: lnt_r is signed[31:0]; inv_sact is
-                            // a fixed positive ROM with max ~2^47 < 2^47, so bit[47]=0 and the
-                            // signed[47:0] slice is always non-negative -> bit-identical product.
-                            aq_prod_r[gp] <= $signed(lnt_r[gp]) * $signed(inv_sact[a_asel][47:0]);
-                            aq_neg_r[gp]  <= (lnt_r[gp] < 0);
+                            // 32x48 signed multiply (operand widths PROVEN in
+                            // research/aq_range_proof.py). Both pair streams.
+                            aq_prod_r[gp]   <= $signed(lnt_r[gp])   * $signed(inv_sact[a_asel][47:0]);
+                            aq_neg_r[gp]    <= (lnt_r[gp]   < 0);
+                            aq_prod_r_b[gp] <= $signed(lnt_r_b[gp]) * $signed(inv_sact[a_asel][47:0]);
+                            aq_neg_r_b[gp]  <= (lnt_r_b[gp] < 0);
                         end
                     end
                     // ---- stage 2: round + shift -> register (the retimed cone) ---
@@ -409,22 +468,32 @@ module cohort_engine #(
                             else
                                 aq_sh = -(((-aq_prod) + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH));
                             aq_sh_r[gp] <= aq_sh[31:0];   // only [31:0] feeds saturation
+                            aq_prod_b = aq_prod_r_b[gp];
+                            if (!aq_neg_r_b[gp])
+                                aq_sh_b = (aq_prod_b + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH);
+                            else
+                                aq_sh_b = -(((-aq_prod_b) + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH));
+                            aq_sh_r_b[gp] <= aq_sh_b[31:0];
                         end
                     end
-                    // ---- stage 3: saturate + pack -> WRITE x row + commit --------
+                    // ---- stage 3: saturate + pack -> WRITE both x rows + commit ---
                     if (gciv3) begin
                         for (gp=0; gp<P; gp=gp+1) begin
                             aq_int = aq_sh_r[gp];
                             if (aq_int>127) aq_int=127; if (aq_int<-128) aq_int=-128;
                             aqw[gp*8 +: 8] = aq_int[7:0];
+                            aq_int_b = aq_sh_r_b[gp];
+                            if (aq_int_b>127) aq_int_b=127; if (aq_int_b<-128) aq_int_b=-128;
+                            aqw2[gp*8 +: 8] = aq_int_b[7:0];
                         end
-                        gv_xwe<=1'b1; gv_xdata<=aqw;
-                        gv_xstream<=gbsd3; gv_xrow<=growd3[$clog2(1024/P)-1:0];
-                        // a row is fully written when its LAST stream lands -> commit
+                        // stream A = gbsd3, stream B = gbsd3+1, same row
+                        gv_xwe <=1'b1; gv_xdata <=aqw;  gv_xstream <=gbsd3;
+                        gv_xrow <=growd3[$clog2(1024/P)-1:0];
+                        gv_xwe2<=1'b1; gv_xdata2<=aqw2; gv_xstream2<=gbsd3 + 1'b1;
+                        gv_xrow2<=growd3[$clog2(1024/P)-1:0];
+                        // a row is fully written when its LAST (B) stream lands -> commit
                         if (rowl3) begin
                             gv_rowcommit<=1'b1;
-                            // start the run once MARGIN rows have committed (this
-                            // commit makes rows_committed = growd3+1)
                             if (!gv_started && growd3 >= AQ_START_MARGIN-1) begin
                                 gv_started<=1'b1;
                                 gv_m<=a_m; gv_k<=a_k; gv_wbase<=a_wbase[$clog2(WWORDS)-1:0];

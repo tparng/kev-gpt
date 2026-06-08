@@ -70,6 +70,10 @@ module nl_engine #(
     input  wire [P*16-1:0] dwm_data,
     // GE-side AQ feed reads (registered, 1-cycle): ge_ra is LOCAL + final
     input  wire [10:0] ge_ra,
+    // DOUBLE-PUMP-100K: 2nd AQ-feed read port so the GE_AQ producer can quantize
+    // TWO streams/clk (a pair) and keep the double-pumped MAC fed. A true-dual-
+    // port read of the same banks; ge_ra2 = the pair's 2nd stream's row address.
+    input  wire [10:0] ge_ra2,
     // host-debug read path: dbg_stream LOCAL (0..G-1), dbg_addr already row
     input  wire [$clog2(G)-1:0] dbg_stream,
     input  wire [10:0] dbg_addr,
@@ -116,6 +120,11 @@ module nl_engine #(
     output reg  [P*32-1:0] lnout2_r,
     output reg  [P*32-1:0] ctxv_g,
     output reg  [P*16-1:0] mlpbuf_r,
+    // DOUBLE-PUMP-100K: 2nd AQ-feed read port (registered, at ge_ra2)
+    output reg  [P*32-1:0] lnout1_r2,
+    output reg  [P*32-1:0] lnout2_r2,
+    output reg  [P*32-1:0] ctxv_g2,
+    output reg  [P*16-1:0] mlpbuf_r2,
     // NL-side registered bank reads (for host debug muxing in sequencer_pp)
     output reg  [P*32-1:0] xres_r,
     output reg  [P*32-1:0] qkv_r,
@@ -298,6 +307,11 @@ module nl_engine #(
         lnout2_r <= lnout2_bank[ge_ra];
         ctxv_g   <= ctxv_bank  [ge_ra];
         mlpbuf_r <= mlpbuf_bank[ge_ra];
+        // 2nd AQ-feed port (TDP read): the pair's 2nd stream's row.
+        lnout1_r2 <= lnout1_bank[ge_ra2];
+        lnout2_r2 <= lnout2_bank[ge_ra2];
+        ctxv_g2   <= ctxv_bank  [ge_ra2];
+        mlpbuf_r2 <= mlpbuf_bank[ge_ra2];
     end
 
     // GE drain writes (one write site per bank)
