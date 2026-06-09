@@ -112,7 +112,22 @@ Predicted outcome, honestly hedged: **C lands ~95–107k, D lands ~110–122k @2
 (PROJECTED → exact at step 3). The whole campaign is bounded by one or two Vivado runs, not by
 a new RTL architecture.
 
-## 6. What this review adds beyond doc 6
+## 6. Disposition (2026-06-09): model shrink VETOED — 100k is CLOSED on the KV260
+
+User decision, same day: the model's quality is already at its floor ("I don't want to make
+the chat/model any worse than it already is"). The C/D configs trade quality for cycles, so
+they are off the table. With every datapath/clock/parallelism lever measured to a wall (§2)
+and the model fixed at L4 d256, the honest ceiling of this project on this part is:
+
+- **59,965.5 tok/s @200 MHz MEASURED** — the standing record, the deliverable;
+- ~62–64k @200 if the residual gated serial cuts are ever routed (marginal, not pursued);
+- ~78k @250 only if the route-congestion wall ever yields (4 builds say it won't).
+
+**100,000 tok/s is not reachable on the KV260 at this model size. Do not reopen this without
+either a bigger part (LANES=256 needs 2,048 DSPs) or an explicit user reversal on model size.**
+The analysis above (§1–5) stays as the record of *how* it would be done if either changes.
+
+## 7. What this review adds beyond doc 6
 
 Doc 6 already said "100k needs the model, not the schedule." This review (a) verified the
 cycle law bit-exactly against silicon so the model-shrink projections are quantitative, (b)
