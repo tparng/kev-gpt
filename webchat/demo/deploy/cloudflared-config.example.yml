@@ -1,0 +1,21 @@
+# cloudflared named-tunnel config for the live chat at chat.mikeayles.com
+#
+# The chat is the i7 server (webchat.demo.server) which now serves BOTH the
+# client.html page AND the wss:// upgrade on one port, so a single tunnel
+# hostname routes everything to it. Copy this to ~/.cloudflared/config.yml on
+# the serving box and fill in <TUNNEL_ID> + the credentials path printed by
+# `cloudflared tunnel create`.
+
+tunnel: kevin-chat
+credentials-file: /home/CHANGE_ME/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  # the chat — UI + WebSocket on the same origin (server default port 8090)
+  - hostname: chat.mikeayles.com
+    service: http://127.0.0.1:8090
+    originRequest:
+      # WebSockets work over Tunnel by default; no extra flag needed. Bump only
+      # if long-idle sockets get cut — the server pings every 20s anyway.
+      noTLSVerify: true
+  # everything else -> 404
+  - service: http_status:404

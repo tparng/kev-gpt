@@ -29,10 +29,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import time
 from typing import Optional
 
 import websockets
+from websockets.datastructures import Headers
+from websockets.http11 import Response
 
 from .backend import InferRequest
 from .backend_stub import StubBackend
@@ -240,9 +243,38 @@ async def serve(args):
     async def handler(ws):
         await client_handler(ws, hub)
 
+    # Serve the chat page over plain HTTP on the SAME origin as the WebSocket, so
+    # a single tunnel hostname (e.g. chat.mikeayles.com via cloudflared) hands out
+    # both the UI and the wss:// upgrade. A browser GET gets client.html; a WS
+    # upgrade request is passed straight through to the handshake.
+    client_path = args.client_html or os.path.join(os.path.dirname(__file__),
+                                                    "client.html")
+    try:
+        with open(client_path, "rb") as f:
+            client_html = f.read()
+    except OSError:
+        client_html = None
+
+    def process_request(connection, request):
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return None   # not an HTTP page request -> let the WS handshake run
+        if client_html is not None and request.path.split("?")[0] in ("/", "/client.html"):
+            return Response(200, "OK", Headers([
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Content-Length", str(len(client_html))),
+                ("Cache-Control", "no-cache"),
+            ]), client_html)
+        body = b"not found\n"
+        return Response(404, "Not Found", Headers([
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Content-Length", str(len(body))),
+        ]), body)
+
     print(f"[server] backend={args.backend} debounce={args.debounce_ms}ms "
-          f"batch={args.batch} tick={args.tick_ms}ms ws://{args.host}:{args.port}")
+          f"batch={args.batch} tick={args.tick_ms}ms ws://{args.host}:{args.port} "
+          f"(serving client.html: {client_html is not None})")
     async with websockets.serve(handler, args.host, args.port,
+                                process_request=process_request,
                                 max_size=64 * 1024, ping_interval=20):
         # run until a stop signal (or forever)
         stop = asyncio.Future()
@@ -277,6 +309,9 @@ def build_parser():
     ap.add_argument("--fclk", type=float, default=125e6, help="PL backend clock Hz")
     ap.add_argument("--gen-chars", type=int, default=6,
                     help="PL backend completion length (chars; T=1 stub)")
+    ap.add_argument("--client-html", default=None,
+                    help="path to client.html to serve over HTTP on the same "
+                         "origin as the WS (default: the sibling client.html)")
     ap.add_argument("--jsonl", default="demo_telemetry.jsonl",
                     help="local JSONL telemetry record (post-mortem trail)")
     ap.add_argument("--push-url", default=None,
