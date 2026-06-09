@@ -240,6 +240,13 @@ async def serve(args):
         backend = TcpPLBackend(args.daemon_host, args.daemon_port,
                                use_msgpack=(args.daemon_transport == "msgpack"),
                                capacity=args.batch)
+    elif args.backend == "kv":
+        # real model-faithful MULTI-TOKEN Kevin, in-process (host-KV path). numpy
+        # off-box; pl/c on the Kria (server-on-board single-box). Not the 60k
+        # single-token fabric pass — see backend_kv.py / PRD gap 1.
+        from .backend_kv import KVChatBackend
+        backend = KVChatBackend(gemv_backend=args.kv_backend, capacity=args.batch,
+                                gen_chars=args.gen_chars, greedy=args.greedy)
     else:
         raise SystemExit(f"unknown backend {args.backend!r}")
 
@@ -302,9 +309,16 @@ def build_parser():
     ap = argparse.ArgumentParser(description="i7 inference-plane WebSocket server")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8090)
-    ap.add_argument("--backend", choices=["stub", "pl", "tcp"], default="stub",
-                    help="stub=fake; pl=local /dev/mem (server ON the Kria); "
-                         "tcp=remote Kria daemon (the Precision-serves split)")
+    ap.add_argument("--backend", choices=["stub", "pl", "tcp", "kv"],
+                    default="stub",
+                    help="stub=fake; pl=local single-token /dev/mem; tcp=remote "
+                         "Kria daemon (Precision-serves split); kv=in-process "
+                         "model-faithful multi-token Kevin (--kv-backend)")
+    ap.add_argument("--kv-backend", choices=["numpy", "pl", "c"], default="numpy",
+                    help="GEMV backend for --backend kv: numpy off-box, pl/c on "
+                         "the Kria")
+    ap.add_argument("--greedy", action="store_true",
+                    help="--backend kv: argmax decode (reproducible) vs sampled")
     ap.add_argument("--daemon-host", default=None,
                     help="Kria A53 daemon address for --backend tcp "
                          "(e.g. the Tailscale IP <kria-ip>)")

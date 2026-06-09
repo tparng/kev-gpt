@@ -22,8 +22,9 @@ telegraphic gibberish for load tests. Real multi-token chat is the P1 RTL campai
 | `protocol.py` | pure-python core: `Coalescer` (debounce + latest-wins coalescing), `BatchAssembler` (16-slot fill + queue depth), `freshness_blit`. Socket-free, unit-tested. |
 | `backend.py` | `InferenceBackend` interface (`infer_batch` -> `BatchOutcome`). |
 | `backend_stub.py` | `StubBackend` (deterministic fake completions + modelled latency) and `PLSingleTokenBackend` (drives the real N=16 single-token PL via `pl_seq_pp16`, **T=1 stub past first token**). |
-| `server.py` | the i7 asyncio WebSocket server. One task/client + a submission loop + a telemetry loop. |
-| `a53_daemon.py` | the Kria daemon: length-prefixed JSON / msgpack batch in -> one PL submission -> results out. `--bench` measures launches/s. |
+| `backend_kv.py` | **`KVChatBackend` / `KVChatDevice` — model-faithful MULTI-TOKEN Kevin** (host-KV `goformer_kv.KVDecoder`, GEMVs on numpy/pl/c). The real-text path; not the 60k single-token pass (PRD gap 1). |
+| `server.py` | the i7 asyncio WebSocket server. One task/client + a submission loop + a telemetry loop. Backends: `stub`/`pl`/`tcp`/`kv`. |
+| `a53_daemon.py` | the Kria daemon: length-prefixed JSON / msgpack batch in -> PL submission -> results out. `--engine {t1,kv}`; `TcpPLBackend` (the i7-side adapter) also lives here. `--bench` measures launches/s. |
 | `telemetry.py` | the 1 Hz aggregator: active users, agg tok/s, latency reservoir p50/95/99, queue depth, fabric occupancy (software proxy), amplification, ready-at-Enter, power/temp (Kria sysfs, None off-box). JSONL sink. |
 | `client.html` | minimal chat UI: debounced keystroke send, speculation buffer, blit-on-Enter, freshness re-fire, inline latency readout. |
 | `loadgen.py` | synthetic typists (human-ish cadence, bursts, pre-Enter pauses); reports client-side spec latency p50/95/99 + ready-at-Enter. The death rehearsal. |
@@ -63,8 +64,10 @@ curl -X POST localhost:8787/ingest -H 'content-type: application/json' \
 ## On-box (the real topology)
 
 ```bash
-# On the Kria (needs root for /dev/mem; chat bitstream loaded; weights boot-streamed):
-sudo python -m webchat.demo.a53_daemon --port 9099 --json --lanes 128 --fclk 200e6
+# On the Kria (needs root for /dev/mem; resident bitstream loaded; weights streamed).
+#   real multi-token Kevin (host-KV decoder, GEMVs on the compiled-C MMIO driver):
+sudo python -m webchat.demo.a53_daemon --port 9099 --json --engine kv --kv-backend c
+#   or the single-token 60k pass (first token faithful): --engine t1 (default)
 
 # The real split — i7/Precision serves, Kria has the fabric, reached over the
 # network (Tailscale/GigE) via the daemon above:
@@ -112,6 +115,8 @@ telemetry aggregation.
   `--host`/`--port` and the i7→daemon adapter to the wired addresses; confirm both
   the RPC link and the tunnel uplink are wired, not WiFi.
 - **Laptop hygiene during the event** (mains, sleep/USB-suspend off, watch thermals).
-- Co-run the `tcp` split (`TcpPLBackend` ↔ `a53_daemon`, already implemented +
-  unit-tested) with a real chat bitstream + the KV-decode daemon on the board.
+- Co-run the `tcp` split (`TcpPLBackend` ↔ `a53_daemon --engine kv`, implemented +
+  unit-tested off-box) on the board: the KV path needs only the resident bitstream
+  (host keeps K/V, PL does the GEMVs). The remaining RTL campaign is the *fast*
+  fully-on-chip multi-token decode at fabric speed (PRD gap 1).
 ```

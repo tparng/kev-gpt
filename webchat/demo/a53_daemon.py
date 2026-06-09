@@ -207,10 +207,20 @@ def bench(dev, secs: float, batch: int):
     print(f"BENCH_VERDICT launches_per_s={lps:.0f} batched_streams_per_s={lps*16:.0f}")
 
 
+def make_device(args):
+    """t1 = single-token PL pass (the 60k path, first-token-faithful); kv =
+    model-faithful multi-token Kevin over the host-KV decoder (--kv-backend)."""
+    if args.engine == "kv":
+        from .backend_kv import KVChatDevice
+        return KVChatDevice(gemv_backend=args.kv_backend, gen_chars=args.gen_chars,
+                            greedy=args.greedy)
+    return PLDevice(args.lanes, args.fclk, args.gen_chars)
+
+
 async def serve(args):
     use_msgpack = _HAVE_MSGPACK and not args.json
-    dev = PLDevice(args.lanes, args.fclk, args.gen_chars)
-    print(f"[a53d] PL ready (lanes={args.lanes} fclk={args.fclk/1e6:.0f}MHz "
+    dev = make_device(args)
+    print(f"[a53d] {args.engine} ready (lanes={args.lanes} fclk={args.fclk/1e6:.0f}MHz "
           f"transport={'msgpack' if use_msgpack else 'json'})")
     server = await asyncio.start_server(
         lambda r, w: handle_conn(r, w, dev, use_msgpack),
@@ -227,6 +237,13 @@ def main(argv=None):
     ap.add_argument("--lanes", type=int, default=128)
     ap.add_argument("--fclk", type=float, default=125e6)
     ap.add_argument("--gen-chars", type=int, default=6)
+    ap.add_argument("--engine", choices=["t1", "kv"], default="t1",
+                    help="t1=single-token PL pass (first-token-faithful); "
+                         "kv=model-faithful multi-token Kevin (host-KV decoder)")
+    ap.add_argument("--kv-backend", choices=["numpy", "pl", "c"], default="c",
+                    help="--engine kv GEMV backend (c=compiled MMIO on the Kria)")
+    ap.add_argument("--greedy", action="store_true",
+                    help="--engine kv: argmax decode (reproducible) vs sampled")
     ap.add_argument("--json", action="store_true",
                     help="force length-prefixed JSON even if msgpack is present")
     ap.add_argument("--bench", action="store_true",
