@@ -54,6 +54,86 @@ async def read_frame(reader: asyncio.StreamReader, use_msgpack: bool):
     return msgpack.unpackb(body, raw=False) if use_msgpack else json.loads(body)
 
 
+# --------------------------------------------------------------------------- #
+# The i7-SIDE adapter: the server's `pl` split-deployment backend. Lives here so
+# the wire protocol (encode/read_frame above) has one source of truth shared by
+# both ends. The Precision runs the server (TcpPLBackend); the Kria runs the
+# daemon (handle_conn). Over Tailscale/GigE they speak the frames above.
+# --------------------------------------------------------------------------- #
+class TcpPLBackend:
+    """InferenceBackend that runs the PL submission on a REMOTE Kria daemon.
+
+    One infer_batch == one framed RPC: send {prompts:[...]}, get back
+    {completions:[...], busy_ms}. busy_ms is the daemon's MEASURED PL submission
+    time, so fabric occupancy stays honest end-to-end (not a software proxy).
+
+    A single persistent connection carries a serial stream of batches (the server
+    serializes the fabric, so calls don't overlap; a lock guards it anyway so the
+    backend is correct standalone). On a dropped socket it reconnects once and
+    retries; if that fails the call raises and the server releases those clients.
+    """
+
+    capacity: int = 16
+
+    def __init__(self, host: str, port: int = 9099, *, use_msgpack: bool = False,
+                 capacity: int = 16, connect_timeout: float = 5.0,
+                 rpc_timeout: float = 30.0):
+        self.host = host
+        self.port = port
+        self.use_msgpack = use_msgpack and _HAVE_MSGPACK
+        self.capacity = capacity
+        self.connect_timeout = connect_timeout
+        self.rpc_timeout = rpc_timeout
+        self._reader: "asyncio.StreamReader | None" = None
+        self._writer: "asyncio.StreamWriter | None" = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure_conn(self) -> None:
+        if self._writer is not None and not self._writer.is_closing():
+            return
+        self._reader, self._writer = await asyncio.wait_for(
+            asyncio.open_connection(self.host, self.port), self.connect_timeout)
+
+    async def _reset(self) -> None:
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
+        self._reader = self._writer = None
+
+    async def _rpc(self, obj: dict) -> dict:
+        await self._ensure_conn()
+        self._writer.write(encode(obj, self.use_msgpack))
+        await self._writer.drain()
+        return await asyncio.wait_for(read_frame(self._reader, self.use_msgpack),
+                                      self.rpc_timeout)
+
+    async def infer_batch(self, reqs):
+        from .backend import BatchOutcome, InferResult
+        prompts = [r.prompt for r in reqs]
+        async with self._lock:
+            try:
+                resp = await self._rpc({"prompts": prompts})
+            except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError,
+                    ConnectionError):
+                # dead/half-open socket -> drop it and retry once on a fresh conn
+                await self._reset()
+                resp = await self._rpc({"prompts": prompts})
+        comps = list(resp.get("completions", []))
+        results = [
+            InferResult(client_id=r.client_id, prompt=r.prompt, seq=r.seq,
+                        completion=(comps[i] if i < len(comps) else ""))
+            for i, r in enumerate(reqs)
+        ]
+        busy_s = float(resp.get("busy_ms", 0.0)) / 1000.0
+        return BatchOutcome(results=results, busy_s=busy_s,
+                            filled=len(reqs), capacity=self.capacity)
+
+    async def close(self) -> None:
+        await self._reset()
+
+
 class PLDevice:
     """Owns the real PL via pl_seq_pp16 (boot-streamed weights). Lazy heavy
     import so the daemon module loads on a dev box; construction raises if no

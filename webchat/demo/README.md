@@ -64,17 +64,22 @@ curl -X POST localhost:8787/ingest -H 'content-type: application/json' \
 
 ```bash
 # On the Kria (needs root for /dev/mem; chat bitstream loaded; weights boot-streamed):
-sudo python -m webchat.demo.a53_daemon --port 9099 --lanes 128 --fclk 125e6
+sudo python -m webchat.demo.a53_daemon --port 9099 --json --lanes 128 --fclk 200e6
 
-# On the i7 (if it has the device locally — it does NOT in the real split, so this
-# is the in-process form for a single-box bring-up):
-sudo python -m webchat.demo.server --backend pl --lanes 128 --fclk 125e6 --port 8090
+# The real split — i7/Precision serves, Kria has the fabric, reached over the
+# network (Tailscale/GigE) via the daemon above:
+python -m webchat.demo.server --backend tcp --daemon-host <kria-ip> --daemon-port 9099 \
+    --daemon-transport json --port 8090
+
+# Single-box bring-up only (server ON the Kria, local /dev/mem):
+sudo python -m webchat.demo.server --backend pl --lanes 128 --fclk 200e6 --port 8090
 ```
 
-In the real split the i7 has no `/dev/mem`; the `pl` backend talks JSON to the
-A53 daemon over GigE. Wiring the i7 server to the daemon (a `TcpPLBackend`) is a
-small adapter left for integration — the daemon protocol is already defined in
-`a53_daemon.py`.
+In the real split the i7 has no `/dev/mem`; the `tcp` backend (`TcpPLBackend` in
+`a53_daemon.py`) frames batches to the A53 daemon over the network. `--daemon-transport`
+must match the daemon (pass `--json` on both). Protocol + adapter are implemented and
+unit-tested (`tests/test_demo_tcp.py`); what remains is co-running it with a real chat
+bitstream on the board.
 
 ## The A53 launch-rate bench (the PRD's open question)
 
@@ -107,6 +112,6 @@ telemetry aggregation.
   `--host`/`--port` and the i7→daemon adapter to the wired addresses; confirm both
   the RPC link and the tunnel uplink are wired, not WiFi.
 - **Laptop hygiene during the event** (mains, sleep/USB-suspend off, watch thermals).
-- Wire the in-process `pl` backend to the A53 daemon over TCP for the real split
-  (small `TcpPLBackend` adapter), once the chat bitstream + daemon are co-running.
+- Co-run the `tcp` split (`TcpPLBackend` ↔ `a53_daemon`, already implemented +
+  unit-tested) with a real chat bitstream + the KV-decode daemon on the board.
 ```

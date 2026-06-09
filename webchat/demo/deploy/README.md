@@ -40,10 +40,19 @@ cloudflared tunnel route dns kevin-chat chat.mikeayles.com
 #    and fill in <TUNNEL_ID> + the credentials-file path from step 3.
 
 # 6. start the chat server (serves client.html + the WS on one port)
+#    (a) stub — telegraphic gibberish, no board; exercises the whole plumbing:
 python -m webchat.demo.server --backend stub --port 8090
-#    real-fabric path instead of stub: --backend pl --lanes 128 --fclk 200e6
-#    (needs the TcpPLBackend adapter to the A53 daemon — still TODO; stub is
-#     telegraphic gibberish but exercises the whole plumbing + telemetry)
+#    (b) REAL fabric over the split — the Precision talks to the Kria's A53
+#        daemon over Tailscale/GigE (this is the production shape):
+python -m webchat.demo.server --backend tcp --port 8090 \
+    --daemon-host <kria-ip> --daemon-port 9099 --daemon-transport json
+#    ...and on the KRIA, with the chat bitstream loaded + weights boot-streamed:
+#        sudo python -m webchat.demo.a53_daemon --port 9099 --json \
+#             --lanes 128 --fclk 200e6
+#    NOTE: --daemon-transport MUST match the daemon. Pass --json on BOTH (the
+#    daemon defaults to msgpack when the lib is present; --json keeps them in
+#    lockstep). --backend pl (local /dev/mem) is only for running the server
+#    ON the Kria — not this split.
 
 # 7. run the tunnel (separate terminal / a service)
 cloudflared tunnel run kevin-chat

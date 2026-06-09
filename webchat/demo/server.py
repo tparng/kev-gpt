@@ -227,9 +227,19 @@ async def serve(args):
     if args.backend == "stub":
         backend = StubBackend(latency_ms=args.latency_ms, capacity=args.batch)
     elif args.backend == "pl":
+        # local /dev/mem PL — only valid when the server runs ON the Kria.
         from .backend_stub import PLSingleTokenBackend
         backend = PLSingleTokenBackend(lanes=args.lanes, fclk=args.fclk,
                                        gen_chars=args.gen_chars)
+    elif args.backend == "tcp":
+        # the real split: server on the Precision, fabric on the Kria, reached
+        # over the network (Tailscale/GigE) via the A53 daemon.
+        if not args.daemon_host:
+            raise SystemExit("--backend tcp needs --daemon-host (the Kria address)")
+        from .a53_daemon import TcpPLBackend
+        backend = TcpPLBackend(args.daemon_host, args.daemon_port,
+                               use_msgpack=(args.daemon_transport == "msgpack"),
+                               capacity=args.batch)
     else:
         raise SystemExit(f"unknown backend {args.backend!r}")
 
@@ -292,7 +302,18 @@ def build_parser():
     ap = argparse.ArgumentParser(description="i7 inference-plane WebSocket server")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8090)
-    ap.add_argument("--backend", choices=["stub", "pl"], default="stub")
+    ap.add_argument("--backend", choices=["stub", "pl", "tcp"], default="stub",
+                    help="stub=fake; pl=local /dev/mem (server ON the Kria); "
+                         "tcp=remote Kria daemon (the Precision-serves split)")
+    ap.add_argument("--daemon-host", default=None,
+                    help="Kria A53 daemon address for --backend tcp "
+                         "(e.g. the Tailscale IP <kria-ip>)")
+    ap.add_argument("--daemon-port", type=int, default=9099,
+                    help="Kria A53 daemon port (a53_daemon --port)")
+    ap.add_argument("--daemon-transport", choices=["json", "msgpack"],
+                    default="json",
+                    help="frame codec; MUST match the daemon (run it with --json "
+                         "for json, default msgpack-if-available otherwise)")
     ap.add_argument("--debounce-ms", type=float, default=50.0,
                     help="idle debounce before a speculation fires (PRD: 40-60)")
     ap.add_argument("--batch", type=int, default=16,
