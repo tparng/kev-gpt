@@ -83,18 +83,22 @@ class StubBackend(InferenceBackend):
                % 1000) / 1000.0
         batch_ms = (self.latency_ms + self.per_stream_ms * filled
                     + self.jitter_ms * jit)
-        # perf_counter, not monotonic: on Windows time.monotonic() has ~15 ms
-        # granularity, so a single-digit-ms sleep reads back 0 and occupancy/
-        # latency would be a flat 0. perf_counter is the high-res clock.
-        t0 = time.perf_counter()
-        await asyncio.sleep(batch_ms / 1000.0)
-        busy_s = time.perf_counter() - t0
+        # busy_s is the MODELLED service time, not a wall-clock measurement of the
+        # sleep below. Under a saturated event loop asyncio.sleep(8 ms) can resolve
+        # in ~50 us (the loop short-circuits small timer waits when its ready-queue
+        # is deep), so measuring the sleep would collapse busy_s -> ~0 and hide the
+        # very fabric-bound death this demo exists to show. For a stub, the model IS
+        # the honest number; the real PL backend measures wall-clock because there
+        # the fabric genuinely takes that long. We still await so the server's
+        # concurrency/scheduling is exercised against realistic service latency.
+        service_s = batch_ms / 1000.0
+        await asyncio.sleep(service_s)
         results = [
             InferResult(client_id=r.client_id, prompt=r.prompt, seq=r.seq,
                         completion=_fake_completion(r.prompt, self.n_words))
             for r in reqs
         ]
-        return BatchOutcome(results=results, busy_s=busy_s,
+        return BatchOutcome(results=results, busy_s=service_s,
                             filled=filled, capacity=self.capacity)
 
 

@@ -59,6 +59,8 @@ let ws, seq=0, debTimer=null;
 // the speculation buffer: completion the server computed for `bufPrompt`.
 let bufPrompt=null, bufCompletion=null;
 let lastSentAt=0, lastSentPrompt=null;
+// a pending "…" bubble waiting for an authoritative completion (freshness miss)
+let pendingWait=null;
 
 function add(cls,txt){const d=document.createElement('div');d.className='msg '+cls;
  d.textContent=txt||'';log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
@@ -80,7 +82,17 @@ function connect(){
      // show the live speculation under the input (the "before you finish" trick)
      if(m.prompt===inp.value.trim()){specEl.textContent='▍ '+m.completion;}
      if(m.type==='authoritative'){ // a freshness miss was resolved -> render it
-       blit(m.prompt, m.completion, true);
+       if(pendingWait && pendingWait.prompt===m.prompt){
+         // fill the "…" placeholder we already showed on Enter (don't re-add the
+         // user bubble — onEnter's stale path already did)
+         pendingWait.el.textContent=m.completion;
+         add('meta','authoritative (freshness miss → 1 round trip)');
+         pendingWait=null;
+         specEl.textContent=''; bufPrompt=null; bufCompletion=null;
+         log.scrollTop=log.scrollHeight;
+       } else {
+         blit(m.prompt, m.completion, true);
+       }
      }
    } else if(m.type==='blit_ok'){ /* server agreed; we already blitted */ }
  };
@@ -117,6 +129,7 @@ function onEnter(e){
    // stale/absent -> wait for the server's authoritative completion (it fires one)
    add('you',cur); inp.value=''; specEl.textContent='';
    const wait=add('kev','…'); wait.dataset.waiting='1';
+   pendingWait={el:wait, prompt:cur};
  }
  return false;
 }

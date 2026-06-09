@@ -47,7 +47,7 @@ class Hub:
 
     def __init__(self, *, backend, debounce_ms: float, batch: int,
                  tick_ms: float, jsonl: str, push_url: Optional[str],
-                 push_token: Optional[str]):
+                 push_token: Optional[str], fabric_depth: int = 1):
         self.backend = backend
         self.co = Coalescer(debounce_ms=debounce_ms)
         self.asm = BatchAssembler(self.co, batch=batch)
@@ -56,9 +56,21 @@ class Hub:
         self.sink = JsonlSink(jsonl)
         self.push_url = push_url
         self.push_token = push_token
+        # The fabric is ONE resource: it runs `fabric_depth` batches at once
+        # (1 = strictly serial, the honest single-server model; >1 models an A53
+        # that assembles the next batch while the PL drains the current one). When
+        # all slots are busy, due jobs accumulate -> queue_depth climbs and the
+        # death is fabric-bound, which is the PRD's success criterion. It is also
+        # required for the real PL backend: concurrent infer_batch calls would race
+        # the single PL over /dev/mem.
+        self.fabric_depth = max(1, fabric_depth)
+        self._inflight_n = 0
         # client_id -> websocket (for fan-out of completions)
         self.conns: dict[str, object] = {}
-        # job tracking: client_id -> submit-eligible monotonic (for latency)
+        # client_id -> the submit-eligible (debounce-expiry) perf_counter instant.
+        # Latency is measured from here, so it includes queue wait under load.
+        self._eligible_perf: dict[str, float] = {}
+        # job tracking: client_id -> eligibility instant snapshotted at assembly
         self._submit_t: dict[str, float] = {}
         self._next_id = 0
         self._http = None   # lazy aiohttp session for telemetry push
@@ -80,23 +92,38 @@ class Hub:
     async def submission_loop(self):
         while True:
             now = time.monotonic()
-            jobs = self.asm.assemble(now)
-            if jobs:
-                self.tel.on_inference(len(jobs))
-                # latency is sub-tick, so timestamp it with the HIGH-RES clock
-                # (perf_counter); monotonic on Windows is ~15 ms granular and
-                # would floor small latencies to 0.
-                submit_perf = time.perf_counter()
-                for j in jobs:
-                    self._submit_t[j.client_id] = submit_perf
-                reqs = [InferRequest(client_id=j.client_id, prompt=j.prompt,
-                                     seq=j.seq) for j in jobs]
-                # one backend call == one PL submission for the whole batch
-                asyncio.create_task(self._run_batch(reqs, jobs, submit_perf))
+            # Only submit if a fabric slot is free; otherwise due jobs wait in the
+            # coalescer (and show up as queue_depth) until the fabric drains.
+            if self._inflight_n < self.fabric_depth:
+                jobs = self.asm.assemble(now)
+                if jobs:
+                    self._inflight_n += 1
+                    self.tel.on_inference(len(jobs))
+                    submit_perf = time.perf_counter()
+                    for j in jobs:
+                        # Snapshot the submit-eligible instant at assembly so a
+                        # later keystroke for this client can't move it. Falls back
+                        # to now if we never saw the keystroke (e.g. refire path).
+                        self._submit_t[j.client_id] = self._eligible_perf.get(
+                            j.client_id, submit_perf)
+                    reqs = [InferRequest(client_id=j.client_id, prompt=j.prompt,
+                                         seq=j.seq) for j in jobs]
+                    # one backend call == one PL submission for the whole batch
+                    asyncio.create_task(self._run_batch(reqs, jobs, submit_perf))
             await asyncio.sleep(self.tick_s)
 
     async def _run_batch(self, reqs, jobs, submitted_at):
-        outcome = await self.backend.infer_batch(reqs)
+        try:
+            outcome = await self.backend.infer_batch(reqs)
+        except Exception:
+            # A backend failure must not strand these clients as in-flight forever
+            # (they'd never speculate again). Release them so the next keystroke
+            # re-queues; the fabric slot is freed in the finally below.
+            for j in jobs:
+                self.asm.on_result(j.client_id, None)
+            return
+        finally:
+            self._inflight_n -= 1
         deliver_t = time.perf_counter()
         tokens = 0
         reason_by_client = {j.client_id: j.reason for j in jobs}
@@ -169,6 +196,10 @@ async def client_handler(ws, hub: Hub):
             if mtype == MSG_KEYSTROKE:
                 hub.tel.on_keystroke(cid, now)
                 hub.co.on_keystroke(cid, prompt, seq, now)
+                # the job becomes submit-eligible one debounce window from now;
+                # latency is measured from there (PRD: from the submit-eligible
+                # instant), so it excludes the debounce but includes queue wait.
+                hub._eligible_perf[cid] = time.perf_counter() + hub.co.debounce_s
             elif mtype == MSG_ENTER:
                 cs = hub.co.client(cid)
                 if freshness_blit(cs, prompt):
@@ -179,12 +210,14 @@ async def client_handler(ws, hub: Hub):
                     # stale/absent -> one authoritative inference, no blit
                     hub.tel.on_enter(blitted=False)
                     hub.co.on_enter_refire(cid, prompt, seq, now)
+                    hub._eligible_perf[cid] = time.perf_counter()  # eligible now
     except websockets.ConnectionClosed:
         pass
     finally:
         hub.conns.pop(cid, None)
         hub.co.clients.pop(cid, None)
         hub._submit_t.pop(cid, None)
+        hub._eligible_perf.pop(cid, None)
 
 
 async def serve(args):
@@ -199,7 +232,7 @@ async def serve(args):
 
     hub = Hub(backend=backend, debounce_ms=args.debounce_ms, batch=args.batch,
               tick_ms=args.tick_ms, jsonl=args.jsonl, push_url=args.push_url,
-              push_token=args.push_token)
+              push_token=args.push_token, fabric_depth=args.fabric_depth)
 
     sub_task = asyncio.create_task(hub.submission_loop())
     tel_task = asyncio.create_task(hub.telemetry_loop())
@@ -234,6 +267,10 @@ def build_parser():
                     help="max streams per PL submission (fabric natural N=16)")
     ap.add_argument("--tick-ms", type=float, default=10.0,
                     help="submission-loop period; how often batches are assembled")
+    ap.add_argument("--fabric-depth", type=int, default=1,
+                    help="batches the fabric runs at once (1 = serial single-server; "
+                         ">1 models A53 pipelining). The single resource that makes "
+                         "the death fabric-bound.")
     ap.add_argument("--latency-ms", type=float, default=8.0,
                     help="stub backend per-batch modelled latency")
     ap.add_argument("--lanes", type=int, default=128, help="PL backend PE width")

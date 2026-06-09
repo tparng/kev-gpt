@@ -64,6 +64,11 @@ const DEFS = {
  temp_c:"SoC thermal-zone temperature (C). None off-box."
 };
 function fmt(v,d=1){return v==null?"—":(typeof v==="number"?v.toFixed(d):v);}
+// compact big counts so the amplification card doesn't overflow under real load
+function human(n){n=n||0;
+ if(n>=1e6)return (n/1e6).toFixed(n<1e7?1:0)+"M";
+ if(n>=1e3)return (n/1e3).toFixed(n<1e4?1:0)+"k";
+ return ""+n;}
 
 function card(id,title,big,sub,def){
  return `<div class="card"><h3>${title}</h3><div class="big" id="v_${id}">${big}</div>`+
@@ -84,7 +89,7 @@ function render(d){
   card('p99','latency p99 (ms)',fmt(lat.p99,1),'p50 '+fmt(lat.p50,1)+' · p95 '+fmt(lat.p95,1),DEFS.latency_ms),
   card('occ','fabric occupancy',fmt((t.fabric_occupancy||0)*100,1)+'%','busy '+fmt((t.occupancy_busy_frac||0)*100,0)+'% · fill '+fmt((t.slot_fill_frac||0)*100,0)+'%',DEFS.fabric_occupancy),
   card('q','queue depth',fmt(t.queue_depth,0),'waiting on fabric',DEFS.queue_depth),
-  card('amp','amplification',(amp.keystrokes||0)+':'+(amp.inferences||0)+':'+(amp.blits||0),'ratio '+fmt(amp.ratio,2)+'×',DEFS.amplification),
+  card('amp','amplification',human(amp.keystrokes)+':'+human(amp.inferences)+':'+human(amp.blits),'ratio '+fmt(amp.ratio,2)+'×',DEFS.amplification),
   card('rae','ready-at-Enter',(t.ready_at_enter==null?'—':fmt(t.ready_at_enter*100,1)+'%'),fmt(t.enters,0)+' enters',DEFS.ready_at_enter),
   card('pwr','power (W)',fmt(t.power_w,1),'temp '+fmt(t.temp_c,1)+'°C',DEFS.power_w),
  ].join('');
