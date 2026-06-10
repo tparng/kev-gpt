@@ -1203,3 +1203,24 @@ mux (+1 RLAT stage), K4/V4+Hadamard (code 16->8, NLL +0.72% still in band),
 inv_lut 2-ROM split (23 -> ~8 BRAM), dequant lanes use_dsp=no (DSP 98.6% ->
 headroom). TMAX=256 embeds (93 BRAM) likely need the runtime-URAM loader
 pattern if BRAM stays tight.
+
+## 36. OOC take-5 (XPM banks): URAM 64/64, LUT 94% — BRAM 281.5/144 is the last fit fight
+
+The XPM dual-dialect landed: **LUT 110,392 (94.3%, was 278%), URAM 64/64,
+DSP 1,231 (98.6%)**. WNS -2.415 @5ns (timing work queued after fit). The BRAM
+ledger (281.5): embeds ~92 (temb/pemb 8192-deep), kv code_bank ~114 (XPM chose
+BRAM — the URAM was filled by the weights), inv ROMs ~16, gelu 16, explut x2
+~10, dq/misc ~30. Also: ctxv_bank fell to REGISTERS — the R4f direct-A ctx
+write made it 2W1R; revert to both-engines-buffered (costs 8 cyc/pair back).
+
+THE FIT PLAN (next block):
+1. **K4/V4 + Hadamard** — the ORIGINAL KVarN contract (+0.72% NLL, in band);
+   halves the code bank to ~57 BRAM. The integer butterfly + rotate semantics
+   already exist bit-true in goformer_kvq (rotate=True path): k/v rotated at
+   quant, q rotated to preserve q.k, ctx un-rotated after the V sum.
+2. **Embeds into the weight URAM's spare depth** — 16,384 - 12,496 = 3,888
+   addresses x 1080b = 4.2Mb spare >= the 3.5Mb of tok+pos embeds. Embed reads
+   (S_EMB, 32 rows/token) are phase-disjoint from GEMV reads -> port-arbitrated
+   on the same bank. Image builder packs 4x256b embed rows per 1024b word.
+   Frees ~92 BRAM -> total ~130-140 <= 144 with K4.
+3. DSP diet (dequant lanes -> LUT) for BD margin; then the -2.4ns timing pass.
