@@ -1,29 +1,17 @@
 // -----------------------------------------------------------------------------
 // kv_bank — the on-chip K/V cache that makes the single-stream sequencer decode
-// FAITHFULLY (doc 7 R1). Quantise-at-write, dequantise-at-read-stream, K4/V4 +
-// per-head Hadamard, per-(head, position) asymmetric — the PINNED goformer_kvq
-// rotate=True divfree contract (log §36 fit-plan item 1: halves the code bank):
+// FAITHFULLY (doc 7 R1). Quantise-at-write, dequantise-at-read-stream, K8/V8,
+// per-(head, position) asymmetric — the PINNED goformer_kvq divfree contract:
 //
 //   write (one head's K or V vector, HEAD_DIM Q.16 ints, streamed HR rows wide):
-//     x     = rsh_round(butterfly(x_raw), 3)        6-stage Sylvester Hadamard,
-//                                                   then >>3 round-half-away-0
-//     lo    = min(x),  span = max(x) - lo           over the ROTATED values
+//     lo    = min(x),  span = max(x) - lo
 //     scale = max( rdiv(span, QMAX), 1 )            rdiv = round-half-up (a+b/2)/b
-//             = ((span+7)*0x88888889)>>35 at QMAX=15 (EXACT magic, proven
-//               exhaustively over the full uint32 domain)
 //     inv   = rdiv(1<<INV_SH, scale)                one serial divide per head*pos
-//             (scale reaches rdiv(2^21,15) ~ 2^17-class — an inv ROM is
-//              infeasible at 4 bits, so the serial restoring divider returns)
 //     code  = clip( (u*inv + HALF) >> INV_SH, QMAX) u = x - lo  (all non-negative)
-//   read  (stream tcount positions of one head, 1 position/cycle after prefetch):
-//     x_hat = code * scale16 + lo                   exact integer, kv_dma verbatim
-//             (hdr stores scale & 0xFFFF, the position_ddr_row sc16 field — real
-//              spans keep scale < 65,536 on this model, max observed ~36k)
+//   read  (stream tcount positions of one head, HR rows/cycle after prefetch):
+//     x_hat = code * scale + lo                      exact integer, kv_dma verbatim
 //
-// q is rotated the SAME way inside vec_attn_w (so q.k is preserved) and the ctx
-// output is un-rotated there after the V sum (H is symmetric: unrotate==rotate).
-//
-// Storage (KBITS=4, TMAX=256, 4 layers, 4 heads): codes 256 KB + hdr 48 KB.
+// Storage (KBITS=8, TMAX=256, 4 layers, 4 heads): codes 512 KB + hdr 48 KB.
 // Banks are row-addressed wide words (CLAUDE.md banking rule): the position is a
 // memory ADDRESS, never a per-lane mux. Banks are NOT cleared between tokens or
 // conversations — a conversation restarts at pos 0 and overwrites; attention at
@@ -41,7 +29,7 @@ module kv_bank #(
     parameter integer NHEAD    = 4,
     parameter integer NLAYER   = 4,
     parameter integer TMAX     = 256,
-    parameter integer KBITS    = 4,
+    parameter integer KBITS    = 8,
     parameter integer INV_SH   = 24
 ) (
     input  wire        clk,
@@ -81,17 +69,10 @@ module kv_bank #(
     localparam integer QMAX  = (1 << KBITS) - 1;
     localparam integer NHSEL = NLAYER * 2 * NHEAD;          // (layer,kv,head) combos
     localparam integer HROWS = NHSEL * TMAX;                // one row per (sel, pos)
-    localparam integer DIVW  = INV_SH + 2;                  // divider width (26):
-                                                            // num = 2^24 + scale/2 < 2^25
+    localparam integer DIVW  = INV_SH + 2;                  // divider width (26)
 
-    // the scale magic below is /15-specific: this bank is the K4/V4 contract.
-    initial if (KBITS != 4) begin
-        $display("kv_bank: KBITS must be 4 (the /15 scale magic is pinned)");
-        $finish;
-    end
-
-    // ---- banks (doc-7 R2: one POSITION per code row — KBITS=4 makes a head's
-    // position exactly HEAD_DIM*4 = 256 bits, read 1 position/cycle).
+    // ---- banks (doc-7 R2: one POSITION per code row — KBITS=8 makes a head's
+    // position exactly HEAD_DIM*8 = 512 bits, read 1 position/cycle).
     // DUAL-DIALECT (the weight_bank_tdp pattern): HDL inference of TDP UltraRAM
     // is dead in 2025.2, so the SYNTHESIS branch is xpm_memory_tdpram and the
     // sim branch a behavioral 2-port array. Gates verify sim; the board run is
@@ -104,79 +85,60 @@ module kv_bank #(
     reg [HEAD_DIM*32-1:0] vecbuf;            // plain reg: the head vector, collected
     reg signed [31:0] minv, maxv;
     reg [$clog2(HR+1)-1:0] w_vi;             // collect beat counter
-    reg [$clog2(HR+1)-1:0] w_qi;             // round / quantise row counter
+    reg [$clog2(HR+1)-1:0] w_qi;             // quantise row counter
     reg signed [31:0] w_lo;
     reg [15:0] w_scale;
     reg [INV_SH:0] w_inv;                    // inv <= 2^INV_SH
 
-    // ---- integer Hadamard: TWO butterfly stages per cycle over vecbuf ----------
-    // (Sylvester order h = 1,2 | 4,8 | 16,32 — exact integer adds, no rounding
-    // mid-stage, so the 2-per-cycle grouping is bit-identical to the reference's
-    // 6 sequential stages). |x_raw| < 2^21 on this model -> raw < 2^27: int32 ok.
-    reg [1:0] had_i;                          // 0..2 (stage-pair counter)
-    reg [HEAD_DIM*32-1:0] had_t, had_n;
-    integer hb, hh1, hh2, hp;
-    reg signed [31:0] hx, hy;
+    // doc-7 R4a: NO divider. scale = rdiv(span,255) by the EXACT magic multiply
+    // ((span+127)*0x80808081)>>39, proven == floor((span+127)/255) over the full
+    // span range [0, 2^22) by exhaustive python check; inv = rdiv(2^24, scale)
+    // from a constant ROM (one q_round_div per entry, data-independent, written
+    // by the harness as inv_lut.mem). Same numbers as the serial divides, ~52
+    // cycles fewer per (head, pos).
+    // Two-ROM split (BRAM diet): scale < 4096 needs the full 25-bit inv;
+    // scale >= 4096 has inv = rdiv(2^24, scale) <= 4096 -> 13 bits. Same values,
+    // ~1/3 the BRAM bits of one padded 32k x 25 ROM.
+    localparam integer INVD = 16512;         // scale <= rdiv(2^22, 255) = 16,449
+    (* rom_style = "block" *) reg [INV_SH:0] inv_lut_lo [0:4095];
+    (* rom_style = "block" *) reg [12:0]     inv_lut_hi [0:INVD-4097];
+    initial begin
+        $readmemh("inv_lut_lo.mem", inv_lut_lo);
+        $readmemh("inv_lut_hi.mem", inv_lut_hi);
+    end
+    reg [22:0] w_span;                       // span+127, explicitly unsigned
+    reg [53:0] w_magic;                      // w_span * 0x80808081 (23b x 32b, unsigned)
+    reg [INV_SH:0] inv_lo_rd;
+    reg [12:0]     inv_hi_rd;
+    reg            inv_hi_sel;
+    // sync ROM read: address is the combinational scale during W_INVL (so the
+    // reads land in W_INVR), then the registered w_scale.
+    wire [14:0] sc_now = (w_magic[53:39] == 0) ? 15'd1 : w_magic[53:39];
+    wire [14:0] lut_sc = (wst == 3'd3) ? sc_now : w_scale[14:0];
+    always @(posedge clk) begin
+        inv_lo_rd  <= inv_lut_lo[lut_sc[11:0]];
+        inv_hi_rd  <= inv_lut_hi[lut_sc - 15'd4096];
+        inv_hi_sel <= (lut_sc >= 15'd4096);
+    end
+    wire [INV_SH:0] inv_rd = inv_hi_sel ? {12'b0, inv_hi_rd} : inv_lo_rd;
+
+    // P-lane signed min/max of the incoming beat (combinational tree, P=8)
+    integer mp;
+    reg signed [31:0] lane_v, beat_min, beat_max;
     always @* begin
-        hh1 = 1 << (had_i * 2);
-        hh2 = 2 << (had_i * 2);
-        for (hb = 0; hb < HEAD_DIM; hb = hb + 1) begin
-            hp = hb ^ hh1;
-            hx = $signed(vecbuf[hb*32 +: 32]);
-            hy = $signed(vecbuf[hp*32 +: 32]);
-            had_t[hb*32 +: 32] = ((hb & hh1) == 0) ? (hx + hy) : (hy - hx);
-        end
-        for (hb = 0; hb < HEAD_DIM; hb = hb + 1) begin
-            hp = hb ^ hh2;
-            hx = $signed(had_t[hb*32 +: 32]);
-            hy = $signed(had_t[hp*32 +: 32]);
-            had_n[hb*32 +: 32] = ((hb & hh2) == 0) ? (hx + hy) : (hy - hx);
+        beat_min = 32'sh7FFFFFFF; beat_max = 32'sh80000000;
+        for (mp = 0; mp < P; mp = mp + 1) begin
+            lane_v = $signed(wq_data[mp*32 +: 32]);
+            if (lane_v < beat_min) beat_min = lane_v;
+            if (lane_v > beat_max) beat_max = lane_v;
         end
     end
-
-    // ---- per-row >>3 round (half-away-from-zero) + row min/max ------------------
-    // One vecbuf row per W_RND cycle: round in place, fold min/max of the ROTATED
-    // ROUNDED values (the quantiser input — reference order: rotate, round, minmax).
-    reg [P*32-1:0] rnd_row;
-    reg signed [31:0] rn_v, rn_r, row_min, row_max;
-    integer rp;
-    always @* begin
-        row_min = 32'sh7FFFFFFF; row_max = 32'sh80000000;
-        for (rp = 0; rp < P; rp = rp + 1) begin
-            rn_v = $signed(vecbuf[(w_qi*P + rp)*32 +: 32]);
-            if (rn_v >= 0) rn_r = (rn_v + 32'sd4) >>> 3;
-            else           rn_r = -((-rn_v + 32'sd4) >>> 3);
-            rnd_row[rp*32 +: 32] = rn_r;
-            if (rn_r < row_min) row_min = rn_r;
-            if (rn_r > row_max) row_max = rn_r;
-        end
-    end
-
-    // ---- scale = rdiv(span, 15) by EXACT magic multiply --------------------------
-    // ((span+7) * 0x88888889) >> 35 == floor((span+7)/15), proven EXHAUSTIVELY over
-    // the full uint32 domain in python (run_vec_kv campaign). Then the python sc16
-    // truncation: hdr scale = scale & 0xFFFF (real spans keep scale < 2^16).
-    reg [25:0] w_span;                       // span+7, explicitly unsigned (< 2^26)
-    reg [57:0] w_magic;                      // w_span * 0x88888889 (26b x 32b, unsigned)
-    wire [22:0] sc_full = w_magic[57:35];
-    wire [15:0] sc_q    = (sc_full == 23'd0) ? 16'd1 : sc_full[15:0];
-
-    // ---- serial unsigned restoring divider: inv = rdiv(2^24, scale) --------------
-    // (restored from the pre-R4a kv_bank: at 4 bits scale spans up to ~2^17-class
-    // values so the split inv ROM no longer fits; ~DIVW cycles per head*pos)
-    reg [DIVW-1:0] dv_num, dv_quo;
-    reg [DIVW:0]   dv_rem;
-    reg [DIVW-1:0] dv_den;
-    reg [$clog2(DIVW+1)-1:0] dv_i;
-    // one divider step per cycle: rem' = {rem, num[msb]}; sub if >= den
-    wire [DIVW:0] dv_shift = {dv_rem[DIVW-1:0], dv_num[DIVW-1]};
-    wire          dv_ge    = (dv_shift >= {1'b0, dv_den});
 
     // quantise P lanes of vecbuf row w_qi (combinational; all operands registered)
     reg [P*KBITS-1:0] q_codes;
     reg signed [32:0] q_diff;
     reg [31:0]  q_u;
-    reg [31+INV_SH+1:0] q_prod;              // u(<=2^21-class) * inv(<=2^24) + rounding
+    reg [31+INV_SH+1:0] q_prod;              // u(<=2^21) * inv(<=2^24) + rounding
     reg [31:0]  q_code;
     integer qp;
     always @* begin
@@ -200,17 +162,10 @@ module kv_bank #(
     reg [8:0]  r_ecnt,  r2_ecnt;               // emitted-position counters
     reg        r_v0,    r2_v0;                 // addr-stage valids
     reg        r_v1,    r2_v1;                 // mem-out-register stage valids
-
-    // TIMING (take-5 worst path): the hdr/code BRAM-out registers fed the 64-lane
-    // dequant COMBINATIONALLY into the engines' DSP inputs (7-high BRAM cascade +
-    // mult = -2.4ns @5ns). One register stage between the memory outputs and the
-    // dequant splits the path; the stream grows by one cycle.
+    // TIMING (take-5 worst path): one register stage between the hdr/code memory
+    // outputs and the 64-lane dequant; the stream grows by one cycle.
     reg [HEAD_DIM*KBITS-1:0] code_q, code_q2;
     reg [47:0]               hdr_q,  hdr_q2;
-    always @(posedge clk) begin
-        code_q  <= code_r;   hdr_q  <= hdr_rd;
-        code_q2 <= code_r2;  hdr_q2 <= hdr_rd2;
-    end
 
     // base addresses (registered at start; code and hdr share the per-position base)
     reg [$clog2(HROWS)-1:0] w_pbase, r_pbase, r2_pbase;
@@ -247,10 +202,9 @@ module kv_bank #(
     end
 
     // ---- write FSM ---------------------------------------------------------------
-    localparam [3:0] W_IDLE=4'd0, W_COLL=4'd1, W_HAD=4'd2, W_RND=4'd3,
-                     W_SCALE=4'd4, W_MAG=4'd5, W_DIV=4'd6, W_DIVF=4'd7,
-                     W_QNT=4'd8, W_CWR=4'd9;
-    reg [3:0] wst;
+    localparam [2:0] W_IDLE=3'd0, W_COLL=3'd1, W_SCALE=3'd2, W_INVL=3'd3,
+                     W_INVR=3'd4, W_SCALE2=3'd5, W_QNT=3'd6, W_CWR=3'd7;
+    reg [2:0] wst;
 
     // ---- read FSMs (A and B) -------------------------------------------------
     localparam [1:0] R_IDLE=2'd0, R_RUN=2'd2;
@@ -324,6 +278,10 @@ module kv_bank #(
     assign hdr_rd  = hdr_rd_b;
     assign hdr_rd2 = hdr_rd2_b;
 `endif
+    always @(posedge clk) begin
+        code_q  <= code_r;   hdr_q  <= hdr_rd;
+        code_q2 <= code_r2;  hdr_q2 <= hdr_rd2;
+    end
 
     always @(posedge clk) begin
         wq_done <= 1'b0; rd_done <= 1'b0; rd2_done <= 1'b0;
@@ -343,56 +301,32 @@ module kv_bank #(
                 end
                 W_COLL: if (wq_valid) begin
                     vecbuf[w_vi*P*32 +: P*32] <= wq_data;
+                    if (beat_min < minv) minv <= beat_min;
+                    if (beat_max > maxv) maxv <= beat_max;
                     if (w_vi == HR-1) begin
-                        had_i <= 2'd0; wst <= W_HAD;
+                        wst <= W_SCALE;
                     end else w_vi <= w_vi + 1'b1;
                 end
-                // 6-stage Hadamard butterfly, 2 stages/cycle (exact integer adds)
-                W_HAD: begin
-                    vecbuf <= had_n;
-                    if (had_i == 2'd2) begin
-                        w_qi <= 0; wst <= W_RND;
-                    end else had_i <= had_i + 2'd1;
-                end
-                // >>3 round (half-away-from-zero) per row + min/max of the result
-                W_RND: begin
-                    vecbuf[w_qi*P*32 +: P*32] <= rnd_row;
-                    if (row_min < minv) minv <= row_min;
-                    if (row_max > maxv) maxv <= row_max;
-                    if (w_qi == HR-1) wst <= W_SCALE;
-                    else w_qi <= w_qi + 1'b1;
-                end
                 W_SCALE: begin
+                    // scale = rdiv(span,255) = ((span+127)*0x80808081)>>39 (EXACT;
+                    // two registered steps, all-unsigned, no mixed-sign multiply)
                     w_lo   <= minv;
-                    w_span <= (maxv - minv + (QMAX >> 1));   // span+7, non-negative
-                    wst <= W_MAG;
+                    w_span <= (maxv - minv + (QMAX >> 1));
+                    wst <= W_SCALE2;
                 end
-                W_MAG: begin
-                    // scale = rdiv(span,15) = ((span+7)*0x88888889)>>35 (EXACT;
-                    // registered step, all-unsigned, no mixed-sign multiply)
-                    w_magic <= {32'd0, w_span} * 58'd2290649225;
-                    wst <= W_DIV;
+                W_SCALE2: begin
+                    w_magic <= {31'd0, w_span} * 54'd2155905153;
+                    wst <= W_INVL;
                 end
-                W_DIV: begin
-                    // hdr scale16 (= python sc16 = scale & 0xFFFF) and the divider
-                    // setup: inv = rdiv(1<<INV_SH, scale), num = 2^24 + scale>>1
-                    w_scale <= sc_q;
-                    dv_num  <= (1 << INV_SH) + ({10'b0, sc_q} >> 1);
-                    dv_den  <= {{(DIVW-16){1'b0}}, sc_q};
-                    dv_rem  <= 0; dv_quo <= 0; dv_i <= DIVW[$clog2(DIVW+1)-1:0];
-                    wst <= W_DIVF;
+                W_INVL: begin
+                    w_scale <= {1'b0, sc_now};
+                    wst <= W_INVR;                     // ROM read for sc_now lands next cycle
                 end
-                W_DIVF: begin
-                    if (dv_i != 0) begin
-                        dv_rem <= dv_ge ? (dv_shift - {1'b0, dv_den}) : dv_shift;
-                        dv_quo <= {dv_quo[DIVW-2:0], dv_ge};
-                        dv_num <= {dv_num[DIVW-2:0], 1'b0};
-                        dv_i   <= dv_i - 1'b1;
-                    end else begin
-                        w_inv <= dv_quo[INV_SH:0];
-                        w_qi  <= 0;
-                        wst   <= W_QNT;
-                    end
+                W_INVR: begin
+                    // inv_rd (sync ROM read at w_scale) lands NOW
+                    w_inv <= inv_rd;
+                    w_qi  <= 0;
+                    wst   <= W_QNT;
                 end
                 W_QNT: begin
                     // stage P codes/cycle into the position row, commit once whole
@@ -418,7 +352,6 @@ module kv_bank #(
                     r_rowi  <= 0;
                     r_ecnt  <= 0;
                     r_v0    <= 1'b0;
-                    r_v1    <= 1'b0;
                     r_pbase <= ((rd_layer*2 + {3'b0,rd_kv})*NHEAD
                                  + {2'b0,rd_head})*TMAX;
                     rst_st <= R_RUN;
@@ -449,7 +382,6 @@ module kv_bank #(
                     r2_rowi  <= 0;
                     r2_ecnt  <= 0;
                     r2_v0    <= 1'b0;
-                    r2_v1    <= 1'b0;
                     r2_pbase <= ((rd2_layer*2 + {3'b0,rd2_kv})*NHEAD
                                   + {2'b0,rd2_head})*TMAX;
                     rst2_st <= R_RUN;

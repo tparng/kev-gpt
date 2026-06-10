@@ -232,7 +232,7 @@ module sequencer_vec #(
     wire [10:0] kvw_src = (kvw_kv ? 2*D/P : D/P) + kvw_h*HR
                           + {{(11-$clog2(ROWSM+1)){1'b0}}, fr};
     kv_bank #(.P(P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(NLAYER),
-              .TMAX(TMAX), .KBITS(4)) u_kvb (
+              .TMAX(TMAX), .KBITS(8)) u_kvb (
         .clk(clk), .rst(rst),
         .wq_start(kb_wstart), .wq_layer(blk), .wq_kv(kvw_kv), .wq_head(kvw_h),
         .wq_pos(pos), .wq_valid(kb_wvalid), .wq_data(kb_wdata_q), .wq_done(kb_wdone),

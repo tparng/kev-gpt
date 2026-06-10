@@ -1224,3 +1224,22 @@ THE FIT PLAN (next block):
    on the same bank. Image builder packs 4x256b embed rows per 1024b word.
    Frees ~92 BRAM -> total ~130-140 <= 144 with K4.
 3. DSP diet (dequant lanes -> LUT) for BD margin; then the -2.4ns timing pass.
+
+## 37. The shipping pivot: K8 @ TMAX=128 (fits TODAY) — K4/T=256 parked with a long-T bug
+
+OOC take-6 (K4 + embeds-in-URAM): **BRAM 129/144 — the fit plan WORKED** — but
+LUT exploded to 181%: the Hadamard butterflies. The variable-stage-offset form
+(lane i reads i^h with runtime h) synthesises a 64:1 mux per lane; and even
+fixed-wired, five 6-stage 64-lane networks are ~66k LUT of adders — they need a
+SHARED constant-geometry unit (the FFT trick: fixed perfect-shuffle wiring +
+one 64-lane add/sub bank reused 6 cycles, ~3k LUT) — the queued T=256 rung.
+ALSO: the K4 build diverged at long T (first mismatch ~pos 84 on the T->127
+law run; clean to ~76) — un-debugged, parked with the rung.
+
+THE SHIPPING CONFIG: **K8 no-rotate (the +0.09%-NLL contract, clean to T=255)
+at TMAX=128** — the BRAM ledger is the same ~129 (code 4096x512b = 57 tiles),
+no butterflies, no divider, LUT back to the take-5 ~94% class. T=128 still
+holds a full chat turn + reply; T=256 returns with the butterfly rung. kv_bank/
+vec_attn_w reverted to the K8 pair (d936640) + the dequant pipeline register
+reapplied; golden back to IntKVQSequencer(8,8,rotate=False,divfree=True).
+GATE: 28/28 bit-exact, avg 11,475 (T to 31, TMAX=128 mems).

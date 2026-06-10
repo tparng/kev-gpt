@@ -47,7 +47,7 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
     assert plen + ngen - 1 <= tmax, "prompt+gen must fit the KV window"
 
     p, cfg = seq_ref.build(npz)
-    gold_seq = IntKVQSequencer(p, cfg, kbits=4, vbits=4, rotate=True, divfree=True)
+    gold_seq = IntKVQSequencer(p, cfg, kbits=8, vbits=8, rotate=False, divfree=True)
     gold = gold_seq.generate_greedy(list(prompt_ids), ngen)[plen:]
 
     iseq = seq_ref.IntSequencer(p, cfg)
@@ -59,8 +59,14 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
         fh.write("\n".join(lut[0::2]) + "\n")
     with open(os.path.join(sim_dir, "gelu_lut_o.mem"), "w") as fh:
         fh.write("\n".join(lut[1::2]) + "\n")
-    # (K4 kv_bank computes inv = q_round_div(2^24, scale) with its serial divider —
-    #  the R4a inv_lut .mem ROMs are gone: scale at 4 bits outranges a feasible ROM.)
+    # kv_bank R4a (K8): inv = q_round_div(2^24, scale), split lo (25b) / hi (13b) ROMs
+    from fabric.stage3.seq_ref import q_round_div
+    with open(os.path.join(sim_dir, "inv_lut_lo.mem"), "w") as fh:
+        for s4 in range(4096):
+            fh.write(f"{q_round_div(1 << 24, max(s4, 1)) & 0x1FFFFFF:07x}\n")
+    with open(os.path.join(sim_dir, "inv_lut_hi.mem"), "w") as fh:
+        for s4 in range(4096, 16512):
+            fh.write(f"{q_round_div(1 << 24, s4) & 0x1FFF:04x}\n")
     with open(os.path.join(sim_dir, "prompt.mem"), "w") as fh:
         for t in prompt_ids:
             fh.write(f"{int(t):03x}\n")
