@@ -24,7 +24,7 @@ TB = os.path.join(HERE, "tb", "tb_seq_vec_kv.sv")
 
 RTL_FILES = ["sequencer_vec.sv", "kv_bank.sv", "vec_attn_w.sv", "layernorm_vec.sv",
              "vec_dequant.sv", "vec_gelu.sv", "gelu_lut.sv", "gelu_lut2.sv",
-             "softmax_f.sv", "gemv_banked_resident_vec.sv"]
+             "softmax_f.sv", "gemv_banked_resident_vec.sv", "weight_bank_tdp.sv"]
 
 
 def _encode(meta_path, text):

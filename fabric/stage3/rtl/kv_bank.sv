@@ -72,13 +72,13 @@ module kv_bank #(
     localparam integer DIVW  = INV_SH + 2;                  // divider width (26)
 
     // ---- banks (doc-7 R2: one POSITION per code row — KBITS=8 makes a head's
-    // position exactly HEAD_DIM*8 = 512 bits, read 1 position/cycle) -----------
-    (* ram_style = "ultra" *) reg [HEAD_DIM*KBITS-1:0] code_bank [0:HROWS-1];
-    (* ram_style = "block" *) reg [47:0]               hdr_bank  [0:HROWS-1]; // {scale16, lo32}
-
-    // sync-read registers (A and B streams)
-    reg [HEAD_DIM*KBITS-1:0] code_r,  code_r2;
-    reg [47:0]               hdr_rd,  hdr_rd2;
+    // position exactly HEAD_DIM*8 = 512 bits, read 1 position/cycle).
+    // DUAL-DIALECT (the weight_bank_tdp pattern): HDL inference of TDP UltraRAM
+    // is dead in 2025.2, so the SYNTHESIS branch is xpm_memory_tdpram and the
+    // sim branch a behavioral 2-port array. Gates verify sim; the board run is
+    // the final bit-exactness check on the XPM side.
+    wire [HEAD_DIM*KBITS-1:0] code_r,  code_r2;
+    wire [47:0]               hdr_rd,  hdr_rd2;
 
     // ---- write-side state ------------------------------------------------------
     reg [3:0]  w_layer; reg w_kv; reg [1:0] w_head; reg [8:0] w_pos;
@@ -216,20 +216,63 @@ module kv_bank #(
     // ONE ADDRESS NET PER PORT (the URAM contract): write and read share port A's
     // muxed address; port B is the second read stream.
     wire [$clog2(HROWS)-1:0] kva_a = cwr_fire ? w_pbase : pos_ra;
-    // port A: write + FREE-RUNNING read (no `else` — a !we clock-enable on the
-    // read register is an "invalid write mode" for URAM/BRAM inference). The
-    // value read during a commit cycle is garbage and consumed by nobody
-    // (cwr_fire only fires while stream A is idle).
+`ifdef SYNTHESIS
+    xpm_memory_tdpram #(
+        .ADDR_WIDTH_A($clog2(HROWS)), .ADDR_WIDTH_B($clog2(HROWS)),
+        .BYTE_WRITE_WIDTH_A(HEAD_DIM*KBITS), .BYTE_WRITE_WIDTH_B(HEAD_DIM*KBITS),
+        .CLOCKING_MODE("common_clock"), .MEMORY_PRIMITIVE("ultra"),
+        .MEMORY_SIZE(HEAD_DIM*KBITS*HROWS),
+        .READ_DATA_WIDTH_A(HEAD_DIM*KBITS), .READ_DATA_WIDTH_B(HEAD_DIM*KBITS),
+        .READ_LATENCY_A(1), .READ_LATENCY_B(1),
+        .WRITE_DATA_WIDTH_A(HEAD_DIM*KBITS), .WRITE_DATA_WIDTH_B(HEAD_DIM*KBITS),
+        .WRITE_MODE_A("no_change"), .WRITE_MODE_B("no_change")
+    ) u_code (
+        .clka(clk), .clkb(clk), .rsta(1'b0), .rstb(1'b0), .ena(1'b1), .enb(1'b1),
+        .regcea(1'b1), .regceb(1'b1), .wea(cwr_fire), .web(1'b0),
+        .addra(kva_a), .addrb(pos_ra2),
+        .dina(wstage), .dinb({(HEAD_DIM*KBITS){1'b0}}),
+        .douta(code_r), .doutb(code_r2),
+        .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+        .injectsbiterrb(1'b0), .injectdbiterrb(1'b0),
+        .sbiterra(), .dbiterra(), .sbiterrb(), .dbiterrb(), .sleep(1'b0));
+    xpm_memory_tdpram #(
+        .ADDR_WIDTH_A($clog2(HROWS)), .ADDR_WIDTH_B($clog2(HROWS)),
+        .BYTE_WRITE_WIDTH_A(48), .BYTE_WRITE_WIDTH_B(48),
+        .CLOCKING_MODE("common_clock"), .MEMORY_PRIMITIVE("block"),
+        .MEMORY_SIZE(48*HROWS),
+        .READ_DATA_WIDTH_A(48), .READ_DATA_WIDTH_B(48),
+        .READ_LATENCY_A(1), .READ_LATENCY_B(1),
+        .WRITE_DATA_WIDTH_A(48), .WRITE_DATA_WIDTH_B(48),
+        .WRITE_MODE_A("no_change"), .WRITE_MODE_B("no_change")
+    ) u_hdr (
+        .clka(clk), .clkb(clk), .rsta(1'b0), .rstb(1'b0), .ena(1'b1), .enb(1'b1),
+        .regcea(1'b1), .regceb(1'b1), .wea(cwr_fire), .web(1'b0),
+        .addra(kva_a), .addrb(pos_ra2),
+        .dina({w_scale, w_lo}), .dinb(48'b0),
+        .douta(hdr_rd), .doutb(hdr_rd2),
+        .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+        .injectsbiterrb(1'b0), .injectdbiterrb(1'b0),
+        .sbiterra(), .dbiterra(), .sbiterrb(), .dbiterrb(), .sleep(1'b0));
+`else
+    reg [HEAD_DIM*KBITS-1:0] code_bank [0:HROWS-1];
+    reg [47:0]               hdr_bank  [0:HROWS-1];      // {scale16, lo32}
+    reg [HEAD_DIM*KBITS-1:0] code_r_b,  code_r2_b;
+    reg [47:0]               hdr_rd_b,  hdr_rd2_b;
     always @(posedge clk) begin
         if (cwr_fire) code_bank[kva_a] <= wstage;
-        code_r  <= code_bank[kva_a];
-        code_r2 <= code_bank[pos_ra2];                    // port B: read
+        code_r_b  <= code_bank[kva_a];
+        code_r2_b <= code_bank[pos_ra2];                  // port B: read
     end
     always @(posedge clk) begin
         if (cwr_fire) hdr_bank[kva_a] <= {w_scale, w_lo};
-        hdr_rd  <= hdr_bank[kva_a];
-        hdr_rd2 <= hdr_bank[pos_ra2];
+        hdr_rd_b  <= hdr_bank[kva_a];
+        hdr_rd2_b <= hdr_bank[pos_ra2];
     end
+    assign code_r  = code_r_b;
+    assign code_r2 = code_r2_b;
+    assign hdr_rd  = hdr_rd_b;
+    assign hdr_rd2 = hdr_rd2_b;
+`endif
 
     always @(posedge clk) begin
         wq_done <= 1'b0; rd_done <= 1'b0; rd2_done <= 1'b0;

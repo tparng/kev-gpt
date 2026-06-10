@@ -75,64 +75,28 @@ module gemv_banked_resident_vec #(
     reg [P*8-1:0]    xmem [0:XROWS-1];   // P acts per row
     reg [YBITS-1:0]  ymem [0:GROUPS-1];
 
-    // ---- one-time load: assemble SUBW chunks -> commit all banks in one shot ----
-    reg [WAW-1:0]    wword;
-    reg [SSW-1:0]    wsub;
-    reg [WBITS-1:0]  wbuf;
+    // ---- per-call activation pointer (the weight assembler now lives in the bank)
     reg [XAW-1:0]    xptr;
-    wire [WBITS-1:0] wnext = wbuf | ({{(WBITS-32){1'b0}}, w_data} << (wsub*32));
-    wire [WPAD-1:0]  wnext_pad = {{(WPAD-WBITS){1'b0}}, wnext};
-    wire             wcommit = w_we && (wsub == SUBW-1);
     always @(posedge clk) begin
-        if (ld_rst) begin wword <= 0; wsub <= 0; wbuf <= {WBITS{1'b0}}; xptr <= 0; end
-        else begin
-            if (w_we) begin
-                if (wsub == SUBW-1) begin
-                    wword <= wword + 1'b1; wsub <= 0; wbuf <= {WBITS{1'b0}};
-                end else begin
-                    wbuf <= wnext; wsub <= wsub + 1'b1;
-                end
-            end
-            if (x_we) begin xmem[xptr] <= x_data; xptr <= xptr + 1'b1; end
-        end
+        if (ld_rst) xptr <= 0;
+        else if (x_we) begin xmem[xptr] <= x_data; xptr <= xptr + 1'b1; end
     end
 
-    // ---- per-bank URAM arrays + registered read (= pipeline stage 0) ------------
-    // K2: a SECOND registered read (port B of the TDP URAM) at waddr2 = waddr+1.
-    wire [$clog2(WWORDS)-1:0] waddr, waddr2;
-    wire [WPAD-1:0] wword_pad, wword2_pad;
-    wire [WBITS-1:0] wword_rd  = wword_pad [WBITS-1:0];
-    wire [WBITS-1:0] wword2_rd = wword2_pad[WBITS-1:0];
-    // URAM PORT DISCIPLINE: a URAM has exactly TWO ports. The load-write happens
-    // only at boot (never during a run), so it is FOLDED INTO port A's address
-    // (write-else-read on one port); port B is the K2 second read. Without the
-    // fold this is 1W2R = three ports -> Vivado silently falls back to LUTRAM
-    // (~200k LUTs, the §34 OOC blow-up).
-    // ONE ADDRESS NET PER PORT (the URAM-inference contract): port A's write and
-    // read share a muxed address; two addresses on one port reads as three ports
-    // and Vivado silently falls back ("Infeasible attribute ram_style=ultra").
-    wire [$clog2(WWORDS)-1:0] addr_a = wcommit ? wword : waddr;
-    genvar gb;
-    generate
-        for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
-            (* ram_style = "ultra" *) reg [BANKW-1:0] mem [0:WWORDS-1];
-            reg [BANKW-1:0] rd;
-            always @(posedge clk) begin                 // port A: write + free-running read
-                if (wcommit) mem[addr_a] <= wnext_pad[gb*BANKW +: BANKW];
-                rd <= mem[addr_a];     // unconditional (an `else` makes a !we clock-enable
-                                       // = "invalid write mode" for URAM); the value read
-                                       // during a load write is consumed by nobody.
-            end
-            assign wword_pad[gb*BANKW +: BANKW] = rd;
-            if (K2 != 0) begin : g_p2
-                reg [BANKW-1:0] rd2;
-                always @(posedge clk) rd2 <= mem[waddr2];   // port B: read
-                assign wword2_pad[gb*BANKW +: BANKW] = rd2;
-            end else begin : g_np
-                assign wword2_pad[gb*BANKW +: BANKW] = {BANKW{1'b0}};
-            end
-        end
-    endgenerate
+    // ---- resident weights: the silicon-proven TDP URAM bank (weight_bank_tdp).
+    // HDL inference of TDP UltraRAM is DEAD in 2025.2 (three OOC takes confirmed
+    // it again: two-address ports, then "invalid write mode" for every template
+    // variant). The bank's SYNTHESIS branch is xpm_memory_tdpram("ultra"), the
+    // sim branch behavioral — gates verify sim, the board verifies XPM (the
+    // codebase's dual-dialect pattern). K2 rides the bank's DP=1 COLUMN-PARITY
+    // mode: ONE port-B read at the even pair address returns BOTH words kc
+    // (rword_b) and kc+1 (rword1_b); grp_base and k_count are always even here.
+    wire [$clog2(WWORDS)-1:0] waddr;
+    wire [WBITS-1:0] wword_rd, wword2_rd;
+    weight_bank_tdp #(.LANES(LANES), .WWORDS(WWORDS), .DP((K2 != 0) ? 1 : 0)) u_wb (
+        .clk(clk), .clk2x(clk),
+        .ld_rst(ld_rst), .w_we(w_we), .w_data(w_data),
+        .raddr_b(waddr), .rword_b(wword_rd), .rword1_b(wword2_rd),
+        .raddr_a({$clog2(WWORDS){1'b0}}), .rword_a(), .rword1_a());
 
     // ---- run FSM + RLAT-deep read/mac pipeline -------------------------------
     localparam [1:0] IDLE = 2'd0, RUN = 2'd1, FIN = 2'd2;
@@ -145,8 +109,7 @@ module gemv_banked_resident_vec #(
     wire [$clog2(GROUPS):0] gcount = (m_count + LANES - 1) >> LSH;
     wire                 issue   = (kc < k_count);
     wire                 issue2  = (K2 != 0) && (kc + 1 < k_count);
-    assign               waddr   = grp_base + kc;
-    assign               waddr2  = grp_base + kc + 1;
+    assign               waddr   = grp_base + kc;   // even pair base (kc steps by 2)
     wire [$clog2(KMAX):0] kc1    = kc + 1;
 
     // pipeline: weight word (stage 0 = the per-bank URAM read reg) + act + valid
