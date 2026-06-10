@@ -71,7 +71,23 @@ class KVChatDevice:
                                  temperature=self.temperature, top_k=self.top_k,
                                  rng=self._rng, greedy=self.greedy)
         text = self._dec(full[len(ids):])
-        return text.split("\n", 1)[0]                # one utterance per reply
+        return self._tidy(text)
+
+    @staticmethod
+    def _tidy(text: str) -> str:
+        """One presentable utterance from a raw char-budget continuation: first
+        line only, stop at the first sentence end if one landed, otherwise drop
+        the trailing partial word the hard char cut leaves behind ("…come in h")."""
+        text = text.split("\n", 1)[0]
+        for stop in (". ", "! ", "? "):
+            i = text.find(stop)
+            if i != -1:
+                return text[: i + 1].rstrip()
+        if text.rstrip().endswith((".", "!", "?")):
+            return text.rstrip()
+        cut = text.rstrip()
+        i = cut.rfind(" ")
+        return cut[:i].rstrip() if i > 0 else cut
 
     def _gen_all(self, prompts):
         # one KVDecoder reused per prompt — kv_generate resets it each call, so
