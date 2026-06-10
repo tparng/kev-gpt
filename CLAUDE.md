@@ -30,7 +30,7 @@ Three code pillars feed the hardware, plus the design docs:
 - **Design docs** `0-master.md`…`7-kevin-remembers.md` (read in numeric order; `0-master.md`
   is the through-line). `5-demo-prd.md` is the live-demo PRD; `6-past-the-stream-ceiling.md` is the
   speed campaign past the N=16 stream ceiling (split-brain + worst-path retirement toward 100k);
-  `7-kevin-remembers.md` is the faithful-stream campaign (N=1, T=160, 20k tok/s average — real
+  `7-kevin-remembers.md` is the faithful-stream campaign (N=1, T=256 full trained context, 20k tok/s average — real
   messages instead of T=1 degenerate text).
   Plus `README.md`, `ROADMAP-10K.md`, `BUILD-LOG.md`, `DEPLOYMENT.md`, `GLOSSARY.md`.
 
@@ -147,7 +147,7 @@ the fusion (train doc-2's model on a doc-1 corpus). `4-live-chatbot.md` = the pu
 = the speed campaign (split-brain on the dual-ported URAM, the cycle/clock lever campaign, the
 KV-DDR context-restore path, the 100k identity) — read it before touching `fabric/stage3` to know
 which levers are live vs proven-dead. `7-kevin-remembers.md` = the faithful-stream campaign
-(N=1, T=160 on-chip KV, 20k tok/s average — the rung ladder R0–R5, the INT8-KV reference change,
+(N=1, T=256 on-chip KV, 20k tok/s average — the rung ladder R0–R5, the INT8-KV reference change,
 and the dual-port GEMV / wide-attention / wide-NL levers).
 
 ## The Keviniser implementation (doc 1 → `keviniser/`)
