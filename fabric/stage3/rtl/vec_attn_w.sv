@@ -62,7 +62,9 @@ module vec_attn_w #(
     wire               sm_out_valid;
     wire [20:0]        sm_prob;
     wire               sm_done;
-    softmax #(.TMAX(TMAX)) u_sm (
+    // softmax_f = softmax.sv with PASS2/3 pipelined to 1 element/cycle (R4c);
+    // bit-identical probs, ~6 -> ~2 cycles/position.
+    softmax_f #(.TMAX(TMAX)) u_sm (
         .clk(clk), .rst(rst), .start(sm_start), .t_count(sm_tcount),
         .in_valid(sm_in_valid), .score(sm_score), .in_ready(sm_in_ready),
         .out_valid(sm_out_valid), .prob(sm_prob), .done(sm_done)
@@ -170,13 +172,12 @@ module vec_attn_w #(
                         else scnt <= scnt + 9'd1;
                     end
                 end
-                // ---- collect remaining probs until softmax done ----
+                // ---- V starts at the FIRST prob (R4c): probmem stays >= 3 cycles
+                // ahead of the V beats (prob j lands at first+j; the V stream the
+                // host starts on k_done delivers beat j at first+3+j at best).
+                // Prob collection itself is the UNCONDITIONAL block below the case.
                 W_SMC: begin
                     if (sm_out_valid) begin
-                        probmem[jc] <= sm_prob;
-                        jc <= jc + 1'b1;
-                    end
-                    if (sm_done) begin
                         k_done <= 1'b1;            // host: stream V now
                         vj <= 0; vjc <= 0; vv0 <= 1'b0;
                         st <= W_V;
@@ -222,6 +223,11 @@ module vec_attn_w #(
                 end
                 default: st <= W_IDLE;
             endcase
+            // prob collection runs across W_SMC AND W_V (PASS3 overlaps the V phase)
+            if (sm_out_valid) begin
+                probmem[jc] <= sm_prob;
+                jc <= jc + 1'b1;
+            end
             if (start) jc <= 0;                  // prob counter reset per call
         end
     end

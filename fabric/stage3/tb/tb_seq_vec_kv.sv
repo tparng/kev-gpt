@@ -167,6 +167,19 @@ module tb;
     integer ldcnt = 0;
     integer glcnt = 0;
     reg [7:0] xs = 8'b0;
+    // attention-phase occupancy (u_attn.st: 0 IDLE, 1 Q, 2 K, 3 SMC, 4 V, 5 EMIT)
+    integer atcnt [0:7];
+    integer k3, fat;
+    initial for (k3 = 0; k3 < 8; k3 = k3 + 1) atcnt[k3] = 0;
+    always @(posedge clk) begin
+        if (running) atcnt[dut.u_attn.st] = atcnt[dut.u_attn.st] + 1;
+        if (done && running) begin
+            fat = $fopen("atprof.out", "w");
+            for (k3 = 0; k3 < 8; k3 = k3 + 1)
+                if (atcnt[k3] > 0) $fwrite(fat, "%0d %0d\n", k3, atcnt[k3]);
+            $fclose(fat);
+        end
+    end
 `endif
     initial begin #400000000; $display("TB_TIMEOUT cyc=%0d st=%0d blk=%0d", dbgcyc, dut.st, dut.blk); $finish; end
 endmodule

@@ -1118,3 +1118,24 @@ R1 19,842+528(T-1) -> 3,235 · R2 19,666+128(T-1) -> 6,706 · R3 13,394 ->
 8,485 · R4a 11,730 -> 9,131 (11,414 @250). Remaining R4 menu by profile:
 G_RB ~1.3k, G_AQ ~1.0k, LN ~0.85k, the 128/pos slope (softmax PASS2/3 + K/V
 streams), and S_KVW residual ~0.7k.
+
+## 32. Doc-7 R4c: pipelined softmax + V||PASS3 — slope 128 -> 48 cyc/position
+
+The attention-phase profile put W_SMC at ~6 cyc/position/call — softmax.sv runs
+PASS2 and PASS3 at 3 cycles/element (read->compute->store sub-phases). Fork
+`softmax_f.sv`: both passes through 3-STAGE PIPELINES at 1 element/cycle —
+per-element arithmetic, LUT, j-ascending accumulation order and the divider
+VERBATIM, so probs are bit-identical; the shared softmax.sv (the N=16 record
+designs) is untouched. Plus the free overlap: probs land in probmem at
+first+j while the V stream (started on k_done) can only deliver beat j at
+first+3+j — so k_done moves to the FIRST out_valid and PASS3 overlaps the
+whole V phase (prob collection becomes an unconditional block).
+
+GATE: 31 passes, 28/28 tokens identical. **cyc(T) = 11,714 + 48*(T-1)**
+(slope was 528 at R1, 128 at R2/R3 — now 48). DERIVED @ T-bar=80: 15.5k cyc ->
+12,870 tok/s avg @200 / 16,088 @250. T=256 worst 24.0k -> 8,343 / 10,429.
+Remaining to the doc-7 20k: base trims (G_RB 1.3k, G_AQ 1.0k, LN 0.85k, KVW
+residual 0.7k) and the head-overlap lever (next head's K stream behind the
+current head's V/ctx tail -> slope ~32). P=16 global build tried: -1.9k base
+but FAILS the gate (diverges at token 4 — a brick is not bit-exact across P;
+parked, not shipped).
