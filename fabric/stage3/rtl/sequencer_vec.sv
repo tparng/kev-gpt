@@ -169,7 +169,7 @@ module sequencer_vec #(
         .clk(clk), .in_valid(gl_vin), .x(gl_x),
         .out_valid(gl_vout), .y(gl_y));
 
-    // ---- vec_attn (one head at a time; T=1 single-token block0 gate) -----------
+    // ---- vec_attn (one head at a time; KV-faithful: tcount = pos+1) ------------
     reg               at_start, at_ldv;
     reg [8:0]         at_tcount;
     wire              at_ldready, at_ctxv, at_done;
@@ -179,19 +179,42 @@ module sequencer_vec #(
     reg [8:0]  wi;                          // load-address counter (runs ahead)
     reg [8:0]  wic;                         // accepted-word counter (consume stage)
     reg        wiv;                         // load-data valid (qkv read pipeline)
-    // P-wide load: stream whole qkv_bank rows (P lanes per row). Per head: HEAD_DIM/P
-    // q rows, then K rows at +D/P, then V rows at +2*D/P. 3*HR rows per head.
+    // P-wide load, doc-7 R1 shape: per head, HR q rows from qkv_bank (the CURRENT
+    // position, exact Q.16), then tcount*HR K rows and tcount*HR V rows streamed
+    // DEQUANTISED from kv_bank (positions 0..pos, K8/V8 — the goformer_kvq
+    // contract: the current position's k/v also go through the quant round-trip).
     localparam integer HR = HEAD_DIM / P;
-    wire [10:0] aw_src = (wi < HR)   ? (hh*HR + wi) :
-                         (wi < 2*HR) ? (D/P   + hh*HR + (wi - HR)) :
-                                       (2*D/P + hh*HR + (wi - 2*HR));
-    // sync-read prefetch: address on cycle k -> qkv_r on k+1 (ld_ready stays high
-    // through the q/K/V stream, so the 1-deep prefetch keeps 1 word/cycle).
-    wire [P*32-1:0] aw_data = qkv_r;
-    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(32)) u_attn (
+    wire [10:0] aw_src = hh*HR + wi;             // q rows only (k/v live in kv_bank)
+    // sync-read prefetch: address on cycle k -> qkv_r on k+1. ald_sel is registered
+    // in the SAME cycle as at_ldv so the data mux stays aligned across the q->K->V
+    // phase transitions (including the final V beat that lands after st leaves S_ALD).
+    reg            ald_sel;                      // 0 = qkv_r (q), 1 = kv_bank stream
+    reg [P*32-1:0] kb_rdata_d;                   // kv_bank data delayed to match at_ldv
+    wire [P*32-1:0] aw_data = ald_sel ? kb_rdata_d : qkv_r;
+    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attn (
         .clk(clk), .rst(rst), .start(at_start), .tcount(at_tcount),
         .ld_valid(at_ldv), .ld_data(aw_data), .ld_ready(at_ldready),
         .ctx_valid(at_ctxv), .ctx_idx(at_ctxidx), .ctx_data(at_ctxdata), .done(at_done));
+
+    // ---- kv_bank (doc-7 R1): the on-chip K8/V8 cache making decode faithful ----
+    reg         kb_wstart, kb_wvalid, kb_rstart, kb_rkv;
+    reg  [P*32-1:0] kb_wdata_q;                  // registered with kb_wvalid (L_FEED idiom)
+    reg  [1:0]  kvw_h;                           // KV-write head loop
+    reg         kvw_kv;                          // 0 = K, 1 = V
+    wire        kb_wdone, kb_rvalid, kb_rdone;
+    wire [P*32-1:0] kb_rdata;
+    reg  [1:0]  alds;                            // S_ALD phase: 0 q, 1 K, 2 V
+    wire [10:0] kvw_src = (kvw_kv ? 2*D/P : D/P) + kvw_h*HR
+                          + {{(11-$clog2(ROWSM+1)){1'b0}}, fr};
+    kv_bank #(.P(P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(NLAYER),
+              .TMAX(TMAX), .KBITS(8)) u_kvb (
+        .clk(clk), .rst(rst),
+        .wq_start(kb_wstart), .wq_layer(blk), .wq_kv(kvw_kv), .wq_head(kvw_h),
+        .wq_pos(pos), .wq_valid(kb_wvalid), .wq_data(kb_wdata_q), .wq_done(kb_wdone),
+        .rd_start(kb_rstart), .rd_layer(blk), .rd_kv(kb_rkv), .rd_head(hh),
+        .rd_tcount(pos + 9'd1),
+        .rd_valid(kb_rvalid), .rd_data(kb_rdata), .rd_done(kb_rdone));
+    always @(posedge clk) kb_rdata_d <= kb_rdata;
 
     // ---- callable GEMV / LN parameter registers --------------------------------
     reg [19:0] g_wbase;            // weight base
@@ -248,7 +271,8 @@ module sequencer_vec #(
       S_QKVRET=10, S_AST=11, S_ALD=12, S_ACL=13,    // attention
       S_RES1=14, S_LN2=15, S_FCRET=16,              // proj/res1/LN2-call
       S_MPSET=17, S_RES2=20, S_FIN=21,              // mlp_proj setup (GELU folded into G_RB)
-      S_HEADSET=22, S_ARGMAX=23;                    // final LN_f -> head -> argmax
+      S_HEADSET=22, S_ARGMAX=23,                    // final LN_f -> head -> argmax
+      S_KVW_S=24, S_KVW_F=25, S_KVW_W=26;           // KV quant-write (doc-7 R1)
     reg [4:0] st;
     reg [10:0] ci;
     reg [$clog2(ROWSM+1)-1:0] fr, orow, dor;
@@ -266,7 +290,8 @@ module sequencer_vec #(
     wire [10:0] lnout2_ra = (st==G_AQ) ? ci : rbr;
     wire [10:0] ctxv_ra   = (st==G_AQ) ? ci : rbr;
     wire [10:0] mlpbuf_ra = (st==G_AQ) ? ci : rbr;
-    wire [10:0] qkv_ra    = (st==S_ALD) ? aw_src : rbr;
+    wire [10:0] qkv_ra    = (st==S_ALD)   ? aw_src :
+                            (st==S_KVW_F) ? kvw_src : rbr;
     wire [10:0] attn_ra   = (st==S_RES1) ? ci : rbr;
     wire [10:0] mlp_ra    = (st==S_RES2) ? ci : rbr;
     wire [10:0] head_ra   = (st==S_ARGMAX) ? {{(11-$clog2(ARROWS+1)){1'b0}}, ar} : rbr;
@@ -289,6 +314,7 @@ module sequencer_vec #(
     always @(posedge clk) begin
         ln_start<=1'b0; ln_vin<=1'b0; gv_ldrst<=1'b0; gv_xwe<=1'b0; gv_start<=1'b0;
         dq_vin<=1'b0; gl_vin<=1'b0; at_start<=1'b0; at_ldv<=1'b0; done<=1'b0;
+        kb_wstart<=1'b0; kb_wvalid<=1'b0; kb_rstart<=1'b0;
         if (rst) begin
             st<=S_IDLE; ci<=0; fr<=0; orow<=0; dor<=0; gor<=0;
             rv0<=0; rv1<=0; rv2<=0;
@@ -332,10 +358,29 @@ module sequencer_vec #(
                     end
                 end
                 // qkv GEMV setup (after LN1) and the GEMV call ------------------
+                // returns to S_KVW_S: the new position's k/v are quantised into
+                // kv_bank BEFORE attention reads positions 0..pos (R1 contract).
                 S_QKVRET: begin
                     g_wbase<=blk*GW_BLK + WB_QKV; g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
                     g_asel<=blk*4 + 6'd0; g_frac<=7'd16; g_dqrow<=blk*DQB_P + DR_QKV; g_dst<=3'd0;
-                    g_ret<=S_AST; ci<=0; civ<=0; hh<=2'd0; gv_ldrst<=1'b1; st<=G_AQ;
+                    g_ret<=S_KVW_S; ci<=0; civ<=0; hh<=2'd0; kvw_h<=2'd0; kvw_kv<=1'b0;
+                    gv_ldrst<=1'b1; st<=G_AQ;
+                end
+                // ============ KV quant-write: k then v, per head ==============
+                S_KVW_S: begin
+                    kb_wstart<=1'b1; fr<=0; frv<=0; st<=S_KVW_F;
+                end
+                S_KVW_F: begin
+                    frd <= fr; frv <= (fr != HR[$clog2(ROWSM+1)-1:0]);
+                    if (fr != HR[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
+                    kb_wvalid  <= frv;
+                    kb_wdata_q <= qkv_r;
+                    if (frv && frd==HR-1) begin fr<=0; frv<=0; st<=S_KVW_W; end
+                end
+                S_KVW_W: if (kb_wdone) begin
+                    if (!kvw_kv) begin kvw_kv<=1'b1; st<=S_KVW_S; end
+                    else if (kvw_h != NHEAD-1) begin kvw_h<=kvw_h+2'd1; kvw_kv<=1'b0; st<=S_KVW_S; end
+                    else begin hh<=2'd0; st<=S_AST; end
                 end
                 // ================= callable GEMV ==============================
                 G_AQ: begin    // act-quant: P lanes/cycle, 3-STAGE (mux | mult | round+sat).
@@ -441,19 +486,35 @@ module sequencer_vec #(
                         else gor<=gor+1'b1;
                     end
                 end
-                // ================= attention ==================================
+                // ================= attention (KV-faithful) ====================
                 S_AST: begin
-                    at_start<=1'b1; at_tcount<=9'd1; wi<=9'd0; wic<=9'd0; wiv<=1'b0; st<=S_ALD;
+                    at_start<=1'b1; at_tcount<=pos + 9'd1;
+                    wi<=9'd0; wic<=9'd0; wiv<=1'b0; alds<=2'd0; ald_sel<=1'b0; st<=S_ALD;
                 end
                 S_ALD: begin
-                    // 1-deep prefetch: qkv_r trails wi by one cycle, and at_ldv is one
-                    // register behind wi — both land in the same cycle at vec_attn.
-                    // P-wide: 3*HR rows per head (q, K, V).
-                    at_ldv <= (wi != 3*HR);
-                    if (wi != 3*HR) wi <= wi + 1'b1;
-                    if (at_ldv) begin
-                        if (wic == 3*HR-1) st <= S_ACL;
-                        else wic <= wic + 1'b1;
+                    if (alds == 2'd0) begin
+                        // phase q: HR rows of the current position from qkv_bank
+                        // (1-deep prefetch: qkv_r trails wi by one cycle).
+                        at_ldv  <= (wi != HR[8:0]);
+                        ald_sel <= 1'b0;
+                        if (wi != HR[8:0]) wi <= wi + 1'b1;
+                        if (at_ldv) begin
+                            if (wic == HR-1) begin
+                                kb_rstart <= 1'b1; kb_rkv <= 1'b0;   // K stream, head hh
+                                alds <= 2'd1;
+                            end else wic <= wic + 1'b1;
+                        end
+                    end else begin
+                        // phases K/V: forward the kv_bank dequant stream (valid and
+                        // data both re-registered here, so they stay aligned).
+                        at_ldv  <= kb_rvalid;
+                        ald_sel <= 1'b1;
+                        if (kb_rdone) begin
+                            if (alds == 2'd1) begin
+                                kb_rstart <= 1'b1; kb_rkv <= 1'b1;   // V stream
+                                alds <= 2'd2;
+                            end else st <= S_ACL;
+                        end
                     end
                 end
                 S_ACL: begin

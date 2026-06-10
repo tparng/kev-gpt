@@ -135,7 +135,10 @@ def hadamard_rotate_q16(x_q16, nh=NHEAD, hd=HEAD_DIM):
 
 
 # ============================================================ asym N-bit pack
-def quant_head_asym(x_q16, bits):
+INV_SH = 24   # divfree reciprocal shift: code = rsh_round((x-lo)*inv, INV_SH)
+
+
+def quant_head_asym(x_q16, bits, divfree=False):
     """Asymmetric per-head (per-token) quantiser of hd signed Q.16 ints to `bits`.
 
     Returns (codes, lo, scale): codes unsigned 0..(2^bits-1); lo signed Q.16 int;
@@ -148,7 +151,16 @@ def quant_head_asym(x_q16, bits):
     scale = q_round_div(span, qmax) if span > 0 else 0
     if scale < 1:
         scale = 1                                  # >=1 LSB; degenerate constant head
-    codes = [sat(q_round_div(int(v) - lo, scale), 0, qmax) for v in x_q16]
+    if divfree:
+        # The RTL-friendly form (doc 7 R1): ONE reciprocal divide per (head, pos),
+        # then multiply+shift per element — the codebase's inv_sact/dqm idiom.
+        # inv <= 2^INV_SH (scale >= 1); (v-lo) <= span < 2^21 on this model, so the
+        # product fits 45 bits. Deviation from the true divide is < 1/32 LSB (ties
+        # only); the NLL gate re-measures the scheme as its own contract.
+        inv = q_round_div(1 << INV_SH, scale)
+        codes = [sat(rsh_round((int(v) - lo) * inv, INV_SH), 0, qmax) for v in x_q16]
+    else:
+        codes = [sat(q_round_div(int(v) - lo, scale), 0, qmax) for v in x_q16]
     return codes, lo, scale
 
 
@@ -176,7 +188,7 @@ def _pack_codes_lsb(codes, bits):
     return out
 
 
-def position_ddr_row(vec_q16, bits, nh=NHEAD, hd=HEAD_DIM):
+def position_ddr_row(vec_q16, bits, nh=NHEAD, hd=HEAD_DIM, divfree=False):
     """Build the per-position DDR byte row for ONE K (or V) vector (nh*hd Q.16 ints,
     already rotated if Hadamard is on). Head-major: [lo32 | scale16 | packed codes]*nh.
 
@@ -198,7 +210,7 @@ def position_ddr_row(vec_q16, bits, nh=NHEAD, hd=HEAD_DIM):
     per_head = []
     for h in range(nh):
         base = h * hd
-        codes, lo, scale = quant_head_asym(vec_q16[base:base + hd], bits)
+        codes, lo, scale = quant_head_asym(vec_q16[base:base + hd], bits, divfree=divfree)
         lo32 = lo & 0xFFFFFFFF                       # full signed Q.16 as int32 (RTL sign-extends)
         sc16 = int(scale) & 0xFFFF
         row += [lo32 & 0xFF, (lo32 >> 8) & 0xFF, (lo32 >> 16) & 0xFF, (lo32 >> 24) & 0xFF,
@@ -220,8 +232,9 @@ class IntKVQSequencer(IntSequencer):
     same Hadamard (H^T = H). kbits/vbits >= 16 disables that path entirely (transparent
     pass-through => bit-identical to IntSequencer)."""
 
-    def __init__(self, params, cfg, kbits=4, vbits=4, rotate=True):
+    def __init__(self, params, cfg, kbits=4, vbits=4, rotate=True, divfree=False):
         self.kbits, self.vbits, self.rotate = kbits, vbits, rotate
+        self.divfree = divfree
         # per-position DDR byte rows, indexed [layer] -> list over positions of dict
         self.kv_ddr = None
         super().__init__(params, cfg)
@@ -250,7 +263,7 @@ class IntKVQSequencer(IntSequencer):
             k_row, k_heads = None, None
             k_stored = kr
         else:
-            k_row, k_heads = position_ddr_row(kr, self.kbits)
+            k_row, k_heads = position_ddr_row(kr, self.kbits, divfree=self.divfree)
             k_stored = []
             for h in range(NHEAD):
                 k_stored += dequant_head(*k_heads[h])
@@ -258,7 +271,7 @@ class IntKVQSequencer(IntSequencer):
             v_row, v_heads = None, None
             v_stored = vr
         else:
-            v_row, v_heads = position_ddr_row(vr, self.vbits)
+            v_row, v_heads = position_ddr_row(vr, self.vbits, divfree=self.divfree)
             v_stored = []
             for h in range(NHEAD):
                 v_stored += dequant_head(*v_heads[h])
@@ -380,7 +393,7 @@ def val_nll_int(seq_factory, text_ids, chunks, clen, rng_seed=7):
 # ===================================================================== gate
 def _validate(npz="fabric/export/goformer.npz", n_gen=24, prompt_len=8,
               val="data/sample.kevin.txt", val_chunks=6, val_len=96,
-              kbits=4, vbits=4, rotate=True):
+              kbits=4, vbits=4, rotate=True, divfree=False):
     import json
     import os
 
@@ -422,14 +435,14 @@ def _validate(npz="fabric/export/goformer.npz", n_gen=24, prompt_len=8,
         ids = np.array([stoi.get(c, 0) for c in text[:200_000]], dtype=np.int64)
         base_nll = val_nll_int(lambda: IntSequencer(p, cfg), ids, val_chunks, val_len)
         q_nll = val_nll_int(lambda: IntKVQSequencer(p, cfg, kbits=kbits, vbits=vbits,
-                                                    rotate=rotate),
+                                                    rotate=rotate, divfree=divfree),
                             ids, val_chunks, val_len)
         delta = (q_nll - base_nll) / base_nll
         # honest range: the float exp_kvarn measured +0.72% at K4/V4; the integer
         # datapath adds its own rounding, so accept anything in a wide quality band
         # (<=2% NLL). Wider bit-widths must land well inside it.
         nll_ok = delta <= 0.02
-        rot = "+Hadamard" if rotate else " no-rot"
+        rot = ("+Hadamard" if rotate else " no-rot") + (" divfree" if divfree else "")
         nll_line = (f"(b) K{kbits}/V{vbits}{rot} NLL: int-FP={base_nll:.4f} "
                     f"int-KVQ={q_nll:.4f} "
                     f"delta={q_nll - base_nll:+.4f} ({delta:+.2%}) nats/tok "
@@ -466,10 +479,13 @@ def main(argv=None):
     ap.add_argument("--vbits", type=int, default=4)
     ap.add_argument("--no-rotate", action="store_true",
                     help="skip the Hadamard (candidate simplification at >=8 bits)")
+    ap.add_argument("--divfree", action="store_true",
+                    help="reciprocal multiply+shift quantiser (the doc-7 R1 RTL form)")
     args = ap.parse_args(argv)
     ok = _validate(args.npz, args.gen, args.prompt_len,
                    args.val, args.val_chunks, args.val_len,
-                   kbits=args.kbits, vbits=args.vbits, rotate=not args.no_rotate)
+                   kbits=args.kbits, vbits=args.vbits, rotate=not args.no_rotate,
+                   divfree=args.divfree)
     return 0 if ok else 1
 
 

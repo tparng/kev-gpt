@@ -1003,3 +1003,45 @@ diverged at this density. The next lever is the named embed->residual cone
 (u_embank URAM -> xres_bank add) AND a density cut (the ATT2=1 un-share is
 ~1.9k over; recovering it would also let the router breathe). 250 silicon
 remains the gate between 60k and 75k+.
+
+## 28. Doc-7 R1: the KV-faithful single-stream sequencer (kv_bank, K8/V8 divfree)
+
+The doc-7 campaign's first RTL rung: `sequencer_vec` decodes FAITHFULLY — per-GO
+`pos` advances, an on-chip `kv_bank` (rtl/kv_bank.sv) holds K8/V8 codes + per-
+(head,pos) asymmetric headers across GOs, attention runs `tcount = pos+1`.
+
+- **Contract** = `IntKVQSequencer(kbits=8, vbits=8, rotate=False, divfree=True)`
+  (model/goformer_kvq.py). The divfree amendment replaces the per-element
+  `round_div(x-lo, scale)` with `(x-lo)*inv >> 24`, `inv = round_div(2^24, scale)`
+  — one serial divide per (head,pos), the codebase's inv_sact idiom. NLL
+  re-MEASURED: **+0.09%** (24×128 held-out tok; +0.45% on the noisy 6×96 slice).
+  Hadamard dropped (buys 0.03 points at 8 bits, costs a 6-stage butterfly).
+- **kv_bank**: quant-at-write (running min/max while collecting HR beats, two
+  26-cycle serial divides, P codes/cycle pack), dequant-at-read-stream
+  (`code*scale+lo`, the kv_dma arithmetic verbatim) with the per-position header
+  CO-READ alongside the code row every cycle — zero-bubble 1 row/cycle, T*HR+2
+  per stream. Codes 512 KB (URAM), headers 48 KB (BRAM) at TMAX=256. Banks are
+  never cleared: a conversation restarts at pos 0 and overwrites (attention at
+  pos p reads only rows 0..p, all freshly written).
+- **sequencer_vec**: qkv GEMV returns via new S_KVW states (per head: k then v
+  streamed from qkv_bank into the quantiser); S_ALD is 3-phase (q rows exact from
+  qkv_bank, then K and V dequant-streamed from kv_bank); `ald_sel` registered
+  WITH at_ldv so the data mux survives the phase handoffs. vec_attn TMAX
+  parameterised through (kmem/vmem/probmem/softmax grow with the generic).
+- **Bugs en route, for the file:** (1) `r_rowi[$clog2(CROWS)-1:0]` selected 16
+  bits of a 14-bit reg — the over-wide part-select X trap (CLAUDE.md), X'd every
+  code read while the in-range hdr slice worked; zero-extend instead. (2)
+  vec_gelu moved to gelu_lut2 (even/odd paired LUT) during the SB campaign but
+  run_vec_seq's file list + mem writer were never updated — gelu_lut_e/o.mem
+  missing -> $readmemh silently loads nothing -> GELU outputs X. Latent on main;
+  both harnesses now write the split. run_vec_seq's gold (exact-KV IntSequencer)
+  is SUPERSEDED by run_vec_kv for this design (attention is always quantised now).
+- **Gate:** `run_vec_kv.py` — multi-GO TB (tb_seq_vec_kv.sv), prompt + greedy
+  feedback, token stream vs the golden. **GREEN: plen=4 + ngen=6 (10 positions,
+  T growing 1..9, KV persisting across GOs) — token stream IDENTICAL to the
+  golden ([1,38,34,40,38,51], match=True).** One TB bug en route: the greedy
+  append clobbered prompt slots (stream[pi+1]=tok_out unguarded), which fed the
+  DUT its own pass-1 output instead of prompt[1] — the "mismatches" it caused
+  were fully self-consistent quantisations of the wrong token. The faithful
+  single-stream sequencer EXISTS in RTL as of this entry; cycle numbers at
+  LANES=256 are the next measurement, then R2 (P=128 attention).

@@ -39,6 +39,13 @@ def run(sim_dir, tok, P, lanes=16, tmax=256, npz="fabric/export/goformer.npz"):
     sig = iseq.full_forward_signals(int(tok))
     iseq.reset()
     write_mems_wideword(sim_dir, iseq, lanes, 4, P)
+    # gelu_lut2 (vec_gelu's paired-lane core) reads the even/odd split
+    with open(os.path.join(sim_dir, "gelu_lut.mem")) as fh:
+        _lut = [ln.strip() for ln in fh if ln.strip()]
+    with open(os.path.join(sim_dir, "gelu_lut_e.mem"), "w") as fh:
+        fh.write("\n".join(_lut[0::2]) + "\n")
+    with open(os.path.join(sim_dir, "gelu_lut_o.mem"), "w") as fh:
+        fh.write("\n".join(_lut[1::2]) + "\n")
     with open(os.path.join(sim_dir, "wrom.mem")) as fh:
         wrom_n = sum(1 for ln in fh if ln.strip())
 
@@ -48,11 +55,13 @@ def run(sim_dir, tok, P, lanes=16, tmax=256, npz="fabric/export/goformer.npz"):
                          f"-DLVAL={lanes}", f"-DWROMN={wrom_n}", f"-DTMAXVAL={tmax}",
                          TB,
                          os.path.join(RTL, "sequencer_vec.sv"),
+                         os.path.join(RTL, "kv_bank.sv"),
                          os.path.join(RTL, "layernorm_vec.sv"),
                          os.path.join(RTL, "vec_dequant.sv"),
                          os.path.join(RTL, "vec_attn.sv"),
                          os.path.join(RTL, "vec_gelu.sv"),
                          os.path.join(RTL, "gelu_lut.sv"),
+                         os.path.join(RTL, "gelu_lut2.sv"),
                          os.path.join(RTL, "softmax.sv"),
                          os.path.join(RTL, "gemv_banked_resident_vec.sv")],
                         capture_output=True, text=True)
