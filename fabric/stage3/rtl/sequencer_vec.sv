@@ -85,19 +85,32 @@ module sequencer_vec #(
     localparam integer ARROWS  = (VOCAB + P - 1)/P;                      // argmax rows
     localparam integer EROWS   = D / P;                                  // emb/gamma rows per set
 
+    // ---- embed image in the resident weight URAM's SPARE DEPTH (log §36 plan 2) -
+    // The tok/pos embed ROMs (~92 BRAM tiles) are APPENDED to the wrom weight image
+    // by write_mems_wideword and read through the GEMV bank's port B (phase-disjoint
+    // with GEMV reads). EPW embed rows (P*32b each) pack into one LANES*4-bit word:
+    // word = {row_{EPW-1}, .., row1, row0}; row r of a table lives at word
+    // EMB_*_BASE + r/EPW. Bases are EVEN-ALIGNED so the DP=1 column-parity pair
+    // read returns RPP = 2*EPW consecutive rows; slot select within the pair is
+    // r % RPP. Requires EPW >= 1 (LANES >= 8*P, e.g. LANES=256 at P=8): smaller
+    // LANES no longer carry embeds in the wrom image.
+    localparam integer EPW   = (LANES*4)/(P*32);            // embed rows per wrom word
+    localparam integer EPWS  = (EPW > 1) ? $clog2(EPW) : 0; // row -> word shift
+    localparam integer RPP   = (EPW > 0) ? 2*EPW : 1;       // rows per pair read
+    localparam [2:0]   RSELM = RPP - 1;                     // pair-slot mask (RPP<=8)
+    localparam integer EMB_TOK0     = WB_HEAD + GW_HEAD;    // first word past the image
+    localparam integer EMB_TOK_BASE = EMB_TOK0 + (EMB_TOK0 % 2);
+    localparam integer EMB_TOKW     = (EPW > 0) ? (VOCAB*EROWS + EPW - 1)/EPW : 0;
+    localparam integer EMB_POS0     = EMB_TOK_BASE + EMB_TOKW;
+    localparam integer EMB_POS_BASE = EMB_POS0 + (EMB_POS0 % 2);
+
     // ---- wide-word ROMs ($readmemh: one P-packed word per line) -----------------
     // All sync-read (registered) so they infer BLOCK RAM, not LUTs.
-    (* rom_style = "block" *) reg [P*32-1:0] tok_emb_w [0:VOCAB*EROWS-1];  // Q6.25
-    // BRAM budget: both embeds in BRAM at TMAX=256 hit 174/144 tiles. URAM has no init.
-    // Build at TMAX=64 (Kevin context) -> ~131/144 BRAM.
-    (* rom_style = "block" *) reg [P*32-1:0] pos_emb_w [0:TMAX*EROWS-1];   // Q6.25
     (* rom_style = "block" *) reg [P*32-1:0] gamma_w   [0:GAMMA_N*EROWS-1];// Q4.20
     reg signed [63:0] inv_sact [0:NSACT-1];                       // 17-deep: stays LUT
     (* rom_style = "block" *) reg [P*24-1:0] dqm_w [0:DQROWS-1];           // P mant / word
     (* rom_style = "block" *) reg [P*8-1:0]  dqe_w [0:DQROWS-1];           // P exp  / word
     initial begin
-        $readmemh("tok_emb_w.mem", tok_emb_w);
-        $readmemh("pos_emb_w.mem", pos_emb_w);
         $readmemh("gamma_w.mem",   gamma_w);
         $readmemh("inv_sact.mem",  inv_sact);
         $readmemh("dqm_w.mem",     dqm_w);
@@ -118,7 +131,7 @@ module sequencer_vec #(
     // ---- synchronous-read registers (BRAM output stage; declared before use) ---
     reg [P*32-1:0] xres_r, qkv_r, ctxv_r, attn_r, mlp_r, head_r;
     reg [P*64-1:0] lnout1_r, lnout2_r, mlpbuf_r;
-    reg [P*32-1:0] temb_r, pemb_r, gam_r;
+    reg [P*32-1:0] gam_r;
 
     // ---- layernorm_vec ---------------------------------------------------------
     reg                ln_start, ln_vin;
@@ -139,13 +152,15 @@ module sequencer_vec #(
     wire               gv_done;
     reg [10:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
+    wire [LANES*8-1:0] emb_pair;            // pair-read data (RPP embed rows)
     gemv_banked_resident_vec #(.LANES(LANES), .P(P), .MMAX(1024), .KMAX(1024), .RLAT(2),
                   .WWORDS(WWORDS), .K2(1)) u_gemv (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
         .x_we(gv_xwe), .x_data(gv_xdata),
         .start(gv_start), .done(gv_done),
-        .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout));
+        .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),
+        .emb_sel(emb_sel_w), .emb_addr(emb_addr_w), .emb_pair(emb_pair));
 
     // ---- vec_dequant (P lanes, runtime frac) -----------------------------------
     reg               dq_vin;
@@ -217,7 +232,7 @@ module sequencer_vec #(
     wire [10:0] kvw_src = (kvw_kv ? 2*D/P : D/P) + kvw_h*HR
                           + {{(11-$clog2(ROWSM+1)){1'b0}}, fr};
     kv_bank #(.P(P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(NLAYER),
-              .TMAX(TMAX), .KBITS(8)) u_kvb (
+              .TMAX(TMAX), .KBITS(4)) u_kvb (
         .clk(clk), .rst(rst),
         .wq_start(kb_wstart), .wq_layer(blk), .wq_kv(kvw_kv), .wq_head(kvw_h),
         .wq_pos(pos), .wq_valid(kb_wvalid), .wq_data(kb_wdata_q), .wq_done(kb_wdone),
@@ -310,6 +325,26 @@ module sequencer_vec #(
     reg [$clog2(ROWSM+1)-1:0] frd;  reg frv;
     reg [$clog2(ARROWS+1)-1:0] ard;  reg arv;
 
+    // ---- S_EMB embed fetch through the weight bank's embed port -----------------
+    // Issue alternates tok (etp=0) / pos (etp=1) row fetches, one address/cycle;
+    // the pair lands on emb_pair 1 cycle later (eb_* are the arrival-stage regs).
+    // tok row = tok_id*EROWS+fr, pos row = pos*EROWS+fr; word = BASE + row/EPW;
+    // pair slot = row % RPP (bases even-aligned). ~2*EROWS+2 cycles per token.
+    reg        etp;                          // fetch phase: 0 = tok row, 1 = pos row
+    reg        eb_v, eb_tp;                  // arrival valid + phase
+    reg [2:0]  eb_sel;                       // arrival pair-slot (row % RPP)
+    reg [$clog2(ROWSM+1)-1:0] eb_row;        // arrival xres destination row
+    reg [P*32-1:0]    tacc;                  // tok row held for the tok+pos sum
+    reg [LANES*8-1:0] epr;                   // plain-reg pair copy (safe part-select)
+    reg [P*32-1:0]    erw;                   // selected embed row
+    wire [13:0] emb_row_w = (etp ? pos : tok_id) * EROWS
+                            + {{(14-$clog2(ROWSM+1)){1'b0}}, fr};
+    // 32-bit param + 14-bit row word offset, truncated to the address width
+    // (both bases + the largest offset are < WWORDS by the spare-depth budget)
+    wire [$clog2(WWORDS)-1:0] emb_addr_w =
+        (etp ? EMB_POS_BASE : EMB_TOK_BASE) + (emb_row_w >> EPWS);
+    wire emb_sel_w = (st == S_EMB);
+
     // ---- synchronous reads (one read register per memory, address muxed) -------
     wire [10:0] rbr = rd_addr >> LSH;            // board readback row (idle only)
     wire [10:0] xres_ra   = (st==L_FEED) ? {{(11-$clog2(ROWSM+1)){1'b0}}, fr} :
@@ -336,8 +371,6 @@ module sequencer_vec #(
         mlpbuf_r <= mlpbuf_bank[mlpbuf_ra];
         mlp_r    <= mlp_bank   [mlp_ra];
         head_r   <= head_bank  [head_ra];
-        temb_r   <= tok_emb_w[tok_id*EROWS + fr];
-        pemb_r   <= pos_emb_w[pos*EROWS + fr];
         gam_r    <= gamma_w  [l_gbase*EROWS + fr];
     end
 
@@ -349,26 +382,40 @@ module sequencer_vec #(
         if (rst) begin
             st<=S_IDLE; ci<=0; fr<=0; orow<=0; dor<=0; gor<=0;
             rv0<=0; rv1<=0; rv2<=0;
-            civ<=0; frv<=0; arv<=0; wiv<=0;
+            civ<=0; frv<=0; arv<=0; wiv<=0; etp<=1'b0; eb_v<=1'b0;
             kvf_st<=KF_IDLE; kvf_active<=1'b0;
         end else begin
             case (st)
                 S_IDLE: if (go) begin
-                    fr<=0; frv<=0; blk<=4'd0; st<=S_EMB;
+                    fr<=0; frv<=0; etp<=1'b0; eb_v<=1'b0; blk<=4'd0; st<=S_EMB;
                 end
-                // ---- embed -> xres (wide ROM, sync read, P/cyc); then LN1 of block 0
+                // ---- embed -> xres via the weight bank's embed port (log §36 plan 2):
+                // tok row then pos row per fr, serial (1 fetch/cycle, ~2*EROWS+2 cyc).
                 S_EMB: begin
-                    frd <= fr; frv <= (fr != ROWS[$clog2(ROWSM+1)-1:0]);
-                    if (fr != ROWS[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
-                    if (frv) begin
-                        for (pp=0; pp<P; pp=pp+1)
-                            ww[pp*32 +: 32] = $signed(temb_r[pp*32 +: 32])
-                                            + $signed(pemb_r[pp*32 +: 32]);
-                        xres_bank[frd] <= ww;
-                        if (frd==ROWS-1) begin
-                            fr<=0; frv<=0;
-                            if (dbg_stop==2'd1) st<=S_FIN;       // DEBUG: stop after embed
-                            else begin l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; st<=L_GAM; end
+                    // issue stage: emb_addr_w is combinational from etp/fr this cycle
+                    eb_v   <= (fr != ROWS[$clog2(ROWSM+1)-1:0]);
+                    eb_tp  <= etp;
+                    eb_sel <= emb_row_w[2:0] & RSELM;
+                    eb_row <= fr;
+                    if (fr != ROWS[$clog2(ROWSM+1)-1:0]) begin
+                        if (etp) begin etp <= 1'b0; fr <= fr + 1'b1; end
+                        else etp <= 1'b1;
+                    end
+                    // arrival stage: last cycle's pair is on emb_pair now
+                    if (eb_v) begin
+                        epr = emb_pair;                         // plain-reg copy first
+                        erw = epr[eb_sel*(P*32) +: P*32];
+                        if (!eb_tp) tacc <= erw;                // hold the tok row
+                        else begin                              // pos row: sum + commit
+                            for (pp=0; pp<P; pp=pp+1)
+                                ww[pp*32 +: 32] = $signed(tacc[pp*32 +: 32])
+                                                + $signed(erw[pp*32 +: 32]);
+                            xres_bank[eb_row] <= ww;
+                            if (eb_row==ROWS-1) begin
+                                fr<=0; frv<=0; eb_v<=1'b0; etp<=1'b0;
+                                if (dbg_stop==2'd1) st<=S_FIN;       // DEBUG: stop after embed
+                                else begin l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; st<=L_GAM; end
+                            end
                         end
                     end
                 end

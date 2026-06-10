@@ -48,7 +48,18 @@ module gemv_banked_resident_vec #(
     output reg                           done,
     // readback: P INT32 outputs per address (2-cycle latency)
     input  wire [$clog2(MMAX/P)-1:0]     rd_addr,
-    output reg  [P*32-1:0]               y_out
+    output reg  [P*32-1:0]               y_out,
+    // ---- embed read port (log §36 fit-plan 2) --------------------------------
+    // The tok/pos embeds live in the SPARE DEPTH of the resident weight URAM,
+    // above the GEMV image. When emb_sel=1 (the sequencer only raises it while
+    // the GEMV FSM is IDLE — embed reads are phase-disjoint from GEMV reads)
+    // port-B reads emb_addr instead of grp_base+kc. The DP=1 column-parity bank
+    // returns the (even,odd) word PAIR of emb_addr's column one cycle later on
+    // emb_pair = {word@(addr|1), word@(addr&~1)} — 2*WBITS bits = 8 embed rows
+    // at LANES=256. The sequencer addresses embeds from even pair bases.
+    input  wire                          emb_sel,
+    input  wire [$clog2(WWORDS)-1:0]     emb_addr,
+    output wire [LANES*8-1:0]            emb_pair
 );
     localparam integer WBITS  = LANES*4;
     localparam integer YBITS  = LANES*32;
@@ -109,7 +120,9 @@ module gemv_banked_resident_vec #(
     wire [$clog2(GROUPS):0] gcount = (m_count + LANES - 1) >> LSH;
     wire                 issue   = (kc < k_count);
     wire                 issue2  = (K2 != 0) && (kc + 1 < k_count);
-    assign               waddr   = grp_base + kc;   // even pair base (kc steps by 2)
+    // embed port steals the (idle) port-B address; otherwise the GEMV K-walk
+    assign               waddr   = emb_sel ? emb_addr : (grp_base + kc);
+    assign               emb_pair = {wword2_rd, wword_rd};
     wire [$clog2(KMAX):0] kc1    = kc + 1;
 
     // pipeline: weight word (stage 0 = the per-bank URAM read reg) + act + valid

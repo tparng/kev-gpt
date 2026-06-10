@@ -1,8 +1,9 @@
-"""Multi-token KV-faithful gate for sequencer_vec (doc-7 R1): drives PLEN prompt
-positions + NGEN greedy feedback positions through repeated GO pulses (kv_bank
-persisting across passes) and demands the generated token stream equal the PINNED
-golden reference IntKVQSequencer(kbits=8, vbits=8, rotate=False, divfree=True)
-.generate_greedy — the R0 contract. Also reports per-pass cycles (the R1 number).
+"""Multi-token KV-faithful gate for sequencer_vec (doc-7 R1 / log §36 item 1):
+drives PLEN prompt positions + NGEN greedy feedback positions through repeated GO
+pulses (kv_bank persisting across passes) and demands the generated token stream
+equal the PINNED golden reference IntKVQSequencer(kbits=4, vbits=4, rotate=True,
+divfree=True).generate_greedy — the original KVarN K4/V4+Hadamard contract
+(halves the code bank vs K8). Also reports per-pass cycles.
 
     python -m fabric.stage3.run_vec_kv --plen 4 --ngen 6 --dir C:/kevbuild/stage3_vec_kv
 """
@@ -46,7 +47,7 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
     assert plen + ngen - 1 <= tmax, "prompt+gen must fit the KV window"
 
     p, cfg = seq_ref.build(npz)
-    gold_seq = IntKVQSequencer(p, cfg, kbits=8, vbits=8, rotate=False, divfree=True)
+    gold_seq = IntKVQSequencer(p, cfg, kbits=4, vbits=4, rotate=True, divfree=True)
     gold = gold_seq.generate_greedy(list(prompt_ids), ngen)[plen:]
 
     iseq = seq_ref.IntSequencer(p, cfg)
@@ -58,14 +59,8 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
         fh.write("\n".join(lut[0::2]) + "\n")
     with open(os.path.join(sim_dir, "gelu_lut_o.mem"), "w") as fh:
         fh.write("\n".join(lut[1::2]) + "\n")
-    # kv_bank R4a: inv = q_round_div(2^24, scale), split lo (25b) / hi (13b) ROMs
-    from fabric.stage3.seq_ref import q_round_div
-    with open(os.path.join(sim_dir, "inv_lut_lo.mem"), "w") as fh:
-        for s in range(4096):
-            fh.write(f"{q_round_div(1 << 24, max(s, 1)) & 0x1FFFFFF:07x}\n")
-    with open(os.path.join(sim_dir, "inv_lut_hi.mem"), "w") as fh:
-        for s in range(4096, 16512):
-            fh.write(f"{q_round_div(1 << 24, s) & 0x1FFF:04x}\n")
+    # (K4 kv_bank computes inv = q_round_div(2^24, scale) with its serial divider —
+    #  the R4a inv_lut .mem ROMs are gone: scale at 4 bits outranges a feasible ROM.)
     with open(os.path.join(sim_dir, "prompt.mem"), "w") as fh:
         for t in prompt_ids:
             fh.write(f"{int(t):03x}\n")

@@ -209,6 +209,51 @@ def write_mems_wideword(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlaye
     write_wideword_mem(os.path.join(sim_dir, "tok_emb_w.mem"), tok, P, 32)
     write_wideword_mem(os.path.join(sim_dir, "pos_emb_w.mem"), pos, P, 32)
 
+    # log §36 fit-plan 2: APPEND the embed tables to wrom.mem so sequencer_vec reads
+    # them from the resident weight URAM's spare depth (through the GEMV bank's idle
+    # port-B) instead of dedicated BRAM ROMs. Word format matches write_mems' wrom
+    # lines exactly (LANES hex nibbles = LANES*4 bits, streamed low-32-bits-first by
+    # the loader). EPW embed rows (each P x 32b, lane 0 in the low bits — the same
+    # element->(row,lane) map as tok_emb_w.mem) pack into one word:
+    # word = {row_{EPW-1}, ..., row1, row0}. Both bases are padded EVEN so the DP=1
+    # column-parity pair-read returns 2*EPW consecutive rows; the RTL derives the
+    # same bases (EMB_TOK_BASE/EMB_POS_BASE) from its weight-image localparams.
+    # The old tok_emb_w.mem/pos_emb_w.mem files above are still emitted for other
+    # harnesses. Requires EPW >= 1 (LANES >= 8*P); smaller LANES are skipped.
+    epw = (lanes * 4) // (P * 32)
+    if epw >= 1:
+        nib = lanes                                   # hex chars/word, as in write_mems
+
+        def _emb_words(flat):
+            nrows = (len(flat) + P - 1) // P
+            rows = []
+            for w in range(nrows):                    # P*32b rows, lane l at [l*32 +: 32]
+                acc = 0
+                for l in range(P):
+                    idx = w * P + l
+                    v = int(flat[idx]) & 0xFFFFFFFF if idx < len(flat) else 0
+                    acc |= v << (l * 32)
+                rows.append(acc)
+            words = []
+            for b in range(0, len(rows), epw):        # EPW rows per wrom word, row0 low
+                acc = 0
+                for r, rv in enumerate(rows[b:b + epw]):
+                    acc |= rv << (r * P * 32)
+                words.append(acc)
+            return words
+
+        wrom_path = os.path.join(sim_dir, "wrom.mem")
+        with open(wrom_path) as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        if len(lines) % 2:                            # even-align EMB_TOK_BASE
+            lines.append("0" * nib)
+        lines += [f"{w:0{nib}x}" for w in _emb_words(tok)]
+        if len(lines) % 2:                            # even-align EMB_POS_BASE
+            lines.append("0" * nib)
+        lines += [f"{w:0{nib}x}" for w in _emb_words(pos)]
+        with open(wrom_path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+
     gam = []
     for bi in range(nlayer):
         gam += list(np.round(p["blocks"][bi]["ln1"] * (1 << LN_GFRAC)).astype(np.int64))

@@ -23,7 +23,8 @@ def main(argv=None):
     toks = [int(t) for t in a.toks.split(",")]
 
     p, cfg = seq_ref.build("fabric/export/goformer.npz")
-    seq = IntKVQSequencer(p, cfg, kbits=8, vbits=8, rotate=False, divfree=True)
+    KBITS = 4
+    seq = IntKVQSequencer(p, cfg, kbits=KBITS, vbits=KBITS, rotate=True, divfree=True)
 
     captures = []          # (pos, blk, sink)
     orig = seq._attn_step
@@ -43,7 +44,7 @@ def main(argv=None):
     # reference hdrs per (pos, blk, kv, head) from the recorded DDR rows
     def ref_hdr(pos, blk, kv, h):
         row = seq.kv_ddr[blk][pos]["k_row" if kv == 0 else "v_row"]
-        hb = 38 if False else (6 + HEAD_DIM)        # K8: 6 hdr + 64 codes = 70 B/head
+        hb = 6 + HEAD_DIM * KBITS // 8              # K4: 6 hdr + 32 code bytes = 38 B/head
         off = h * hb
         lo = int.from_bytes(bytes(row[off:off+4]), "little", signed=True)
         sc = int.from_bytes(bytes(row[off+4:off+6]), "little")
@@ -73,17 +74,14 @@ def main(argv=None):
                   f"rtl(lo={lo},sc={sc},inv={inv}) ref(lo={rlo},sc={rsc},inv={rinv})")
     print(f"  {len(kvw)} writes, {bad} mismatches")
 
-    # KVR check: for pass at pos1, blk0, K, h0: stream = pos0 rows then pos1 rows.
-    # lane0 of row (j, g) = k_deq_q16[h*64 + g*8] at position j.
+    # KVR check: for pass at pos1, blk0, K, h0: the wide reader emits ONE row per
+    # position; lane0 of position j = k_deq_q16[h*64 + 0] (the dequantised value
+    # the cache reconstructs from the stored K4 codes).
     print("=== KVR stream compare (pass pos=1, blk0, K, h0) ===")
-    want = []
-    for j in range(2):
-        kd = seq.kv_ddr[0][j]["k_deq_q16" if True else None]
-        for g in range(HEAD_DIM // 8):
-            want.append(kd[0 * 64 + g * 8])
-    # find the SECOND pass's first K/h0/blk0 stream: skip pass-1 reads (8 rows)
+    want = [seq.kv_ddr[0][j]["k_deq_q16"][0] for j in range(2)]
+    # the SECOND pass's K/h0/blk0 stream: skip pass-1's read (1 position)
     got_all = [l0 for (blk, kv, h, l0) in kvr if blk == 0 and kv == 0 and h == 0]
-    got = got_all[8:8+16]          # pass2: 2 positions x 8 rows
+    got = got_all[1:1+2]           # pass2: 2 positions x 1 row
     print(f"  rtl : {got}")
     print(f"  ref : {want}")
     print(f"  match = {got == want}")
