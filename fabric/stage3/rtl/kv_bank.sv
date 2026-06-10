@@ -213,12 +213,17 @@ module kv_bank #(
     wire [$clog2(HROWS)-1:0] pos_ra  = r_pbase  + {{($clog2(HROWS)-9){1'b0}}, r_rowi};
     wire [$clog2(HROWS)-1:0] pos_ra2 = r2_pbase + {{($clog2(HROWS)-9){1'b0}}, r2_rowi};
     wire cwr_fire = (wst == W_CWR) && (rst_st == R_IDLE);
+    // ONE ADDRESS NET PER PORT (the URAM contract): write and read share port A's
+    // muxed address; port B is the second read stream.
+    wire [$clog2(HROWS)-1:0] kva_a = cwr_fire ? w_pbase : pos_ra;
     always @(posedge clk) begin
-        if (cwr_fire) code_bank[w_pbase] <= wstage;       // port A: write...
-        else          code_r <= code_bank[pos_ra];        // ...else read
-        if (cwr_fire) hdr_bank[w_pbase] <= {w_scale, w_lo};
-        else          hdr_rd <= hdr_bank[pos_ra];
+        if (cwr_fire) code_bank[kva_a] <= wstage;         // port A: write...
+        else          code_r <= code_bank[kva_a];         // ...else read
         code_r2 <= code_bank[pos_ra2];                    // port B: read
+    end
+    always @(posedge clk) begin
+        if (cwr_fire) hdr_bank[kva_a] <= {w_scale, w_lo};
+        else          hdr_rd <= hdr_bank[kva_a];
         hdr_rd2 <= hdr_bank[pos_ra2];
     end
 

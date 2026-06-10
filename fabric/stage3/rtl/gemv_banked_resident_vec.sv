@@ -108,14 +108,18 @@ module gemv_banked_resident_vec #(
     // (write-else-read on one port); port B is the K2 second read. Without the
     // fold this is 1W2R = three ports -> Vivado silently falls back to LUTRAM
     // (~200k LUTs, the §34 OOC blow-up).
+    // ONE ADDRESS NET PER PORT (the URAM-inference contract): port A's write and
+    // read share a muxed address; two addresses on one port reads as three ports
+    // and Vivado silently falls back ("Infeasible attribute ram_style=ultra").
+    wire [$clog2(WWORDS)-1:0] addr_a = wcommit ? wword : waddr;
     genvar gb;
     generate
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
             (* ram_style = "ultra" *) reg [BANKW-1:0] mem [0:WWORDS-1];
             reg [BANKW-1:0] rd;
             always @(posedge clk) begin                 // port A: write-else-read
-                if (wcommit) mem[wword] <= wnext_pad[gb*BANKW +: BANKW];
-                else         rd <= mem[waddr];
+                if (wcommit) mem[addr_a] <= wnext_pad[gb*BANKW +: BANKW];
+                else         rd <= mem[addr_a];
             end
             assign wword_pad[gb*BANKW +: BANKW] = rd;
             if (K2 != 0) begin : g_p2
