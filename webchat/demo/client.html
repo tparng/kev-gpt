@@ -1,6 +1,6 @@
 <!doctype html>
 <!--
-  client.html — the live chat UI (chat.mikeayles.com), performativeUI skin.
+  client.html — minimal chat UI implementing the demo protocol.
 
   Protocol it speaks:
     out: {type:"keystroke", prompt, seq}  on each debounced input change
@@ -8,174 +8,53 @@
     in : {type:"hello", client_id}
     in : {type:"speculation"|"authoritative", prompt, completion, infer_ms}
     in : {type:"blit_ok", prompt}         server confirms a fresh blit
-    in : {type:"stats", ...}              1 Hz live telemetry for the stat panel
 
-  The magic: each keystroke (debounced ~25ms client-side too, to match the
+  The magic: each keystroke (debounced ~50ms client-side too, to match the
   server) fires a speculation; the latest completion is BUFFERED. On Enter we
   blit the buffer locally with no round trip IF it matches the exact current
   input (freshness). If it doesn't, we wait for the authoritative completion the
   server fires. A tiny latency readout shows speculation round-trip ms so you can
   watch the magic hold or break.
-
-  The look is a deadpan parody of an over-funded AI launch page (Aurora gradient,
-  glass cards, count-up stat flexes) — the joke is the thesis. The numbers under
-  it are honest: percentiles not means, duty cycle a labelled software proxy.
 -->
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kevin on Kria — live</title>
 <style>
- /* ---- performativeUI tokens (from vorpus/performativeUI) ---- */
- :root{
-   color-scheme:dark;
-   --pui-bg:#08080b; --pui-fg:#f4f4f6; --pui-fg-dim:#a3a3b2; --pui-fg-mute:#6b6b7a;
-   --pui-border:#1f1f2b; --pui-border-bright:#2a2a3a;
-   --pui-grad:linear-gradient(120deg,#7c3aed,#ec4899,#06b6d4);
-   --pui-glow:0 0 24px rgba(124,58,237,.45);
-   --pui-success:#22c55e;
-   --pui-glass:rgba(255,255,255,.035);
-   --pui-glass-strong:rgba(255,255,255,.07);
-   --pui-radius-xl:22px;
-   --pui-font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,system-ui,sans-serif;
- }
- *{box-sizing:border-box}
- body{margin:0;font-family:var(--pui-font);background:var(--pui-bg);color:var(--pui-fg);
-      display:flex;flex-direction:column;height:100vh;overflow:hidden;
-      -webkit-font-smoothing:antialiased}
-
- /* ---- Aurora: drifting radial blobs behind everything ---- */
- #aurora{position:fixed;inset:0;z-index:0;overflow:hidden;filter:blur(50px) saturate(140%);
-         pointer-events:none}
- #aurora i{position:absolute;border-radius:50%;display:block}
- #aurora .b1{width:48vw;height:48vw;left:-8vw;top:-12vw;
-   background:radial-gradient(circle at center,rgba(124,58,237,.45) 0%,transparent 70%);
-   animation:drift1 26s ease-in-out infinite}
- #aurora .b2{width:42vw;height:42vw;right:-6vw;top:8vh;
-   background:radial-gradient(circle at center,rgba(236,72,153,.35) 0%,transparent 70%);
-   animation:drift2 31s ease-in-out infinite}
- #aurora .b3{width:50vw;height:50vw;left:18vw;bottom:-22vh;
-   background:radial-gradient(circle at center,rgba(6,182,212,.30) 0%,transparent 70%);
-   animation:drift3 37s ease-in-out infinite}
- @keyframes drift1{50%{transform:translate(8vw,6vh) scale(1.12)}}
- @keyframes drift2{50%{transform:translate(-7vw,4vh) scale(1.08)}}
- @keyframes drift3{50%{transform:translate(5vw,-6vh) scale(1.15)}}
-
- /* sparkles — a faint, tasteful sprinkle of immaculate vibes */
- #aurora .sp{width:3px;height:3px;border-radius:50%;background:#fff;filter:none;
-   box-shadow:0 0 6px 1px rgba(255,255,255,.8);animation:tw 3.6s ease-in-out infinite}
-
- @keyframes tw{0%,100%{opacity:0;transform:scale(.4)}50%{opacity:.9;transform:scale(1)}}
- @keyframes grad-shift{0%{background-position:0% 50%}100%{background-position:200% 50%}}
- @keyframes pulse-dot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.7)}}
- @keyframes blink{50%{opacity:0}}
- @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-
- .wrap{position:relative;z-index:1;display:flex;flex-direction:column;height:100vh;min-height:0}
-
- /* ---- glass primitive ---- */
- .glass{background:linear-gradient(180deg,var(--pui-glass-strong),transparent);
-   border:1px solid var(--pui-border-bright);border-radius:var(--pui-radius-xl);
-   backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
-
- /* ---- header ---- */
- header{padding:16px 22px 10px;display:flex;flex-direction:column;gap:10px;
-        border-bottom:1px solid var(--pui-border)}
- .toprow{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
- .brand{display:flex;align-items:baseline;gap:10px}
- .grad{background:var(--pui-grad);background-size:200% 200%;
-   -webkit-background-clip:text;background-clip:text;color:transparent;display:inline-block;
-   animation:grad-shift 8s linear infinite;font-weight:800;letter-spacing:-.03em}
- h1{margin:0;font-size:22px;font-weight:800;letter-spacing:-.03em}
- h1 .em{font-size:24px}
- .tag{color:var(--pui-fg-dim);font-size:13px;font-weight:500}
- .pill{display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:999px;
-   border:1px solid var(--pui-border-bright);background:var(--pui-glass);
-   backdrop-filter:blur(6px);font-size:12.5px;color:var(--pui-fg-dim);white-space:nowrap}
- .dot{width:7px;height:7px;border-radius:50%;background:var(--pui-fg-mute);
-   box-shadow:0 0 10px currentColor}
- .dot.on{background:var(--pui-success);color:var(--pui-success);animation:pulse-dot 1.6s ease-in-out infinite}
- .dot.off{background:#f85149;color:#f85149}
- #lat{font-variant-numeric:tabular-nums}
- #lat b{color:var(--pui-fg)}
-
- /* ---- stats panel ---- */
- .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;
-        padding:12px 22px 14px}
- .stat{padding:14px 16px 13px;animation:rise .5s ease both}
- .stat .lbl{font-size:10.5px;font-weight:700;color:var(--pui-fg-mute);
-   text-transform:uppercase;letter-spacing:.08em}
- .stat .val{font-size:30px;font-weight:800;letter-spacing:-.04em;font-variant-numeric:tabular-nums;
-   line-height:1.1;margin-top:3px;background:var(--pui-grad);background-size:200% 200%;
-   -webkit-background-clip:text;background-clip:text;color:transparent;animation:grad-shift 10s linear infinite}
- .stat .sub{font-size:11px;color:var(--pui-fg-mute);margin-top:4px;font-variant-numeric:tabular-nums}
-
- /* ---- chat log ---- */
- #log{flex:1;min-height:0;overflow-y:auto;padding:8px 22px 4px;display:flex;
-   flex-direction:column;gap:7px}
- .msg{max-width:78%;padding:10px 14px;border-radius:16px;line-height:1.5;white-space:pre-wrap;
-   animation:rise .35s ease both;font-size:15px}
- .you{align-self:flex-end;background:var(--pui-grad);background-size:160% 160%;color:#fff;
-   border-bottom-right-radius:5px;margin-top:8px;box-shadow:var(--pui-glow);font-weight:500}
- .kev{align-self:flex-start;background:var(--pui-glass-strong);border:1px solid var(--pui-border-bright);
-   border-bottom-left-radius:5px;backdrop-filter:blur(12px)}
- .meta{align-self:flex-start;font-size:11px;color:var(--pui-fg-mute);
-   font-variant-numeric:tabular-nums;padding-left:6px}
- .meta b{color:var(--pui-success)}
- #spec{align-self:flex-start;color:var(--pui-fg-dim);font-style:italic;font-size:14px;
-   min-height:20px;padding:2px 6px 0}
- #spec b{color:#c4b5fd;font-style:normal}
-
- /* ---- input ---- */
- form{display:flex;gap:10px;padding:14px 22px 18px;border-top:1px solid var(--pui-border)}
- .inwrap{flex:1;display:flex;align-items:center;padding:0 4px 0 16px;border-radius:14px}
- input[type=text]{flex:1;padding:13px 6px;border:0;background:transparent;color:var(--pui-fg);
-   font-size:15px;outline:none}
- input[type=text]::placeholder{color:var(--pui-fg-mute)}
- button{padding:12px 22px;border:0;border-radius:14px;background:var(--pui-grad);
-   background-size:160% 160%;color:#fff;font-weight:700;font-size:15px;cursor:pointer;
-   letter-spacing:-.01em;box-shadow:var(--pui-glow);transition:transform .08s ease,filter .15s ease}
- button:hover{filter:brightness(1.08)}
- button:active{transform:translateY(1px) scale(.985)}
- .scuff::-webkit-scrollbar{width:8px}
- .scuff::-webkit-scrollbar-thumb{background:var(--pui-border-bright);border-radius:8px}
+ :root{color-scheme:dark}
+ body{margin:0;font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;
+      display:flex;flex-direction:column;height:100vh}
+ header{padding:12px 16px;background:#161b22;border-bottom:1px solid #30363d;
+        font-weight:600;display:flex;justify-content:space-between;align-items:center}
+ header small{font-weight:400;color:#8b949e}
+ #log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:6px}
+ .msg{max-width:80%;padding:9px 13px;border-radius:14px;line-height:1.45;white-space:pre-wrap}
+ .you{align-self:flex-end;background:#1f6feb;color:#fff;border-bottom-right-radius:4px;margin-top:8px}
+ .kev{align-self:flex-start;background:#21262d;border:1px solid #30363d;border-bottom-left-radius:4px}
+ #spec{align-self:flex-start;color:#8b949e;font-style:italic;font-size:13px;min-height:18px;padding-left:6px}
+ .meta{align-self:flex-start;font-size:11px;color:#8b949e;font-variant-numeric:tabular-nums;padding-left:6px}
+ .meta b{color:#3fb950}
+ form{display:flex;gap:8px;padding:12px 16px;background:#161b22;border-top:1px solid #30363d}
+ input[type=text]{flex:1;padding:11px 13px;border-radius:10px;border:1px solid #30363d;
+      background:#0d1117;color:#e6edf3;font-size:15px}
+ button{padding:11px 18px;border:0;border-radius:10px;background:#238636;color:#fff;font-weight:600;cursor:pointer}
 </style></head><body>
-<div id="aurora"><i class="b1"></i><i class="b2"></i><i class="b3"></i></div>
-<div class="wrap">
- <header>
-  <div class="toprow">
-   <div class="brand">
-    <h1><span class="em">🧒</span> <span class="grad">Kevin on Kria</span></h1>
-    <span class="tag">frontier-grade telegraphic intelligence, on a single chip</span>
-   </div>
-   <div style="display:flex;gap:8px;align-items:center">
-    <span class="pill"><span id="sdot" class="dot off"></span><span id="status">connecting…</span></span>
-    <span class="pill" id="lat">spec —</span>
-   </div>
-  </div>
-  <div class="stats">
-   <div class="stat glass"><div class="lbl">Live users</div><div class="val" id="st_users">—</div><div class="sub" id="sub_users">peak —</div></div>
-   <div class="stat glass"><div class="lbl">Peak tok/s</div><div class="val" id="st_peak">—</div><div class="sub" id="sub_peak">now — tok/s</div></div>
-   <div class="stat glass"><div class="lbl">Avg tok/s</div><div class="val" id="st_avg">—</div><div class="sub">aggregate, since boot</div></div>
-   <div class="stat glass"><div class="lbl">Duty cycle</div><div class="val" id="st_duty">—</div><div class="sub">engine busy · sw proxy</div></div>
-   <div class="stat glass"><div class="lbl">Requests</div><div class="val" id="st_req">—</div><div class="sub" id="sub_req">— amp ×</div></div>
-   <div class="stat glass"><div class="lbl">Tokens generated</div><div class="val" id="st_tok">—</div><div class="sub" id="sub_tok">chars, all streams</div></div>
-  </div>
- </header>
-
- <div id="log" class="scuff">
-  <div class="msg kev">few word do trick. type thing. me finish it. (answer shows up before you hit enter.)</div>
-  <div class="msg meta">kevin be 3.3M-param toddler. him only know telegraphic tinystories — start story, no ask question. try: “once upon time” · “little girl find dog” · “one day big bear”. the point be the speed, not the prose.</div>
- </div>
- <div id="spec"></div>
- <form id="f" onsubmit="return onEnter(event)">
-  <div class="inwrap glass"><input id="p" type="text" autocomplete="off" placeholder="once upon time…" autofocus></div>
-  <button type="submit">Send</button>
- </form>
+<header>
+ <span>🧒 Kevin <small>on Kria · speculative · <span id="status">connecting…</span></small></span>
+ <span class="meta" id="lat">spec —</span>
+</header>
+<div id="log">
+ <div class="msg kev">few word do trick. type thing. me finish it. (answer shows up before you hit enter.)</div>
+ <div class="msg meta">kevin be 3.3M-param toddler. him only know telegraphic tinystories — start story, no ask question. try: “once upon time” · “little girl find dog” · “one day big bear”. the point be the speed, not the prose.</div>
 </div>
+<div id="spec"></div>
+<form id="f" onsubmit="return onEnter(event)">
+ <input id="p" type="text" autocomplete="off" placeholder="once upon time..." autofocus>
+ <button type="submit">Send</button>
+</form>
 <script>
 const log=document.getElementById('log'), inp=document.getElementById('p'),
       specEl=document.getElementById('spec'), statusEl=document.getElementById('status'),
-      latEl=document.getElementById('lat'), sdot=document.getElementById('sdot');
+      latEl=document.getElementById('lat');
 const DEBOUNCE_MS=25;   // matches the server's --debounce-ms (infer is ~40ms now)
 let ws, seq=0, debTimer=null;
 // the speculation buffer: completion the server computed for `bufPrompt`.
@@ -184,61 +63,25 @@ let lastSentAt=0, lastSentPrompt=null;
 // a pending "…" bubble waiting for an authoritative completion (freshness miss)
 let pendingWait=null;
 
-// ---- scatter the sparkles once (cosmetic; performativeUI immaculate-vibes) ----
-(function(){const a=document.getElementById('aurora');
- for(let i=0;i<14;i++){const s=document.createElement('i');s.className='sp';
-  s.style.left=(6+Math.random()*88).toFixed(1)+'%';
-  s.style.top=(6+Math.random()*88).toFixed(1)+'%';
-  s.style.animationDelay=(Math.random()*3.6).toFixed(2)+'s';a.appendChild(s);} })();
-
 function add(cls,txt){const d=document.createElement('div');d.className='msg '+cls;
  d.textContent=txt||'';log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-
-// ---- animated count-up for the stat flexes ----
-function human(n){n=n||0;
- if(n>=1e6)return (n/1e6).toFixed(n<1e7?1:0)+'M';
- if(n>=1e3)return (n/1e3).toFixed(n<1e4?1:0)+'k';
- return Math.round(n).toLocaleString();}
-function setStat(id,value,fmt){
- const el=document.getElementById('st_'+id); if(!el) return;
- if(value==null){el.textContent='—';el._v=null;return;}
- const target=Number(value), from=(typeof el._v==='number')?el._v:0, t0=performance.now(), dur=600;
- cancelAnimationFrame(el._raf||0);
- const step=t=>{const k=Math.min(1,(t-t0)/dur), e=1-Math.pow(1-k,3), v=from+(target-from)*e;
-  el.textContent=fmt(v); el._v=v;
-  if(k<1) el._raf=requestAnimationFrame(step); else {el._v=target; el.textContent=fmt(target);}};
- el._raf=requestAnimationFrame(step);
-}
-function renderStats(m){
- setStat('users', m.live_users, v=>Math.round(v).toString());
- setStat('peak',  m.peak_tok_s, v=>v.toFixed(1));
- setStat('avg',   m.avg_tok_s,  v=>v.toFixed(1));
- setStat('duty',  m.duty_cycle==null?null:m.duty_cycle*100, v=>v.toFixed(0)+'%');
- setStat('req',   m.requests,   v=>human(v));
- setStat('tok',   m.total_tokens, v=>human(v));
- const su=document.getElementById('sub_users'); if(su) su.textContent='peak '+(m.peak_users??'—');
- const sp=document.getElementById('sub_peak');  if(sp) sp.textContent='now '+(m.agg_tok_s!=null?m.agg_tok_s.toFixed(1):'—')+' tok/s';
- const sr=document.getElementById('sub_req');   if(sr) sr.textContent=(m.amp_ratio!=null?m.amp_ratio.toFixed(1):'—')+'× amplification';
- const st=document.getElementById('sub_tok');   if(st) st.textContent=(m.ready_at_enter!=null?Math.round(m.ready_at_enter*100)+'% ready-at-Enter':'chars, all streams');
-}
 
 function connect(){
  const proto=location.protocol==='https:'?'wss':'ws';
  const url=(window.WS_URL)||(proto+'://'+location.host);
  ws=new WebSocket(url);
- ws.onopen=()=>{statusEl.textContent='live';sdot.className='dot on';};
- ws.onclose=()=>{statusEl.textContent='disconnected';sdot.className='dot off';setTimeout(connect,1500);};
+ ws.onopen=()=>{statusEl.textContent='live';};
+ ws.onclose=()=>{statusEl.textContent='disconnected';setTimeout(connect,1500);};
  ws.onmessage=(ev)=>{
    const m=JSON.parse(ev.data);
-   if(m.type==='hello'){statusEl.textContent='live · '+m.client_id;sdot.className='dot on';}
-   else if(m.type==='stats'){renderStats(m);}
+   if(m.type==='hello'){statusEl.textContent='live · '+m.client_id;}
    else if(m.type==='speculation'||m.type==='authoritative'){
      bufPrompt=m.prompt; bufCompletion=m.completion;
      if(m.prompt===lastSentPrompt&&lastSentAt){
        latEl.innerHTML='spec <b>'+Math.round(performance.now()-lastSentAt)+' ms</b>';
      }
      // show the live speculation under the input (the "before you finish" trick)
-     if(m.prompt===inp.value.trim()){specEl.innerHTML='<b>▍</b> '+m.completion;}
+     if(m.prompt===inp.value.trim()){specEl.textContent='▍ '+m.completion;}
      if(m.type==='authoritative'){ // a freshness miss was resolved -> render it
        if(pendingWait && pendingWait.prompt===m.prompt){
          // fill the "…" placeholder we already showed on Enter (don't re-add the

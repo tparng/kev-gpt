@@ -68,12 +68,6 @@ class Hub:
         # the single PL over /dev/mem.
         self.fabric_depth = max(1, fabric_depth)
         self._inflight_n = 0
-        # lifetime aggregates feeding the chat-page stat panel (the "flexes"):
-        # total chars emitted, peak 1s aggregate rate, and a wall-clock start so
-        # the panel can show an average tok/s since boot.
-        self._start_mono = time.monotonic()
-        self.total_tokens = 0
-        self.peak_tok_s = 0.0
         # client_id -> websocket (for fan-out of completions)
         self.conns: dict[str, object] = {}
         # client_id -> the submit-eligible (debounce-expiry) perf_counter instant.
@@ -150,7 +144,6 @@ class Hub:
                 "completion": res.completion,
                 "infer_ms": round(outcome.busy_s * 1000.0, 2),
             })
-        self.total_tokens += tokens
         self.tel.on_batch(busy_s=outcome.busy_s, filled=outcome.filled,
                           capacity=outcome.capacity, tokens=tokens)
 
@@ -164,44 +157,8 @@ class Hub:
             rec["connections"] = len(self.conns)
             rec["dropped_keystrokes"] = self.co.dropped
             self.sink.write(rec)
-            await self._broadcast_stats(rec, now)
             if self.push_url:
                 await self._push(rec)
-
-    async def _broadcast_stats(self, rec: dict, now: float):
-        """Push a compact, chat-page-shaped stat frame to every connected client.
-
-        The dashboard Worker gets the full telemetry record; the chat page only
-        needs the handful of headline 'flex' numbers, pre-shaped so the client
-        renders without re-deriving anything. Same honest definitions as the
-        dashboard: percentiles not means, duty cycle a labelled software proxy."""
-        if not self.conns:
-            return
-        agg = rec.get("agg_tok_s") or 0.0
-        if agg > self.peak_tok_s:
-            self.peak_tok_s = agg
-        uptime = max(1e-6, now - self._start_mono)
-        amp = rec.get("amplification") or {}
-        stats = {
-            "type": "stats",
-            "live_users": rec.get("active_users"),
-            "peak_users": rec.get("peak_active"),
-            "agg_tok_s": agg,
-            "peak_tok_s": round(self.peak_tok_s, 1),
-            "avg_tok_s": round(self.total_tokens / uptime, 1),
-            "duty_cycle": rec.get("occupancy_busy_frac"),
-            "requests": amp.get("inferences"),
-            "amp_ratio": amp.get("ratio"),
-            "total_tokens": self.total_tokens,
-            "ready_at_enter": rec.get("ready_at_enter"),
-            "uptime_s": round(uptime, 0),
-        }
-        payload = json.dumps(stats)
-        for ws in list(self.conns.values()):
-            try:
-                await ws.send(payload)
-            except Exception:
-                pass
 
     async def _push(self, rec: dict):
         try:
