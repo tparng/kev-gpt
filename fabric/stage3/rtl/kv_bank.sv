@@ -199,6 +199,18 @@ module kv_bank #(
     reg [8:0]  r_nrows, r2_nrows;              // T
     reg [8:0]  r_ecnt,  r2_ecnt;               // emitted-position counters
     reg        r_v0,    r2_v0;                 // addr-stage valids
+    reg        r_v1,    r2_v1;                 // mem-out-register stage valids
+
+    // TIMING (take-5 worst path): the hdr/code BRAM-out registers fed the 64-lane
+    // dequant COMBINATIONALLY into the engines' DSP inputs (7-high BRAM cascade +
+    // mult = -2.4ns @5ns). One register stage between the memory outputs and the
+    // dequant splits the path; the stream grows by one cycle.
+    reg [HEAD_DIM*KBITS-1:0] code_q, code_q2;
+    reg [47:0]               hdr_q,  hdr_q2;
+    always @(posedge clk) begin
+        code_q  <= code_r;   hdr_q  <= hdr_rd;
+        code_q2 <= code_r2;  hdr_q2 <= hdr_rd2;
+    end
 
     // base addresses (registered at start; code and hdr share the per-position base)
     reg [$clog2(HROWS)-1:0] w_pbase, r_pbase, r2_pbase;
@@ -214,9 +226,9 @@ module kv_bank #(
     always @* begin
         deq_word = {(HEAD_DIM*32){1'b0}};
         for (dp = 0; dp < HEAD_DIM; dp = dp + 1) begin
-            d_code = code_r[dp*KBITS +: KBITS];
-            d_prod = d_code * hdr_rd[47:32];                  // unsigned mul (kv_dma shape)
-            d_full = $signed({1'b0, d_prod}) + $signed(hdr_rd[31:0]); // + signed lo
+            d_code = code_q[dp*KBITS +: KBITS];
+            d_prod = d_code * hdr_q[47:32];                  // unsigned mul (kv_dma shape)
+            d_full = $signed({1'b0, d_prod}) + $signed(hdr_q[31:0]); // + signed lo
             deq_word[dp*32 +: 32] = d_full[31:0];
         end
     end
@@ -227,9 +239,9 @@ module kv_bank #(
     always @* begin
         deq_word2 = {(HEAD_DIM*32){1'b0}};
         for (dq2 = 0; dq2 < HEAD_DIM; dq2 = dq2 + 1) begin
-            d2_code = code_r2[dq2*KBITS +: KBITS];
-            d2_prod = d2_code * hdr_rd2[47:32];
-            d2_full = $signed({1'b0, d2_prod}) + $signed(hdr_rd2[31:0]);
+            d2_code = code_q2[dq2*KBITS +: KBITS];
+            d2_prod = d2_code * hdr_q2[47:32];
+            d2_full = $signed({1'b0, d2_prod}) + $signed(hdr_q2[31:0]);
             deq_word2[dq2*32 +: 32] = d2_full[31:0];
         end
     end
@@ -317,8 +329,8 @@ module kv_bank #(
         wq_done <= 1'b0; rd_done <= 1'b0; rd2_done <= 1'b0;
         if (rst) begin
             wst <= W_IDLE; rst_st <= R_IDLE; rst2_st <= R_IDLE;
-            rd_valid <= 1'b0; r_v0 <= 1'b0;
-            rd2_valid <= 1'b0; r2_v0 <= 1'b0;
+            rd_valid <= 1'b0; r_v0 <= 1'b0; r_v1 <= 1'b0;
+            rd2_valid <= 1'b0; r2_v0 <= 1'b0; r2_v1 <= 1'b0;
         end else begin
             // =================== write side ===================
             case (wst)
@@ -406,6 +418,7 @@ module kv_bank #(
                     r_rowi  <= 0;
                     r_ecnt  <= 0;
                     r_v0    <= 1'b0;
+                    r_v1    <= 1'b0;
                     r_pbase <= ((rd_layer*2 + {3'b0,rd_kv})*NHEAD
                                  + {2'b0,rd_head})*TMAX;
                     rst_st <= R_RUN;
@@ -413,9 +426,10 @@ module kv_bank #(
                 R_RUN: begin
                     // addr stage: present row rowi (code + its position's hdr together)
                     r_v0 <= (r_rowi != r_nrows);
+                    r_v1 <= r_v0;
                     if (r_rowi != r_nrows) r_rowi <= r_rowi + 1'b1;
-                    // emit stage: code_r/hdr_rd for the previous address land now
-                    if (r_v0) begin
+                    // emit stage: code_q/hdr_q (mem-out + one reg) land now
+                    if (r_v1) begin
                         rd_valid <= 1'b1;
                         rd_data  <= deq_word;
                         if (r_ecnt == r_nrows - 1) begin
@@ -435,14 +449,16 @@ module kv_bank #(
                     r2_rowi  <= 0;
                     r2_ecnt  <= 0;
                     r2_v0    <= 1'b0;
+                    r2_v1    <= 1'b0;
                     r2_pbase <= ((rd2_layer*2 + {3'b0,rd2_kv})*NHEAD
                                   + {2'b0,rd2_head})*TMAX;
                     rst2_st <= R_RUN;
                 end
                 R_RUN: begin
                     r2_v0 <= (r2_rowi != r2_nrows);
+                    r2_v1 <= r2_v0;
                     if (r2_rowi != r2_nrows) r2_rowi <= r2_rowi + 1'b1;
-                    if (r2_v0) begin
+                    if (r2_v1) begin
                         rd2_valid <= 1'b1;
                         rd2_data  <= deq_word2;
                         if (r2_ecnt == r2_nrows - 1) begin
