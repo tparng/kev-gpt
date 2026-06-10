@@ -21,12 +21,14 @@ set rtl  "$root/fabric/stage3/rtl"
 
 read_verilog -sv [list \
     "$rtl/sequencer_vec.sv" \
+    "$rtl/kv_bank.sv" \
+    "$rtl/vec_attn_w.sv" \
     "$rtl/layernorm_vec.sv" \
     "$rtl/vec_dequant.sv" \
-    "$rtl/vec_attn.sv" \
     "$rtl/vec_gelu.sv" \
     "$rtl/gelu_lut.sv" \
-    "$rtl/softmax.sv" \
+    "$rtl/gelu_lut2.sv" \
+    "$rtl/softmax_f.sv" \
     "$rtl/gemv_banked_resident_vec.sv"]
 
 synth_design -top sequencer_vec -part $part -mode out_of_context \

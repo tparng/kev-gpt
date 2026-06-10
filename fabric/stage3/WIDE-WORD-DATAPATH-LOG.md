@@ -1159,3 +1159,25 @@ rung away (KVW-overlap ~0.7k, dual-row RB ~0.65k, LN ~0.4k, AQ ~0.5k on the
 menu). Area note for R5: two engines = 128 dot mults + 128 ctx mults + 2x64
 dequant lanes + softmax_f x2 — the N=1 fabric has ~15/16 of the SB design's
 MAC area free.
+
+## 34. Doc-7 R4f + the FULL-WINDOW gate — and the 20k line in sight
+
+**FULL-WINDOW BOUNDARY GATE GREEN (the R2-era compile): 248/248 generated
+tokens bit-exact out to T=255 — the model's ENTIRE trained context** — prompt
++ greedy through the whole window, KV persisting across all 255 positions
+("her start spin around around around... suddenly her hear something
+spinning"). The faithful architecture is proven at the TMAX boundary.
+
+R4f: (a) KV-write FEEDER — heads 2..3 quantise into kv_bank DURING pair-0's
+attention (a parallel mini-FSM sharing the temporally-exclusive S_KVW
+machinery; the qkv read port arbitrated, S_ALD's q streams win, the feeder
+pauses; pair-1 holds on kvf_active — only bites at tiny T). (b) Engine A's
+ctx strobes write ctxv_bank DIRECTLY (A always finishes before B; only B keeps
+a catch buffer, S_CDR drains HR not 2*HR).
+
+GATE: 31 passes, 28/28 identical. cyc: 11,138 (T=1) .. 11,698 (T=31), avg
+11,375 at T-bar=16; the slope inside the window measures ~19-24/pos (the
+feeder hides more as T grows). DERIVED @ T-bar=80: ~12.6-12.9k cyc ->
+15.5-15.9k tok/s @200 / **19.4-19.8k @250** — at the 20k line; the T->127 law
+run pins the asymptote. OOC synth of the R4e/f design in flight (fit + 200MHz
+WNS; TMAX=256 embeds vs the 144-BRAM budget is the watch item).

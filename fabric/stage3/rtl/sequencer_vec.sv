@@ -190,10 +190,20 @@ module sequencer_vec #(
     wire [10:0] aw_src = (qsel ? hB : hh)*HR + wi;
     reg  [P*32-1:0] q_data_q;                    // registered WITH at_ldv (aligned pair)
     reg             ldv0;                        // addr-stage valid (1 ahead of at_ldv)
-    // per-engine ctx catchers (strobes can collide in time; ctxv_bank has one port)
-    reg [P*32-1:0] ctxbufA [0:HR-1];
+    // Engine A's ctx strobes write ctxv_bank DIRECTLY (A always finishes before B,
+    // and pair N+1's strobes can't fire before pair N's drain completes); only B
+    // needs a catch buffer, drained in S_CDR (HR cycles).
     reg [P*32-1:0] ctxbufB [0:HR-1];
-    reg [4:0]  cdr;                         // ctx drain counter (0..2*HR-1)
+    reg [4:0]  cdr;                         // ctx drain counter (0..HR-1)
+    // R4f: KV-write FEEDER — heads 2..3 quantise into kv_bank DURING pair-0's
+    // attention, sharing the main S_KVW machinery (fr/frv/kvw_h/kvw_kv) which is
+    // temporally exclusive. The qkv_bank read port is arbitrated: S_ALD's q
+    // streams win; the feeder pauses (addr presented only when granted, the
+    // in-flight beat completes regardless — qkv_r was latched from our address).
+    localparam [1:0] KF_IDLE=2'd0, KF_S=2'd1, KF_F=2'd2, KF_W=2'd3;
+    reg [1:0] kvf_st;
+    reg       kvf_active;
+    wire      kvf_grant = (st != S_ALD) && (st != S_KVW_F);
 
     // ---- kv_bank: the on-chip K8/V8 cache making decode faithful ---------------
     reg         kb_wstart, kb_wvalid, kb_rstart, kb_rkv, kb2_rstart, kb2_rkv;
@@ -309,7 +319,8 @@ module sequencer_vec #(
     wire [10:0] ctxv_ra   = (st==G_AQ) ? ci : rbr;
     wire [10:0] mlpbuf_ra = (st==G_AQ) ? ci : rbr;
     wire [10:0] qkv_ra    = (st==S_ALD)   ? aw_src :
-                            (st==S_KVW_F) ? kvw_src : rbr;
+                            (st==S_KVW_F) ? kvw_src :
+                            (kvf_active && kvf_st==KF_F) ? kvw_src : rbr;
     wire [10:0] attn_ra   = (st==S_RES1) ? ci : rbr;
     wire [10:0] mlp_ra    = (st==S_RES2) ? ci : rbr;
     wire [10:0] head_ra   = (st==S_ARGMAX) ? {{(11-$clog2(ARROWS+1)){1'b0}}, ar} : rbr;
@@ -338,6 +349,7 @@ module sequencer_vec #(
             st<=S_IDLE; ci<=0; fr<=0; orow<=0; dor<=0; gor<=0;
             rv0<=0; rv1<=0; rv2<=0;
             civ<=0; frv<=0; arv<=0; wiv<=0;
+            kvf_st<=KF_IDLE; kvf_active<=1'b0;
         end else begin
             case (st)
                 S_IDLE: if (go) begin
@@ -396,10 +408,15 @@ module sequencer_vec #(
                     kb_wdata_q <= qkv_r;
                     if (frv && frd==HR-1) begin fr<=0; frv<=0; st<=S_KVW_W; end
                 end
+                // main FSM writes heads 0..1 only; heads 2..3 go to the FEEDER,
+                // which runs during pair-0's attention (R4f).
                 S_KVW_W: if (kb_wdone) begin
                     if (!kvw_kv) begin kvw_kv<=1'b1; st<=S_KVW_S; end
-                    else if (kvw_h != NHEAD-1) begin kvw_h<=kvw_h+2'd1; kvw_kv<=1'b0; st<=S_KVW_S; end
-                    else begin hh<=2'd0; hB<=2'd1; pair<=1'b0; st<=S_AST; end
+                    else if (kvw_h == 2'd0) begin kvw_h<=2'd1; kvw_kv<=1'b0; st<=S_KVW_S; end
+                    else begin
+                        kvw_h<=2'd2; kvw_kv<=1'b0; kvf_active<=1'b1; kvf_st<=KF_S;
+                        hh<=2'd0; hB<=2'd1; pair<=1'b0; st<=S_AST;
+                    end
                 end
                 // ================= callable GEMV ==============================
                 G_AQ: begin    // act-quant: P lanes/cycle, 3-STAGE (mux | mult | round+sat).
@@ -506,7 +523,9 @@ module sequencer_vec #(
                     end
                 end
                 // ============ attention (R4e: twin engines, head pairs) ========
-                S_AST: begin
+                // pair 1 holds until the feeder has written heads 2..3 (only
+                // bites at tiny T; the feeder hides under pair-0 attention).
+                S_AST: if (!(pair && kvf_active)) begin
                     at_startA<=1'b1; at_tcount<=pos + 9'd1;
                     wi<=9'd0; wic<=9'd0; wiv<=1'b0; ldv0<=1'b0; qsel<=1'b0;
                     adone_s<=1'b0; bdone_s<=1'b0; st<=S_ALD;
@@ -535,13 +554,10 @@ module sequencer_vec #(
                 S_ACL: if (adone_s && bdone_s) begin
                     cdr <= 5'd0; st <= S_CDR;
                 end
-                // drain the pair's ctx catchers into ctxv_bank (single write port)
+                // drain engine B's ctx catcher into ctxv_bank (A wrote directly)
                 S_CDR: begin
-                    if (cdr < HR[4:0])
-                        ctxv_bank[hh*HR + {6'b0, cdr[2:0]}] <= ctxbufA[cdr[2:0]];
-                    else
-                        ctxv_bank[hB*HR + {6'b0, cdr[2:0]}] <= ctxbufB[cdr[2:0]];
-                    if (cdr == 2*HR-1) begin
+                    ctxv_bank[hB*HR + {6'b0, cdr[2:0]}] <= ctxbufB[cdr[2:0]];
+                    if (cdr == HR-1) begin
                         if (pair) begin                           // -> proj GEMV
                             g_wbase<=blk*GW_BLK + WB_PROJ; g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
                             g_asel<=blk*4 + 6'd1; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_PROJ; g_dst<=3'd1;
@@ -649,14 +665,37 @@ module sequencer_vec #(
                 default: st<=S_IDLE;
             endcase
             // ---- R4e catchers: fire regardless of FSM state -------------------
-            // V streams start the moment each engine's probs are ready; ctx
-            // strobes land in per-engine buffers (drained serially in S_CDR).
+            // V streams start the moment each engine's probs are ready. Engine A
+            // writes ctxv_bank DIRECTLY (its strobes never collide with B's drain);
+            // engine B's strobes land in the catch buffer.
             if (at_kdoneA) begin kb_rstart  <= 1'b1; kb_rkv  <= 1'b1; end
             if (at_kdoneB) begin kb2_rstart <= 1'b1; kb2_rkv <= 1'b1; end
-            if (at_ctxvA) ctxbufA[at_ctxidxA[2:0]] <= at_ctxdataA;
+            if (at_ctxvA) ctxv_bank[hh*HR + {4'b0, at_ctxidxA[2:0]}] <= at_ctxdataA;
             if (at_ctxvB) ctxbufB[at_ctxidxB[2:0]] <= at_ctxdataB;
             if (at_doneA) adone_s <= 1'b1;
             if (at_doneB) bdone_s <= 1'b1;
+            // ---- R4f feeder: quantise heads 2..3 during pair-0's attention ----
+            case (kvf_st)
+                KF_S: if (kvf_active) begin
+                    kb_wstart<=1'b1; fr<=0; frv<=0; kvf_st<=KF_F;
+                end
+                KF_F: begin
+                    if (kvf_grant) begin
+                        frd <= fr; frv <= (fr != HR[$clog2(ROWSM+1)-1:0]);
+                        if (fr != HR[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
+                    end else frv <= 1'b0;
+                    kb_wvalid  <= frv;
+                    kb_wdata_q <= qkv_r;
+                    if (frv && frd==HR-1) begin fr<=0; frv<=0; kvf_st<=KF_W; end
+                end
+                KF_W: if (kb_wdone) begin
+                    if (!kvw_kv) begin kvw_kv<=1'b1; kvf_st<=KF_S; end
+                    else if (kvw_h != NHEAD-1) begin
+                        kvw_h<=kvw_h+2'd1; kvw_kv<=1'b0; kvf_st<=KF_S;
+                    end else begin kvf_active<=1'b0; kvf_st<=KF_IDLE; end
+                end
+                default: ;
+            endcase
         end
     end
 
