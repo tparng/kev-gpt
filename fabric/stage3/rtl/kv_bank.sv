@@ -96,18 +96,31 @@ module kv_bank #(
     // from a constant ROM (one q_round_div per entry, data-independent, written
     // by the harness as inv_lut.mem). Same numbers as the serial divides, ~52
     // cycles fewer per (head, pos).
+    // Two-ROM split (BRAM diet): scale < 4096 needs the full 25-bit inv;
+    // scale >= 4096 has inv = rdiv(2^24, scale) <= 4096 -> 13 bits. Same values,
+    // ~1/3 the BRAM bits of one padded 32k x 25 ROM.
     localparam integer INVD = 16512;         // scale <= rdiv(2^22, 255) = 16,449
-    (* rom_style = "block" *) reg [INV_SH:0] inv_lut [0:INVD-1];
-    initial $readmemh("inv_lut.mem", inv_lut);
+    (* rom_style = "block" *) reg [INV_SH:0] inv_lut_lo [0:4095];
+    (* rom_style = "block" *) reg [12:0]     inv_lut_hi [0:INVD-4097];
+    initial begin
+        $readmemh("inv_lut_lo.mem", inv_lut_lo);
+        $readmemh("inv_lut_hi.mem", inv_lut_hi);
+    end
     reg [22:0] w_span;                       // span+127, explicitly unsigned
     reg [53:0] w_magic;                      // w_span * 0x80808081 (23b x 32b, unsigned)
-    reg [INV_SH:0] inv_rd;
-    // sync ROM read: address is the combinational scale during W_INVL (so inv_rd
-    // lands in W_INVR), then the registered w_scale.
+    reg [INV_SH:0] inv_lo_rd;
+    reg [12:0]     inv_hi_rd;
+    reg            inv_hi_sel;
+    // sync ROM read: address is the combinational scale during W_INVL (so the
+    // reads land in W_INVR), then the registered w_scale.
     wire [14:0] sc_now = (w_magic[53:39] == 0) ? 15'd1 : w_magic[53:39];
-    wire [$clog2(INVD)-1:0] lut_a = (wst == 3'd3) ? {{($clog2(INVD)-15){1'b0}}, sc_now}
-                                                  : w_scale[$clog2(INVD)-1:0];
-    always @(posedge clk) inv_rd <= inv_lut[lut_a];
+    wire [14:0] lut_sc = (wst == 3'd3) ? sc_now : w_scale[14:0];
+    always @(posedge clk) begin
+        inv_lo_rd  <= inv_lut_lo[lut_sc[11:0]];
+        inv_hi_rd  <= inv_lut_hi[lut_sc - 15'd4096];
+        inv_hi_sel <= (lut_sc >= 15'd4096);
+    end
+    wire [INV_SH:0] inv_rd = inv_hi_sel ? {12'b0, inv_hi_rd} : inv_lo_rd;
 
     // P-lane signed min/max of the incoming beat (combinational tree, P=8)
     integer mp;
