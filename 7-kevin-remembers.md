@@ -119,6 +119,36 @@ lands ~18.5k). *Contingency if 250 won't close:* 214.3 MHz (next PL divisor) →
 ~19,850 avg — within trimming distance (softmax/control), or the realistic-traffic
 number (T̄≈90 → ~21,500 @ 214.3) carries the demo honestly.
 
+## 4b. How the rungs actually landed (the night of 2026-06-10/11)
+
+All sim-MEASURED, every rung bit-exact vs the pinned golden:
+
+| rung | cycle law | avg tok/s @200 (T-bar=80) | @250 |
+|---|---|---|---|
+| R1 KV banks | 19,842 + 528(T-1) | 3,235 | - |
+| R2 wide attention | 19,666 + 128(T-1) | 6,706 | - |
+| R3 dual-port GEMV | 13,394 + 128(T-1) | 8,485 | 10,606 |
+| R4a divide-free quantiser | 11,730 + 128(T-1) | 9,131 | 11,414 |
+| R4c softmax_f + V-overlap | 11,714 + 48(T-1) | 12,870 | 16,088 |
+| R4e twin engines | 11,442 + 24(T-1) | 14,981 | 18,727 |
+| R4f feeder + trims | 11,138 + 22.7(T-1) | 15,454 | 19,318 |
+
+A full 127-token generation averages 12,499 cyc = 16,001 tok/s @200 / 20,001
+@250 (DERIVED). **Full-window correctness: 248/248 tokens bit-exact to T=255.**
+
+The fit war (log §34-§37): HDL TDP-URAM inference is dead in 2025.2 -> XPM
+dual-dialect banks; embeds moved into the weight URAM's spare depth; the K4+
+Hadamard cache diet FIT the BRAM budget (129/144) but cost ~66k LUT of
+butterfly adders (181%) AND showed an un-debugged long-T divergence — so the
+SHIPPING build is **K8 no-rotate (the +0.09% contract, clean to T=255) at
+TMAX=128**: OOC LUT 85.4% / BRAM 92.4% / URAM 64/64 / DSP 98.6%, WNS -1.99
+@5ns (silicon sweep decides the clock). T=128 still holds a turn + reply.
+
+**The T=256 rung (queued):** a SHARED constant-geometry Hadamard unit (FFT
+perfect-shuffle fixed wiring + one 64-lane add/sub bank reused 6 cycles, ~3k
+LUT — verify the fixed output permutation against _butterfly_hadamard in
+python first), plus the K4 long-T divergence debug. Both documented in §37.
+
 ## 5. Already proven dead — do not re-propose (doc 6 / log §19–26)
 
 LN→AQ schedule overlap · attention→PROJ overlap · 3 INT4×INT8 MACs/DSP
