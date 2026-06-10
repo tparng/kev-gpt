@@ -45,7 +45,7 @@ module kv_bank #(
     input  wire [P*32-1:0] wq_data,
     output reg         wq_done,             // pulses when codes + hdr are stored
 
-    // ---- dequant read-stream port: tcount positions of one head --------------
+    // ---- dequant read-stream port A: tcount positions of one head ------------
     input  wire        rd_start,            // pulse; selectors sampled here
     input  wire [3:0]  rd_layer,
     input  wire        rd_kv,
@@ -53,7 +53,17 @@ module kv_bank #(
     input  wire [8:0]  rd_tcount,           // positions to stream (1..TMAX)
     output reg         rd_valid,            // a dequantised wide row is on rd_data
     output reg  [HEAD_DIM*32-1:0] rd_data,  // ONE POSITION's head row, dequantised
-    output reg         rd_done              // pulses after the last position
+    output reg         rd_done,             // pulses after the last position
+
+    // ---- dequant read-stream port B (doc-7 R4e): the URAM/BRAM second port ----
+    input  wire        rd2_start,
+    input  wire [3:0]  rd2_layer,
+    input  wire        rd2_kv,
+    input  wire [1:0]  rd2_head,
+    input  wire [8:0]  rd2_tcount,
+    output reg         rd2_valid,
+    output reg  [HEAD_DIM*32-1:0] rd2_data,
+    output reg         rd2_done
 );
     localparam integer HR    = HEAD_DIM / P;
     localparam integer QMAX  = (1 << KBITS) - 1;
@@ -66,9 +76,9 @@ module kv_bank #(
     (* ram_style = "ultra" *) reg [HEAD_DIM*KBITS-1:0] code_bank [0:HROWS-1];
     (* ram_style = "block" *) reg [47:0]               hdr_bank  [0:HROWS-1]; // {scale16, lo32}
 
-    // sync-read registers
-    reg [HEAD_DIM*KBITS-1:0] code_r;
-    reg [47:0]               hdr_rd;
+    // sync-read registers (A and B streams)
+    reg [HEAD_DIM*KBITS-1:0] code_r,  code_r2;
+    reg [47:0]               hdr_rd,  hdr_rd2;
 
     // ---- write-side state ------------------------------------------------------
     reg [3:0]  w_layer; reg w_kv; reg [1:0] w_head; reg [8:0] w_pos;
@@ -134,18 +144,18 @@ module kv_bank #(
     // ZERO-BUBBLE stream, one POSITION per cycle: the hdr read is pipelined
     // ALONGSIDE the code-row read (separate memories, same 1-cycle latency).
     // rowi walks positions 0..T-1. Total = T + 2 cycles per stream.
-    reg [8:0]  r_rowi;                         // position counter (0..TMAX)
-    reg [8:0]  r_nrows;                        // T
-    reg [8:0]  r_ecnt;                         // emitted-position counter
-    reg        r_v0;                           // addr-stage valid (data lands next cyc)
+    reg [8:0]  r_rowi,  r2_rowi;               // position counters (0..TMAX)
+    reg [8:0]  r_nrows, r2_nrows;              // T
+    reg [8:0]  r_ecnt,  r2_ecnt;               // emitted-position counters
+    reg        r_v0,    r2_v0;                 // addr-stage valids
 
     // base addresses (registered at start; code and hdr share the per-position base)
-    reg [$clog2(HROWS)-1:0] w_pbase, r_pbase;
+    reg [$clog2(HROWS)-1:0] w_pbase, r_pbase, r2_pbase;
     reg [HEAD_DIM*KBITS-1:0] wstage;           // staged code row (P codes per W_QNT cycle)
 
     // dequant HEAD_DIM lanes of code_r with the CO-READ header (aligned):
     //   x_hat = code * scale + lo   (exact integer, kv_dma verbatim)
-    reg [HEAD_DIM*32-1:0] deq_word;
+    reg [HEAD_DIM*32-1:0] deq_word, deq_word2;
     reg [KBITS-1:0] d_code;
     reg [KBITS+16-1:0] d_prod;
     reg signed [33:0] d_full;
@@ -159,28 +169,46 @@ module kv_bank #(
             deq_word[dp*32 +: 32] = d_full[31:0];
         end
     end
+    reg [KBITS-1:0] d2_code;
+    reg [KBITS+16-1:0] d2_prod;
+    reg signed [33:0] d2_full;
+    integer dq2;
+    always @* begin
+        deq_word2 = {(HEAD_DIM*32){1'b0}};
+        for (dq2 = 0; dq2 < HEAD_DIM; dq2 = dq2 + 1) begin
+            d2_code = code_r2[dq2*KBITS +: KBITS];
+            d2_prod = d2_code * hdr_rd2[47:32];
+            d2_full = $signed({1'b0, d2_prod}) + $signed(hdr_rd2[31:0]);
+            deq_word2[dq2*32 +: 32] = d2_full[31:0];
+        end
+    end
 
     // ---- write FSM ---------------------------------------------------------------
     localparam [2:0] W_IDLE=3'd0, W_COLL=3'd1, W_SCALE=3'd2, W_INVL=3'd3,
                      W_INVR=3'd4, W_SCALE2=3'd5, W_QNT=3'd6, W_CWR=3'd7;
     reg [2:0] wst;
 
-    // ---- read FSM ----------------------------------------------------------------
+    // ---- read FSMs (A and B) -------------------------------------------------
     localparam [1:0] R_IDLE=2'd0, R_RUN=2'd2;
-    reg [1:0] rst_st;
+    reg [1:0] rst_st, rst2_st;
 
     // sync reads: code row + hdr row for position rowi — co-read every cycle.
-    wire [$clog2(HROWS)-1:0] pos_ra = r_pbase + {{($clog2(HROWS)-9){1'b0}}, r_rowi};
+    // Stream B reads through the memories' SECOND port (URAM/BRAM TDP).
+    wire [$clog2(HROWS)-1:0] pos_ra  = r_pbase  + {{($clog2(HROWS)-9){1'b0}}, r_rowi};
+    wire [$clog2(HROWS)-1:0] pos_ra2 = r2_pbase + {{($clog2(HROWS)-9){1'b0}}, r2_rowi};
     always @(posedge clk) begin
-        code_r <= code_bank[pos_ra];
-        hdr_rd <= hdr_bank[pos_ra];
+        code_r  <= code_bank[pos_ra];
+        hdr_rd  <= hdr_bank[pos_ra];
+        code_r2 <= code_bank[pos_ra2];
+        hdr_rd2 <= hdr_bank[pos_ra2];
     end
 
     always @(posedge clk) begin
-        wq_done <= 1'b0; rd_done <= 1'b0;
+        wq_done <= 1'b0; rd_done <= 1'b0; rd2_done <= 1'b0;
         if (rst) begin
-            wst <= W_IDLE; rst_st <= R_IDLE;
+            wst <= W_IDLE; rst_st <= R_IDLE; rst2_st <= R_IDLE;
             rd_valid <= 1'b0; r_v0 <= 1'b0;
+            rd2_valid <= 1'b0; r2_v0 <= 1'b0;
         end else begin
             // =================== write side ===================
             case (wst)
@@ -235,7 +263,7 @@ module kv_bank #(
                 default: wst <= W_IDLE;
             endcase
 
-            // =================== read side ===================
+            // =================== read side (stream A) ===================
             rd_valid <= 1'b0;
             case (rst_st)
                 R_IDLE: if (rd_start) begin
@@ -262,6 +290,33 @@ module kv_bank #(
                     end
                 end
                 default: rst_st <= R_IDLE;
+            endcase
+
+            // =================== read side (stream B, port B) ===================
+            rd2_valid <= 1'b0;
+            case (rst2_st)
+                R_IDLE: if (rd2_start) begin
+                    r2_nrows <= rd2_tcount;
+                    r2_rowi  <= 0;
+                    r2_ecnt  <= 0;
+                    r2_v0    <= 1'b0;
+                    r2_pbase <= ((rd2_layer*2 + {3'b0,rd2_kv})*NHEAD
+                                  + {2'b0,rd2_head})*TMAX;
+                    rst2_st <= R_RUN;
+                end
+                R_RUN: begin
+                    r2_v0 <= (r2_rowi != r2_nrows);
+                    if (r2_rowi != r2_nrows) r2_rowi <= r2_rowi + 1'b1;
+                    if (r2_v0) begin
+                        rd2_valid <= 1'b1;
+                        rd2_data  <= deq_word2;
+                        if (r2_ecnt == r2_nrows - 1) begin
+                            rd2_done <= 1'b1;
+                            rst2_st  <= R_IDLE;
+                        end else r2_ecnt <= r2_ecnt + 1'b1;
+                    end
+                end
+                default: rst2_st <= R_IDLE;
             endcase
         end
     end

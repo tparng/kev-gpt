@@ -1139,3 +1139,23 @@ residual 0.7k) and the head-overlap lever (next head's K stream behind the
 current head's V/ctx tail -> slope ~32). P=16 global build tried: -1.9k base
 but FAILS the gate (diverges at token 4 — a brick is not bit-exact across P;
 parked, not shipped).
+
+## 33. Doc-7 R4e: twin attention engines — slope 48 -> 24 cyc/position
+
+Heads ping-pong between TWO vec_attn_w instances by parity, each on its OWN
+kv_bank read stream — stream B is the code/hdr memories' SECOND port (the same
+TDP fact split-brain proved at 200 MHz). A head PAIR runs fully concurrently:
+qA (8 beats) -> K-A starts -> qB -> K-B starts; V-starts fire from catchers on
+each engine's k_done; ctx strobes land in per-engine catch buffers and drain
+serially into ctxv_bank (S_CDR, 16 cycles/pair — the single write port stays
+single-writer). PASS2 cannot start before the final max, so pairing is the
+right axis; per layer = 2 sequential pairs instead of 4 sequential heads.
+
+GATE: 31 passes, 28/28 tokens identical. **cyc(T) = 11,442 + 24*(T-1)** —
+the slope ladder: 528 (R1) -> 128 (R2/R3) -> 48 (R4c) -> 24. DERIVED @
+T-bar=80: 13.35k cyc -> 14,981 tok/s avg @200 / 18,727 @250; T=256 worst
+17.56k -> 11,390 / 14,238. The 20k@250 line needs avg <= 12.5k: one base-trim
+rung away (KVW-overlap ~0.7k, dual-row RB ~0.65k, LN ~0.4k, AQ ~0.5k on the
+menu). Area note for R5: two engines = 128 dot mults + 128 ctx mults + 2x64
+dequant lanes + softmax_f x2 — the N=1 fabric has ~15/16 of the SB design's
+MAC area free.

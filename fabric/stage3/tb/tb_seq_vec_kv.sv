@@ -141,10 +141,10 @@ module tb;
                      $signed(dut.u_kvb.hdr_rd[31:0]), dut.u_kvb.hdr_rd[47:32]);
         if (dut.u_kvb.wq_done)
             $display("KVWD pbase=%0d", dut.u_kvb.w_pbase);
-        if (dut.at_start)
+        if (dut.at_startA)
             $display("AST blk=%0d h=%0d tcount=%0d ldcnt_prev=%0d", dut.blk, dut.hh,
                      dut.at_tcount, ldcnt);
-        if (dut.at_ldv) ldcnt = ldcnt + 1;
+        if (dut.at_ldvA || dut.at_ldvB) ldcnt = ldcnt + 1;
         // first-X detectors at each datapath write point (print once each)
         if (dut.gv_xwe   && (^dut.gv_xdata === 1'bx) && !xs[0]) begin
             $display("X@AQ st=%0d blk=%0d asrc=%0d row=%0d cyc=%0d glcnt=%0d",
@@ -156,7 +156,7 @@ module tb;
             $display("X@DQ dst=%0d blk=%0d cyc=%0d", dut.g_dst, dut.blk, dbgcyc); xs[1]=1; end
         if (dut.ln_yv    && (^dut.ln_y === 1'bx) && !xs[2]) begin
             $display("X@LN gbase=%0d blk=%0d cyc=%0d", dut.l_gbase, dut.blk, dbgcyc); xs[2]=1; end
-        if (dut.at_ctxv  && (^dut.at_ctxdata === 1'bx) && !xs[3]) begin
+        if (dut.at_ctxvA && (^dut.at_ctxdataA === 1'bx) && !xs[3]) begin
             $display("X@CTX blk=%0d h=%0d cyc=%0d", dut.blk, dut.hh, dbgcyc); xs[3]=1; end
         if (dut.st==5'd14 && (^dut.sw === 1'bx) && !xs[4]) begin
             $display("X@RES1 blk=%0d cyc=%0d cid=%0d xres_x=%b attn_x=%b", dut.blk, dbgcyc,
@@ -167,12 +167,12 @@ module tb;
     integer ldcnt = 0;
     integer glcnt = 0;
     reg [7:0] xs = 8'b0;
-    // attention-phase occupancy (u_attn.st: 0 IDLE, 1 Q, 2 K, 3 SMC, 4 V, 5 EMIT)
+    // attention-phase occupancy (engine A; 0 IDLE, 1 Q, 2 K, 3 SMC, 4 V, 5 EMIT)
     integer atcnt [0:7];
     integer k3, fat;
     initial for (k3 = 0; k3 < 8; k3 = k3 + 1) atcnt[k3] = 0;
     always @(posedge clk) begin
-        if (running) atcnt[dut.u_attn.st] = atcnt[dut.u_attn.st] + 1;
+        if (running) atcnt[dut.u_attnA.st] = atcnt[dut.u_attnA.st] + 1;
         if (done && running) begin
             fat = $fopen("atprof.out", "w");
             for (k3 = 0; k3 < 8; k3 = k3 + 1)
