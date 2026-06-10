@@ -136,6 +136,7 @@ class PLSingleTokenBackend(InferenceBackend):
         if repo not in sys.path:
             sys.path.insert(0, repo)
         from fabric.stage3.board import pl_seq_pp16 as pp16   # noqa: E402
+        from fabric.stage3.board import pl_seq_sb as sb       # noqa: E402
         self._pp16 = pp16
         npz = npz or os.path.join(repo, "fabric", "export", "goformer.npz")
         meta = meta or os.path.join(repo, "fabric", "export", "goformer_meta.json")
@@ -148,12 +149,19 @@ class PLSingleTokenBackend(InferenceBackend):
         # force PL clock, open device, stream weights + embed exactly once.
         self._fclk_hz = pp16.set_and_verify_fclk(self.fclk)
         words = pp16.build_weight_image(self._intseq, self.lanes)
-        emb = pp16.build_embed_chunks(self._intseq)
         self._dev = pp16.Dev()
         idc = self._dev.rd(pp16.R_IDCODE)
-        if idc != pp16.IDCODE_SQ16:
+        # SQ16 (pl_seq_pp16) and SQSB (the split-brain record sequencer) share the
+        # register map verbatim; they differ only in the TMAX generic, which sets
+        # how many pos_emb rows the embed loader expects — a count mismatch shifts
+        # the stream and corrupts every embedding.
+        if idc == pp16.IDCODE_SQ16:
+            emb = pp16.build_embed_chunks(self._intseq)                 # TMAX=32
+        elif idc == sb.IDCODE_SQSB:
+            emb = sb.build_embed_chunks(self._intseq, sb.TMAX_DEFAULT)  # TMAX=16
+        else:
             self._dev.close()
-            raise RuntimeError(f"PL IDCODE 0x{idc:08X} != SQ16; wrong bitstream")
+            raise RuntimeError(f"PL IDCODE 0x{idc:08X}: expected SQ16 or SQSB")
         self._dev.wr(pp16.R_CTRL, 0x4); self._dev.wr(pp16.R_CTRL, 0x0)  # soft reset
         self._dev.wr(pp16.R_CTRL, 0x2)                                  # wl_rst
         subw = (self.lanes * 4) // 32
@@ -164,6 +172,23 @@ class PLSingleTokenBackend(InferenceBackend):
         for v in emb:
             self._dev.wr(pp16.R_EDATA, v)
         self.launches = 0
+
+        # bit-honest startup gate: one 16-stream pass over the bench token set
+        # must reproduce the integer-reference tokens exactly, or we refuse to
+        # serve (a wrong clock / stale image silently produces garbage instead).
+        gate_toks = [int(t) for t in sb.TOKS16.split(",")]
+        golds = []
+        for t in gate_toks:
+            golds.append(int(self._intseq.full_forward_signals(t)["tok"]))
+            self._intseq.reset()
+        outs, cyc = self._submit_once(gate_toks)
+        if outs != golds:
+            self._dev.close()
+            raise RuntimeError(f"startup gate FAILED: hw={outs} gold={golds}")
+        agg = 16 * self._fclk_hz / cyc if cyc else 0.0
+        print(f"[t1  ] startup gate 16/16 bit-exact, cyc={cyc}, "
+              f"aggregate {agg:.1f} tok/s @ {self._fclk_hz / 1e6:.1f} MHz "
+              f"(idcode=0x{idc:08X})", flush=True)
 
     @staticmethod
     def _load_meta(meta_path):
