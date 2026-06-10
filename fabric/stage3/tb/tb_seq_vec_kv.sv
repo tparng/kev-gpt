@@ -136,14 +136,11 @@ module tb;
                      dut.blk, dut.kvw_kv, dut.kvw_h, pos,
                      $signed(dut.u_kvb.w_lo), dut.u_kvb.w_scale, dut.u_kvb.w_inv);
         if (dut.u_kvb.rd_valid)
-            $display("KVR blk=%0d kv=%0d h=%0d l0=%0d code_r=%h hdr_lo=%0d hdr_sc=%0d cra=%0d",
+            $display("KVR blk=%0d kv=%0d h=%0d l0=%0d hdr_lo=%0d hdr_sc=%0d",
                      dut.blk, dut.kb_rkv, dut.hh, $signed(dut.u_kvb.rd_data[31:0]),
-                     dut.u_kvb.code_r, $signed(dut.u_kvb.hdr_rd[31:0]),
-                     dut.u_kvb.hdr_rd[47:32], dut.u_kvb.code_ra);
+                     $signed(dut.u_kvb.hdr_rd[31:0]), dut.u_kvb.hdr_rd[47:32]);
         if (dut.u_kvb.wq_done)
-            $display("KVWD cb0=%h cbase=%0d hbase=%0d",
-                     dut.u_kvb.code_bank[dut.u_kvb.w_cbase], dut.u_kvb.w_cbase,
-                     dut.u_kvb.w_hbase);
+            $display("KVWD pbase=%0d", dut.u_kvb.w_pbase);
         if (dut.at_start)
             $display("AST blk=%0d h=%0d tcount=%0d ldcnt_prev=%0d", dut.blk, dut.hh,
                      dut.at_tcount, ldcnt);

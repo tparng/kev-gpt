@@ -1098,3 +1098,23 @@ right on the model (12,481 -> ~6,240). DERIVED @200: T-bar=80 ~23.6k cyc ->
 base (P-wide non-linears), the ~2k KV-write (overlap head h+1's quant with
 head h's attention — separate kv_bank ports), and the 128/pos slope (softmax
 PASS2/3 + K/V streams each walk T per head-call).
+
+## 31. Doc-7 R4a: divide-free KV writer — base 13,394 -> 11,730 cyc
+
+The per-pass state profile put S_KVW at ~2.46k/pass — almost all of it the two
+26-cycle serial divides per (head, kv). Both divides are gone, SAME NUMBERS:
+- scale = rdiv(span,255) by the magic multiply ((span+127)*0x80808081)>>39 —
+  proven EXACTLY equal to the divide over the full span range [0, 2^22) by
+  exhaustive python sweep (the /255 reciprocal identity). Two registered
+  all-unsigned steps (the first cut mixed-sign multiply semantics truncated
+  the product — scale 852 vs 1109; explicit 23-bit unsigned span reg fixed it).
+- inv = rdiv(2^24, scale) from a 16,512-deep constant ROM (one q_round_div per
+  entry, data-independent, harness-written inv_lut.mem).
+No reference change — the quantiser RESULTS are bit-identical, only faster.
+GATE: 10 positions, tokens identical. **cyc(T) = 11,730 + 128*(T-1).**
+
+Faithful-ladder tally (sim cycle law, DERIVED tok/s @200 at T-bar=80):
+R1 19,842+528(T-1) -> 3,235 · R2 19,666+128(T-1) -> 6,706 · R3 13,394 ->
+8,485 · R4a 11,730 -> 9,131 (11,414 @250). Remaining R4 menu by profile:
+G_RB ~1.3k, G_AQ ~1.0k, LN ~0.85k, the 128/pos slope (softmax PASS2/3 + K/V
+streams), and S_KVW residual ~0.7k.

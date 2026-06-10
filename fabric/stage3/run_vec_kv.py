@@ -58,6 +58,11 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
         fh.write("\n".join(lut[0::2]) + "\n")
     with open(os.path.join(sim_dir, "gelu_lut_o.mem"), "w") as fh:
         fh.write("\n".join(lut[1::2]) + "\n")
+    # kv_bank R4a: inv = q_round_div(2^24, scale) as a constant ROM (data-independent)
+    from fabric.stage3.seq_ref import q_round_div
+    with open(os.path.join(sim_dir, "inv_lut.mem"), "w") as fh:
+        for s in range(16512):
+            fh.write(f"{q_round_div(1 << 24, max(s, 1)) & 0x1FFFFFF:07x}\n")
     with open(os.path.join(sim_dir, "prompt.mem"), "w") as fh:
         for t in prompt_ids:
             fh.write(f"{int(t):03x}\n")

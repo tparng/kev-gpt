@@ -80,15 +80,24 @@ module kv_bank #(
     reg [15:0] w_scale;
     reg [INV_SH:0] w_inv;                    // inv <= 2^INV_SH
 
-    // serial unsigned restoring divider (shared by the two write-side divides)
-    reg [DIVW-1:0] dv_num, dv_quo;
-    reg [DIVW:0]   dv_rem;
-    reg [DIVW-1:0] dv_den;
-    reg [$clog2(DIVW+1)-1:0] dv_i;
-    reg            dv_run;
-    // one divider step per cycle: rem' = {rem, num[msb]}; sub if >= den
-    wire [DIVW:0] dv_shift = {dv_rem[DIVW-1:0], dv_num[DIVW-1]};
-    wire          dv_ge    = (dv_shift >= {1'b0, dv_den});
+    // doc-7 R4a: NO divider. scale = rdiv(span,255) by the EXACT magic multiply
+    // ((span+127)*0x80808081)>>39, proven == floor((span+127)/255) over the full
+    // span range [0, 2^22) by exhaustive python check; inv = rdiv(2^24, scale)
+    // from a constant ROM (one q_round_div per entry, data-independent, written
+    // by the harness as inv_lut.mem). Same numbers as the serial divides, ~52
+    // cycles fewer per (head, pos).
+    localparam integer INVD = 16512;         // scale <= rdiv(2^22, 255) = 16,449
+    (* rom_style = "block" *) reg [INV_SH:0] inv_lut [0:INVD-1];
+    initial $readmemh("inv_lut.mem", inv_lut);
+    reg [22:0] w_span;                       // span+127, explicitly unsigned
+    reg [53:0] w_magic;                      // w_span * 0x80808081 (23b x 32b, unsigned)
+    reg [INV_SH:0] inv_rd;
+    // sync ROM read: address is the combinational scale during W_INVL (so inv_rd
+    // lands in W_INVR), then the registered w_scale.
+    wire [14:0] sc_now = (w_magic[53:39] == 0) ? 15'd1 : w_magic[53:39];
+    wire [$clog2(INVD)-1:0] lut_a = (wst == 3'd3) ? {{($clog2(INVD)-15){1'b0}}, sc_now}
+                                                  : w_scale[$clog2(INVD)-1:0];
+    always @(posedge clk) inv_rd <= inv_lut[lut_a];
 
     // P-lane signed min/max of the incoming beat (combinational tree, P=8)
     integer mp;
@@ -152,8 +161,8 @@ module kv_bank #(
     end
 
     // ---- write FSM ---------------------------------------------------------------
-    localparam [2:0] W_IDLE=3'd0, W_COLL=3'd1, W_DIV1=3'd2, W_DIV1F=3'd3,
-                     W_DIV2=3'd4, W_DIV2F=3'd5, W_QNT=3'd6, W_CWR=3'd7;
+    localparam [2:0] W_IDLE=3'd0, W_COLL=3'd1, W_SCALE=3'd2, W_INVL=3'd3,
+                     W_INVR=3'd4, W_SCALE2=3'd5, W_QNT=3'd6, W_CWR=3'd7;
     reg [2:0] wst;
 
     // ---- read FSM ----------------------------------------------------------------
@@ -170,7 +179,7 @@ module kv_bank #(
     always @(posedge clk) begin
         wq_done <= 1'b0; rd_done <= 1'b0;
         if (rst) begin
-            wst <= W_IDLE; rst_st <= R_IDLE; dv_run <= 1'b0;
+            wst <= W_IDLE; rst_st <= R_IDLE;
             rd_valid <= 1'b0; r_v0 <= 1'b0;
         end else begin
             // =================== write side ===================
@@ -187,46 +196,29 @@ module kv_bank #(
                     if (beat_min < minv) minv <= beat_min;
                     if (beat_max > maxv) maxv <= beat_max;
                     if (w_vi == HR-1) begin
-                        wst <= W_DIV1;
+                        wst <= W_SCALE;
                     end else w_vi <= w_vi + 1'b1;
                 end
-                W_DIV1: begin
-                    // scale = rdiv(span, QMAX): num = span + QMAX>>1, den = QMAX
+                W_SCALE: begin
+                    // scale = rdiv(span,255) = ((span+127)*0x80808081)>>39 (EXACT;
+                    // two registered steps, all-unsigned, no mixed-sign multiply)
                     w_lo   <= minv;
-                    dv_num <= (maxv - minv + (QMAX >> 1));
-                    dv_den <= QMAX[DIVW-1:0];
-                    dv_rem <= 0; dv_quo <= 0; dv_i <= DIVW[$clog2(DIVW+1)-1:0];
-                    wst <= W_DIV1F;
+                    w_span <= (maxv - minv + (QMAX >> 1));
+                    wst <= W_SCALE2;
                 end
-                W_DIV1F: begin
-                    if (dv_i != 0) begin
-                        dv_rem <= dv_ge ? (dv_shift - {1'b0, dv_den}) : dv_shift;
-                        dv_quo <= {dv_quo[DIVW-2:0], dv_ge};
-                        dv_num <= {dv_num[DIVW-2:0], 1'b0};
-                        dv_i   <= dv_i - 1'b1;
-                    end else begin
-                        w_scale <= (dv_quo == 0) ? 16'd1 : dv_quo[15:0];
-                        wst <= W_DIV2;
-                    end
+                W_SCALE2: begin
+                    w_magic <= {31'd0, w_span} * 54'd2155905153;
+                    wst <= W_INVL;
                 end
-                W_DIV2: begin
-                    // inv = rdiv(1<<INV_SH, scale): num = (1<<INV_SH) + scale>>1
-                    dv_num <= (1 << INV_SH) + ({10'b0, w_scale} >> 1);
-                    dv_den <= {{(DIVW-16){1'b0}}, w_scale};
-                    dv_rem <= 0; dv_quo <= 0; dv_i <= DIVW[$clog2(DIVW+1)-1:0];
-                    wst <= W_DIV2F;
+                W_INVL: begin
+                    w_scale <= {1'b0, sc_now};
+                    wst <= W_INVR;                     // ROM read for sc_now lands next cycle
                 end
-                W_DIV2F: begin
-                    if (dv_i != 0) begin
-                        dv_rem <= dv_ge ? (dv_shift - {1'b0, dv_den}) : dv_shift;
-                        dv_quo <= {dv_quo[DIVW-2:0], dv_ge};
-                        dv_num <= {dv_num[DIVW-2:0], 1'b0};
-                        dv_i   <= dv_i - 1'b1;
-                    end else begin
-                        w_inv <= dv_quo[INV_SH:0];
-                        w_qi  <= 0;
-                        wst   <= W_QNT;
-                    end
+                W_INVR: begin
+                    // inv_rd (sync ROM read at w_scale) lands NOW
+                    w_inv <= inv_rd;
+                    w_qi  <= 0;
+                    wst   <= W_QNT;
                 end
                 W_QNT: begin
                     // stage P codes/cycle into the position row, commit once whole
