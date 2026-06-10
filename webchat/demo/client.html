@@ -55,7 +55,7 @@
 const log=document.getElementById('log'), inp=document.getElementById('p'),
       specEl=document.getElementById('spec'), statusEl=document.getElementById('status'),
       latEl=document.getElementById('lat');
-const DEBOUNCE_MS=50;
+const DEBOUNCE_MS=25;   // matches the server's --debounce-ms (infer is ~40ms now)
 let ws, seq=0, debTimer=null;
 // the speculation buffer: completion the server computed for `bufPrompt`.
 let bufPrompt=null, bufCompletion=null;
