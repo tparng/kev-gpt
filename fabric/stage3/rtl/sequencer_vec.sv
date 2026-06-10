@@ -190,11 +190,12 @@ module sequencer_vec #(
     wire [10:0] aw_src = (qsel ? hB : hh)*HR + wi;
     reg  [P*32-1:0] q_data_q;                    // registered WITH at_ldv (aligned pair)
     reg             ldv0;                        // addr-stage valid (1 ahead of at_ldv)
-    // Engine A's ctx strobes write ctxv_bank DIRECTLY (A always finishes before B,
-    // and pair N+1's strobes can't fire before pair N's drain completes); only B
-    // needs a catch buffer, drained in S_CDR (HR cycles).
+    // BOTH engines' ctx strobes land in catch buffers, drained serially in S_CDR
+    // (2*HR cycles). A direct ctxv_bank write from the catcher made the bank
+    // 2W1R -> synthesis fell back to REGISTERS (take-5); the buffer keeps it 1W1R.
+    reg [P*32-1:0] ctxbufA [0:HR-1];
     reg [P*32-1:0] ctxbufB [0:HR-1];
-    reg [4:0]  cdr;                         // ctx drain counter (0..HR-1)
+    reg [4:0]  cdr;                         // ctx drain counter (0..2*HR-1)
     // R4f: KV-write FEEDER — heads 2..3 quantise into kv_bank DURING pair-0's
     // attention, sharing the main S_KVW machinery (fr/frv/kvw_h/kvw_kv) which is
     // temporally exclusive. The qkv_bank read port is arbitrated: S_ALD's q
@@ -554,10 +555,13 @@ module sequencer_vec #(
                 S_ACL: if (adone_s && bdone_s) begin
                     cdr <= 5'd0; st <= S_CDR;
                 end
-                // drain engine B's ctx catcher into ctxv_bank (A wrote directly)
+                // drain both ctx catchers into ctxv_bank (the bank's ONLY writer)
                 S_CDR: begin
-                    ctxv_bank[hB*HR + {6'b0, cdr[2:0]}] <= ctxbufB[cdr[2:0]];
-                    if (cdr == HR-1) begin
+                    if (cdr < HR[4:0])
+                        ctxv_bank[hh*HR + {6'b0, cdr[2:0]}] <= ctxbufA[cdr[2:0]];
+                    else
+                        ctxv_bank[hB*HR + {6'b0, cdr[2:0]}] <= ctxbufB[cdr[2:0]];
+                    if (cdr == 2*HR-1) begin
                         if (pair) begin                           // -> proj GEMV
                             g_wbase<=blk*GW_BLK + WB_PROJ; g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
                             g_asel<=blk*4 + 6'd1; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_PROJ; g_dst<=3'd1;
@@ -670,7 +674,7 @@ module sequencer_vec #(
             // engine B's strobes land in the catch buffer.
             if (at_kdoneA) begin kb_rstart  <= 1'b1; kb_rkv  <= 1'b1; end
             if (at_kdoneB) begin kb2_rstart <= 1'b1; kb2_rkv <= 1'b1; end
-            if (at_ctxvA) ctxv_bank[hh*HR + {4'b0, at_ctxidxA[2:0]}] <= at_ctxdataA;
+            if (at_ctxvA) ctxbufA[at_ctxidxA[2:0]] <= at_ctxdataA;
             if (at_ctxvB) ctxbufB[at_ctxidxB[2:0]] <= at_ctxdataB;
             if (at_doneA) adone_s <= 1'b1;
             if (at_doneB) bdone_s <= 1'b1;
