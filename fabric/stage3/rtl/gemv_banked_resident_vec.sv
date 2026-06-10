@@ -103,19 +103,24 @@ module gemv_banked_resident_vec #(
     wire [WPAD-1:0] wword_pad, wword2_pad;
     wire [WBITS-1:0] wword_rd  = wword_pad [WBITS-1:0];
     wire [WBITS-1:0] wword2_rd = wword2_pad[WBITS-1:0];
+    // URAM PORT DISCIPLINE: a URAM has exactly TWO ports. The load-write happens
+    // only at boot (never during a run), so it is FOLDED INTO port A's address
+    // (write-else-read on one port); port B is the K2 second read. Without the
+    // fold this is 1W2R = three ports -> Vivado silently falls back to LUTRAM
+    // (~200k LUTs, the §34 OOC blow-up).
     genvar gb;
     generate
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
             (* ram_style = "ultra" *) reg [BANKW-1:0] mem [0:WWORDS-1];
             reg [BANKW-1:0] rd;
-            always @(posedge clk) begin
+            always @(posedge clk) begin                 // port A: write-else-read
                 if (wcommit) mem[wword] <= wnext_pad[gb*BANKW +: BANKW];
-                rd <= mem[waddr];
+                else         rd <= mem[waddr];
             end
             assign wword_pad[gb*BANKW +: BANKW] = rd;
             if (K2 != 0) begin : g_p2
                 reg [BANKW-1:0] rd2;
-                always @(posedge clk) rd2 <= mem[waddr2];
+                always @(posedge clk) rd2 <= mem[waddr2];   // port B: read
                 assign wword2_pad[gb*BANKW +: BANKW] = rd2;
             end else begin : g_np
                 assign wword2_pad[gb*BANKW +: BANKW] = {BANKW{1'b0}};

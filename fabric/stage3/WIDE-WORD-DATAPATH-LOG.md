@@ -1181,3 +1181,25 @@ feeder hides more as T grows). DERIVED @ T-bar=80: ~12.6-12.9k cyc ->
 15.5-15.9k tok/s @200 / **19.4-19.8k @250** — at the 20k line; the T->127 law
 run pins the asymptote. OOC synth of the R4e/f design in flight (fit + 200MHz
 WNS; TMAX=256 embeds vs the 144-BRAM budget is the watch item).
+
+## 35. Port discipline + the pinned R4f law: 22.7 cyc/pos, 20,001 tok/s @250 over a 127-token gen
+
+OOC truth (§34 run): LUT 278% / BRAM 620% / URAM 0 — the K2 weight banks and
+the kv code/hdr banks were 1W2R (three ports) since R3/R4e, so URAM inference
+silently failed and 12.6 Mbit of weights fell into LUTRAM. Fix: fold each
+write into port A (write-else-read; loads are boot-only, and the kv quant
+commit stalls one cycle until stream A idles — it lands in the softmax gaps).
+Gate unchanged-green (avg +4 cyc).
+
+T->127 law run (R4f): **120/120 tokens bit-exact; cyc 11,138 .. 14,002 over
+T=1..127 — slope 22.7 cyc/pos; avg 12,499 = 16,001 tok/s @200 and 20,001 @250
+for a full 127-token generation (DERIVED).** T-bar=80: ~12.9k -> 15,454 @200 /
+19,318 @250. T=256 worst ~16.9k -> 11.8k / 14.8k.
+
+Fit work remaining (arithmetic, to be settled by the next OOC): URAM wants
+weights 60 + code_bank 16 = 76 of 64. Levers on the table: 3-cascade weights
+(15x3=45) with the 208-word head-tail in a BRAM side-memory behind a registered
+mux (+1 RLAT stage), K4/V4+Hadamard (code 16->8, NLL +0.72% still in band),
+inv_lut 2-ROM split (23 -> ~8 BRAM), dequant lanes use_dsp=no (DSP 98.6% ->
+headroom). TMAX=256 embeds (93 BRAM) likely need the runtime-URAM loader
+pattern if BRAM stays tight.

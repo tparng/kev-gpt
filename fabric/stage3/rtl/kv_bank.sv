@@ -194,12 +194,18 @@ module kv_bank #(
 
     // sync reads: code row + hdr row for position rowi — co-read every cycle.
     // Stream B reads through the memories' SECOND port (URAM/BRAM TDP).
+    // PORT DISCIPLINE: the quant-write (W_CWR) is FOLDED INTO port A — it commits
+    // only when stream A is idle (W_CWR stalls on rst_st, see the write FSM), so
+    // each memory is exactly write-else-read on A plus read on B = two ports.
     wire [$clog2(HROWS)-1:0] pos_ra  = r_pbase  + {{($clog2(HROWS)-9){1'b0}}, r_rowi};
     wire [$clog2(HROWS)-1:0] pos_ra2 = r2_pbase + {{($clog2(HROWS)-9){1'b0}}, r2_rowi};
+    wire cwr_fire = (wst == W_CWR) && (rst_st == R_IDLE);
     always @(posedge clk) begin
-        code_r  <= code_bank[pos_ra];
-        hdr_rd  <= hdr_bank[pos_ra];
-        code_r2 <= code_bank[pos_ra2];
+        if (cwr_fire) code_bank[w_pbase] <= wstage;       // port A: write...
+        else          code_r <= code_bank[pos_ra];        // ...else read
+        if (cwr_fire) hdr_bank[w_pbase] <= {w_scale, w_lo};
+        else          hdr_rd <= hdr_bank[pos_ra];
+        code_r2 <= code_bank[pos_ra2];                    // port B: read
         hdr_rd2 <= hdr_bank[pos_ra2];
     end
 
@@ -254,9 +260,10 @@ module kv_bank #(
                     if (w_qi == HR-1) wst <= W_CWR;
                     else w_qi <= w_qi + 1'b1;
                 end
-                W_CWR: begin
-                    code_bank[w_pbase] <= wstage;
-                    hdr_bank [w_pbase] <= {w_scale, w_lo};
+                W_CWR: if (cwr_fire) begin
+                    // commit happens in the port-A always block this same cycle
+                    // (cwr_fire); stalls while stream A is mid-read (the feeder's
+                    // writes land in the softmax gaps between K and V streams).
                     wq_done <= 1'b1;
                     wst <= W_IDLE;
                 end
