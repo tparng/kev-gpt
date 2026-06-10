@@ -21,7 +21,7 @@ set freq   [lindex $argv 3]
 set tmax   [lindex $argv 4]
 if {$pp     eq ""} { set pp 8 }
 if {$lanes  eq ""} { set lanes 256 }
-if {$wwords eq ""} { set wwords 12496 }
+if {$wwords eq ""} { set wwords 16384 }
 if {$freq   eq ""} { set freq 40 }
 # TMAX=256 is the doc-7 KV window (kv_bank depth + pos-table depth).
 if {$tmax   eq ""} { set tmax 256 }
@@ -56,7 +56,7 @@ add_files -norecurse [list \
 # inv_lut_lo/hi the kv_bank dequant-inverse ROMs.
 set memfiles [list tok_emb_w.mem pos_emb_w.mem gamma_w.mem dqm_w.mem dqe_w.mem \
                    inv_sact.mem seed.mem exp_lut.mem gelu_lut_e.mem gelu_lut_o.mem \
-                   inv_lut_lo.mem inv_lut_hi.mem]
+]
 foreach mf $memfiles {
     if {[file exists "$mems/$mf"]} {
         add_files -norecurse "$mems/$mf"

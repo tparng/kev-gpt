@@ -87,6 +87,12 @@ def build_weight_image(intseq, lanes):
         for nm in ("qkv", "proj", "mlp_fc", "mlp_proj"):
             words += pack_banked.pack_transposed(np.asarray(p["blocks"][bi][nm][0], np.int8), lanes)
     words += pack_banked.pack_transposed(np.asarray(p["head"][0], np.int8), lanes)
+    # log SS36 fit-plan 2: the embed tables ride the weight image's spare depth
+    # (shared packer with the sim writer so the two layouts cannot drift).
+    from fabric.stage3.run_sequencer import wrom_embed_words
+    emb = wrom_embed_words(intseq, lanes, len(words))
+    if emb is not None:
+        words += emb
     return words
 
 

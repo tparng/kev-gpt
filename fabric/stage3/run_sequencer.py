@@ -194,6 +194,52 @@ def write_wideword_mem(path, vals, P, bits):
         f.write("\n".join(lines) + "\n")
 
 
+def wrom_embed_words(intseq, lanes: int, nwords, P: int = 8):
+    """log §36 fit-plan 2: the embed tables packed as wrom words for the resident
+    weight URAM's spare depth. Returns the ints to APPEND after the `nwords`
+    weight words (including the even-alignment zeros the RTL's EMB_TOK_BASE/
+    EMB_POS_BASE derivation assumes), or None when EPW < 1 (LANES < 8*P).
+    Shared by the sim writer AND the on-board image builders so the two image
+    layouts cannot drift."""
+    epw = (lanes * 4) // (P * 32)
+    if epw < 1:
+        return None
+    p = intseq.p
+
+    def _emb_words(flat):
+        nrows = (len(flat) + P - 1) // P
+        rows = []
+        for w in range(nrows):                    # P*32b rows, lane l at [l*32 +: 32]
+            acc = 0
+            for l in range(P):
+                idx = w * P + l
+                v = int(flat[idx]) & 0xFFFFFFFF if idx < len(flat) else 0
+                acc |= v << (l * 32)
+            rows.append(acc)
+        words = []
+        for b in range(0, len(rows), epw):        # EPW rows per wrom word, row0 low
+            acc = 0
+            for r, rv in enumerate(rows[b:b + epw]):
+                acc |= rv << (r * P * 32)
+            words.append(acc)
+        return words
+
+    tok = np.round(p["tok_emb"] * (1 << RESID_FRAC)).astype(np.int64).reshape(-1)
+    pos = np.round(p["pos_emb"] * (1 << RESID_FRAC)).astype(np.int64).reshape(-1)
+    out = []
+    n = nwords
+    if n % 2:                                     # even-align EMB_TOK_BASE
+        out.append(0)
+        n += 1
+    tw = _emb_words(tok)
+    out += tw
+    n += len(tw)
+    if n % 2:                                     # even-align EMB_POS_BASE
+        out.append(0)
+    out += _emb_words(pos)
+    return out
+
+
 def write_mems_wideword(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlayer: int,
                         P: int, prompt=None):
     """Outputs for the WIDE-WORD sequencer_vec: the standard 1-wide ROMs (wrom/seed/exp_lut/
@@ -220,39 +266,15 @@ def write_mems_wideword(sim_dir, intseq: seq_ref.IntSequencer, lanes: int, nlaye
     # same bases (EMB_TOK_BASE/EMB_POS_BASE) from its weight-image localparams.
     # The old tok_emb_w.mem/pos_emb_w.mem files above are still emitted for other
     # harnesses. Requires EPW >= 1 (LANES >= 8*P); smaller LANES are skipped.
-    epw = (lanes * 4) // (P * 32)
-    if epw >= 1:
+    if wrom_embed_words(intseq, lanes, 0, P) is not None:
         nib = lanes                                   # hex chars/word, as in write_mems
-
-        def _emb_words(flat):
-            nrows = (len(flat) + P - 1) // P
-            rows = []
-            for w in range(nrows):                    # P*32b rows, lane l at [l*32 +: 32]
-                acc = 0
-                for l in range(P):
-                    idx = w * P + l
-                    v = int(flat[idx]) & 0xFFFFFFFF if idx < len(flat) else 0
-                    acc |= v << (l * 32)
-                rows.append(acc)
-            words = []
-            for b in range(0, len(rows), epw):        # EPW rows per wrom word, row0 low
-                acc = 0
-                for r, rv in enumerate(rows[b:b + epw]):
-                    acc |= rv << (r * P * 32)
-                words.append(acc)
-            return words
-
         wrom_path = os.path.join(sim_dir, "wrom.mem")
         with open(wrom_path) as fh:
-            lines = [ln.strip() for ln in fh if ln.strip()]
-        if len(lines) % 2:                            # even-align EMB_TOK_BASE
-            lines.append("0" * nib)
-        lines += [f"{w:0{nib}x}" for w in _emb_words(tok)]
-        if len(lines) % 2:                            # even-align EMB_POS_BASE
-            lines.append("0" * nib)
-        lines += [f"{w:0{nib}x}" for w in _emb_words(pos)]
+            wlines = [ln.strip() for ln in fh if ln.strip()]
+        wlines += [f"{w:0{nib}x}"
+                   for w in wrom_embed_words(intseq, lanes, len(wlines), P)]
         with open(wrom_path, "w") as fh:
-            fh.write("\n".join(lines) + "\n")
+            fh.write("\n".join(wlines) + "\n")
 
     gam = []
     for bi in range(nlayer):
