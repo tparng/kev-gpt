@@ -209,11 +209,17 @@ def bench(dev, secs: float, batch: int):
 
 def make_device(args):
     """t1 = single-token PL pass (the 60k path, first-token-faithful); kv =
-    model-faithful multi-token Kevin over the host-KV decoder (--kv-backend)."""
+    model-faithful multi-token Kevin over the host-KV decoder (--kv-backend);
+    kv256 = model-faithful multi-token Kevin fully in fabric (doc-7 R1 KV
+    bitstream, single stream — the daemon serves it serially)."""
     if args.engine == "kv":
         from .backend_kv import KVChatDevice
         return KVChatDevice(gemv_backend=args.kv_backend, gen_chars=args.gen_chars,
                             greedy=args.greedy)
+    if args.engine == "kv256":
+        from fabric.stage3.board.pl_kv256 import PLKV256Device
+        return PLKV256Device(lanes=args.lanes, fclk=args.fclk,
+                             gen_chars=args.gen_chars, tmax=args.tmax)
     return PLDevice(args.lanes, args.fclk, args.gen_chars)
 
 
@@ -236,10 +242,16 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=9099)
     ap.add_argument("--lanes", type=int, default=128)
     ap.add_argument("--fclk", type=float, default=125e6)
-    ap.add_argument("--gen-chars", type=int, default=6)
-    ap.add_argument("--engine", choices=["t1", "kv"], default="t1",
+    ap.add_argument("--gen-chars", type=int, default=None,
+                    help="completion chars (default: 48 for kv256, 6 otherwise)")
+    ap.add_argument("--engine", choices=["t1", "kv", "kv256"], default="t1",
                     help="t1=single-token PL pass (first-token-faithful); "
-                         "kv=model-faithful multi-token Kevin (host-KV decoder)")
+                         "kv=model-faithful multi-token Kevin (host-KV decoder); "
+                         "kv256=model-faithful multi-token Kevin in fabric "
+                         "(doc-7 KV bitstream, single stream)")
+    ap.add_argument("--tmax", type=int, default=256,
+                    help="--engine kv256: on-chip KV window; MUST match the "
+                         "bitstream's TMAX generic")
     ap.add_argument("--kv-backend", choices=["numpy", "pl", "c"], default="c",
                     help="--engine kv GEMV backend (c=compiled MMIO on the Kria)")
     ap.add_argument("--greedy", action="store_true",
@@ -251,6 +263,8 @@ def main(argv=None):
     ap.add_argument("--secs", type=float, default=5.0, help="bench duration")
     ap.add_argument("--batch", type=int, default=16)
     args = ap.parse_args(argv)
+    if args.gen_chars is None:
+        args.gen_chars = 48 if args.engine == "kv256" else 6
 
     if args.bench:
         dev = PLDevice(args.lanes, args.fclk, args.gen_chars)
