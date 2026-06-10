@@ -117,9 +117,11 @@ module gemv_banked_resident_vec #(
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
             (* ram_style = "ultra" *) reg [BANKW-1:0] mem [0:WWORDS-1];
             reg [BANKW-1:0] rd;
-            always @(posedge clk) begin                 // port A: write-else-read
+            always @(posedge clk) begin                 // port A: write + free-running read
                 if (wcommit) mem[addr_a] <= wnext_pad[gb*BANKW +: BANKW];
-                else         rd <= mem[addr_a];
+                rd <= mem[addr_a];     // unconditional (an `else` makes a !we clock-enable
+                                       // = "invalid write mode" for URAM); the value read
+                                       // during a load write is consumed by nobody.
             end
             assign wword_pad[gb*BANKW +: BANKW] = rd;
             if (K2 != 0) begin : g_p2

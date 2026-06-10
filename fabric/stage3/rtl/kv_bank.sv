@@ -216,14 +216,18 @@ module kv_bank #(
     // ONE ADDRESS NET PER PORT (the URAM contract): write and read share port A's
     // muxed address; port B is the second read stream.
     wire [$clog2(HROWS)-1:0] kva_a = cwr_fire ? w_pbase : pos_ra;
+    // port A: write + FREE-RUNNING read (no `else` — a !we clock-enable on the
+    // read register is an "invalid write mode" for URAM/BRAM inference). The
+    // value read during a commit cycle is garbage and consumed by nobody
+    // (cwr_fire only fires while stream A is idle).
     always @(posedge clk) begin
-        if (cwr_fire) code_bank[kva_a] <= wstage;         // port A: write...
-        else          code_r <= code_bank[kva_a];         // ...else read
+        if (cwr_fire) code_bank[kva_a] <= wstage;
+        code_r  <= code_bank[kva_a];
         code_r2 <= code_bank[pos_ra2];                    // port B: read
     end
     always @(posedge clk) begin
         if (cwr_fire) hdr_bank[kva_a] <= {w_scale, w_lo};
-        else          hdr_rd <= hdr_bank[kva_a];
+        hdr_rd  <= hdr_bank[kva_a];
         hdr_rd2 <= hdr_bank[pos_ra2];
     end
 
