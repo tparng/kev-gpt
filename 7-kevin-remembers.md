@@ -85,11 +85,14 @@ Dropping the rotation deletes the 6-stage butterfly from the R1 RTL for 0.03 NLL
 points. `IntKVQSequencer(kbits=8, vbits=8, rotate=False)` is the golden reference
 every rung below gates against.
 
-**R1 — make it remember.** Per-layer K/V banks + write-at-`pos` + `tcount = pos+1`
-in the vec-lineage datapath; TMAX=256 pos_emb upload. Gate: `run_vec_kv.py`, token
-streams equal to R0 over full-window generations, then board.
-→ ~50.8k cyc avg = **~3,900 tok/s avg @ 200 (PROJECTED)**. The chat becomes real at
-this rung — a 160-char reply in ~40 ms — everything after is the headline number.
+**R1 — make it remember. GREEN IN SIM (2026-06-10, commit fb9940e).** `kv_bank.sv`
+(K8/V8 quant-at-write, zero-bubble dequant-read with the per-position header
+co-read) + `sequencer_vec` S_KVW states / three-phase attention load / `tcount =
+pos+1`. Gate `run_vec_kv.py`: 10 positions with KV persisting across GO pulses —
+**token stream bit-identical to the R0 golden**. The faithful single-stream
+sequencer exists in RTL; cycle measurement at LANES=256 and the board run are
+what remain of this rung. (Cost-model expectation ~50.8k cyc avg at P=8 →
+~3,900 tok/s avg @ 200, PROJECTED until measured.)
 
 **R2 — wide attention.** `vec_attn` P=8→128 (elementwise MAC; INT8 KV halves the
 read bandwidth that pays for it; N=1 has the area). → ~20.0k cyc = **~10,000

@@ -1043,5 +1043,13 @@ The doc-7 campaign's first RTL rung: `sequencer_vec` decodes FAITHFULLY — per-
   append clobbered prompt slots (stream[pi+1]=tok_out unguarded), which fed the
   DUT its own pass-1 output instead of prompt[1] — the "mismatches" it caused
   were fully self-consistent quantisations of the wrong token. The faithful
-  single-stream sequencer EXISTS in RTL as of this entry; cycle numbers at
-  LANES=256 are the next measurement, then R2 (P=128 attention).
+  single-stream sequencer EXISTS in RTL as of this entry.
+- **Cycle law at LANES=256 (sim-MEASURED, 32 positions, 24/24 tokens identical):
+  cyc(T) = 19,842 + 528*(T-1).** The T=1 base decomposes exactly per the doc-7
+  model (GEMV 12,481 + NL ~5.5k + KV-write ~2k); the 528/position slope is the
+  P=8 attention tax (load 256 + score/softmax/ctx growth). DERIVED: ~62k cyc at
+  T-bar=80 -> ~3,235 tok/s avg @200 for a 160-token message; T=256 worst ~154k
+  -> ~1,294. R2 (full-head-width attention, P_ATT=64 = HEAD_DIM, one position
+  per cycle; the doc-7 "P=128" = 2 positions/cycle via a TDP code-bank read)
+  attacks the slope; the KBITS=8 rows conveniently make one position's head
+  codes exactly one 512b word.
