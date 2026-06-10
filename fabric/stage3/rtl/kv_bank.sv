@@ -52,23 +52,23 @@ module kv_bank #(
     input  wire [1:0]  rd_head,
     input  wire [8:0]  rd_tcount,           // positions to stream (1..TMAX)
     output reg         rd_valid,            // a dequantised wide row is on rd_data
-    output reg  [P*32-1:0] rd_data,         // P sign-extended Q.16 lanes
-    output reg         rd_done              // pulses after the last row
+    output reg  [HEAD_DIM*32-1:0] rd_data,  // ONE POSITION's head row, dequantised
+    output reg         rd_done              // pulses after the last position
 );
     localparam integer HR    = HEAD_DIM / P;
     localparam integer QMAX  = (1 << KBITS) - 1;
     localparam integer NHSEL = NLAYER * 2 * NHEAD;          // (layer,kv,head) combos
-    localparam integer CROWS = NHSEL * TMAX * HR;           // code rows
-    localparam integer HROWS = NHSEL * TMAX;                // hdr rows
+    localparam integer HROWS = NHSEL * TMAX;                // one row per (sel, pos)
     localparam integer DIVW  = INV_SH + 2;                  // divider width (26)
 
-    // ---- banks ---------------------------------------------------------------
-    (* ram_style = "ultra" *) reg [P*KBITS-1:0] code_bank [0:CROWS-1];
-    (* ram_style = "block" *) reg [47:0]        hdr_bank  [0:HROWS-1]; // {scale16, lo32}
+    // ---- banks (doc-7 R2: one POSITION per code row — KBITS=8 makes a head's
+    // position exactly HEAD_DIM*8 = 512 bits, read 1 position/cycle) -----------
+    (* ram_style = "ultra" *) reg [HEAD_DIM*KBITS-1:0] code_bank [0:HROWS-1];
+    (* ram_style = "block" *) reg [47:0]               hdr_bank  [0:HROWS-1]; // {scale16, lo32}
 
     // sync-read registers
-    reg [P*KBITS-1:0] code_r;
-    reg [47:0]        hdr_rd;
+    reg [HEAD_DIM*KBITS-1:0] code_r;
+    reg [47:0]               hdr_rd;
 
     // ---- write-side state ------------------------------------------------------
     reg [3:0]  w_layer; reg w_kv; reg [1:0] w_head; reg [8:0] w_pos;
@@ -122,29 +122,28 @@ module kv_bank #(
     end
 
     // ---- read-side state -------------------------------------------------------
-    // ZERO-BUBBLE stream: the hdr read is pipelined ALONGSIDE the code read every
-    // cycle (separate memories, same 1-cycle latency), so the per-position header
-    // needs no latching FSM and no prologue. rowi walks 0..T*HR-1; the position is
-    // rowi >> log2(HR) for the hdr address. Total = T*HR + 2 cycles per stream.
-    reg [13:0] r_rowi;                         // up to TMAX*HR = 2048
-    reg [13:0] r_nrows;                        // T*HR
-    reg [13:0] r_ecnt;                         // emitted-row counter
+    // ZERO-BUBBLE stream, one POSITION per cycle: the hdr read is pipelined
+    // ALONGSIDE the code-row read (separate memories, same 1-cycle latency).
+    // rowi walks positions 0..T-1. Total = T + 2 cycles per stream.
+    reg [8:0]  r_rowi;                         // position counter (0..TMAX)
+    reg [8:0]  r_nrows;                        // T
+    reg [8:0]  r_ecnt;                         // emitted-position counter
     reg        r_v0;                           // addr-stage valid (data lands next cyc)
 
-    // base addresses (registered at start)
-    reg [$clog2(CROWS)-1:0] w_cbase, r_cbase;
-    reg [$clog2(HROWS)-1:0] w_hbase, r_hbase;
+    // base addresses (registered at start; code and hdr share the per-position base)
+    reg [$clog2(HROWS)-1:0] w_pbase, r_pbase;
+    reg [HEAD_DIM*KBITS-1:0] wstage;           // staged code row (P codes per W_QNT cycle)
 
-    // dequant P lanes of code_r with the CO-READ header hdr_rd (aligned with code_r):
+    // dequant HEAD_DIM lanes of code_r with the CO-READ header (aligned):
     //   x_hat = code * scale + lo   (exact integer, kv_dma verbatim)
-    reg [P*32-1:0] deq_word;
+    reg [HEAD_DIM*32-1:0] deq_word;
     reg [KBITS-1:0] d_code;
     reg [KBITS+16-1:0] d_prod;
     reg signed [33:0] d_full;
     integer dp;
     always @* begin
-        deq_word = {(P*32){1'b0}};
-        for (dp = 0; dp < P; dp = dp + 1) begin
+        deq_word = {(HEAD_DIM*32){1'b0}};
+        for (dp = 0; dp < HEAD_DIM; dp = dp + 1) begin
             d_code = code_r[dp*KBITS +: KBITS];
             d_prod = d_code * hdr_rd[47:32];                  // unsigned mul (kv_dma shape)
             d_full = $signed({1'b0, d_prod}) + $signed(hdr_rd[31:0]); // + signed lo
@@ -154,21 +153,18 @@ module kv_bank #(
 
     // ---- write FSM ---------------------------------------------------------------
     localparam [2:0] W_IDLE=3'd0, W_COLL=3'd1, W_DIV1=3'd2, W_DIV1F=3'd3,
-                     W_DIV2=3'd4, W_DIV2F=3'd5, W_QNT=3'd6;
+                     W_DIV2=3'd4, W_DIV2F=3'd5, W_QNT=3'd6, W_CWR=3'd7;
     reg [2:0] wst;
 
     // ---- read FSM ----------------------------------------------------------------
     localparam [1:0] R_IDLE=2'd0, R_RUN=2'd2;
     reg [1:0] rst_st;
 
-    // sync reads: code row rowi, hdr row = rowi's position — co-read every cycle.
-    // NB zero-EXTEND r_rowi (never part-select wider than the reg — the X trap).
-    wire [$clog2(CROWS)-1:0] code_ra = r_cbase + {{($clog2(CROWS)-14){1'b0}}, r_rowi};
-    wire [$clog2(HROWS)-1:0] hdr_ra  = r_hbase
-                                       + {{($clog2(HROWS)-11){1'b0}}, r_rowi[13:$clog2(HR)]};
+    // sync reads: code row + hdr row for position rowi — co-read every cycle.
+    wire [$clog2(HROWS)-1:0] pos_ra = r_pbase + {{($clog2(HROWS)-9){1'b0}}, r_rowi};
     always @(posedge clk) begin
-        code_r <= code_bank[code_ra];
-        hdr_rd <= hdr_bank[hdr_ra];
+        code_r <= code_bank[pos_ra];
+        hdr_rd <= hdr_bank[pos_ra];
     end
 
     always @(posedge clk) begin
@@ -181,9 +177,7 @@ module kv_bank #(
             case (wst)
                 W_IDLE: if (wq_start) begin
                     w_layer <= wq_layer; w_kv <= wq_kv; w_head <= wq_head; w_pos <= wq_pos;
-                    w_cbase <= (((wq_layer*2 + {3'b0,wq_kv})*NHEAD + {2'b0,wq_head})*TMAX
-                                + {3'b0,wq_pos})*HR;
-                    w_hbase <= ((wq_layer*2 + {3'b0,wq_kv})*NHEAD + {2'b0,wq_head})*TMAX
+                    w_pbase <= ((wq_layer*2 + {3'b0,wq_kv})*NHEAD + {2'b0,wq_head})*TMAX
                                 + {3'b0,wq_pos};
                     minv <= 32'sh7FFFFFFF; maxv <= 32'sh80000000;
                     w_vi <= 0; wst <= W_COLL;
@@ -235,12 +229,16 @@ module kv_bank #(
                     end
                 end
                 W_QNT: begin
-                    code_bank[w_cbase + {{($clog2(CROWS)-$clog2(HR+1)){1'b0}}, w_qi}] <= q_codes;
-                    if (w_qi == HR-1) begin
-                        hdr_bank[w_hbase] <= {w_scale, w_lo};
-                        wq_done <= 1'b1;
-                        wst <= W_IDLE;
-                    end else w_qi <= w_qi + 1'b1;
+                    // stage P codes/cycle into the position row, commit once whole
+                    wstage[w_qi*P*KBITS +: P*KBITS] <= q_codes;
+                    if (w_qi == HR-1) wst <= W_CWR;
+                    else w_qi <= w_qi + 1'b1;
+                end
+                W_CWR: begin
+                    code_bank[w_pbase] <= wstage;
+                    hdr_bank [w_pbase] <= {w_scale, w_lo};
+                    wq_done <= 1'b1;
+                    wst <= W_IDLE;
                 end
                 default: wst <= W_IDLE;
             endcase
@@ -249,13 +247,11 @@ module kv_bank #(
             rd_valid <= 1'b0;
             case (rst_st)
                 R_IDLE: if (rd_start) begin
-                    r_nrows <= rd_tcount * HR;
+                    r_nrows <= rd_tcount;
                     r_rowi  <= 0;
                     r_ecnt  <= 0;
                     r_v0    <= 1'b0;
-                    r_cbase <= (((rd_layer*2 + {3'b0,rd_kv})*NHEAD
-                                 + {2'b0,rd_head})*TMAX)*HR;
-                    r_hbase <= ((rd_layer*2 + {3'b0,rd_kv})*NHEAD
+                    r_pbase <= ((rd_layer*2 + {3'b0,rd_kv})*NHEAD
                                  + {2'b0,rd_head})*TMAX;
                     rst_st <= R_RUN;
                 end

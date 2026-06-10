@@ -22,9 +22,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RTL = os.path.join(HERE, "rtl")
 TB = os.path.join(HERE, "tb", "tb_seq_vec_kv.sv")
 
-RTL_FILES = ["sequencer_vec.sv", "kv_bank.sv", "layernorm_vec.sv", "vec_dequant.sv",
-             "vec_attn.sv", "vec_gelu.sv", "gelu_lut.sv", "gelu_lut2.sv", "softmax.sv",
-             "gemv_banked_resident_vec.sv"]
+RTL_FILES = ["sequencer_vec.sv", "kv_bank.sv", "vec_attn_w.sv", "layernorm_vec.sv",
+             "vec_dequant.sv", "vec_gelu.sv", "gelu_lut.sv", "gelu_lut2.sv",
+             "softmax.sv", "gemv_banked_resident_vec.sv"]
 
 
 def _encode(meta_path, text):

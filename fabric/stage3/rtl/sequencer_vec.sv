@@ -169,40 +169,31 @@ module sequencer_vec #(
         .clk(clk), .in_valid(gl_vin), .x(gl_x),
         .out_valid(gl_vout), .y(gl_y));
 
-    // ---- vec_attn (one head at a time; KV-faithful: tcount = pos+1) ------------
-    reg               at_start, at_ldv;
+    // ---- vec_attn_w (doc-7 R2: one POSITION/cycle, full-head width) ------------
+    reg               at_start, at_ldv;          // at_ldv now = q_valid
     reg [8:0]         at_tcount;
-    wire              at_ldready, at_ctxv, at_done;
+    wire              at_kdone, at_ctxv, at_done;
     wire [6:0]        at_ctxidx;                 // dim-group index (0..HEAD_DIM/P-1)
     wire [P*32-1:0]   at_ctxdata;                // P ctx lanes per strobe
     reg [1:0]  hh;
     reg [8:0]  wi;                          // load-address counter (runs ahead)
     reg [8:0]  wic;                         // accepted-word counter (consume stage)
-    reg        wiv;                         // load-data valid (qkv read pipeline)
-    // P-wide load, doc-7 R1 shape: per head, HR q rows from qkv_bank (the CURRENT
-    // position, exact Q.16), then tcount*HR K rows and tcount*HR V rows streamed
-    // DEQUANTISED from kv_bank (positions 0..pos, K8/V8 — the goformer_kvq
-    // contract: the current position's k/v also go through the quant round-trip).
+    reg        wiv;                         // (legacy)
+    // q rows from qkv_bank (HR beats, the CURRENT position's exact Q.16 q); the
+    // K and V streams flow DIRECTLY from kv_bank's wide dequant read into the
+    // attention engine — one position per beat, no sequencer staging at all.
     localparam integer HR = HEAD_DIM / P;
     wire [10:0] aw_src = hh*HR + wi;             // q rows only (k/v live in kv_bank)
-    // sync-read prefetch: address on cycle k -> qkv_r on k+1. ald_sel is registered
-    // in the SAME cycle as at_ldv so the data mux stays aligned across the q->K->V
-    // phase transitions (including the final V beat that lands after st leaves S_ALD).
-    reg            ald_sel;                      // 0 = qkv_r (q), 1 = kv_bank stream
-    reg [P*32-1:0] kb_rdata_d;                   // kv_bank data delayed to match at_ldv
-    wire [P*32-1:0] aw_data = ald_sel ? kb_rdata_d : qkv_r;
-    vec_attn #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attn (
-        .clk(clk), .rst(rst), .start(at_start), .tcount(at_tcount),
-        .ld_valid(at_ldv), .ld_data(aw_data), .ld_ready(at_ldready),
-        .ctx_valid(at_ctxv), .ctx_idx(at_ctxidx), .ctx_data(at_ctxdata), .done(at_done));
+    reg  [P*32-1:0] q_data_q;                    // registered WITH at_ldv (aligned pair)
+    reg             ldv0;                        // addr-stage valid (1 ahead of at_ldv)
 
-    // ---- kv_bank (doc-7 R1): the on-chip K8/V8 cache making decode faithful ----
+    // ---- kv_bank: the on-chip K8/V8 cache making decode faithful ---------------
     reg         kb_wstart, kb_wvalid, kb_rstart, kb_rkv;
     reg  [P*32-1:0] kb_wdata_q;                  // registered with kb_wvalid (L_FEED idiom)
     reg  [1:0]  kvw_h;                           // KV-write head loop
     reg         kvw_kv;                          // 0 = K, 1 = V
     wire        kb_wdone, kb_rvalid, kb_rdone;
-    wire [P*32-1:0] kb_rdata;
+    wire [HEAD_DIM*32-1:0] kb_rdata;             // one dequantised position per beat
     reg  [1:0]  alds;                            // S_ALD phase: 0 q, 1 K, 2 V
     wire [10:0] kvw_src = (kvw_kv ? 2*D/P : D/P) + kvw_h*HR
                           + {{(11-$clog2(ROWSM+1)){1'b0}}, fr};
@@ -214,7 +205,13 @@ module sequencer_vec #(
         .rd_start(kb_rstart), .rd_layer(blk), .rd_kv(kb_rkv), .rd_head(hh),
         .rd_tcount(pos + 9'd1),
         .rd_valid(kb_rvalid), .rd_data(kb_rdata), .rd_done(kb_rdone));
-    always @(posedge clk) kb_rdata_d <= kb_rdata;
+
+    vec_attn_w #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attn (
+        .clk(clk), .rst(rst), .start(at_start), .tcount(at_tcount),
+        .q_valid(at_ldv), .q_data(q_data_q),
+        .kv_valid(kb_rvalid), .kv_data(kb_rdata),
+        .k_done(at_kdone),
+        .ctx_valid(at_ctxv), .ctx_idx(at_ctxidx), .ctx_data(at_ctxdata), .done(at_done));
 
     // ---- callable GEMV / LN parameter registers --------------------------------
     reg [19:0] g_wbase;            // weight base
@@ -486,17 +483,19 @@ module sequencer_vec #(
                         else gor<=gor+1'b1;
                     end
                 end
-                // ================= attention (KV-faithful) ====================
+                // ================= attention (R2: wide, KV-faithful) ==========
                 S_AST: begin
                     at_start<=1'b1; at_tcount<=pos + 9'd1;
-                    wi<=9'd0; wic<=9'd0; wiv<=1'b0; alds<=2'd0; ald_sel<=1'b0; st<=S_ALD;
+                    wi<=9'd0; wic<=9'd0; wiv<=1'b0; ldv0<=1'b0; alds<=2'd0; st<=S_ALD;
                 end
                 S_ALD: begin
                     if (alds == 2'd0) begin
-                        // phase q: HR rows of the current position from qkv_bank
-                        // (1-deep prefetch: qkv_r trails wi by one cycle).
-                        at_ldv  <= (wi != HR[8:0]);
-                        ald_sel <= 1'b0;
+                        // phase q: HR rows from qkv_bank. Two-stage valid (ldv0 ->
+                        // at_ldv) so at_ldv pairs with q_data_q (both 2 behind wi,
+                        // matching qkv_r's sync-read + the data register).
+                        ldv0     <= (wi != HR[8:0]);
+                        at_ldv   <= ldv0;
+                        q_data_q <= qkv_r;
                         if (wi != HR[8:0]) wi <= wi + 1'b1;
                         if (at_ldv) begin
                             if (wic == HR-1) begin
@@ -504,17 +503,15 @@ module sequencer_vec #(
                                 alds <= 2'd1;
                             end else wic <= wic + 1'b1;
                         end
-                    end else begin
-                        // phases K/V: forward the kv_bank dequant stream (valid and
-                        // data both re-registered here, so they stay aligned).
-                        at_ldv  <= kb_rvalid;
-                        ald_sel <= 1'b1;
-                        if (kb_rdone) begin
-                            if (alds == 2'd1) begin
-                                kb_rstart <= 1'b1; kb_rkv <= 1'b1;   // V stream
-                                alds <= 2'd2;
-                            end else st <= S_ACL;
+                    end else if (alds == 2'd1) begin
+                        // K beats flow kv_bank -> vec_attn_w directly; when scores
+                        // + probs are in (k_done), start the V stream.
+                        if (at_kdone) begin
+                            kb_rstart <= 1'b1; kb_rkv <= 1'b1;       // V stream
+                            alds <= 2'd2;
                         end
+                    end else begin
+                        st <= S_ACL;             // ctx strobes + done arrive there
                     end
                 end
                 S_ACL: begin

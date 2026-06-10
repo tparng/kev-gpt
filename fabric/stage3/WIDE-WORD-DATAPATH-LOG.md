@@ -1053,3 +1053,29 @@ The doc-7 campaign's first RTL rung: `sequencer_vec` decodes FAITHFULLY — per-
   per cycle; the doc-7 "P=128" = 2 positions/cycle via a TDP code-bank read)
   attacks the slope; the KBITS=8 rows conveniently make one position's head
   codes exactly one 512b word.
+
+## 29. Doc-7 R2: full-head-width attention — slope 528 -> 128 cyc/position
+
+`rtl/vec_attn_w.sv` replaces vec_attn in the faithful sequencer: ONE POSITION per
+cycle. Per K beat a 64-MAC dot (8 partial sums of 8 then a sum-of-8 — integer-
+exact, no mid-sum saturation in 64b, so the tree equals the scalar order) feeds
+softmax inline at PASS1 pace; probs land in a FULL-width-indexed probmem (the
+old vec_attn's probmem[ji[4:0]] silently wrapped at T>32 — a latent trap the
+R1 gate at T<=31 sat just inside); the V phase runs 64 per-dim accumulators in
+reference position order. ctx strobes keep the vec_attn interface. kv_bank
+moved to one-position-per-code-row (KBITS=8 makes a head-position exactly one
+512b word; hdr and codes share the per-position base; the write side stages P
+codes/cycle and commits one row). K/V beats flow kv_bank -> vec_attn_w directly;
+the sequencer only streams q (two-stage valid so data/valid stay paired) and
+sequences K -> k_done -> V.
+
+GATE (run_vec_kv, LANES=256): plen=8 + ngen=56, T growing 1..63 — **56/56
+generated tokens IDENTICAL to the golden** (real telegraphic text: "her have no
+ine her sad her want so"). Single-pass T=1 = 19,666 cyc (vs R1 19,842).
+
+**Cycle law: cyc(T) = 19,666 + 128*(T-1)** (sim-MEASURED to T=63). Slope
+528 -> 128 = 4.1x. DERIVED @200 MHz: T-bar=80 avg ~29.8k cyc -> ~6,700 tok/s
+avg for a 160-token message; T=256 worst ~52.3k -> ~3,800. Remaining slope =
+softmax PASS2/PASS3 (2T per call) + K/V stream (2T) = ~8 cyc/pos/head-layer —
+the R4 trim list. Next: R3 (LANES=512 via the second URAM port, GEMV floor
+12,481 -> ~6,241).
