@@ -139,7 +139,8 @@ python -m fabric.stage3.board.pl_seq_vec --lanes 128 --tok 48 --fclk 40e6
 `1-keviniser.md` = the data tool (canonical design rationale). `2-llm-on-kria.md` = the platform
 (HLS/RTL systolic GEMV, on-chip weights, fabric-native softmax/RMSNorm). `3-kevin-on-kria.md` =
 the fusion (train doc-2's model on a doc-1 corpus). `4-live-chatbot.md` = the public stress test
-(web front end behind a Cloudflare Tunnel). `webchat/app.py` is the live chat server.
+(web front end behind a Cloudflare Tunnel). `webchat/demo/server.py` serves the live chat
+(`webchat/demo/client.html`) at chat.mikeayles.com — the single canonical front end.
 `5-demo-prd.md` = the speculative-typing chat + load-dashboard PRD. `6-past-the-stream-ceiling.md`
 = the speed campaign (split-brain on the dual-ported URAM, the cycle/clock lever campaign, the
 KV-DDR context-restore path, the 100k identity) — read it before touching `fabric/stage3` to know
