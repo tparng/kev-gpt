@@ -71,6 +71,15 @@ module kv_bank #(
     localparam integer HROWS = NHSEL * TMAX;                // one row per (sel, pos)
     localparam integer DIVW  = INV_SH + 2;                  // divider width (26)
 
+
+    // ---- write FSM ---------------------------------------------------------------
+    localparam [2:0] W_IDLE=3'd0, W_COLL=3'd1, W_SCALE=3'd2, W_INVL=3'd3,
+                     W_INVR=3'd4, W_SCALE2=3'd5, W_QNT=3'd6, W_CWR=3'd7;
+    reg [2:0] wst;
+
+    // ---- read FSMs (A and B) -------------------------------------------------
+    localparam [1:0] R_IDLE=2'd0, R_RUN=2'd2;
+    reg [1:0] rst_st, rst2_st;
     // ---- banks (doc-7 R2: one POSITION per code row — KBITS=8 makes a head's
     // position exactly HEAD_DIM*8 = 512 bits, read 1 position/cycle).
     // DUAL-DIALECT (the weight_bank_tdp pattern): HDL inference of TDP UltraRAM
@@ -201,14 +210,6 @@ module kv_bank #(
         end
     end
 
-    // ---- write FSM ---------------------------------------------------------------
-    localparam [2:0] W_IDLE=3'd0, W_COLL=3'd1, W_SCALE=3'd2, W_INVL=3'd3,
-                     W_INVR=3'd4, W_SCALE2=3'd5, W_QNT=3'd6, W_CWR=3'd7;
-    reg [2:0] wst;
-
-    // ---- read FSMs (A and B) -------------------------------------------------
-    localparam [1:0] R_IDLE=2'd0, R_RUN=2'd2;
-    reg [1:0] rst_st, rst2_st;
 
     // sync reads: code row + hdr row for position rowi — co-read every cycle.
     // Stream B reads through the memories' SECOND port (URAM/BRAM TDP).

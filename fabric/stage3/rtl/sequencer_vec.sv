@@ -104,6 +104,46 @@ module sequencer_vec #(
     localparam integer EMB_POS0     = EMB_TOK_BASE + EMB_TOKW;
     localparam integer EMB_POS_BASE = EMB_POS0 + (EMB_POS0 % 2);
 
+    // ---- FSM -------------------------------------------------------------------
+    localparam [4:0]
+      S_IDLE=0, S_EMB=1,
+      L_GAM=2, L_FEED=3, L_COLL=4,                  // callable LN (L_GAM = start-only)
+      G_AQ=5, G_RUN=6, G_WAIT=7, G_RB=8,            // callable GEMV (RB = fused rb+dq+gelu)
+      S_QKVRET=10, S_AST=11, S_ALD=12, S_ACL=13,    // attention
+      S_RES1=14, S_LN2=15, S_FCRET=16,              // proj/res1/LN2-call
+      S_MPSET=17, S_RES2=20, S_FIN=21,              // mlp_proj setup (GELU folded into G_RB)
+      S_HEADSET=22, S_ARGMAX=23,                    // final LN_f -> head -> argmax
+      S_KVW_S=24, S_KVW_F=25, S_KVW_W=26,           // KV quant-write (doc-7 R1)
+      S_CDR=27;                                     // ctx drain from the pair catchers
+    reg [4:0] st;
+    reg [3:0] blk;                           // transformer block 0..NLAYER-1
+    reg [10:0] ci;
+    reg [$clog2(ROWSM+1)-1:0] fr, orow, dor;
+    // read-pipeline delayed addresses + valids (consume stage of each FSM loop)
+    reg [10:0] cid;  reg civ;
+    reg [$clog2(ROWSM+1)-1:0] frd;  reg frv;
+    reg [$clog2(ARROWS+1)-1:0] ard;  reg arv;
+
+    // ---- S_EMB embed fetch through the weight bank's embed port -----------------
+    // Issue alternates tok (etp=0) / pos (etp=1) row fetches, one address/cycle;
+    // the pair lands on emb_pair 1 cycle later (eb_* are the arrival-stage regs).
+    // tok row = tok_id*EROWS+fr, pos row = pos*EROWS+fr; word = BASE + row/EPW;
+    // pair slot = row % RPP (bases even-aligned). ~2*EROWS+2 cycles per token.
+    reg        etp;                          // fetch phase: 0 = tok row, 1 = pos row
+    reg        eb_v, eb_tp;                  // arrival valid + phase
+    reg [2:0]  eb_sel;                       // arrival pair-slot (row % RPP)
+    reg [$clog2(ROWSM+1)-1:0] eb_row;        // arrival xres destination row
+    reg [P*32-1:0]    tacc;                  // tok row held for the tok+pos sum
+    reg [LANES*8-1:0] epr;                   // plain-reg pair copy (safe part-select)
+    reg [P*32-1:0]    erw;                   // selected embed row
+    wire [13:0] emb_row_w = (etp ? pos : tok_id) * EROWS
+                            + {{(14-$clog2(ROWSM+1)){1'b0}}, fr};
+    // 32-bit param + 14-bit row word offset, truncated to the address width
+    // (both bases + the largest offset are < WWORDS by the spare-depth budget)
+    wire [$clog2(WWORDS)-1:0] emb_addr_w =
+        (etp ? EMB_POS_BASE : EMB_TOK_BASE) + (emb_row_w >> EPWS);
+    wire emb_sel_w = (st == S_EMB);
+
     // ---- wide-word ROMs ($readmemh: one P-packed word per line) -----------------
     // All sync-read (registered) so they infer BLOCK RAM, not LUTs.
     (* rom_style = "block" *) reg [P*32-1:0] gamma_w   [0:GAMMA_N*EROWS-1];// Q4.20
@@ -291,7 +331,7 @@ module sequencer_vec #(
     reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
     reg [$clog2(ROWSM+1)-1:0] gor;
     integer pp;
-    reg [3:0] blk;                           // transformer block 0..NLAYER-1
+
     reg signed [31:0] best_val; reg [8:0] best_idx, hidx;
     reg [$clog2(ARROWS+1)-1:0] ar;           // argmax row counter
     reg signed [31:0] wm_val;  reg [8:0] wm_idx;        // word-max tree temporaries
@@ -306,44 +346,6 @@ module sequencer_vec #(
     reg signed [31:0] va, vb;
     reg [8:0]         ia, ib;
 
-    // ---- FSM -------------------------------------------------------------------
-    localparam [4:0]
-      S_IDLE=0, S_EMB=1,
-      L_GAM=2, L_FEED=3, L_COLL=4,                  // callable LN (L_GAM = start-only)
-      G_AQ=5, G_RUN=6, G_WAIT=7, G_RB=8,            // callable GEMV (RB = fused rb+dq+gelu)
-      S_QKVRET=10, S_AST=11, S_ALD=12, S_ACL=13,    // attention
-      S_RES1=14, S_LN2=15, S_FCRET=16,              // proj/res1/LN2-call
-      S_MPSET=17, S_RES2=20, S_FIN=21,              // mlp_proj setup (GELU folded into G_RB)
-      S_HEADSET=22, S_ARGMAX=23,                    // final LN_f -> head -> argmax
-      S_KVW_S=24, S_KVW_F=25, S_KVW_W=26,           // KV quant-write (doc-7 R1)
-      S_CDR=27;                                     // ctx drain from the pair catchers
-    reg [4:0] st;
-    reg [10:0] ci;
-    reg [$clog2(ROWSM+1)-1:0] fr, orow, dor;
-    // read-pipeline delayed addresses + valids (consume stage of each FSM loop)
-    reg [10:0] cid;  reg civ;
-    reg [$clog2(ROWSM+1)-1:0] frd;  reg frv;
-    reg [$clog2(ARROWS+1)-1:0] ard;  reg arv;
-
-    // ---- S_EMB embed fetch through the weight bank's embed port -----------------
-    // Issue alternates tok (etp=0) / pos (etp=1) row fetches, one address/cycle;
-    // the pair lands on emb_pair 1 cycle later (eb_* are the arrival-stage regs).
-    // tok row = tok_id*EROWS+fr, pos row = pos*EROWS+fr; word = BASE + row/EPW;
-    // pair slot = row % RPP (bases even-aligned). ~2*EROWS+2 cycles per token.
-    reg        etp;                          // fetch phase: 0 = tok row, 1 = pos row
-    reg        eb_v, eb_tp;                  // arrival valid + phase
-    reg [2:0]  eb_sel;                       // arrival pair-slot (row % RPP)
-    reg [$clog2(ROWSM+1)-1:0] eb_row;        // arrival xres destination row
-    reg [P*32-1:0]    tacc;                  // tok row held for the tok+pos sum
-    reg [LANES*8-1:0] epr;                   // plain-reg pair copy (safe part-select)
-    reg [P*32-1:0]    erw;                   // selected embed row
-    wire [13:0] emb_row_w = (etp ? pos : tok_id) * EROWS
-                            + {{(14-$clog2(ROWSM+1)){1'b0}}, fr};
-    // 32-bit param + 14-bit row word offset, truncated to the address width
-    // (both bases + the largest offset are < WWORDS by the spare-depth budget)
-    wire [$clog2(WWORDS)-1:0] emb_addr_w =
-        (etp ? EMB_POS_BASE : EMB_TOK_BASE) + (emb_row_w >> EPWS);
-    wire emb_sel_w = (st == S_EMB);
 
     // ---- synchronous reads (one read register per memory, address muxed) -------
     wire [10:0] rbr = rd_addr >> LSH;            // board readback row (idle only)

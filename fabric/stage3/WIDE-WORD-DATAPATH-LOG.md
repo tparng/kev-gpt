@@ -1243,3 +1243,34 @@ holds a full chat turn + reply; T=256 returns with the butterfly rung. kv_bank/
 vec_attn_w reverted to the K8 pair (d936640) + the dequant pipeline register
 reapplied; golden back to IntKVQSequencer(8,8,rotate=False,divfree=True).
 GATE: 28/28 bit-exact, avg 11,475 (T to 31, TMAX=128 mems).
+
+## 38. First silicon: ctx wrong, qkv perfect — the bug was an EMPTY ROM, not the URAM
+
+First board run of seq_kv (125MHz build): control timing matched sim within 2
+cycles and dbg_board_kv split the fault cleanly — qkv 0/768 mismatches (GEMV +
+weights + embeds + LN bit-perfect through the URAM image), ctx 252/256 wrong
+with hw = lo x 512 exactly, i.e. every KV code read back 0. The wrong-tree
+phase: netlist probes showed u_code's 8 URAMs perfectly wired (BWE_A[8:0] =
+wea, RDB_WR_A = wea, EN high, ADDR/DIN routed), an xsim run of the SYNTHESIS
+branch (XPM models, tb_xsim_wrap.sv pinning the defines) was bit-exact, and
+the failure was identical at 50MHz — so not timing, not the XPM, not the URAM.
+
+The smoking gun was in the SYNTH log all along:
+
+    CRITICAL WARNING: [Synth 8-4445] could not open $readmem data file
+    'inv_lut_lo.mem' ... ignoring   (and inv_lut_hi.mem)
+
+build_bd_seq_kv.tcl pointed $mems at the OLD stage3_vec_kv sim dir, which
+predates the inv-ROM split — the two files weren't there, the tcl printed a
+soft "WARNING: missing" and shipped. An empty inv ROM means w_inv = 0, so
+every quantise computes code = (u*0 + 2^23) >> 24 = 0: the hardware was
+FAITHFULLY writing all-zero codes. The header path (lo/scale via the magic
+multiply) never touches the ROM, which is why lo read back correct — the
+exact hw = lo x 512 signature. Synthesis even constant-propagated the zero
+codes into grounded URAM DIN bits.
+
+Lesson (the R1 gelu_lut trap, now at SYNTH time): a $readmemh the synthesiser
+can't see is a silent all-zero ROM in the bitstream. Codified twice over:
+build_bd_seq_kv.tcl now HARD-ERRORS on any missing ROM init (and points at the
+k8t128 dir), and impl_seq_kv.tcl greps every synth runme.log for Synth 8-4445
+after SYNTH_OK and fails the run. Rebuild in flight.

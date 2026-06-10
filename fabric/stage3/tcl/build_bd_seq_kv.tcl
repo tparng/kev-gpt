@@ -30,7 +30,7 @@ set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"
 set root  [file normalize [file dirname [info script]]/../../..]
 set bdir  "C:/kevbuild/stage3_seqkv_bit"
-set mems  "C:/kevbuild/stage3_vec_kv"             ;# run_vec_kv sim dir — P-DEPENDENT (packed P/word)
+set mems  "C:/kevbuild/stage3_vec_kvk8t128"       ;# run_vec_kv sim dir — P-DEPENDENT (packed P/word)
 
 file mkdir $bdir
 create_project gemv_seqkv_pl "$bdir/gemv_seqkv_pl" -part $part -force
@@ -58,10 +58,12 @@ set memfiles [list tok_emb_w.mem pos_emb_w.mem gamma_w.mem dqm_w.mem dqe_w.mem \
                    inv_sact.mem seed.mem exp_lut.mem gelu_lut_e.mem gelu_lut_o.mem \
                    inv_lut_lo.mem inv_lut_hi.mem]
 foreach mf $memfiles {
-    if {[file exists "$mems/$mf"]} {
-        add_files -norecurse "$mems/$mf"
-        set_property file_type {Memory Initialization Files} [get_files "$mems/$mf"]
-    } else { puts "WARNING: missing $mems/$mf" }
+    # HARD ERROR, not a warning: a missing ROM init synthesises an all-zero LUT
+    # (silent [Synth 8-4445]) — first silicon shipped with empty kv_bank inv ROMs
+    # this way and quantised every KV code to 0 (log §38).
+    if {![file exists "$mems/$mf"]} { error "missing required ROM init $mems/$mf" }
+    add_files -norecurse "$mems/$mf"
+    set_property file_type {Memory Initialization Files} [get_files "$mems/$mf"]
 }
 update_compile_order -fileset sources_1
 

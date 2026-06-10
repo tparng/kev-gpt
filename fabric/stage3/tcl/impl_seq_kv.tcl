@@ -6,6 +6,15 @@ open_project "$bdir/gemv_seqkv_pl/gemv_seqkv_pl.xpr"
 launch_runs synth_1 -jobs 8
 wait_on_run synth_1
 if {[get_property PROGRESS [get_runs synth_1]] != "100%"} { puts "SYNTH_FAILED"; error "synth" }
+# GATE: any $readmem the synthesiser could not open means a ROM is all-zero in the
+# bitstream (the log §38 first-silicon bug). Scan every synth runme.log, fail loudly.
+foreach slog [glob -nocomplain "$bdir/gemv_seqkv_pl/gemv_seqkv_pl.runs/*synth*/runme.log"] {
+    set fh [open $slog r]; set txt [read $fh]; close $fh
+    if {[regexp {Synth 8-4445[^\n]*} $txt line]} {
+        puts "SYNTH_READMEM_FAIL $slog: $line"
+        error "readmem"
+    }
+}
 puts "SYNTH_OK"
 
 # the P-wide datapath is LUT/SLICEM-dense (distributed-RAM buffers); spread logic across the

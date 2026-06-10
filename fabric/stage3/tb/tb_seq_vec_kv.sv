@@ -70,6 +70,7 @@ module tb;
     reg [8:0] prompt [0:PLEN-1];
     reg [8:0] stream [0:PLEN+NGEN-1];
     integer i, s, f, fs, fc, cyc0, pi;
+    integer dbgcyc = 0;
 
     initial begin
         rst = 1'b1; go = 1'b0; tok = 9'd0; pos = 9'd0; rsel = 0; raddr = 0;
@@ -109,7 +110,6 @@ module tb;
         $finish;
     end
 
-    integer dbgcyc = 0;
     integer stcnt [0:31];
     integer running = 0, k2, fprof;
     initial for (k2 = 0; k2 < 32; k2 = k2 + 1) stcnt[k2] = 0;
