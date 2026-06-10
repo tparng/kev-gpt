@@ -379,7 +379,8 @@ def val_nll_int(seq_factory, text_ids, chunks, clen, rng_seed=7):
 
 # ===================================================================== gate
 def _validate(npz="fabric/export/goformer.npz", n_gen=24, prompt_len=8,
-              val="data/sample.kevin.txt", val_chunks=6, val_len=96):
+              val="data/sample.kevin.txt", val_chunks=6, val_len=96,
+              kbits=4, vbits=4, rotate=True):
     import json
     import os
 
@@ -420,21 +421,25 @@ def _validate(npz="fabric/export/goformer.npz", n_gen=24, prompt_len=8,
             text = f.read()
         ids = np.array([stoi.get(c, 0) for c in text[:200_000]], dtype=np.int64)
         base_nll = val_nll_int(lambda: IntSequencer(p, cfg), ids, val_chunks, val_len)
-        q_nll = val_nll_int(lambda: IntKVQSequencer(p, cfg, kbits=4, vbits=4, rotate=True),
+        q_nll = val_nll_int(lambda: IntKVQSequencer(p, cfg, kbits=kbits, vbits=vbits,
+                                                    rotate=rotate),
                             ids, val_chunks, val_len)
         delta = (q_nll - base_nll) / base_nll
-        # honest range: the float exp_kvarn measured +0.72%; the integer datapath adds
-        # its own rounding, so accept anything in a wide quality band (<=2% NLL).
+        # honest range: the float exp_kvarn measured +0.72% at K4/V4; the integer
+        # datapath adds its own rounding, so accept anything in a wide quality band
+        # (<=2% NLL). Wider bit-widths must land well inside it.
         nll_ok = delta <= 0.02
-        nll_line = (f"(b) K4/V4+Hadamard NLL: int-FP={base_nll:.4f} int-KVQ={q_nll:.4f} "
+        rot = "+Hadamard" if rotate else " no-rot"
+        nll_line = (f"(b) K{kbits}/V{vbits}{rot} NLL: int-FP={base_nll:.4f} "
+                    f"int-KVQ={q_nll:.4f} "
                     f"delta={q_nll - base_nll:+.4f} ({delta:+.2%}) nats/tok "
-                    f"[{val_chunks}x{val_len} tok, exp_kvarn float ref +0.72%]")
+                    f"[{val_chunks}x{val_len} tok, exp_kvarn float ref +0.72% @K4/V4]")
         print(nll_line)
     else:
         print(f"(b) SKIPPED — held-out text {val!r} not found")
 
     # ---- DDR word layout sanity: a round-trip dequant matches the stored cache ----
-    kvq = IntKVQSequencer(p, cfg, kbits=4, vbits=4, rotate=True)
+    kvq = IntKVQSequencer(p, cfg, kbits=kbits, vbits=vbits, rotate=rotate)
     words = kvq.kv_ddr_words(prompt[:4])
     n_pos = len(words[0])
     k_bytes = len(words[0][0]["k_row"])
@@ -457,9 +462,14 @@ def main(argv=None):
     ap.add_argument("--val", default="data/sample.kevin.txt")
     ap.add_argument("--val-chunks", type=int, default=6)
     ap.add_argument("--val-len", type=int, default=96)
+    ap.add_argument("--kbits", type=int, default=4)
+    ap.add_argument("--vbits", type=int, default=4)
+    ap.add_argument("--no-rotate", action="store_true",
+                    help="skip the Hadamard (candidate simplification at >=8 bits)")
     args = ap.parse_args(argv)
     ok = _validate(args.npz, args.gen, args.prompt_len,
-                   args.val, args.val_chunks, args.val_len)
+                   args.val, args.val_chunks, args.val_len,
+                   kbits=args.kbits, vbits=args.vbits, rotate=not args.no_rotate)
     return 0 if ok else 1
 
 

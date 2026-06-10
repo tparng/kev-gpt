@@ -66,12 +66,24 @@ L5-raw training run is a cheap side experiment (data track, no RTL), not the pla
 
 ## 4. The rungs (each ships a MEASURED, bit-exact number)
 
-**R0 — the reference.** `goformer_kv` already proves KV decode ≡ full recompute.
-New: an **INT8-KV** fixed-point reference (`goformer_kv8` + the spec pin in the
-`goformer_fixed` style) and a model-level NLL gate by the KVarN method — K4/V4 was
-already a GO at +0.72% NLL, so K8/V8 must pass with margin or the campaign stops
-here. This changes the golden contract; the new reference becomes the gate for
-every rung below.
+**R0 — the reference. DONE (2026-06-10).** `goformer_kvq.IntKVQSequencer` (built
+for the KV-DDR work) already was the bit-true integer KV-quant reference; the gate
+grew `--kbits/--vbits/--no-rotate` and the K8/V8 point is MEASURED:
+
+```
+K8/V8 no-rot    NLL delta +0.03%   (24×128 = 3,072 held-out tok — the pinned number)
+K8/V8 no-rot    NLL delta +0.29%   (6×96 quick slice; the gap is slice noise)
+K8/V8 +Hadamard NLL delta +0.26%   (6×96 — rotation buys nothing at 8 bits)
+K4/V4 +Hadamard NLL delta +0.72%   (the KVarN float reference point)
+FP-identity gate: kbits=vbits=16 path bit-identical to IntSequencer (logit
+maxabsdiff = 0, stream identical) — the quant path is provably transparent.
+```
+
+**Pinned contract: K8/V8, NO Hadamard** — per-(head, position) asymmetric quant
+over the Q.16 cache words (`hdr` lo/scale + 8-bit codes), round-half-away-from-zero.
+Dropping the rotation deletes the 6-stage butterfly from the R1 RTL for 0.03 NLL
+points. `IntKVQSequencer(kbits=8, vbits=8, rotate=False)` is the golden reference
+every rung below gates against.
 
 **R1 — make it remember.** Per-layer K/V banks + write-at-`pos` + `tcount = pos+1`
 in the vec-lineage datapath; TMAX=256 pos_emb upload. Gate: `run_vec_kv.py`, token
