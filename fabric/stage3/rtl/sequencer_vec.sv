@@ -140,7 +140,7 @@ module sequencer_vec #(
     reg [10:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
     gemv_banked_resident_vec #(.LANES(LANES), .P(P), .MMAX(1024), .KMAX(1024), .RLAT(2),
-                  .WWORDS(WWORDS)) u_gemv (
+                  .WWORDS(WWORDS), .K2(1)) u_gemv (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
         .x_we(gv_xwe), .x_data(gv_xdata),

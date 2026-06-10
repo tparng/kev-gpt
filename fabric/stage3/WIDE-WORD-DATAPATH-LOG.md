@@ -1079,3 +1079,22 @@ avg for a 160-token message; T=256 worst ~52.3k -> ~3,800. Remaining slope =
 softmax PASS2/PASS3 (2T per call) + K/V stream (2T) = ~8 cyc/pos/head-layer —
 the R4 trim list. Next: R3 (LANES=512 via the second URAM port, GEMV floor
 12,481 -> ~6,241).
+
+## 30. Doc-7 R3: dual-port GEMV (K2) — base 19,666 -> 13,394 cyc
+
+`gemv_banked_resident_vec` grows a `K2` generic (default 0 = byte-identical):
+2 K-steps/cycle by reading weight words kc and kc+1 through the URAM's SECOND
+port (free at N=1 — split-brain spent it on cohort 2 and proved the TDP at
+200 MHz on silicon). Both products land in the same lane accumulator in one
+cycle; integer associativity (lane sums peak ~2^20, no mid-sum saturation)
+keeps the accumulate BIT-EXACT vs the serial order. kc advances by 2; odd-K
+tail masked (all layer Ks are even here). This is NOT the dead clock-domain
+double-pump — no second clock exists.
+
+GATE (run_vec_kv, LANES=256, K2=1): 10 positions — tokens identical to the
+golden. **Cycle law: cyc(T) = 13,394 + 128*(T-1)** — the GEMV floor halved
+right on the model (12,481 -> ~6,240). DERIVED @200: T-bar=80 ~23.6k cyc ->
+~8,500 tok/s avg; @250 ~10,600. Remaining ladder to 20k = R4: the ~5.5k NL
+base (P-wide non-linears), the ~2k KV-write (overlap head h+1's quant with
+head h's attention — separate kv_bank ports), and the 128/pos slope (softmax
+PASS2/3 + K/V streams each walk T per head-call).

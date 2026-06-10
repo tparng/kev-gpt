@@ -24,7 +24,12 @@ module gemv_banked_resident_vec #(
     parameter integer MMAX   = 1024,      // max output rows of any single layer
     parameter integer KMAX   = 1024,      // max reduction length of any single layer
     parameter integer WWORDS = 25600,     // resident capacity in wide words
-    parameter integer RLAT   = 2          // read->mac pipeline depth (cycles)
+    parameter integer RLAT   = 2,         // read->mac pipeline depth (cycles)
+    parameter integer K2     = 0          // doc-7 R3: 2 K-steps/cycle via the URAM's
+                                          // SECOND read port (free at N=1; the TDP claim
+                                          // is silicon-proven by split-brain). Integer
+                                          // associativity keeps the accumulate BIT-EXACT
+                                          // (lane sums peak ~2^20, no mid-sum saturation).
 ) (
     input  wire                          clk,
     input  wire                          rst,
@@ -93,9 +98,11 @@ module gemv_banked_resident_vec #(
     end
 
     // ---- per-bank URAM arrays + registered read (= pipeline stage 0) ------------
-    wire [$clog2(WWORDS)-1:0] waddr;
-    wire [WPAD-1:0] wword_pad;
-    wire [WBITS-1:0] wword_rd = wword_pad[WBITS-1:0];
+    // K2: a SECOND registered read (port B of the TDP URAM) at waddr2 = waddr+1.
+    wire [$clog2(WWORDS)-1:0] waddr, waddr2;
+    wire [WPAD-1:0] wword_pad, wword2_pad;
+    wire [WBITS-1:0] wword_rd  = wword_pad [WBITS-1:0];
+    wire [WBITS-1:0] wword2_rd = wword2_pad[WBITS-1:0];
     genvar gb;
     generate
         for (gb = 0; gb < NB; gb = gb + 1) begin : g_w
@@ -106,6 +113,13 @@ module gemv_banked_resident_vec #(
                 rd <= mem[waddr];
             end
             assign wword_pad[gb*BANKW +: BANKW] = rd;
+            if (K2 != 0) begin : g_p2
+                reg [BANKW-1:0] rd2;
+                always @(posedge clk) rd2 <= mem[waddr2];
+                assign wword2_pad[gb*BANKW +: BANKW] = rd2;
+            end else begin : g_np
+                assign wword2_pad[gb*BANKW +: BANKW] = {BANKW{1'b0}};
+            end
         end
     endgenerate
 
@@ -119,38 +133,57 @@ module gemv_banked_resident_vec #(
 
     wire [$clog2(GROUPS):0] gcount = (m_count + LANES - 1) >> LSH;
     wire                 issue   = (kc < k_count);
+    wire                 issue2  = (K2 != 0) && (kc + 1 < k_count);
     assign               waddr   = grp_base + kc;
+    assign               waddr2  = grp_base + kc + 1;
+    wire [$clog2(KMAX):0] kc1    = kc + 1;
 
     // pipeline: weight word (stage 0 = the per-bank URAM read reg) + act + valid
     reg [WBITS-1:0]      word_p [0:RLAT-2];
     reg [P*8-1:0]        xrow_p [0:RLAT-1];
     reg [LSHP-1:0]       xl_p   [0:RLAT-1];
     reg                  v_p    [0:RLAT-1];
+    // K2 second lane (kc+1's word/act/valid ride the same depths)
+    reg [WBITS-1:0]      word2_p [0:RLAT-2];
+    reg [P*8-1:0]        xrow2_p [0:RLAT-1];
+    reg [LSHP-1:0]       xl2_p   [0:RLAT-1];
+    reg                  v2_p    [0:RLAT-1];
     integer i, L;
     reg signed [31:0]    prodL, sumL;
-    reg [WBITS-1:0]      wsel;
-    reg [P*8-1:0]        xrow;
-    reg signed [7:0]     xsel;
+    reg signed [31:0]    prod2L;
+    reg [WBITS-1:0]      wsel, wsel2;
+    reg [P*8-1:0]        xrow, xrow2;
+    reg signed [7:0]     xsel, xsel2;
 
-    wire                 mac_v = v_p[RLAT-1];
+    wire                 mac_v  = v_p[RLAT-1];
+    wire                 mac_v2 = v2_p[RLAT-1];
 
     always @(posedge clk) begin
         word_p[0] <= wword_rd;
         xrow_p[0] <= xmem[kc[$clog2(KMAX)-1:0] >> LSHP];
         xl_p[0]   <= kc[LSHP-1:0];
         v_p[0]    <= (state == RUN) && issue;
-        for (i = 1; i < RLAT-1; i = i + 1)
-            word_p[i] <= word_p[i-1];
+        word2_p[0] <= wword2_rd;
+        xrow2_p[0] <= xmem[kc1[$clog2(KMAX)-1:0] >> LSHP];
+        xl2_p[0]   <= kc1[LSHP-1:0];
+        v2_p[0]    <= (state == RUN) && issue2;
+        for (i = 1; i < RLAT-1; i = i + 1) begin
+            word_p[i]  <= word_p[i-1];
+            word2_p[i] <= word2_p[i-1];
+        end
         for (i = 1; i < RLAT; i = i + 1) begin
             xrow_p[i] <= xrow_p[i-1];
             xl_p[i]   <= xl_p[i-1];
             v_p[i]    <= v_p[i-1];
+            xrow2_p[i] <= xrow2_p[i-1];
+            xl2_p[i]   <= xl2_p[i-1];
+            v2_p[i]    <= v2_p[i-1];
         end
 
         if (rst) begin
             state <= IDLE; done <= 1'b0;
             g <= 0; kc <= 0; kmac <= 0; accb <= {YBITS{1'b0}}; grp_base <= 0;
-            for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+            for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v2_p[i] <= 1'b0; end
         end else begin
             case (state)
                 IDLE: begin
@@ -158,22 +191,28 @@ module gemv_banked_resident_vec #(
                     if (start) begin
                         g <= 0; kc <= 0; kmac <= 0; accb <= {YBITS{1'b0}};
                         grp_base <= w_base;
-                        for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+                        for (i = 0; i < RLAT; i = i + 1) begin
+                            v_p[i] <= 1'b0; v2_p[i] <= 1'b0;
+                        end
                         state <= RUN;
                     end
                 end
                 RUN: begin
-                    if (issue) kc <= kc + 1'b1;
+                    if (issue) kc <= kc + ((K2 != 0 && issue2) ? 2'd2 : 2'd1);
                     if (mac_v) begin
-                        wsel = word_p[RLAT-2];
-                        xrow = xrow_p[RLAT-1];
-                        xsel = xrow[xl_p[RLAT-1]*8 +: 8];
+                        wsel  = word_p[RLAT-2];
+                        xrow  = xrow_p[RLAT-1];
+                        xsel  = xrow[xl_p[RLAT-1]*8 +: 8];
+                        wsel2 = word2_p[RLAT-2];
+                        xrow2 = xrow2_p[RLAT-1];
+                        xsel2 = xrow2[xl2_p[RLAT-1]*8 +: 8];
                         for (L = 0; L < LANES; L = L + 1) begin
-                            prodL = $signed(wsel[L*4 +: 4]) * xsel;
-                            sumL  = $signed(accb[L*32 +: 32]) + prodL;
+                            prodL  = $signed(wsel[L*4 +: 4]) * xsel;
+                            prod2L = mac_v2 ? $signed(wsel2[L*4 +: 4]) * xsel2 : 32'sd0;
+                            sumL   = $signed(accb[L*32 +: 32]) + prodL + prod2L;
                             accb[L*32 +: 32] <= sumL;
                         end
-                        kmac <= kmac + 1'b1;
+                        kmac <= kmac + (mac_v2 ? 2'd2 : 2'd1);
                     end
                     if (kmac == k_count) begin
                         ymem[g[$clog2(GROUPS)-1:0]] <= accb;
@@ -182,7 +221,9 @@ module gemv_banked_resident_vec #(
                             g <= g + 1'b1; kc <= 0; kmac <= 0;
                             accb <= {YBITS{1'b0}};
                             grp_base <= grp_base + k_count;
-                            for (i = 0; i < RLAT; i = i + 1) v_p[i] <= 1'b0;
+                            for (i = 0; i < RLAT; i = i + 1) begin
+                                v_p[i] <= 1'b0; v2_p[i] <= 1'b0;
+                            end
                         end
                     end
                 end
