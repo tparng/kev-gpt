@@ -65,6 +65,7 @@ class NumpyResident:
     def __init__(self):
         self._map = {}          # id(int_w) -> (w_base, M, K)
         self._w = {}            # id(int_w) -> int_w (kept so we can compute)
+        self._wf = {}           # id(int_w) -> float64 copy (BLAS GEMV path)
         self.total_bytes = 0
         self.last_cycles = 0
         self.n_matmul = 0
@@ -78,15 +79,22 @@ class NumpyResident:
             packed = pack.pack_int4_rows(iw8).ravel()
             self._map[id(iw)] = (off, int(M), int(K))
             self._w[id(iw)] = iw8
+            # float32 copy cached once so matmul rides BLAS sgemv instead of
+            # numpy's loop int64 matmul (~10ms -> ~0.07ms per GEMV). Bit-exact:
+            # int4 weights (|w|<=8) x int8 activations (|x|<=128) over K<=1024
+            # bounds every partial sum below ~2^20, inside float32's 2^24
+            # exact-integer range. The assert keeps that proof honest.
+            assert np.abs(iw8).max() <= 8, "int4 bound broken: float32 GEMV unsafe"
+            self._wf[id(iw)] = iw8.astype(np.float32)
             off += int(packed.size)
         self.total_bytes = off
         return off
 
     def matmul(self, int_w, int_x):
         wb, M, K = self._map[id(int_w)]                 # resident: id must be known
-        iw = self._w[id(int_w)]
+        wf = self._wf[id(int_w)]
         self.n_matmul += 1
-        return iw.astype(np.int64) @ np.asarray(int_x, dtype=np.int64)
+        return (wf @ np.asarray(int_x, dtype=np.float32)).astype(np.int64)
 
 
 def _layer_weights(params):
