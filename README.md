@@ -56,7 +56,8 @@ vs the integer reference). The current state, all bit-honest:
 | + softmax latency cut (103,582 cyc / 16 tokens @166.7 MHz) — **the stream ceiling** | 25,744.5 | MEASURED |
 | **Split-brain** N=14 — two cohorts on the dual-ported URAM (63,113 cyc / 14 tokens @166.7 MHz) | 36,970.7 | MEASURED |
 | N=16 @ **200 MHz** — first 200-clean build (LN un-retime + AQ 32×48 range-proof) | 46,604.4 | MEASURED |
-| + schedule-pipelining wave (AQ/RUN overlap, stream-granular NL, attn call cuts; 56,876 cyc @200 MHz) | **56,262.7** | MEASURED |
+| + schedule-pipelining wave (AQ/RUN overlap, stream-granular NL, attn call cuts; 56,876 cyc @200 MHz) | 56,262.7 | MEASURED |
+| + TMAX=16 architectural wave (TMAX 32→16, CTX cross-group stream, LN prod×gamma split; 53,364 cyc @200 MHz) | **59,965.5** | MEASURED |
 | Cycle floor (~53k → ~40k cyc) × 250 MHz silicon | →100k | the 100k identity: 16 × 250 MHz / 40k cyc, PROJECTED |
 
 Past 25.7k, **N=16 is the stream ceiling**: 3 INT4×INT8 MACs/DSP is provably
@@ -65,7 +66,7 @@ accumulator — `fabric/stage3/research/dsp3_pack_proof.py`, 1.2M-trial verified
 so the levers became **cycles and clock, not streams** — the second era, documented
 in [`6-past-the-stream-ceiling.md`](6-past-the-stream-ceiling.md): split-brain
 (two N=8 cohorts on the true-dual-port URAM) plus a systematic worst-path-retirement
-campaign. **56,262.7 is the current MEASURED record** (16/16 bit-exact, 3/3); 100k
+campaign. **59,965.5 is the current MEASURED record** (16/16 bit-exact, 3/3); 100k
 is PROJECTED and needs both the cycle floor *and* 250 MHz on silicon.
 
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
@@ -104,7 +105,7 @@ CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop GPU ~78×.
   log: `fabric/stage3/WIDE-WORD-DATAPATH-LOG.md`; the narrative is doc 6. The current
   design is **split-brain N=16**: two independent 8-stream cohorts each read the
   resident weight image through their own true-dual-port URAM port, sharing only the
-  weight image and arbitrated non-linears — 56,262.7 tok/s @ 200 MHz, 16/16 streams
+  weight image and arbitrated non-linears — 59,965.5 tok/s @ 200 MHz, 16/16 streams
   bit-exact, 3/3. The 16 streams double as keystroke-speculative completions (every
   keypress forks a stream; Enter blits the precomputed answer — doc 5).
 - **KV-to-DDR (sim-complete, bit-exact)**: `kv_dma` + `kv_prefetch` move the KV cache

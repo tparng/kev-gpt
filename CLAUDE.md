@@ -181,7 +181,8 @@ Keviniser on TinyStories → train (Brevitas INT4 QAT) → validate vs goformer 
 
 **Current work (the post-stage-3 speed era, doc 6):** the model has long been running fully in
 fabric; the optimisation is now *cycles and clock*, not getting it on-chip. The MEASURED record is
-**56,262.7 tok/s @ 200 MHz** (split-brain N=16, 16/16 bit-exact, 3/3). The live design is
+**59,965.5 tok/s @ 200 MHz** (split-brain N=16 TMAX=16 wave, 53,364 cyc, 16/16 bit-exact, 3/3 —
+log §27). The live design is
 `sequencer_sb` (two N=8 cohorts on the true-dual-port URAM, parameterized: `ATT2` = per-cohort vs
 shared attention, `TMAX` = on-chip KV window, `DBG` = board-debug readback on/off; bitstream builds
 set `DBG=0`/`ATT2=0` for fit). The target is the **100k identity: 16 streams × 250 MHz / 40k cyc** —
