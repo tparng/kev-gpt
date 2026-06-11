@@ -219,7 +219,9 @@ def make_device(args):
     if args.engine == "kv256":
         from fabric.stage3.board.pl_kv256 import PLKV256Device
         return PLKV256Device(lanes=args.lanes, fclk=args.fclk,
-                             gen_chars=args.gen_chars, tmax=args.tmax)
+                             gen_chars=args.gen_chars, tmax=args.tmax,
+                             temp=(0.0 if args.greedy else args.temp),
+                             top_k=args.top_k)
     return PLDevice(args.lanes, args.fclk, args.gen_chars)
 
 
@@ -255,7 +257,16 @@ def main(argv=None):
     ap.add_argument("--kv-backend", choices=["numpy", "pl", "c"], default="c",
                     help="--engine kv GEMV backend (c=compiled MMIO on the Kria)")
     ap.add_argument("--greedy", action="store_true",
-                    help="--engine kv: argmax decode (reproducible) vs sampled")
+                    help="argmax decode (reproducible); for kv256 this forces "
+                         "temp=0 and overrides --temp")
+    ap.add_argument("--temp", type=float, default=0.0,
+                    help="--engine kv256: host-side sampling temperature over the "
+                         "fabric head logits (0 = greedy/argmax, deterministic; "
+                         "~0.7-0.9 = varied stories). Same prompt -> different "
+                         "completions when >0.")
+    ap.add_argument("--top-k", type=int, default=40,
+                    help="--engine kv256: keep only the top-k logits when sampling "
+                         "(0 = full distribution)")
     ap.add_argument("--json", action="store_true",
                     help="force length-prefixed JSON even if msgpack is present")
     ap.add_argument("--bench", action="store_true",
