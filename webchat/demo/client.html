@@ -48,8 +48,8 @@
  #stats .fab b{color:#58a6ff;font-variant-numeric:tabular-nums}
 </style></head><body>
 <header>
- <span>🧒 Kevin <small>on Kria · speculative · <span id="status">connecting…</span></small></span>
- <span class="meta" id="lat">spec —</span>
+ <span>🧒 Kevin <small>on Kria · <span id="status">connecting…</span></small></span>
+ <span class="meta" id="lat">—</span>
 </header>
 <div id="stats">
  <div class="s hero" title="Chars emitted across all live completions in the last second — aggregate serving throughput, not per-stream and not the raw fabric decode rate."><b id="st_tps">—</b><span>serving tok/s</span></div>
@@ -61,18 +61,16 @@
  <div class="fab" title="The measured on-silicon faithful single-stream decode rate (full 256-token on-chip KV window), 3/3 bit-exact.">fabric: <b>13,162 tok/s</b> @166.7 MHz<br>measured · N=1 · T=128 on-chip KV</div>
 </div>
 <div id="log">
- <div class="msg kev">few word do trick. type thing. me finish it. (answer shows up before you hit enter.)</div>
+ <div class="msg kev">few word do trick. type story start. me finish it.</div>
  <div class="msg meta">kevin be 3.3M-param toddler. him only know telegraphic tinystories — start story, no ask question. try: “once upon time” · “little girl find dog” · “one day big bear”. the point be the speed, not the prose.</div>
 </div>
-<div id="spec"></div>
 <form id="f" onsubmit="return onEnter(event)">
  <input id="p" type="text" autocomplete="off" placeholder="once upon time..." autofocus>
  <button type="submit">Send</button>
 </form>
 <script>
 const log=document.getElementById('log'), inp=document.getElementById('p'),
-      specEl=document.getElementById('spec'), statusEl=document.getElementById('status'),
-      latEl=document.getElementById('lat');
+      statusEl=document.getElementById('status'), latEl=document.getElementById('lat');
 const DEBOUNCE_MS=20;   // client-side keystroke coalesce; the server adds its own
                         // small settle (--debounce-ms, now 20). Faithful infer is
                         // ~20ms and the Precision->Kria hop ~1ms (gigabit), so these
@@ -97,23 +95,22 @@ function connect(){
    const m=JSON.parse(ev.data);
    if(m.type==='hello'){statusEl.textContent='live · '+m.client_id;}
    else if(m.type==='speculation'||m.type==='authoritative'){
+     // the speculation stays INVISIBLE — it just primes the buffer so Enter
+     // resolves instantly. No preview, no labels: the magic is that the answer
+     // is simply already there.
      bufPrompt=m.prompt; bufCompletion=m.completion;
      if(m.prompt===lastSentPrompt&&lastSentAt){
-       latEl.innerHTML='spec <b>'+Math.round(performance.now()-lastSentAt)+' ms</b>';
+       latEl.innerHTML='<b>'+Math.round(performance.now()-lastSentAt)+' ms</b>';
      }
-     // show the live speculation under the input (the "before you finish" trick)
-     if(m.prompt===inp.value.trim()){specEl.textContent='▍ '+m.completion;}
-     if(m.type==='authoritative'){ // a freshness miss was resolved -> render it
+     if(m.type==='authoritative'){ // a buffer miss was resolved -> fill it in
        if(pendingWait && pendingWait.prompt===m.prompt){
-         // fill the "…" placeholder we already showed on Enter (don't re-add the
-         // user bubble — onEnter's stale path already did)
+         // fill the "…" placeholder we already showed on Enter (silently)
          pendingWait.el.textContent=m.completion;
-         add('meta','authoritative (freshness miss → 1 round trip)');
          pendingWait=null;
-         specEl.textContent=''; bufPrompt=null; bufCompletion=null;
+         bufPrompt=null; bufCompletion=null;
          log.scrollTop=log.scrollHeight;
        } else {
-         blit(m.prompt, m.completion, true);
+         blit(m.prompt, m.completion);
        }
      }
    } else if(m.type==='stats'){ renderStats(m); }
@@ -147,11 +144,10 @@ inp.addEventListener('input',()=>{
  debTimer=setTimeout(sendKeystroke,DEBOUNCE_MS);
 });
 
-function blit(prompt, completion, authoritative){
+function blit(prompt, completion){
  add('you',prompt);
  add('kev',completion);
- add('meta', authoritative?'authoritative (freshness miss → 1 round trip)':'blitted from buffer · 0 round trip');
- inp.value=''; specEl.textContent=''; bufPrompt=null; bufCompletion=null;
+ inp.value=''; bufPrompt=null; bufCompletion=null;
  log.scrollTop=log.scrollHeight;
 }
 
@@ -160,12 +156,12 @@ function onEnter(e){
  const cur=inp.value.trim(); if(!cur)return false;
  seq++;
  ws.send(JSON.stringify({type:'enter',prompt:cur,seq:seq}));
- // freshness check, client side: blit only if the buffer matches EXACTLY.
+ // freshness check, client side: blit instantly if the buffer matches EXACTLY.
  if(bufPrompt===cur && bufCompletion!=null){
-   blit(cur, bufCompletion, false);     // 0 round trip
+   blit(cur, bufCompletion);            // already there — instant, no round trip
  } else {
-   // stale/absent -> wait for the server's authoritative completion (it fires one)
-   add('you',cur); inp.value=''; specEl.textContent='';
+   // buffer not ready yet -> show the user line + a quiet "…" until it lands
+   add('you',cur); inp.value='';
    const wait=add('kev','…'); wait.dataset.waiting='1';
    pendingWait={el:wait, prompt:cur};
  }
