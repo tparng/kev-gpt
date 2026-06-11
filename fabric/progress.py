@@ -67,10 +67,14 @@ LADDER = [
      "the GE/nl ping-pong + per-call attn overhead (56,876 cyc / 16 tok @200; 16/16 bit-exact 3/3; 250 fails)"),
     ("+ TMAX=16 + per-cohort attn + CTX stream\n+ LN prod*gamma split", 59965.5, "MEASURED",
      "the shared-attn wall + LN critical path (53,364 cyc / 16 tok @200; 16/16 bit-exact 3/3; 250 hangs)"),
-    ("+ cycle floor push\n(AQ/RB overlap -> ~40k cyc)", 80000.0, "PROJECTED",
-     "GE-engine idle: AQ/RB serialization, group gaps (the solid case)"),
-    ("x 250 MHz silicon\n(16 x 250MHz / 40k cyc)", 100000.0, "PROJECTED",
-     "the last 25%: a 7ns-target timing campaign on a -2LV part (unproven)"),
+    # ---- the doc-7 axis change: tok/s that spell real MESSAGES, not aggregate T=1 ----
+    # (all N>=4 rungs above decode with attention T=1 — blistering aggregate, degenerate
+    # text. The faithful rung is ONE stream with the full on-chip KV window: every token
+    # attends to the whole conversation. Different metric, honestly labelled.)
+    ("FAITHFUL N=1, T=128 window\n(doc-7 R1-R4f: on-chip KV @142.9MHz)", 11343.2, "MEASURED",
+     "the T=1 degenerate attention — 119-tok real message, 12,594 cyc/tok avg, 3/3 bit-exact"),
+    ("x 250 MHz timing build\n(R5: quantise+attn paths pipelined)", 19850.0, "PROJECTED",
+     "the 8ns build's WNS -1.65 paths (kv quantise, attn dot tree) -> the 20k line"),
 ]
 
 # reference baselines (drawn as guide lines, not rungs) — all the same model, B=1 greedy

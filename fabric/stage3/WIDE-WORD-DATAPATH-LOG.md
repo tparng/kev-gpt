@@ -1274,3 +1274,26 @@ can't see is a silent all-zero ROM in the bitstream. Codified twice over:
 build_bd_seq_kv.tcl now HARD-ERRORS on any missing ROM init (and points at the
 k8t128 dir), and impl_seq_kv.tcl greps every synth runme.log for Synth 8-4445
 after SYNTH_OK and fails the run. Rebuild in flight.
+
+## 39. FAITHFUL DECODE MEASURED: 11,343 tok/s avg, N=1, full T=128 window, 3/3 bit-exact
+
+The rebuilt bitstream (inv ROMs present, the §38 guard green) on the KV260:
+
+- dbg_board_kv @125: qkv 0/768, **ctx 0/256** — the KV round-trip is bit-perfect.
+- pl_seq_kv --tmax 128, prompt 8 + 24 gen: 3/3 match, 11,473 cyc/tok avg —
+  within 2 cycles of the sim gate (11,475). Sim IS silicon.
+- fclk sweep: 125 ✓ (10,895.5) → **142.9 ✓ (12,452.0)** → 166.7 ✗ (0/3).
+  STA-max is 103.6 MHz (WNS −1.654 @8ns) → silicon margin ~1.38×, in family.
+- **THE NUMBER: full-window 119-token generation, 3/3 bit-exact, avg 12,594
+  cyc/tok = 11,343.2 tok/s @142.9 MHz (MEASURED)** — and the stream is a real
+  message ("her start spin around around around her start spin around…"), every
+  token attending to the whole window. First faithful single-stream decode on
+  the fabric; the previous faithful record was 751.8 (sequencer_fast era) —
+  a 15.1× jump on the axis that actually spells text.
+
+WNS −1.654's worst paths are the kv quantise (w_qi→wstage: variable part-select
+of the 2048b vecbuf + mult, single cycle) and the attention dot tree
+(qreg→ps partials) — both pipeline-able without touching the cycle laws'
+slopes (the quantise is feeder-side, the dot tree adds latency not rate).
+That's the R5 rung: a 5ns-target build → 200/250 on silicon → 15,880/19,850
+tok/s on the same 12,594-cyc law. 20k needs 250 — exactly the doc-7 plan.
