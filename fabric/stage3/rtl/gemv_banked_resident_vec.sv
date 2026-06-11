@@ -145,6 +145,19 @@ module gemv_banked_resident_vec #(
     wire                 mac_v  = v_p[RLAT-1];
     wire                 mac_v2 = v2_p[RLAT-1];
 
+    // ---- addend stage (timing): the MAC front-end (act lane-mux, INT4xINT8
+    // nibble products, K2 mux) was 13 logic levels feeding the accb carry chain
+    // — the @5ns worst path. Register the per-lane addend (prodL + prod2L) one
+    // cycle ahead so the accumulate cycle is ONLY accb <= accb + sext(addend_r).
+    // Bit-exact: same addends, same order, one cycle later in absolute time —
+    // kmac now counts in the ADD stage, so the end-of-group sample of accb into
+    // ymem (kmac == k_count) shifts with it automatically (+1 cyc per group).
+    // |w*x| <= 1024 each, so prodL + prod2L is in [-2032, 2048] — ADW=14 holds
+    // it exactly (two's-complement truncate then sign-extend is lossless).
+    localparam integer ADW = 14;
+    reg [LANES*ADW-1:0]  addend_r;
+    reg                  add_v, add_v2;
+
     always @(posedge clk) begin
         word_p[0] <= wword_rd;
         xrow_p[0] <= xmem[kc[$clog2(KMAX)-1:0] >> LSHP];
@@ -167,10 +180,30 @@ module gemv_banked_resident_vec #(
             v2_p[i]    <= v2_p[i-1];
         end
 
+        // addend stage: the heavy combinational front-end, registered. Runs
+        // unconditionally on mac_v (mac_v only asserts in RUN); add_v/add_v2
+        // are the delayed valid/K2 tags consumed by the accumulate below.
+        add_v  <= mac_v;
+        add_v2 <= mac_v && mac_v2;
+        if (mac_v) begin
+            wsel  = word_p[RLAT-2];
+            xrow  = xrow_p[RLAT-1];
+            xsel  = xrow[xl_p[RLAT-1]*8 +: 8];
+            wsel2 = word2_p[RLAT-2];
+            xrow2 = xrow2_p[RLAT-1];
+            xsel2 = xrow2[xl2_p[RLAT-1]*8 +: 8];
+            for (L = 0; L < LANES; L = L + 1) begin
+                prodL  = $signed(wsel[L*4 +: 4]) * xsel;
+                prod2L = mac_v2 ? $signed(wsel2[L*4 +: 4]) * xsel2 : 32'sd0;
+                addend_r[L*ADW +: ADW] <= prodL + prod2L;  // fits ADW, lossless
+            end
+        end
+
         if (rst) begin
             state <= IDLE; done <= 1'b0;
             g <= 0; kc <= 0; kmac <= 0; accb <= {YBITS{1'b0}}; grp_base <= 0;
             for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v2_p[i] <= 1'b0; end
+            add_v <= 1'b0; add_v2 <= 1'b0;
         end else begin
             case (state)
                 IDLE: begin
@@ -181,25 +214,21 @@ module gemv_banked_resident_vec #(
                         for (i = 0; i < RLAT; i = i + 1) begin
                             v_p[i] <= 1'b0; v2_p[i] <= 1'b0;
                         end
+                        add_v <= 1'b0; add_v2 <= 1'b0;
                         state <= RUN;
                     end
                 end
                 RUN: begin
                     if (issue) kc <= kc + ((K2 != 0 && issue2) ? 2'd2 : 2'd1);
-                    if (mac_v) begin
-                        wsel  = word_p[RLAT-2];
-                        xrow  = xrow_p[RLAT-1];
-                        xsel  = xrow[xl_p[RLAT-1]*8 +: 8];
-                        wsel2 = word2_p[RLAT-2];
-                        xrow2 = xrow2_p[RLAT-1];
-                        xsel2 = xrow2[xl2_p[RLAT-1]*8 +: 8];
+                    // accumulate stage: ONLY the add — the sole logic between
+                    // accb and accb's D input is the sign-extended carry chain.
+                    if (add_v) begin
                         for (L = 0; L < LANES; L = L + 1) begin
-                            prodL  = $signed(wsel[L*4 +: 4]) * xsel;
-                            prod2L = mac_v2 ? $signed(wsel2[L*4 +: 4]) * xsel2 : 32'sd0;
-                            sumL   = $signed(accb[L*32 +: 32]) + prodL + prod2L;
+                            sumL = $signed(accb[L*32 +: 32])
+                                 + $signed(addend_r[L*ADW +: ADW]);
                             accb[L*32 +: 32] <= sumL;
                         end
-                        kmac <= kmac + (mac_v2 ? 2'd2 : 2'd1);
+                        kmac <= kmac + (add_v2 ? 2'd2 : 2'd1);
                     end
                     if (kmac == k_count) begin
                         ymem[g[$clog2(GROUPS)-1:0]] <= accb;
@@ -211,6 +240,7 @@ module gemv_banked_resident_vec #(
                             for (i = 0; i < RLAT; i = i + 1) begin
                                 v_p[i] <= 1'b0; v2_p[i] <= 1'b0;
                             end
+                            add_v <= 1'b0; add_v2 <= 1'b0;
                         end
                     end
                 end
