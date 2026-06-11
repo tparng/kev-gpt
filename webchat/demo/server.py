@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import json
 import os
 import time
@@ -74,6 +75,11 @@ class Hub:
         self._start_mono = time.monotonic()
         self.total_tokens = 0
         self.peak_tok_s = 0.0
+        # rolling unique-visitor log: (open_ts, visitor_key) per connection, keyed
+        # by the real client IP (CF-Connecting-IP behind the tunnel) so a refresh /
+        # reconnect from the same person counts once. Pruned to the 30-min window.
+        self._visits: "collections.deque[tuple[float, str]]" = collections.deque()
+        self.visit_window_s = 1800.0
         # client_id -> websocket (for fan-out of completions)
         self.conns: dict[str, object] = {}
         # client_id -> the submit-eligible (debounce-expiry) perf_counter instant.
@@ -87,6 +93,17 @@ class Hub:
     def new_client_id(self) -> str:
         self._next_id += 1
         return f"c{self._next_id}"
+
+    def note_visit(self, key: str, now: float) -> None:
+        self._visits.append((now, key))
+
+    def unique_visitors(self, now: float) -> int:
+        """Distinct visitors (by IP) seen in the last `visit_window_s` — a real
+        reach number, not the instantaneous 0/1. Prunes the window first."""
+        cutoff = now - self.visit_window_s
+        while self._visits and self._visits[0][0] < cutoff:
+            self._visits.popleft()
+        return len({k for _, k in self._visits})
 
     async def send(self, client_id: str, obj: dict) -> None:
         ws = self.conns.get(client_id)
@@ -226,6 +243,7 @@ class Hub:
             "type": "stats",
             "live_users": rec.get("active_users"),
             "peak_users": rec.get("peak_active"),
+            "users_30m": self.unique_visitors(now),
             "agg_tok_s": agg,
             "peak_tok_s": round(self.peak_tok_s, 1),
             "avg_tok_s": round(self.total_tokens / uptime, 1),
@@ -268,6 +286,18 @@ async def client_handler(ws, hub: Hub):
     (blit locally if fresh else queue an authoritative inference)."""
     cid = hub.new_client_id()
     hub.conns[cid] = ws
+    # the real visitor key: CF-Connecting-IP (set by Cloudflare, forwarded by the
+    # tunnel) so a refresh from the same person is one visitor; fall back to the
+    # forwarded-for first hop, then the per-connection id for local/no-proxy runs.
+    vkey = cid
+    try:
+        hdrs = ws.request.headers
+        vkey = (hdrs.get("CF-Connecting-IP")
+                or (hdrs.get("X-Forwarded-For") or "").split(",")[0].strip()
+                or cid)
+    except Exception:
+        pass
+    hub.note_visit(vkey, time.monotonic())
     try:
         await ws.send(json.dumps({"type": "hello", "client_id": cid}))
         async for raw in ws:

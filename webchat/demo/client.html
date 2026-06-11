@@ -54,7 +54,7 @@
 <div id="stats">
  <div class="s hero" title="Chars emitted across all live completions in the last second — aggregate serving throughput, not per-stream and not the raw fabric decode rate."><b id="st_tps">—</b><span>serving tok/s</span></div>
  <div class="s" title="Peak aggregate serving tok/s seen this session."><b id="st_peak">—</b><span>peak</span></div>
- <div class="s" title="Connected clients now / peak this session."><b id="st_users">—</b><span>live users</span></div>
+ <div class="s" title="Distinct visitors (by IP) in the last 30 minutes — real reach, not the instantaneous count."><b id="st_users">—</b><span>visitors (30m)</span></div>
  <div class="s" title="Total characters Kevin has generated since the server booted."><b id="st_total">—</b><span>chars served</span></div>
  <div class="s" title="Fabric busy fraction — a labelled software occupancy proxy, not a hardware counter."><b id="st_duty">—</b><span>fabric busy</span></div>
  <div class="s" title="Fraction of Enters answered straight from the speculation buffer with zero round trips."><b id="st_zrt">—</b><span>0-trip hits</span></div>
@@ -145,7 +145,7 @@ function pct(x){ return x==null?'—':Math.round(x*100)+'%'; }
 function renderStats(m){
  setStat('st_tps',  m.agg_tok_s !=null?Math.round(m.agg_tok_s):'—');
  setStat('st_peak', m.peak_tok_s!=null?Math.round(m.peak_tok_s):'—');
- setStat('st_users',(m.live_users??0)+' / '+(m.peak_users??m.live_users??0));
+ setStat('st_users', m.users_30m!=null?fmtN(m.users_30m):'—');
  setStat('st_total',fmtN(m.total_tokens));
  setStat('st_duty', pct(m.duty_cycle));
  setStat('st_zrt',  pct(m.ready_at_enter));
