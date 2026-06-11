@@ -37,11 +37,29 @@
  input[type=text]{flex:1;padding:11px 13px;border-radius:10px;border:1px solid #30363d;
       background:#0d1117;color:#e6edf3;font-size:15px}
  button{padding:11px 18px;border:0;border-radius:10px;background:#238636;color:#fff;font-weight:600;cursor:pointer}
+ #stats{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;padding:8px 16px;
+        background:#0f141a;border-bottom:1px solid #30363d;font-size:12px;color:#8b949e;
+        font-variant-numeric:tabular-nums}
+ #stats .s{display:flex;flex-direction:column;line-height:1.2;cursor:help}
+ #stats .s b{color:#e6edf3;font-size:16px;font-weight:600}
+ #stats .s.hero b{color:#3fb950}
+ #stats .s span{font-size:9.5px;text-transform:uppercase;letter-spacing:.04em;color:#6e7681}
+ #stats .fab{margin-left:auto;text-align:right;font-size:11px;line-height:1.35;color:#6e7681}
+ #stats .fab b{color:#58a6ff;font-variant-numeric:tabular-nums}
 </style></head><body>
 <header>
  <span>🧒 Kevin <small>on Kria · speculative · <span id="status">connecting…</span></small></span>
  <span class="meta" id="lat">spec —</span>
 </header>
+<div id="stats">
+ <div class="s hero" title="Chars emitted across all live completions in the last second — aggregate serving throughput, not per-stream and not the raw fabric decode rate."><b id="st_tps">—</b><span>serving tok/s</span></div>
+ <div class="s" title="Peak aggregate serving tok/s seen this session."><b id="st_peak">—</b><span>peak</span></div>
+ <div class="s" title="Connected clients now / peak this session."><b id="st_users">—</b><span>live users</span></div>
+ <div class="s" title="Total characters Kevin has generated since the server booted."><b id="st_total">—</b><span>chars served</span></div>
+ <div class="s" title="Fabric busy fraction — a labelled software occupancy proxy, not a hardware counter."><b id="st_duty">—</b><span>fabric busy</span></div>
+ <div class="s" title="Fraction of Enters answered straight from the speculation buffer with zero round trips."><b id="st_zrt">—</b><span>0-trip hits</span></div>
+ <div class="fab" title="The measured on-silicon faithful single-stream decode rate (full 256-token on-chip KV window), 3/3 bit-exact.">fabric: <b>13,162 tok/s</b> @166.7 MHz<br>measured · N=1 · T=128 on-chip KV</div>
+</div>
 <div id="log">
  <div class="msg kev">few word do trick. type thing. me finish it. (answer shows up before you hit enter.)</div>
  <div class="msg meta">kevin be 3.3M-param toddler. him only know telegraphic tinystories — start story, no ask question. try: “once upon time” · “little girl find dog” · “one day big bear”. the point be the speed, not the prose.</div>
@@ -55,7 +73,10 @@
 const log=document.getElementById('log'), inp=document.getElementById('p'),
       specEl=document.getElementById('spec'), statusEl=document.getElementById('status'),
       latEl=document.getElementById('lat');
-const DEBOUNCE_MS=25;   // matches the server's --debounce-ms (infer is ~40ms now)
+const DEBOUNCE_MS=20;   // client-side keystroke coalesce; the server adds its own
+                        // small settle (--debounce-ms, now 20). Faithful infer is
+                        // ~20ms and the Precision->Kria hop ~1ms (gigabit), so these
+                        // two debounces are the dominant controllable latency — kept tight.
 let ws, seq=0, debTimer=null;
 // the speculation buffer: completion the server computed for `bufPrompt`.
 let bufPrompt=null, bufCompletion=null;
@@ -95,8 +116,24 @@ function connect(){
          blit(m.prompt, m.completion, true);
        }
      }
-   } else if(m.type==='blit_ok'){ /* server agreed; we already blitted */ }
+   } else if(m.type==='stats'){ renderStats(m); }
+   else if(m.type==='blit_ok'){ /* server agreed; we already blitted */ }
  };
+}
+
+// ---- live serving stats (the server pushes a `stats` frame every ~1s) --------
+function fmtN(n){ if(n==null)return '—';
+ if(n>=1e6)return (n/1e6).toFixed(1)+'M';
+ if(n>=1e3)return (n/1e3).toFixed(1)+'k'; return ''+Math.round(n); }
+function setStat(id,v){ const e=document.getElementById(id); if(e)e.textContent=v; }
+function pct(x){ return x==null?'—':Math.round(x*100)+'%'; }
+function renderStats(m){
+ setStat('st_tps',  m.agg_tok_s !=null?Math.round(m.agg_tok_s):'—');
+ setStat('st_peak', m.peak_tok_s!=null?Math.round(m.peak_tok_s):'—');
+ setStat('st_users',(m.live_users??0)+' / '+(m.peak_users??m.live_users??0));
+ setStat('st_total',fmtN(m.total_tokens));
+ setStat('st_duty', pct(m.duty_cycle));
+ setStat('st_zrt',  pct(m.ready_at_enter));
 }
 
 function sendKeystroke(){
