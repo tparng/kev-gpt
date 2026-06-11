@@ -143,6 +143,14 @@ class Telemetry:
         self._last_seen: dict[str, float] = {}
         self._last_tick = time.monotonic()
         self.peak_active = 0
+        # ---- rollup window (for the over-time log) — distinct from the 1 Hz tick:
+        # WINDOWED latency (exact, not the all-time reservoir) + request volume IN
+        # the rollup interval, so the post-mortem shows how latency/volume CHANGED.
+        self._win_lat: list[float] = []
+        self._win_tokens = 0
+        self._win_peak = 0
+        self._rollup_t = self._last_tick
+        self._rb_inf = self._rb_ent = self._rb_key = self._rb_blit = 0
 
     # --- hot-path hooks (O(1)) ---
     def on_keystroke(self, client_id: str, now: float) -> None:
@@ -164,9 +172,11 @@ class Telemetry:
         self.window.filled_sum += filled
         self.window.cap_sum += capacity
         self.window.tokens += tokens
+        self._win_tokens += tokens
 
     def add_latency(self, ms: float) -> None:
         self.latency.add(ms)
+        self._win_lat.append(ms)
 
     # --- per-tick collapse ---
     def active_users(self, now: float) -> int:
@@ -177,7 +187,49 @@ class Telemetry:
             del self._last_seen[c]
         n = len(self._last_seen)
         self.peak_active = max(self.peak_active, n)
+        self._win_peak = max(self._win_peak, n)
         return n
+
+    def rollup(self, now: Optional[float] = None) -> dict:
+        """Collapse the ROLLUP window (minutes, not the 1 Hz tick) into one
+        over-time record and reset it: EXACT windowed latency percentiles and the
+        request volume DURING this interval (deltas, not cumulative). Cheap (sort
+        a few hundred floats); call from the telemetry loop every rollup_s."""
+        if now is None:
+            now = time.monotonic()
+        dt = max(1e-6, now - self._rollup_t)
+        lat = sorted(self._win_lat)
+
+        def pct(q):
+            if not lat:
+                return None
+            return round(lat[max(0, min(len(lat) - 1,
+                                        int(round(q * (len(lat) - 1)))))], 1)
+        rec = {
+            "type": "rollup",
+            "ts": time.time(),
+            "window_s": round(dt, 1),
+            "requests": self.inferences - self._rb_inf,
+            "enters": self.enters - self._rb_ent,
+            "keystrokes": self.keystrokes - self._rb_key,
+            "blits": self.blits - self._rb_blit,
+            "req_per_min": round((self.inferences - self._rb_inf) / dt * 60.0, 1),
+            "tokens": self._win_tokens,
+            "tok_s": round(self._win_tokens / dt, 1),
+            "lat_p50": pct(0.50),
+            "lat_p95": pct(0.95),
+            "lat_p99": pct(0.99),
+            "lat_n": len(lat),
+            "peak_concurrent": self._win_peak,
+        }
+        # reset window
+        self._win_lat = []
+        self._win_tokens = 0
+        self._win_peak = 0
+        self._rollup_t = now
+        self._rb_inf, self._rb_ent = self.inferences, self.enters
+        self._rb_key, self._rb_blit = self.keystrokes, self.blits
+        return rec
 
     def tick(self, now: Optional[float] = None, queue_depth: int = 0) -> dict:
         if now is None:

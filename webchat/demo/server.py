@@ -51,13 +51,19 @@ class Hub:
 
     def __init__(self, *, backend, debounce_ms: float, batch: int,
                  tick_ms: float, jsonl: str, push_url: Optional[str],
-                 push_token: Optional[str], fabric_depth: int = 1):
+                 push_token: Optional[str], fabric_depth: int = 1,
+                 rollup_s: float = 60.0, rollup_jsonl: Optional[str] = None):
         self.backend = backend
         self.co = Coalescer(debounce_ms=debounce_ms)
         self.asm = BatchAssembler(self.co, batch=batch)
         self.tel = Telemetry()
         self.tick_s = tick_ms / 1000.0
         self.sink = JsonlSink(jsonl)
+        # over-time rollup: a compact per-rollup_s line (latency percentiles +
+        # request volume in the window) to its own JSONL, also printed for the log.
+        self.rollup_s = rollup_s
+        self.rollup_sink = JsonlSink(rollup_jsonl) if rollup_jsonl else None
+        self._rollup_at = time.monotonic() + rollup_s
         self.push_url = push_url
         self.push_token = push_token
         # The fabric is ONE resource: it runs `fabric_depth` batches at once
@@ -224,6 +230,20 @@ class Hub:
             await self._broadcast_stats(rec, now)
             if self.push_url:
                 await self._push(rec)
+            # ---- over-time rollup (latency + request volume) every rollup_s ----
+            if now >= self._rollup_at:
+                self._rollup_at = now + self.rollup_s
+                r = self.tel.rollup(now)
+                r["visitors_30m"] = self.unique_visitors(now)
+                r["connections"] = len(self.conns)
+                if self.rollup_sink:
+                    self.rollup_sink.write(r)
+                p50 = r["lat_p50"]; p95 = r["lat_p95"]
+                print(f"[metrics] {time.strftime('%H:%M:%S')} "
+                      f"req={r['requests']} ({r['req_per_min']}/min) "
+                      f"lat p50={p50}ms p95={p95}ms (n={r['lat_n']}) "
+                      f"tok/s={r['tok_s']} peak={r['peak_concurrent']} "
+                      f"visitors30m={r['visitors_30m']}", flush=True)
 
     async def _broadcast_stats(self, rec: dict, now: float):
         """Push a compact, chat-page-shaped stat frame to every connected client.
@@ -370,9 +390,15 @@ async def serve(args):
     else:
         raise SystemExit(f"unknown backend {args.backend!r}")
 
+    # default the rollup log next to the per-second jsonl: live.jsonl -> live.rollup.jsonl
+    rollup_jsonl = args.rollup_jsonl
+    if rollup_jsonl is None and args.jsonl:
+        base, ext = os.path.splitext(args.jsonl)
+        rollup_jsonl = f"{base}.rollup{ext or '.jsonl'}"
     hub = Hub(backend=backend, debounce_ms=args.debounce_ms, batch=args.batch,
               tick_ms=args.tick_ms, jsonl=args.jsonl, push_url=args.push_url,
-              push_token=args.push_token, fabric_depth=args.fabric_depth)
+              push_token=args.push_token, fabric_depth=args.fabric_depth,
+              rollup_s=args.rollup_s, rollup_jsonl=rollup_jsonl)
 
     sub_task = asyncio.create_task(hub.submission_loop())
     tel_task = asyncio.create_task(hub.telemetry_loop())
@@ -473,6 +499,11 @@ def build_parser():
                          "origin as the WS (default: the sibling client.html)")
     ap.add_argument("--jsonl", default="demo_telemetry.jsonl",
                     help="local JSONL telemetry record (post-mortem trail)")
+    ap.add_argument("--rollup-s", type=float, default=60.0,
+                    help="seconds per over-time rollup line (latency percentiles "
+                         "+ request volume in that window); also printed to the log")
+    ap.add_argument("--rollup-jsonl", default=None,
+                    help="rollup log path (default: <jsonl>.rollup.<ext>)")
     ap.add_argument("--push-url", default=None,
                     help="Cloudflare Worker ingest URL for 1 Hz telemetry POST")
     ap.add_argument("--push-token", default=None,
