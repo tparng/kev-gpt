@@ -73,8 +73,10 @@ LADDER = [
     # attends to the whole conversation. Different metric, honestly labelled.)
     ("FAITHFUL N=1, T=128 window\n(doc-7 R1-R4f: on-chip KV @142.9MHz)", 11343.2, "MEASURED",
      "the T=1 degenerate attention — 119-tok real message, 12,594 cyc/tok avg, 3/3 bit-exact"),
-    ("x 250 MHz timing build\n(R5: quantise+attn paths pipelined)", 19850.0, "PROJECTED",
-     "the 8ns build's WNS -1.65 paths (kv quantise, attn dot tree) -> the 20k line"),
+    ("+ R5 cone ladder -> 166.7 MHz\n(7 paths pipelined, OOC MET @5ns)", 13162.3, "MEASURED",
+     "the kv-quantise / attn-dot / min-max / AQ timing cones (12,662 cyc/tok, 3/3; 200 fails on the MAC floor)"),
+    ("+ schedule trims + MAC accumulate fix\n(-> 200 MHz silicon)", 20000.0, "PROJECTED",
+     "the last ~2.7k cyc (KVW overlap, dual-row RB, LN/AQ feeds) + the accb carry chain -> the 20k line"),
 ]
 
 # reference baselines (drawn as guide lines, not rungs) — all the same model, B=1 greedy

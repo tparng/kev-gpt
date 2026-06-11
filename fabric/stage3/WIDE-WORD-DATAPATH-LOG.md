@@ -1321,3 +1321,26 @@ slope. Commit c4934ef. The 200MHz BD+impl build is in flight; the law says
 ~15.8k tok/s @200 and ~19.9k @250 on a 119-token message — the last ~100
 cycles to put 250 over the 20k line come from the §34 base-trim menu (KVW
 overlap, dual-row RB, LN feed) if the silicon sweep proves 250.
+
+## 41. R5 on silicon: 13,162.3 tok/s @166.7 — and the MAC floor is the next wall
+
+The 200MHz-target build (R5 RTL, 5ns constraint): impl WNS −3.752 after a
+3h50m congestion fight — the OOC→impl routing gap eats the entire OOC MET.
+The worst path is no longer any of the seven whacked cones: it is the GEMV
+MAC accumulate itself (accb carry chain + bank mux, 13 levels, ~8.75ns) —
+the design's structural floor, untouched since LANES=256 landed.
+
+Board sweep (full-window 119-tok gen, 3/3 bit-exact each):
+- 142.9 ✓ 11,282.0 (sanity, matches the §39 class)
+- **166.7 ✓ 13,162.3 tok/s MEASURED — the new faithful record** (12,662 cyc/tok;
+  silicon 1.46× over the 114.3MHz STA-max, top of the proven margin band)
+- 200 ✗ 0/3 (the MAC floor: needs 1.75×)
+
+Live chat redeployed at 166.7 (same kv256 daemon, new bitstream).
+
+The 20k arithmetic, post-R5: 20k @200 needs avg ≤10,000 cyc (−2,662); the §34
+trim menu (KVW overlap ~0.7k, dual-row RB ~0.65k, LN ~0.4k, AQ ~0.5k ≈ −2.25k)
+plus one more small trim gets there — IF 200 closes, which now means fixing
+accb: pipeline the bank-select mux out of the accumulate loop or go
+carry-save. Clock alone is dead past 166.7 (doc-6's lesson, again, measured);
+cycles+MAC-surgery is the road.
