@@ -1297,3 +1297,27 @@ of the 2048b vecbuf + mult, single cycle) and the attention dot tree
 slopes (the quantise is feeder-side, the dot tree adds latency not rate).
 That's the R5 rung: a 5ns-target build → 200/250 on silicon → 15,880/19,850
 tok/s on the same 12,594-cyc law. 20k needs 250 — exactly the doc-7 plan.
+
+## 40. R5 cone-whacking: OOC MET at 5ns — the 200MHz-class faithful sequencer
+
+Iterative OOC-at-5ns ladder on the post-§39 RTL, one cone per pass, every step
+gated bit-exact (run_vec_kv T-to-31, avg cyc in parens):
+
+- baseline (take-7 RTL): WNS −1.99 → with quantise+dot pipelined: **−2.09**
+  (the kv quantise W_QNT and attn dot-tree cones removed; maxv surfaced)
+  (11,475 → 11,504)
+- kv_bank beat-merge split (bm regs, merge folded into W_SCALE): **−0.776**
+- vec_attn_w stage-D split (D1 two 4-way partial sums, D2 round/sat): **−0.576**
+  (11,509)
+- S_EMB select stage (erw_r + eb2 tags; commit one behind): AQ surfaced **−1.388**
+- isact_r free-running registered ROM read (g_asel constant per call): **−0.392**
+- quad min/max (2-level tree registered, 2-level merge 1-behind, W_MMD drain,
+  wst widened to 4b): **−0.324** (11,533)
+- AQ stage 2a/2b split (96-bit negate+round registered, clip+pack behind):
+  **MET +0.112** (11,550)
+
+Total cycle cost of the whole campaign: +75 avg (+0.65%) — all latency, no
+slope. Commit c4934ef. The 200MHz BD+impl build is in flight; the law says
+~15.8k tok/s @200 and ~19.9k @250 on a 119-token message — the last ~100
+cycles to put 250 over the 20k line come from the §34 base-trim menu (KVW
+overlap, dual-row RB, LN feed) if the silicon sweep proves 250.
