@@ -14,10 +14,11 @@
 //           identical to the scalar reference (per-dim sequential adds)
 //   ctx   : NGRP P-wide strobes (interface identical to vec_attn's S_ACL shape)
 //
-// Bit-exactness: the 64-product dot is summed as 8 partial sums of 8 then a
-// final sum-of-8 — integer addition with no mid-sum saturation in a 64-bit
-// accumulator (|q|,|k| < 2^21 -> 64 products < 2^48), so the tree order is
-// EXACTLY the scalar sequential sum. Score and ctx rounding/sat are verbatim
+// Bit-exactness: the 64-product dot is summed as 8 partial sums of 8, then
+// two registered 4-way sums, then a final 2-way sum — integer addition with
+// no mid-sum saturation in a 64-bit accumulator (|q|,|k| < 2^21 -> 64
+// products < 2^48, full sum < 2^54), so ANY reduction order is bit-identical
+// to the scalar sequential sum. Score and ctx rounding/sat are verbatim
 // vec_attn: rsh_round(acc, 27) -> sat16 -> softmax; rsh_round(acc, 11) -> ctx.
 //
 // iverilog-2012 safe: unpacked elements copied to plain regs before part-
@@ -81,13 +82,24 @@ module vec_attn_w #(
     reg [20:0] probmem [0:TMAX-1];              // Q1.20 probs, FULL-width indexed
     reg [TW-1:0] jc;                            // prob collect counter
 
-    // ---- score pipeline (3 stages, 1 position/cycle) ----
+    // ---- score pipeline (5 stages, 1 position/cycle) ----
+    // TIMING: the 16x16 LUT multiplies are REGISTERED (stage B) before the
+    // 8-of-8 partial sums (stage C); the 8-way final reduction + round/sat
+    // cone (OOC 5ns WNS -0.776, ps_reg -> sm_score_reg) is SPLIT: stage D1
+    // registers two 4-way sums, stage D2 does the 2-way sum + rsh_round +
+    // sat16 into sm_score. Pure integer adds at full 64-bit width with no
+    // intermediate saturation, so the regrouping is bit-exact; the stream
+    // stays 1 position/cycle, +1 more cycle of latency.
     reg [HEAD_DIM*32-1:0] kreg;                 // stage A: registered K row
     reg                   kv0;
-    reg signed [63:0]     ps   [0:NGRP-1];      // stage B: 8 partial sums of 8
+    reg signed [63:0]     pr   [0:HEAD_DIM-1];  // stage B: 64 registered products
+    reg                   kvp;
+    reg signed [63:0]     ps   [0:NGRP-1];      // stage C: 8 partial sums of 8
     reg                   kv1;
+    reg signed [63:0]     sum_lo, sum_hi;       // stage D1: two 4-way sums
+    reg                   kv2;
     reg [8:0]             scnt;                 // scores fed to softmax (0..T)
-    // stage C feeds softmax (sm_in_valid/sm_score)
+    // stage D2 feeds softmax (sm_in_valid/sm_score)
 
     // ---- ctx pipeline (V phase) ----
     reg [HEAD_DIM*32-1:0] vreg;                 // stage A: registered V row
@@ -130,7 +142,8 @@ module vec_attn_w #(
         sm_start <= 1'b0; sm_in_valid <= 1'b0;
         ctx_valid <= 1'b0; k_done <= 1'b0; done <= 1'b0;
         if (rst) begin
-            st <= W_IDLE; kv0 <= 1'b0; kv1 <= 1'b0; vv0 <= 1'b0;
+            st <= W_IDLE; kv0 <= 1'b0; kvp <= 1'b0; kv1 <= 1'b0; kv2 <= 1'b0;
+            vv0 <= 1'b0;
         end else begin
             case (st)
                 W_IDLE: if (start) begin
@@ -140,7 +153,8 @@ module vec_attn_w #(
                     qreg[qcnt*P*32 +: P*32] <= q_data;
                     if (qcnt == NGRP-1) begin
                         sm_tcount <= T; sm_start <= 1'b1;     // PASS1 armed for K
-                        kv0 <= 1'b0; kv1 <= 1'b0; scnt <= 9'd0;
+                        kv0 <= 1'b0; kvp <= 1'b0; kv1 <= 1'b0; kv2 <= 1'b0;
+                        scnt <= 9'd0;
                         st <= W_K;
                     end else qcnt <= qcnt + 1'b1;
                 end
@@ -149,23 +163,40 @@ module vec_attn_w #(
                     // stage A: register the row
                     if (kv_valid) kreg <= kv_data;
                     kv0 <= kv_valid;
-                    // stage B: 64 products -> NGRP partial sums of P
+                    // stage B: 64 REGISTERED products (multiply only — timing split)
                     if (kv0) begin
+                        for (l = 0; l < HEAD_DIM; l = l + 1) begin
+                            q_l = qreg[l*32 +: 32];
+                            k_l = kreg[l*32 +: 32];
+                            pr[l] <= $signed(q_l) * $signed(k_l);
+                        end
+                    end
+                    kvp <= kv0;
+                    // stage C: NGRP partial sums of P (SAME addition order as before)
+                    if (kvp) begin
                         for (g = 0; g < NGRP; g = g + 1) begin
                             part = 64'sd0;
-                            for (l = 0; l < P; l = l + 1) begin
-                                q_l = qreg[(g*P+l)*32 +: 32];
-                                k_l = kreg[(g*P+l)*32 +: 32];
-                                part = part + $signed(q_l) * $signed(k_l);
-                            end
+                            for (l = 0; l < P; l = l + 1)
+                                part = part + pr[g*P+l];
                             ps[g] <= part;
                         end
                     end
-                    kv1 <= kv0;
-                    // stage C: total -> round/sat -> softmax (PASS1 takes 1/cycle)
+                    kv1 <= kvp;
+                    // stage D1: two REGISTERED 4-way sums (timing split of the
+                    // old 8-way sum + round/sat cone; exact 64-bit adds, any
+                    // grouping is bit-identical)
                     if (kv1) begin
-                        tot = 64'sd0;
-                        for (g = 0; g < NGRP; g = g + 1) tot = tot + ps[g];
+                        part = 64'sd0;
+                        for (g = 0; g < NGRP/2; g = g + 1) part = part + ps[g];
+                        sum_lo <= part;
+                        part = 64'sd0;
+                        for (g = NGRP/2; g < NGRP; g = g + 1) part = part + ps[g];
+                        sum_hi <= part;
+                    end
+                    kv2 <= kv1;
+                    // stage D2: final sum -> round/sat -> softmax (PASS1 1/cycle)
+                    if (kv2) begin
+                        tot = sum_lo + sum_hi;
                         sm_score    <= sat16(rsh_round({{32{tot[63]}}, tot}, SCORE_SH));
                         sm_in_valid <= 1'b1;
                         if (scnt == T - 1) st <= W_SMC;       // all T scores fed

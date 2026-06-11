@@ -136,6 +136,12 @@ module sequencer_vec #(
     reg [P*32-1:0]    tacc;                  // tok row held for the tok+pos sum
     reg [LANES*8-1:0] epr;                   // plain-reg pair copy (safe part-select)
     reg [P*32-1:0]    erw;                   // selected embed row
+    // TIMING (5ns cone weight-bank BRAM -> xres LUTRAM): the pair-slot select is
+    // REGISTERED (erw_r + eb2_* tags); the tacc hold / tok+pos sum / xres commit
+    // run one cycle behind the arrival. Same numbers, +1 cycle per token.
+    reg        eb2_v, eb2_tp;                // select-stage valid + phase
+    reg [$clog2(ROWSM+1)-1:0] eb2_row;       // select-stage xres destination row
+    reg [P*32-1:0]    erw_r;                 // REGISTERED selected embed row
     wire [13:0] emb_row_w = (etp ? pos : tok_id) * EROWS
                             + {{(14-$clog2(ROWSM+1)){1'b0}}, fr};
     // 32-bit param + 14-bit row word offset, truncated to the address width
@@ -319,7 +325,18 @@ module sequencer_vec #(
     reg signed [95:0]  aq_prod_r [0:P-1];     // G_AQ stage-1 product registers
     reg                aq_neg_r  [0:P-1];
     reg signed [63:0]  lnt_r     [0:P-1];     // G_AQ stage-0 source registers
+    // TIMING (5ns cone g_asel -> aq_prod_r): the 17-deep inv_sact LUT read was
+    // muxed combinationally INSIDE the multiply cycle. g_asel is constant for a
+    // whole GEMV call (set at dispatch, >=2 cycles before the first civ1 multiply),
+    // so a free-running registered read is always settled in time.
+    reg signed [63:0]  isact_r;
     reg [10:0]         cid1, cid2;  reg civ1, civ2;
+    // TIMING (5ns cone aq_prod_r DSP-out -> gv_xdata): the 96-bit conditional
+    // negate+round+shift and the clip+pack were one cycle. Stage 2a registers the
+    // rounded value (only [31:0] is ever consumed downstream — identical
+    // semantics), stage 2b clips+packs. +1 cycle per AQ phase.
+    reg signed [31:0]  aq_sh_r [0:P-1];
+    reg [10:0]         cid3;  reg civ3;
     reg signed [31:0]  cb, dqv, hv;
     reg [P*32-1:0]  ww, sw, dword, hw;
     reg [P*8-1:0]   aqw;                     // P-wide act-quant word
@@ -331,6 +348,9 @@ module sequencer_vec #(
     reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
     reg [$clog2(ROWSM+1)-1:0] gor;
     integer pp;
+
+    // free-running registered inv_sact read (see isact_r note above)
+    always @(posedge clk) isact_r <= inv_sact[g_asel];
 
     reg signed [31:0] best_val; reg [8:0] best_idx, hidx;
     reg [$clog2(ARROWS+1)-1:0] ar;           // argmax row counter
@@ -384,12 +404,12 @@ module sequencer_vec #(
         if (rst) begin
             st<=S_IDLE; ci<=0; fr<=0; orow<=0; dor<=0; gor<=0;
             rv0<=0; rv1<=0; rv2<=0;
-            civ<=0; frv<=0; arv<=0; wiv<=0; etp<=1'b0; eb_v<=1'b0;
+            civ<=0; frv<=0; arv<=0; wiv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0;
             kvf_st<=KF_IDLE; kvf_active<=1'b0;
         end else begin
             case (st)
                 S_IDLE: if (go) begin
-                    fr<=0; frv<=0; etp<=1'b0; eb_v<=1'b0; blk<=4'd0; st<=S_EMB;
+                    fr<=0; frv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0; blk<=4'd0; st<=S_EMB;
                 end
                 // ---- embed -> xres via the weight bank's embed port (log §36 plan 2):
                 // tok row then pos row per fr, serial (1 fetch/cycle, ~2*EROWS+2 cyc).
@@ -403,18 +423,22 @@ module sequencer_vec #(
                         if (etp) begin etp <= 1'b0; fr <= fr + 1'b1; end
                         else etp <= 1'b1;
                     end
-                    // arrival stage: last cycle's pair is on emb_pair now
+                    // select stage: register the pair-slot mux of last cycle's pair
                     if (eb_v) begin
                         epr = emb_pair;                         // plain-reg copy first
-                        erw = epr[eb_sel*(P*32) +: P*32];
-                        if (!eb_tp) tacc <= erw;                // hold the tok row
+                        erw_r <= epr[eb_sel*(P*32) +: P*32];
+                    end
+                    eb2_v <= eb_v; eb2_tp <= eb_tp; eb2_row <= eb_row;
+                    // commit stage: tacc hold / tok+pos sum, one cycle behind
+                    if (eb2_v) begin
+                        if (!eb2_tp) tacc <= erw_r;             // hold the tok row
                         else begin                              // pos row: sum + commit
                             for (pp=0; pp<P; pp=pp+1)
                                 ww[pp*32 +: 32] = $signed(tacc[pp*32 +: 32])
-                                                + $signed(erw[pp*32 +: 32]);
-                            xres_bank[eb_row] <= ww;
-                            if (eb_row==ROWS-1) begin
-                                fr<=0; frv<=0; eb_v<=1'b0; etp<=1'b0;
+                                                + $signed(erw_r[pp*32 +: 32]);
+                            xres_bank[eb2_row] <= ww;
+                            if (eb2_row==ROWS-1) begin
+                                fr<=0; frv<=0; eb_v<=1'b0; eb2_v<=1'b0; etp<=1'b0;
                                 if (dbg_stop==2'd1) st<=S_FIN;       // DEBUG: stop after embed
                                 else begin l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; st<=L_GAM; end
                             end
@@ -475,6 +499,7 @@ module sequencer_vec #(
                     cid <= ci; civ <= (ci != (g_k >> LSH));
                     cid1 <= cid; civ1 <= civ;
                     cid2 <= cid1; civ2 <= civ1;
+                    cid3 <= cid2; civ3 <= civ2;
                     if (ci != (g_k >> LSH)) ci <= ci + 1'b1;
                     if (civ) begin                 // stage 0: source mux -> lnt_r
                         for (pp=0; pp<P; pp=pp+1) begin
@@ -496,23 +521,30 @@ module sequencer_vec #(
                     end
                     if (civ1) begin                // stage 1: multiply (DSP-retimed)
                         for (pp=0; pp<P; pp=pp+1) begin
-                            aq_prod_r[pp] <= $signed(lnt_r[pp]) * $signed(inv_sact[g_asel]);
+                            aq_prod_r[pp] <= $signed(lnt_r[pp]) * $signed(isact_r);
                             aq_neg_r[pp]  <= (lnt_r[pp] < 0);
                         end
                     end
-                    if (civ2) begin                // stage 2: round/sat -> INT8 lane
+                    if (civ2) begin                // stage 2a: round (negate/add/shift)
                         for (pp=0; pp<P; pp=pp+1) begin
                             aq_prod = aq_prod_r[pp];
                             if (!aq_neg_r[pp])
                                 aq_sh = (aq_prod + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH);
                             else
                                 aq_sh = -(((-aq_prod) + (96'sd1 <<< (LN_OUT_FRAC+ISH-1))) >>> (LN_OUT_FRAC+ISH));
-                            aq_int = aq_sh[31:0];
+                            aq_sh_r[pp] <= aq_sh[31:0];
+                        end
+                    end
+                    if (civ3) begin                // stage 2b: clip + pack -> INT8 lane
+                        for (pp=0; pp<P; pp=pp+1) begin
+                            aq_int = aq_sh_r[pp];
                             if (aq_int>127) aq_int=127; if (aq_int<-128) aq_int=-128;
                             aqw[pp*8 +: 8] = aq_int[7:0];
                         end
                         gv_xwe<=1'b1; gv_xdata<=aqw;
-                        if (cid2==(g_k >> LSH)-1) begin ci<=0; civ<=0; civ1<=0; civ2<=0; st<=G_RUN; end
+                        if (cid3==(g_k >> LSH)-1) begin
+                            ci<=0; civ<=0; civ1<=0; civ2<=0; civ3<=0; st<=G_RUN;
+                        end
                     end
                 end
                 G_RUN: begin

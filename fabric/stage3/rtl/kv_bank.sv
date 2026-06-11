@@ -73,9 +73,10 @@ module kv_bank #(
 
 
     // ---- write FSM ---------------------------------------------------------------
-    localparam [2:0] W_IDLE=3'd0, W_COLL=3'd1, W_SCALE=3'd2, W_INVL=3'd3,
-                     W_INVR=3'd4, W_SCALE2=3'd5, W_QNT=3'd6, W_CWR=3'd7;
-    reg [2:0] wst;
+    localparam [3:0] W_IDLE=4'd0, W_COLL=4'd1, W_SCALE=4'd2, W_INVL=4'd3,
+                     W_INVR=4'd4, W_SCALE2=4'd5, W_QNT=4'd6, W_CWR=4'd7,
+                     W_MMD=4'd8;             // min/max merge drain (last beat)
+    reg [3:0] wst;
 
     // ---- read FSMs (A and B) -------------------------------------------------
     localparam [1:0] R_IDLE=2'd0, R_RUN=2'd2;
@@ -123,7 +124,7 @@ module kv_bank #(
     // sync ROM read: address is the combinational scale during W_INVL (so the
     // reads land in W_INVR), then the registered w_scale.
     wire [14:0] sc_now = (w_magic[53:39] == 0) ? 15'd1 : w_magic[53:39];
-    wire [14:0] lut_sc = (wst == 3'd3) ? sc_now : w_scale[14:0];
+    wire [14:0] lut_sc = (wst == W_INVL) ? sc_now : w_scale[14:0];
     always @(posedge clk) begin
         inv_lo_rd  <= inv_lut_lo[lut_sc[11:0]];
         inv_hi_rd  <= inv_lut_hi[lut_sc - 15'd4096];
@@ -131,21 +132,52 @@ module kv_bank #(
     end
     wire [INV_SH:0] inv_rd = inv_hi_sel ? {12'b0, inv_hi_rd} : inv_lo_rd;
 
-    // P-lane signed min/max of the incoming beat (combinational tree, P=8)
+    // TIMING (5ns cone wq_data -> beat min/max -> running merge, formerly one
+    // 25-level cycle): stage A registers two QUAD min/max reductions (2 compare
+    // levels) of the incoming beat; stage B merges them into the running
+    // minv/maxv ONE BEAT BEHIND (2 compare levels), gated by qm_v. The LAST
+    // beat's pending quads drain in W_MMD (min/max are associative + idempotent
+    // — same numbers, +1 cycle per write). W_SCALE reads plain minv/maxv.
     integer mp;
-    reg signed [31:0] lane_v, beat_min, beat_max;
+    reg signed [31:0] lane_v, quad_min [0:1], quad_max [0:1];
     always @* begin
-        beat_min = 32'sh7FFFFFFF; beat_max = 32'sh80000000;
+        quad_min[0] = 32'sh7FFFFFFF; quad_max[0] = 32'sh80000000;
+        quad_min[1] = 32'sh7FFFFFFF; quad_max[1] = 32'sh80000000;
         for (mp = 0; mp < P; mp = mp + 1) begin
             lane_v = $signed(wq_data[mp*32 +: 32]);
-            if (lane_v < beat_min) beat_min = lane_v;
-            if (lane_v > beat_max) beat_max = lane_v;
+            if (lane_v < quad_min[mp/(P/2)]) quad_min[mp/(P/2)] = lane_v;
+            if (lane_v > quad_max[mp/(P/2)]) quad_max[mp/(P/2)] = lane_v;
+        end
+    end
+    reg signed [31:0] qm_min0, qm_min1, qm_max0, qm_max1;
+    reg               qm_v;
+    wire signed [31:0] qmn = (qm_min0 < qm_min1) ? qm_min0 : qm_min1;
+    wire signed [31:0] qmx = (qm_max0 > qm_max1) ? qm_max0 : qm_max1;
+
+    // TIMING (8ns worst cone w_qi_reg -> wstage_reg): W_QNT is a 2-stage pipeline.
+    // Stage A registers the SELECTED+SUBTRACTED row (the vecbuf row-mux + w_lo
+    // subtract, the heavy front half); stage B does mult+round+clip and writes
+    // wstage ONE ROW BEHIND (at w_qi_d). One extra drain cycle before W_CWR so
+    // the commit always sees the COMPLETE wstage. Same numbers, +1 cycle per
+    // (head,kv,pos) write — feeder-side, hidden under attention.
+    reg [P*32-1:0] qd_r;                     // stage-A reg: u = x - lo per lane (>= 0)
+    reg [$clog2(HR+1)-1:0] w_qi_d;           // stage-A reg: the row qd_r belongs to
+    reg            qd_v;                     // stage-A valid
+    reg [P*32-1:0] qd_now;                   // combinational diffs of row w_qi
+    reg [$clog2(HR+1)-1:0] q_sel;            // w_qi clamped on the drain cycle
+    reg signed [32:0] q_diff;
+    integer qp2;
+    always @* begin
+        q_sel  = (w_qi >= HR) ? {($clog2(HR+1)){1'b0}} : w_qi;
+        qd_now = {(P*32){1'b0}};
+        for (qp2 = 0; qp2 < P; qp2 = qp2 + 1) begin
+            q_diff = $signed(vecbuf[(q_sel*P + qp2)*32 +: 32]) - w_lo; // >= 0 by construction
+            qd_now[qp2*32 +: 32] = q_diff[31:0];
         end
     end
 
-    // quantise P lanes of vecbuf row w_qi (combinational; all operands registered)
+    // stage B: quantise P lanes of the REGISTERED diffs (mult+round+clip only)
     reg [P*KBITS-1:0] q_codes;
-    reg signed [32:0] q_diff;
     reg [31:0]  q_u;
     reg [31+INV_SH+1:0] q_prod;              // u(<=2^21) * inv(<=2^24) + rounding
     reg [31:0]  q_code;
@@ -153,8 +185,7 @@ module kv_bank #(
     always @* begin
         q_codes = {(P*KBITS){1'b0}};
         for (qp = 0; qp < P; qp = qp + 1) begin
-            q_diff = $signed(vecbuf[(w_qi*P + qp)*32 +: 32]) - w_lo;   // >= 0 by construction
-            q_u    = q_diff[31:0];
+            q_u    = qd_r[qp*32 +: 32];
             q_prod = q_u * w_inv + (1 << (INV_SH-1));
             q_code = q_prod >> INV_SH;
             if (q_code > QMAX) q_code = QMAX;
@@ -287,7 +318,7 @@ module kv_bank #(
     always @(posedge clk) begin
         wq_done <= 1'b0; rd_done <= 1'b0; rd2_done <= 1'b0;
         if (rst) begin
-            wst <= W_IDLE; rst_st <= R_IDLE; rst2_st <= R_IDLE;
+            wst <= W_IDLE; rst_st <= R_IDLE; rst2_st <= R_IDLE; qd_v <= 1'b0;
             rd_valid <= 1'b0; r_v0 <= 1'b0; r_v1 <= 1'b0;
             rd2_valid <= 1'b0; r2_v0 <= 1'b0; r2_v1 <= 1'b0;
         end else begin
@@ -298,15 +329,32 @@ module kv_bank #(
                     w_pbase <= ((wq_layer*2 + {3'b0,wq_kv})*NHEAD + {2'b0,wq_head})*TMAX
                                 + {3'b0,wq_pos};
                     minv <= 32'sh7FFFFFFF; maxv <= 32'sh80000000;
+                    qm_v <= 1'b0;
                     w_vi <= 0; wst <= W_COLL;
                 end
-                W_COLL: if (wq_valid) begin
-                    vecbuf[w_vi*P*32 +: P*32] <= wq_data;
-                    if (beat_min < minv) minv <= beat_min;
-                    if (beat_max > maxv) maxv <= beat_max;
-                    if (w_vi == HR-1) begin
-                        wst <= W_SCALE;
-                    end else w_vi <= w_vi + 1'b1;
+                W_COLL: begin
+                    // merge stage: the PREVIOUS beat's registered quad min/max
+                    if (qm_v) begin
+                        if (qmn < minv) minv <= qmn;
+                        if (qmx > maxv) maxv <= qmx;
+                    end
+                    qm_v <= wq_valid;
+                    if (wq_valid) begin
+                        vecbuf[w_vi*P*32 +: P*32] <= wq_data;
+                        qm_min0 <= quad_min[0]; qm_min1 <= quad_min[1];
+                        qm_max0 <= quad_max[0]; qm_max1 <= quad_max[1];
+                        if (w_vi == HR-1) begin
+                            wst <= W_MMD;
+                        end else w_vi <= w_vi + 1'b1;
+                    end
+                end
+                W_MMD: begin
+                    // drain: merge the LAST beat's pending quads (qm_v is always
+                    // set here — W_COLL exits on a wq_valid beat)
+                    if (qmn < minv) minv <= qmn;
+                    if (qmx > maxv) maxv <= qmx;
+                    qm_v <= 1'b0;
+                    wst <= W_SCALE;
                 end
                 W_SCALE: begin
                     // scale = rdiv(span,255) = ((span+127)*0x80808081)>>39 (EXACT;
@@ -327,12 +375,18 @@ module kv_bank #(
                     // inv_rd (sync ROM read at w_scale) lands NOW
                     w_inv <= inv_rd;
                     w_qi  <= 0;
+                    qd_v  <= 1'b0;
                     wst   <= W_QNT;
                 end
                 W_QNT: begin
-                    // stage P codes/cycle into the position row, commit once whole
-                    wstage[w_qi*P*KBITS +: P*KBITS] <= q_codes;
-                    if (w_qi == HR-1) wst <= W_CWR;
+                    // stage A: register row w_qi's diffs (vecbuf row-mux + subtract)
+                    qd_r   <= qd_now;
+                    w_qi_d <= w_qi;
+                    qd_v   <= (w_qi != HR);
+                    // stage B: codes for row w_qi_d land ONE cycle behind; the
+                    // w_qi == HR drain cycle writes the last row, then commit
+                    if (qd_v) wstage[w_qi_d*P*KBITS +: P*KBITS] <= q_codes;
+                    if (w_qi == HR) wst <= W_CWR;
                     else w_qi <= w_qi + 1'b1;
                 end
                 W_CWR: if (cwr_fire) begin
