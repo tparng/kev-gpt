@@ -1344,3 +1344,24 @@ plus one more small trim gets there — IF 200 closes, which now means fixing
 accb: pipeline the bank-select mux out of the accumulate loop or go
 carry-save. Clock alone is dead past 166.7 (doc-6's lesson, again, measured);
 cycles+MAC-surgery is the road.
+
+## 42. The trims hit the routing wall: 200MHz build UNROUTABLE (182k overlaps)
+
+The cycle-trims RTL (§ schedule trims, 10,362 cyc/tok) built at the 200MHz
+target FAILED route: "Design is not legally routed. There are 182340 node
+overlaps" (router stuck reducing 349k→272k→182k). It PLACED — LUT 92.58%
+(108,426, up from the R5 build's 90.94%), BRAM 133/144, URAM 64/64, DSP
+1215/1248 — but could not legally ROUTE. The trims (KV feeder arbitration,
+groupwise-RB gdone gating, LN fusion) added ~1,900 LUT + control nets on a
+device already URAM-full / BRAM-DSP near-full, crossing the routing-congestion
+cliff (the doc-6 lesson: at this density, logic-for-cycles can be a net loss).
+
+KEY: this was the 5ns (200MHz) target. An aggressive target makes the placer
+SPREAD logic to shorten paths, which on a packed device is what creates the
+routing congestion. Retry at 8ns (125MHz target) — looser timing packs tighter
+and often routes where the aggressive target can't; then the board fclk sweep
+finds the real silicon clock (R5 closed −3.75 STA yet ran 166.7). With 10,362
+cyc, even ~150MHz board = 14.5k (> the 13,162 record). If 125-target ALSO fails
+to route, the trims are fundamentally too dense and the R5 build (13,162 @166.7,
+deployed) stands as the faithful ceiling — 20k then needs the K4/smaller-model
+lever, not more logic.
