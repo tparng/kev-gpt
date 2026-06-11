@@ -40,8 +40,8 @@ from websockets.http11 import Response
 from .backend import InferRequest
 from .backend_stub import StubBackend
 from .protocol import (MSG_AUTHORITATIVE, MSG_ENTER, MSG_KEYSTROKE,
-                       MSG_SPECULATION, BatchAssembler, Coalescer, Reason,
-                       freshness_blit)
+                       MSG_SPECULATION, MSG_STREAM, MSG_STREAM_END,
+                       BatchAssembler, Coalescer, Reason, freshness_blit)
 from .telemetry import JsonlSink, Telemetry
 
 
@@ -122,6 +122,15 @@ class Hub:
             await asyncio.sleep(self.tick_s)
 
     async def _run_batch(self, reqs, jobs, submitted_at):
+        # STREAMING PATH: a lone AUTHORITATIVE job is the Enter freshness-miss —
+        # stream it char-by-char so the first char shows after one token instead
+        # of the full ~100ms reply. Speculations and multi-job batches keep the
+        # one-shot path (a precomputed spec is blitted whole; streaming it buys
+        # nothing). _run_stream owns the in-flight decrement for this branch.
+        if (len(jobs) == 1 and jobs[0].reason is Reason.AUTHORITATIVE
+                and hasattr(self.backend, "infer_stream")):
+            await self._run_stream(reqs[0], jobs[0], submitted_at)
+            return
         try:
             outcome = await self.backend.infer_batch(reqs)
         except Exception:
@@ -153,6 +162,37 @@ class Hub:
         self.total_tokens += tokens
         self.tel.on_batch(busy_s=outcome.busy_s, filled=outcome.filled,
                           capacity=outcome.capacity, tokens=tokens)
+
+    async def _run_stream(self, req, job, submitted_at):
+        """Stream one Enter-miss completion: forward each fabric char to the
+        client as a `stream` frame, then a `stream_end` with the tidied final.
+        Owns the in-flight slot release (the streaming branch of _run_batch
+        skips that method's finally)."""
+        cid = job.client_id
+
+        async def on_chunk(text):
+            await self.send(cid, {"type": MSG_STREAM, "prompt": job.prompt,
+                                  "text": text})
+        try:
+            completion, busy_s = await self.backend.infer_stream(req, on_chunk)
+        except Exception:
+            # release the client so a later Enter re-queues, and close the bubble
+            self.asm.on_result(cid, None)
+            await self.send(cid, {"type": MSG_STREAM_END, "prompt": job.prompt,
+                                  "completion": ""})
+            return
+        finally:
+            self._inflight_n -= 1
+        deliver_t = time.perf_counter()
+        self.asm.on_result(cid, job.prompt)
+        elig = self._submit_t.get(cid, submitted_at)
+        self.tel.add_latency((deliver_t - elig) * 1000.0)
+        self.total_tokens += len(completion)
+        self.tel.on_batch(busy_s=busy_s, filled=1,
+                          capacity=getattr(self.backend, "capacity", 1),
+                          tokens=len(completion))
+        await self.send(cid, {"type": MSG_STREAM_END, "prompt": job.prompt,
+                              "completion": completion})
 
     # ---- telemetry loop --------------------------------------------------
     async def telemetry_loop(self):

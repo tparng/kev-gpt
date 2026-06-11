@@ -44,6 +44,8 @@ MSG_ENTER = "enter"           # {type, prompt, seq}  user committed; blit or re-
 # Server -> client
 MSG_SPECULATION = "speculation"   # {type, prompt, completion, infer_ms}
 MSG_AUTHORITATIVE = "authoritative"  # {type, prompt, completion, infer_ms}
+MSG_STREAM = "stream"             # {type, prompt, text}  one char-chunk of an Enter-miss
+MSG_STREAM_END = "stream_end"     # {type, prompt, completion}  the tidied final
 MSG_TELEMETRY = "telemetry"       # {type, ...aggregate...} (optional per-client echo)
 
 

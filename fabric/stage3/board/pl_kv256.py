@@ -195,7 +195,10 @@ class PLKV256Device:
         """The fabric's on-chip argmax (fast/greedy) or a host-side sample."""
         return self._sample(self._read_logits()) if self.temp > 0 else argmax_tok
 
-    def _gen_one(self, prompt: str) -> str:
+    def _stream_gen(self, prompt: str):
+        """Generator: yield each decoded char AS the fabric produces it. Holds NO
+        lock (the caller serializes). Shared by the batch path (_gen_one) and the
+        streaming path (stream_into) so the two cannot drift."""
         ids = self._enc((prompt or "").strip().lower())
         if not ids:
             ids = self._enc("\n") or [0]
@@ -209,12 +212,28 @@ class PLKV256Device:
         L = len(ids)
         text = ""
         for g in range(self.gen_chars):          # feedback phase
-            text += self._dec([nxt])
+            ch = self._dec([nxt])
+            text += ch
+            yield ch
             if any(stp in text for stp in self._STOPS):
                 break                            # _tidy drops the rest anyway
             if g + 1 < self.gen_chars:
                 nxt = self._next(self._go(nxt, L + g))
-        return self._tidy(text)
+
+    def _gen_one(self, prompt: str) -> str:
+        return self._tidy("".join(self._stream_gen(prompt)))
+
+    def stream_into(self, prompt: str, on_char) -> str:
+        """Run ONE streaming generation under the serial lock, calling
+        on_char(ch) as each char lands; return the tidied completion. The daemon
+        uses this for the Enter-miss path so time-to-first-char is one token, not
+        the full reply."""
+        with self._lock:
+            text = ""
+            for ch in self._stream_gen(prompt):
+                text += ch
+                on_char(ch)
+            return self._tidy(text)
 
     @staticmethod
     def _tidy(text: str) -> str:

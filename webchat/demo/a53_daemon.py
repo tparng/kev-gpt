@@ -109,6 +109,27 @@ class TcpPLBackend:
         return await asyncio.wait_for(read_frame(self._reader, self.use_msgpack),
                                       self.rpc_timeout)
 
+    async def infer_stream(self, req, on_chunk):
+        """Stream ONE prompt: send {prompts:[p], stream:true}, deliver each
+        {chunk} to on_chunk(text) as it arrives, return (completion, busy_s) on
+        the final frame. The server uses this for the Enter freshness-miss so the
+        first char shows after one token. No mid-stream retry (re-streaming would
+        double the chars on the client); a clean socket error before any chunk
+        falls through to the caller's release path."""
+        async with self._lock:
+            await self._ensure_conn()
+            self._writer.write(encode({"prompts": [req.prompt], "stream": True},
+                                      self.use_msgpack))
+            await self._writer.drain()
+            while True:
+                frame = await asyncio.wait_for(
+                    read_frame(self._reader, self.use_msgpack), self.rpc_timeout)
+                if "chunk" in frame:
+                    await on_chunk(frame["chunk"])
+                else:
+                    comp = (frame.get("completions") or [""])[0]
+                    return comp, float(frame.get("busy_ms", 0.0)) / 1000.0
+
     async def infer_batch(self, reqs):
         from .backend import BatchOutcome, InferResult
         prompts = [r.prompt for r in reqs]
@@ -165,13 +186,52 @@ class PLDevice:
             pass
 
 
+async def _stream_one(dev, prompt, writer, use_msgpack):
+    """Run ONE streaming generation: the device produces chars on an executor
+    thread (it's blocking MMIO), bridged to this async writer through a queue so
+    each char is framed as {chunk} the instant it lands, then a final
+    {completions, busy_ms, done}."""
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+    t0 = time.monotonic()
+
+    def work():
+        try:
+            full = dev.stream_into(
+                prompt, lambda ch: loop.call_soon_threadsafe(q.put_nowait, ("c", ch)))
+            loop.call_soon_threadsafe(q.put_nowait, ("done", full))
+        except Exception as exc:                       # noqa: BLE001
+            loop.call_soon_threadsafe(q.put_nowait, ("err", str(exc)))
+
+    fut = loop.run_in_executor(None, work)
+    try:
+        while True:
+            kind, val = await q.get()
+            if kind == "c":
+                writer.write(encode({"chunk": val}, use_msgpack))
+                await writer.drain()
+            else:
+                dt = round((time.monotonic() - t0) * 1000.0, 2)
+                writer.write(encode(
+                    {"completions": [val if kind == "done" else ""],
+                     "busy_ms": dt, "done": True}, use_msgpack))
+                await writer.drain()
+                break
+    finally:
+        await fut
+
+
 async def handle_conn(reader, writer, dev, use_msgpack):
-    """One i7 connection: stream of {prompts:[...]} batches -> {completions:[...]}."""
+    """One i7 connection: batches {prompts:[...]} -> {completions:[...]}, or a
+    streaming request {prompts:[p], stream:true} -> {chunk}* {completions,done}."""
     peer = writer.get_extra_info("peername")
     try:
         while True:
             req = await read_frame(reader, use_msgpack)
             prompts = list(req.get("prompts", []))
+            if req.get("stream") and prompts and hasattr(dev, "stream_into"):
+                await _stream_one(dev, prompts[0], writer, use_msgpack)
+                continue
             t0 = time.monotonic()
             comps = await dev.infer(prompts)
             dt_ms = (time.monotonic() - t0) * 1000.0

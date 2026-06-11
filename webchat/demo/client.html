@@ -113,6 +113,21 @@ function connect(){
          blit(m.prompt, m.completion);
        }
      }
+   } else if(m.type==='stream'){
+     // Enter-miss: the fabric is streaming chars as it generates. Append them
+     // into the "…" bubble the moment they arrive (first char ~1 token, not the
+     // whole reply) so you watch Kevin type at fabric speed.
+     if(pendingWait && pendingWait.prompt===m.prompt){
+       if(!pendingWait.streaming){ pendingWait.el.textContent=''; pendingWait.streaming=true; }
+       pendingWait.el.textContent += m.text;
+       log.scrollTop=log.scrollHeight;
+     }
+   } else if(m.type==='stream_end'){
+     if(pendingWait && pendingWait.prompt===m.prompt){
+       if(m.completion) pendingWait.el.textContent=m.completion;  // snap to tidied
+       pendingWait=null; bufPrompt=null; bufCompletion=null;
+       log.scrollTop=log.scrollHeight;
+     }
    } else if(m.type==='stats'){ renderStats(m); }
    else if(m.type==='blit_ok'){ /* server agreed; we already blitted */ }
  };
