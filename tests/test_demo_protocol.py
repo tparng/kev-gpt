@@ -80,6 +80,33 @@ def test_enter_refire_supersedes_and_is_authoritative():
     assert due[0][1].prompt == "hello"
 
 
+def test_enter_queue_every_committed_message_is_answered_in_order():
+    # spamming Enter must not LOSE messages (the "… never pops in" bug): each
+    # committed Enter is queued and answered FIFO, one at a time (serial fabric).
+    co = Coalescer(debounce_ms=50)
+    asm = BatchAssembler(co, batch=16)
+    for i, p in enumerate(["p1", "p2", "p3"]):
+        co.on_enter_refire("a", p, i + 1, now=0.0)
+    got = []
+    for _ in range(3):
+        jobs = asm.assemble(now=0.1)
+        assert len(jobs) == 1                # one in flight at a time
+        assert asm.assemble(now=0.1) == []   # blocked until the result returns
+        got.append(jobs[0].prompt)
+        asm.on_result("a", jobs[0].prompt)
+    assert got == ["p1", "p2", "p3"]         # all answered, in order
+
+
+def test_enter_queue_capped_drops_oldest():
+    co = Coalescer(debounce_ms=50)
+    for i in range(Coalescer.AUTH_CAP + 3):
+        co.on_enter_refire("a", f"p{i}", i, now=0.0)
+    q = list(co.client("a").auth_q)
+    assert len(q) == Coalescer.AUTH_CAP      # capped
+    assert q[0].prompt == "p3"               # the 3 oldest fell off
+    assert co.dropped == 3
+
+
 # ---- batch assembly --------------------------------------------------------
 def test_batch_caps_at_capacity_and_reports_queue_depth():
     co = Coalescer(debounce_ms=10)

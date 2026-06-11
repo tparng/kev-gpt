@@ -79,8 +79,17 @@ let ws, seq=0, debTimer=null;
 // the speculation buffer: completion the server computed for `bufPrompt`.
 let bufPrompt=null, bufCompletion=null;
 let lastSentAt=0, lastSentPrompt=null;
-// a pending "…" bubble waiting for an authoritative completion (freshness miss)
-let pendingWait=null;
+// FIFO of "…" bubbles awaiting an answer (one per Enter that missed the buffer).
+// A list, not a single slot, so a burst of Enters can't orphan earlier bubbles.
+let pendingWaits=[];
+function oldestWait(prompt){           // the oldest unfilled bubble for this prompt
+ for(const pw of pendingWaits){ if(pw.prompt===prompt) return pw; }
+ return null;
+}
+function finishWait(pw){
+ if(pw.timer) clearTimeout(pw.timer);
+ const i=pendingWaits.indexOf(pw); if(i>=0) pendingWaits.splice(i,1);
+}
 
 function add(cls,txt){const d=document.createElement('div');d.className='msg '+cls;
  d.textContent=txt||'';log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
@@ -102,31 +111,25 @@ function connect(){
      if(m.prompt===lastSentPrompt&&lastSentAt){
        latEl.innerHTML='<b>'+Math.round(performance.now()-lastSentAt)+' ms</b>';
      }
-     if(m.type==='authoritative'){ // a buffer miss was resolved -> fill it in
-       if(pendingWait && pendingWait.prompt===m.prompt){
-         // fill the "…" placeholder we already showed on Enter (silently)
-         pendingWait.el.textContent=m.completion;
-         pendingWait=null;
-         bufPrompt=null; bufCompletion=null;
-         log.scrollTop=log.scrollHeight;
-       } else {
-         blit(m.prompt, m.completion);
-       }
+     if(m.type==='authoritative'){ // a buffer miss was resolved (non-stream) -> fill
+       const pw=oldestWait(m.prompt);
+       if(pw){ pw.el.textContent=m.completion||'(no reply)'; finishWait(pw);
+               bufPrompt=null; bufCompletion=null; log.scrollTop=log.scrollHeight; }
+       else { blit(m.prompt, m.completion); }
      }
    } else if(m.type==='stream'){
      // Enter-miss: the fabric is streaming chars as it generates. Append them
-     // into the "…" bubble the moment they arrive (first char ~1 token, not the
-     // whole reply) so you watch Kevin type at fabric speed.
-     if(pendingWait && pendingWait.prompt===m.prompt){
-       if(!pendingWait.streaming){ pendingWait.el.textContent=''; pendingWait.streaming=true; }
-       pendingWait.el.textContent += m.text;
-       log.scrollTop=log.scrollHeight;
-     }
+     // into the matching "…" bubble the moment they arrive (first char ~1 token,
+     // not the whole reply) so you watch Kevin type at fabric speed.
+     const pw=oldestWait(m.prompt);
+     if(pw){ if(!pw.streaming){ pw.el.textContent=''; pw.streaming=true; }
+             pw.el.textContent += m.text; log.scrollTop=log.scrollHeight; }
    } else if(m.type==='stream_end'){
-     if(pendingWait && pendingWait.prompt===m.prompt){
-       if(m.completion) pendingWait.el.textContent=m.completion;  // snap to tidied
-       pendingWait=null; bufPrompt=null; bufCompletion=null;
-       log.scrollTop=log.scrollHeight;
+     const pw=oldestWait(m.prompt);
+     if(pw){
+       if(m.completion) pw.el.textContent=m.completion;        // snap to tidied
+       else if(!pw.streaming) pw.el.textContent='(no reply)';  // never leave a stuck …
+       finishWait(pw); bufPrompt=null; bufCompletion=null; log.scrollTop=log.scrollHeight;
      }
    } else if(m.type==='stats'){ renderStats(m); }
    else if(m.type==='blit_ok'){ /* server agreed; we already blitted */ }
@@ -175,10 +178,19 @@ function onEnter(e){
  if(bufPrompt===cur && bufCompletion!=null){
    blit(cur, bufCompletion);            // already there — instant, no round trip
  } else {
-   // buffer not ready yet -> show the user line + a quiet "…" until it lands
+   // buffer not ready yet -> show the user line + a quiet "…" until it lands.
+   // Queue the bubble (a burst of Enters each gets its own) and arm a safety-net
+   // timeout so a dropped/lost reply can never leave a "…" hanging forever.
    add('you',cur); inp.value='';
    const wait=add('kev','…'); wait.dataset.waiting='1';
-   pendingWait={el:wait, prompt:cur};
+   const pw={el:wait, prompt:cur, streaming:false, seq:seq};
+   pw.timer=setTimeout(()=>{
+     if(pendingWaits.includes(pw)){
+       if(!pw.streaming) pw.el.textContent='(kevin lost his train of thought — try again)';
+       finishWait(pw);
+     }
+   }, 15000);
+   pendingWaits.push(pw);
  }
  return false;
 }

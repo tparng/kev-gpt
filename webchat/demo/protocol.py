@@ -31,6 +31,7 @@ tests can supply a fake clock; nothing here calls time.monotonic() itself.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import enum
 from typing import Optional
@@ -75,9 +76,13 @@ class ClientState:
     """
     client_id: str
     pending: Optional[PendingPrompt] = None
-    inflight: bool = False           # a speculation for this client is in a batch
+    inflight: bool = False           # a job for this client is in a batch
     last_keystroke_at: float = 0.0   # for "active user" accounting
     last_speculated: Optional[str] = None   # prompt of last completion we sent
+    # committed Enters QUEUE here (FIFO) so every one gets a reply even under a
+    # burst — unlike `pending` (a single latest-wins speculation slot).
+    auth_q: "collections.deque[PendingPrompt]" = dataclasses.field(
+        default_factory=collections.deque)
 
     # amplification counters (monotonic, per client)
     keystrokes: int = 0
@@ -93,6 +98,8 @@ class Coalescer:
     has elapsed and that have no speculation already in flight — those become
     batch jobs.
     """
+
+    AUTH_CAP = 8   # max queued Enters per client (a spammer can't grow it forever)
 
     def __init__(self, debounce_ms: float = 50.0):
         self.debounce_s = debounce_ms / 1000.0
@@ -119,28 +126,38 @@ class Coalescer:
         )
 
     def on_enter_refire(self, client_id: str, prompt: str, seq: int, now: float) -> None:
-        """Queue an AUTHORITATIVE inference (freshness miss on Enter). Bypasses
-        the debounce window — the user is already waiting — and supersedes any
-        pending speculation for this client."""
+        """QUEUE an AUTHORITATIVE inference (freshness miss on Enter). An Enter is
+        a committed message, so unlike a keystroke it does NOT supersede — it is
+        appended to the client's FIFO queue so every Enter gets a reply, in order,
+        even when the user spams them faster than the fabric drains. Bypasses the
+        debounce window (the user is already waiting). A not-yet-run speculation
+        for this client is now stale intent and is dropped. The queue is capped so
+        a spammer can't grow it without bound (oldest un-started Enter falls off)."""
         cs = self.client(client_id)
         if cs.pending is not None and cs.pending.reason is Reason.SPECULATION:
             self.dropped += 1
-        cs.pending = PendingPrompt(
+            cs.pending = None
+        cs.auth_q.append(PendingPrompt(
             prompt=prompt, seq=seq, arrived_at=now,
             ready_at=now, reason=Reason.AUTHORITATIVE,
-        )
+        ))
+        while len(cs.auth_q) > self.AUTH_CAP:
+            cs.auth_q.popleft()
+            self.dropped += 1
 
     def due(self, now: float) -> list[tuple[str, PendingPrompt]]:
-        """Return (client_id, PendingPrompt) for every client whose pending
-        prompt is past its debounce window and has no speculation in flight.
-        Sorted by ready_at (FIFO) so the batch assembler is fair-ish."""
+        """Return (client_id, PendingPrompt) for every client with a job ready and
+        nothing in flight: a queued Enter (committed, FIFO, takes priority) else a
+        speculation past its debounce window. Sorted by ready_at so the assembler
+        is fair-ish across clients."""
         out: list[tuple[str, PendingPrompt]] = []
         for cid, cs in self.clients.items():
-            p = cs.pending
-            if p is None or cs.inflight:
+            if cs.inflight:
                 continue
-            if now >= p.ready_at:
-                out.append((cid, p))
+            if cs.auth_q:                       # committed Enters first (FIFO head)
+                out.append((cid, cs.auth_q[0]))
+            elif cs.pending is not None and now >= cs.pending.ready_at:
+                out.append((cid, cs.pending))
         out.sort(key=lambda kp: kp[1].ready_at)
         return out
 
@@ -175,7 +192,10 @@ class BatchAssembler:
             cs = self.co.client(cid)
             cs.inflight = True
             cs.inferences += 1
-            cs.pending = None
+            if cs.auth_q and cs.auth_q[0] is p:   # popped the Enter we scheduled
+                cs.auth_q.popleft()
+            else:
+                cs.pending = None
             jobs.append(BatchJob(client_id=cid, prompt=p.prompt,
                                  seq=p.seq, reason=p.reason))
         return jobs
@@ -187,7 +207,10 @@ class BatchAssembler:
         plots. It counts everything past its debounce window and not in flight,
         minus what a single batch can absorb."""
         ready = len(self.co.due(now))
-        return max(0, ready - self.batch)
+        # plus the queued Enters behind each client's head (committed, waiting)
+        backlog = sum(max(0, len(cs.auth_q) - 1)
+                      for cs in self.co.clients.values())
+        return max(0, ready - self.batch) + backlog
 
     def on_result(self, client_id: str, prompt: str) -> None:
         """Mark a client's speculation no longer in flight + record the prompt
