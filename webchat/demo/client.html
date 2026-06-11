@@ -173,9 +173,11 @@ function onEnter(e){
  e.preventDefault();
  const cur=inp.value.trim(); if(!cur)return false;
  seq++;
- ws.send(JSON.stringify({type:'enter',prompt:cur,seq:seq}));
- // freshness check, client side: blit instantly if the buffer matches EXACTLY.
- if(bufPrompt===cur && bufCompletion!=null){
+ // The CLIENT decides blit-vs-reply and TELLS the server, which obeys (no
+ // independent server freshness check that could disagree and strand a "…").
+ const fresh = (bufPrompt===cur && bufCompletion!=null);
+ ws.send(JSON.stringify({type:'enter',prompt:cur,seq:seq,blitted:fresh}));
+ if(fresh){
    blit(cur, bufCompletion);            // already there — instant, no round trip
  } else {
    // buffer not ready yet -> show the user line + a quiet "…" until it lands.

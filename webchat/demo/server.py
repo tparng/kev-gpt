@@ -287,13 +287,20 @@ async def client_handler(ws, hub: Hub):
                 # instant), so it excludes the debounce but includes queue wait.
                 hub._eligible_perf[cid] = time.perf_counter() + hub.co.debounce_s
             elif mtype == MSG_ENTER:
-                cs = hub.co.client(cid)
-                if freshness_blit(cs, prompt):
-                    # fresh buffer -> the client blits locally; record the hit
-                    hub.tel.on_enter(blitted=True)
-                    await ws.send(json.dumps({"type": "blit_ok", "prompt": prompt}))
+                # THE CLIENT IS THE AUTHORITY on blit-vs-reply. It alone knows
+                # whether its buffer held the EXACT prompt; the server's own
+                # last_speculated can disagree (e.g. a stream updates it but not
+                # the client's buffer), which used to leave a "…" with no reply
+                # ever coming. So trust msg.blitted: if the client blitted, just
+                # count it; otherwise ALWAYS queue a reply. (A legacy client
+                # without the flag falls back to the server freshness check.)
+                if "blitted" in msg:
+                    blitted = bool(msg["blitted"])
                 else:
-                    # stale/absent -> one authoritative inference, no blit
+                    blitted = freshness_blit(hub.co.client(cid), prompt)
+                if blitted:
+                    hub.tel.on_enter(blitted=True)
+                else:
                     hub.tel.on_enter(blitted=False)
                     hub.co.on_enter_refire(cid, prompt, seq, now)
                     hub._eligible_perf[cid] = time.perf_counter()  # eligible now
