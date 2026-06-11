@@ -46,6 +46,10 @@ module gemv_banked_resident_vec #(
     // run
     input  wire                          start,
     output reg                           done,
+    // committed-group count (groupwise RB overlap): increments the cycle group
+    // g's ymem word commits, so the host may drain rows of groups < gdone while
+    // the MAC computes the next group. Reset on start.
+    output reg  [3:0]                    gdone,
     // readback: P INT32 outputs per address (2-cycle latency)
     input  wire [$clog2(MMAX/P)-1:0]     rd_addr,
     output reg  [P*32-1:0]               y_out,
@@ -200,7 +204,7 @@ module gemv_banked_resident_vec #(
         end
 
         if (rst) begin
-            state <= IDLE; done <= 1'b0;
+            state <= IDLE; done <= 1'b0; gdone <= 4'd0;
             g <= 0; kc <= 0; kmac <= 0; accb <= {YBITS{1'b0}}; grp_base <= 0;
             for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v2_p[i] <= 1'b0; end
             add_v <= 1'b0; add_v2 <= 1'b0;
@@ -210,6 +214,7 @@ module gemv_banked_resident_vec #(
                     done <= 1'b0;
                     if (start) begin
                         g <= 0; kc <= 0; kmac <= 0; accb <= {YBITS{1'b0}};
+                        gdone <= 4'd0;
                         grp_base <= w_base;
                         for (i = 0; i < RLAT; i = i + 1) begin
                             v_p[i] <= 1'b0; v2_p[i] <= 1'b0;
@@ -232,6 +237,7 @@ module gemv_banked_resident_vec #(
                     end
                     if (kmac == k_count) begin
                         ymem[g[$clog2(GROUPS)-1:0]] <= accb;
+                        gdone <= gdone + 4'd1;
                         if (g == gcount - 1) state <= FIN;
                         else begin
                             g <= g + 1'b1; kc <= 0; kmac <= 0;

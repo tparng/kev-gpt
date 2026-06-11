@@ -67,6 +67,7 @@ module sequencer_vec #(
     localparam integer ROWS3 = D3   / P;
     localparam integer ROWSM = D_MLP/ P;
     localparam integer LSH   = $clog2(P);
+    localparam integer GRPSH = $clog2(LANES/P);   // P-rows per ymem group word (shift)
     localparam integer DQROWS = (DQ_N + P - 1) / P;
     // weight bases (LANES=16) and dequant channel-row bases (/P)
     localparam integer GW_QKV  = ((D3   + LANES-1)/LANES) * D;   // 12288
@@ -196,6 +197,7 @@ module sequencer_vec #(
     reg [10:0]         gv_m, gv_k;
     reg [$clog2(WWORDS)-1:0] gv_wbase;
     wire               gv_done;
+    wire [3:0]         gv_gdone;           // committed-group count (RB overlap)
     reg [10:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
     wire [LANES*8-1:0] emb_pair;            // pair-read data (RPP embed rows)
@@ -204,7 +206,7 @@ module sequencer_vec #(
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
         .x_we(gv_xwe), .x_data(gv_xdata),
-        .start(gv_start), .done(gv_done),
+        .start(gv_start), .done(gv_done), .gdone(gv_gdone),
         .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),
         .emb_sel(emb_sel_w), .emb_addr(emb_addr_w), .emb_pair(emb_pair));
 
@@ -257,15 +259,29 @@ module sequencer_vec #(
     reg [P*32-1:0] ctxbufA [0:HR-1];
     reg [P*32-1:0] ctxbufB [0:HR-1];
     reg [4:0]  cdr;                         // ctx drain counter (0..2*HR-1)
-    // R4f: KV-write FEEDER — heads 2..3 quantise into kv_bank DURING pair-0's
-    // attention, sharing the main S_KVW machinery (fr/frv/kvw_h/kvw_kv) which is
-    // temporally exclusive. The qkv_bank read port is arbitrated: S_ALD's q
-    // streams win; the feeder pauses (addr presented only when granted, the
-    // in-flight beat completes regardless — qkv_r was latched from our address).
+    // KV-write FEEDER (R4f, extended to ALL writes): every (head, K/V) of the
+    // new position quantises into kv_bank through this mini-FSM, STARTED AT THE
+    // QKV DISPATCH so the K writes hide under the qkv GEMV+readback. Ordering
+    // (NHEAD=4, head pairs (0,1)/(2,3)): K h0,h1,h2,h3 then V h1,h0,h3,h2 —
+    // K-first so attention pairs can start on kvp_done counts (pair0 >= 2,
+    // pair1 >= 4); within each V pair, engine B's head FIRST so its commit
+    // lands in stream A's K->V gap instead of stalling behind engine A's
+    // T-beat V read (W_CWR commits only while read-stream A is idle).
+    // Data-ready gate: row fr of the current vector may be consumed only once
+    // the qkv readback has written it (kvw_src < qkv_wrow). The qkv_bank read
+    // port is arbitrated: S_ALD's q streams win; the feeder pauses (addr
+    // presented only when granted, the in-flight beat completes regardless).
+    // V reads are interlocked: at_kdone latches a pending flag, kb_rstart
+    // fires once kvp_done covers that engine's V write (vneedA/vneedB).
     localparam [1:0] KF_IDLE=2'd0, KF_S=2'd1, KF_F=2'd2, KF_W=2'd3;
     reg [1:0] kvf_st;
     reg       kvf_active;
+    reg [3:0] kvp_done;                     // completed (head,K/V) writes 0..8
+    reg [10:0] qkv_wrow;                    // qkv rows committed by G_RB so far
+    reg       vpA, vpB;                     // V-read pending (kdone seen, write not)
     wire      kvf_grant = (st != S_ALD) && (st != S_KVW_F);
+    wire [3:0] vneedA = {2'b0, hh} + 4'd6;  // V write index for engine A's head
+    wire [3:0] vneedB = {2'b0, hB} + 4'd4;  // V write index for engine B's head
 
     // ---- kv_bank: the on-chip K8/V8 cache making decode faithful ---------------
     reg         kb_wstart, kb_wvalid, kb_rstart, kb_rkv, kb2_rstart, kb2_rkv;
@@ -382,6 +398,11 @@ module sequencer_vec #(
     wire [10:0] attn_ra   = (st==S_RES1) ? ci : rbr;
     wire [10:0] mlp_ra    = (st==S_RES2) ? ci : rbr;
     wire [10:0] head_ra   = (st==S_ARGMAX) ? {{(11-$clog2(ARROWS+1)){1'b0}}, ar} : rbr;
+    // LN FEED FUSION: every LN call is fed DURING the state that produces its
+    // input rows (S_EMB commit / S_RES1 / S_RES2), so the gamma read tracks the
+    // producer's row counter (eb_row in S_EMB — issued one cycle ahead of the
+    // commit stage; ci elsewhere). L_GAM/L_FEED are retired.
+    wire [10:0] gam_fr    = (st==S_EMB) ? {{(11-$clog2(ROWSM+1)){1'b0}}, eb_row} : ci;
 
     always @(posedge clk) begin
         xres_r   <= xres_bank  [xres_ra];
@@ -393,7 +414,7 @@ module sequencer_vec #(
         mlpbuf_r <= mlpbuf_bank[mlpbuf_ra];
         mlp_r    <= mlp_bank   [mlp_ra];
         head_r   <= head_bank  [head_ra];
-        gam_r    <= gamma_w  [l_gbase*EROWS + fr];
+        gam_r    <= gamma_w  [l_gbase*EROWS + gam_fr];
     end
 
     always @(posedge clk) begin
@@ -406,10 +427,14 @@ module sequencer_vec #(
             rv0<=0; rv1<=0; rv2<=0;
             civ<=0; frv<=0; arv<=0; wiv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0;
             kvf_st<=KF_IDLE; kvf_active<=1'b0;
+            kvp_done<=4'd0; qkv_wrow<=11'd0; vpA<=1'b0; vpB<=1'b0;
         end else begin
             case (st)
                 S_IDLE: if (go) begin
-                    fr<=0; frv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0; blk<=4'd0; st<=S_EMB;
+                    fr<=0; frv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0; blk<=4'd0;
+                    // block-0 LN1 is FED during the S_EMB commits (LN fusion)
+                    l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; ln_start<=1'b1;
+                    st<=S_EMB;
                 end
                 // ---- embed -> xres via the weight bank's embed port (log §36 plan 2):
                 // tok row then pos row per fr, serial (1 fetch/cycle, ~2*EROWS+2 cyc).
@@ -429,7 +454,12 @@ module sequencer_vec #(
                         erw_r <= epr[eb_sel*(P*32) +: P*32];
                     end
                     eb2_v <= eb_v; eb2_tp <= eb_tp; eb2_row <= eb_row;
-                    // commit stage: tacc hold / tok+pos sum, one cycle behind
+                    // commit stage: tacc hold / tok+pos sum, one cycle behind.
+                    // LN FUSION: each committed row is ALSO fed to the LN (ln_x
+                    // = the same sum, ln_g = the gamma row issued at the eb
+                    // stage) — block-0 LN1 loads during the embed, L_FEED dies.
+                    ln_vin <= eb2_v && eb2_tp;
+                    ln_g   <= gam_r;
                     if (eb2_v) begin
                         if (!eb2_tp) tacc <= erw_r;             // hold the tok row
                         else begin                              // pos row: sum + commit
@@ -437,10 +467,11 @@ module sequencer_vec #(
                                 ww[pp*32 +: 32] = $signed(tacc[pp*32 +: 32])
                                                 + $signed(erw_r[pp*32 +: 32]);
                             xres_bank[eb2_row] <= ww;
+                            ln_x <= ww;
                             if (eb2_row==ROWS-1) begin
                                 fr<=0; frv<=0; eb_v<=1'b0; eb2_v<=1'b0; etp<=1'b0;
                                 if (dbg_stop==2'd1) st<=S_FIN;       // DEBUG: stop after embed
-                                else begin l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; st<=L_GAM; end
+                                else begin orow<=0; st<=L_COLL; end
                             end
                         end
                     end
@@ -463,12 +494,18 @@ module sequencer_vec #(
                     end
                 end
                 // qkv GEMV setup (after LN1) and the GEMV call ------------------
-                // returns to S_KVW_S: the new position's k/v are quantised into
-                // kv_bank BEFORE attention reads positions 0..pos (R1 contract).
+                // The KV FEEDER is armed HERE: its K writes ride the qkv
+                // readback (data-ready gated), so attention starts as soon as
+                // the pair's K writes commit (R1 contract kept per-read via
+                // the kvp_done gates + V interlocks, not a serial S_KVW block).
                 S_QKVRET: begin
                     g_wbase<=blk*GW_BLK + WB_QKV; g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
                     g_asel<=blk*4 + 6'd0; g_frac<=7'd16; g_dqrow<=blk*DQB_P + DR_QKV; g_dst<=3'd0;
-                    g_ret<=S_KVW_S; ci<=0; civ<=0; hh<=2'd0; kvw_h<=2'd0; kvw_kv<=1'b0;
+                    g_ret<=S_AST; ci<=0; civ<=0;
+                    hh<=2'd0; hB<=2'd1; pair<=1'b0;
+                    kvw_h<=2'd0; kvw_kv<=1'b0;
+                    kvf_active<=1'b1; kvf_st<=KF_S; kvp_done<=4'd0; qkv_wrow<=11'd0;
+                    vpA<=1'b0; vpB<=1'b0;
                     gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // ============ KV quant-write: k then v, per head ==============
@@ -542,16 +579,27 @@ module sequencer_vec #(
                             aqw[pp*8 +: 8] = aq_int[7:0];
                         end
                         gv_xwe<=1'b1; gv_xdata<=aqw;
+                        // AQ/RUN OVERLAP (the §22/§24-proven SB lever, now here):
+                        // start the GEMV WITH the first act-row write. xmem row r
+                        // is written at edge firstxwe+1+r; the MAC (K2=1) first
+                        // reads row r at edge firstxwe+2+4r — the feed stays >=1
+                        // row ahead for all r, so the values the MAC consumes are
+                        // identical and the AQ feed hides under the MAC compute.
+                        if (cid3 == 11'd0) begin
+                            gv_m<=g_m; gv_k<=g_k;
+                            gv_wbase<=g_wbase[$clog2(WWORDS)-1:0];
+                            gv_start<=1'b1;
+                        end
                         if (cid3==(g_k >> LSH)-1) begin
-                            ci<=0; civ<=0; civ1<=0; civ2<=0; civ3<=0; st<=G_RUN;
+                            ci<=0; civ<=0; civ1<=0; civ2<=0; civ3<=0; st<=G_WAIT;
                         end
                     end
                 end
-                G_RUN: begin
-                    gv_m<=g_m; gv_k<=g_k; gv_wbase<=g_wbase[$clog2(WWORDS)-1:0];
-                    gv_start<=1'b1; st<=G_WAIT;
-                end
-                G_WAIT: if (gv_done) begin
+                // G_RUN retired: gv_start now fires inside G_AQ (AQ/RUN overlap)
+                G_WAIT: if (gv_gdone != 4'd0) begin
+                    // groupwise RB overlap: drain begins on the FIRST group commit,
+                    // not gv_done — rows of committed groups are final (the MAC
+                    // writes ymem[g] exactly once, at group g's commit).
                     ci<=0; gv_rdaddr<=0; rv0<=0; rv1<=0; rv2<=0; dor<=0; st<=G_RB;
                 end
                 G_RB: begin
@@ -560,11 +608,18 @@ module sequencer_vec #(
                     // dqm/dqe BRAM reads at rb1 land in the same cycle -> stream the
                     // dequant unit at 1 word/cycle. For g_dst==2 (mlp hidden), dequant
                     // output feeds vec_gelu in flight; exit when GELU drains.
+                    // Row issue is gated on the row's GROUP being committed
+                    // (ci>>GRPSH < gv_gdone): the drain rides the MAC, stalling
+                    // (rv0=0 bubbles) when it catches the in-flight group.
                     if (ci < ((g_m + P-1) >> LSH)) begin
-                        gv_rdaddr<=ci; rb0<=ci; ci<=ci+1'b1;
+                        if ({4'b0, ci} >> GRPSH < {11'b0, gv_gdone}) begin
+                            gv_rdaddr<=ci; rb0<=ci; ci<=ci+1'b1;
+                        end
                     end else gv_rdaddr <= ((g_m + P-1) >> LSH) - 1'b1;
                     rb1<=rb0; rb2<=rb1;
-                    rv0<=(ci < ((g_m + P-1) >> LSH)); rv1<=rv0; rv2<=rv1;
+                    rv0<=(ci < ((g_m + P-1) >> LSH))
+                         && ({4'b0, ci} >> GRPSH < {11'b0, gv_gdone});
+                    rv1<=rv0; rv2<=rv1;
                     mwr <= dqm_w[g_dqrow + rb1];
                     ewr <= dqe_w[g_dqrow + rb1];
                     if (rv2) begin
@@ -581,6 +636,9 @@ module sequencer_vec #(
                             else if ($signed(dqv) < -32'sd32768)  mword[pp*16 +: 16] = -16'sd32768;
                             else    mword[pp*16 +: 16] = dqv[15:0];
                         end
+                        // feeder data-ready horizon: rows 0..dor are committed
+                        if (g_dst == 3'd0)
+                            qkv_wrow <= {{(11-$clog2(ROWSM+1)){1'b0}}, dor} + 11'd1;
                         case (g_dst)
                             3'd0: qkv_bank [dor] <= dword;
                             3'd1: attn_bank[dor] <= dword;
@@ -592,6 +650,8 @@ module sequencer_vec #(
                         // On silicon the 6-bit address WRAPS (the §6 board bug); keep clean.
                         if (g_dst != 3'd2 && dor==((g_m + P-1) >> LSH)-1) begin
                             ci<=0; civ<=0; st<=g_ret;
+                            // LN fusion: arm the LN for the residual-state feed
+                            if (g_ret==S_RES1 || g_ret==S_RES2) ln_start<=1'b1;
                         end else dor<=dor+1'b1;
                     end
                     if (gl_vout) begin                     // collect GELU -> mlpbuf (Q.22)
@@ -605,9 +665,10 @@ module sequencer_vec #(
                     end
                 end
                 // ============ attention (R4e: twin engines, head pairs) ========
-                // pair 1 holds until the feeder has written heads 2..3 (only
-                // bites at tiny T; the feeder hides under pair-0 attention).
-                S_AST: if (!(pair && kvf_active)) begin
+                // a pair starts once ITS K writes have committed (pair0 needs
+                // K h0,h1 = writes 1..2; pair1 needs K h2,h3 = writes 3..4);
+                // the V writes are covered by the per-engine read interlocks.
+                S_AST: if (kvp_done >= (pair ? 4'd4 : 4'd2)) begin
                     at_startA<=1'b1; at_tcount<=pos + 9'd1;
                     wi<=9'd0; wic<=9'd0; wiv<=1'b0; ldv0<=1'b0; qsel<=1'b0;
                     adone_s<=1'b0; bdone_s<=1'b0; st<=S_ALD;
@@ -646,24 +707,30 @@ module sequencer_vec #(
                         if (pair) begin                           // -> proj GEMV
                             g_wbase<=blk*GW_BLK + WB_PROJ; g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
                             g_asel<=blk*4 + 6'd1; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_PROJ; g_dst<=3'd1;
+                            l_gbase<=blk*2 + 4'd1; l_dst<=1'b1; l_ret<=S_FCRET;  // LN2 (fed in S_RES1)
                             g_ret<=S_RES1; ci<=0; civ<=0; gv_ldrst<=1'b1; st<=G_AQ;
                         end else begin
                             pair<=1'b1; hh<=2'd2; hB<=2'd3; st<=S_AST;
                         end
                     end else cdr <= cdr + 5'd1;
                 end
-                // ---- res1: xres += attn_out (sync read, 1-cyc skew) ; then LN2 ----
+                // ---- res1: xres += attn_out (sync read, 1-cyc skew) ----
+                // LN FUSION: LN2 is fed the residual sum AS IT IS WRITTEN
+                // (ln_start fired at the proj G_RB exit; l_gbase/l_dst/l_ret
+                // were set at the proj dispatch) -> straight to L_COLL.
                 S_RES1: begin
                     cid <= ci; civ <= (ci != ROWS[10:0]);
                     if (ci != ROWS[10:0]) ci <= ci + 1'b1;
+                    ln_vin <= civ;
+                    ln_g   <= gam_r;
                     if (civ) begin
                         for (pp=0; pp<P; pp=pp+1)
                             sw[pp*32 +: 32] = $signed(xres_r[pp*32 +: 32])
                                             + $signed(attn_r[pp*32 +: 32]);
                         xres_bank[cid] <= sw;
+                        ln_x <= sw;
                         if (cid==ROWS-1) begin
-                            ci<=0; civ<=0;
-                            l_gbase<=blk*2 + 4'd1; l_dst<=1'b1; l_ret<=S_FCRET; st<=L_GAM;
+                            ci<=0; civ<=0; orow<=0; st<=L_COLL;
                         end
                     end
                 end
@@ -678,25 +745,34 @@ module sequencer_vec #(
                 S_MPSET: begin
                     g_wbase<=blk*GW_BLK + WB_MP; g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
                     g_asel<=blk*4 + 6'd3; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_MP; g_dst<=3'd3;
+                    // next LN (fed in S_RES2): block blk+1's LN1, or LN_f after the last block
+                    if (blk == NLAYER-1) begin
+                        l_gbase<=NLAYER*2;     l_dst<=1'b0; l_ret<=S_HEADSET;
+                    end else begin
+                        l_gbase<=(blk+4'd1)*2; l_dst<=1'b0; l_ret<=S_QKVRET;
+                    end
                     g_ret<=S_RES2; ci<=0; civ<=0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
-                // ---- res2: xres += mlp_out ; next block or final LN_f --------
+                // ---- res2: xres += mlp_out ; next block LN1 or final LN_f ----
+                // LN FUSION: the next LN (set up at S_MPSET) is fed the residual
+                // sum as it is written -> straight to L_COLL.
                 S_RES2: begin
                     cid <= ci; civ <= (ci != ROWS[10:0]);
                     if (ci != ROWS[10:0]) ci <= ci + 1'b1;
+                    ln_vin <= civ;
+                    ln_g   <= gam_r;
                     if (civ) begin
                         for (pp=0; pp<P; pp=pp+1)
                             sw[pp*32 +: 32] = $signed(xres_r[pp*32 +: 32])
                                             + $signed(mlp_r[pp*32 +: 32]);
                         xres_bank[cid] <= sw;
+                        ln_x <= sw;
                         if (cid==ROWS-1) begin
                             ci<=0; civ<=0;
                             if (dbg_stop==2'd3 && blk==4'd0) st<=S_FIN; // DEBUG: stop after block 0
-                            else if (blk == NLAYER-1) begin            // -> final LN_f -> head
-                                l_gbase<=NLAYER*2; l_dst<=1'b0; l_ret<=S_HEADSET; st<=L_GAM;
-                            end else begin                             // -> next block LN1
-                                blk<=blk+1'b1; l_gbase<=(blk+1'b1)*2; l_dst<=1'b0;
-                                l_ret<=S_QKVRET; st<=L_GAM;
+                            else begin
+                                if (blk != NLAYER-1) blk<=blk+1'b1;
+                                orow<=0; st<=L_COLL;
                             end
                         end
                     end
@@ -750,22 +826,32 @@ module sequencer_vec #(
                 default: st<=S_IDLE;
             endcase
             // ---- R4e catchers: fire regardless of FSM state -------------------
-            // V streams start the moment each engine's probs are ready. Engine A
-            // writes ctxv_bank DIRECTLY (its strobes never collide with B's drain);
-            // engine B's strobes land in the catch buffer.
-            if (at_kdoneA) begin kb_rstart  <= 1'b1; kb_rkv  <= 1'b1; end
-            if (at_kdoneB) begin kb2_rstart <= 1'b1; kb2_rkv <= 1'b1; end
+            // V streams start when the engine's probs are ready AND that head's
+            // V write has committed (kvp_done >= vneed); a not-yet-ready kdone
+            // latches a pending flag and fires on the write's completion.
+            if (at_kdoneA) vpA <= 1'b1;
+            if (at_kdoneB) vpB <= 1'b1;
+            if ((at_kdoneA || vpA) && (kvp_done >= vneedA)) begin
+                kb_rstart  <= 1'b1; kb_rkv  <= 1'b1; vpA <= 1'b0;
+            end
+            if ((at_kdoneB || vpB) && (kvp_done >= vneedB)) begin
+                kb2_rstart <= 1'b1; kb2_rkv <= 1'b1; vpB <= 1'b0;
+            end
             if (at_ctxvA) ctxbufA[at_ctxidxA[2:0]] <= at_ctxdataA;
             if (at_ctxvB) ctxbufB[at_ctxidxB[2:0]] <= at_ctxdataB;
             if (at_doneA) adone_s <= 1'b1;
             if (at_doneB) bdone_s <= 1'b1;
-            // ---- R4f feeder: quantise heads 2..3 during pair-0's attention ----
+            // ---- KV feeder: ALL (head,K/V) writes, armed at the qkv dispatch --
+            // K h0..h3 ride the qkv readback (data-ready gated row by row),
+            // then V h1,h0,h3,h2 hide under the attention pairs (B-head first,
+            // see the declaration comment). Hardcodes NHEAD=4 head pairs.
             case (kvf_st)
                 KF_S: if (kvf_active) begin
                     kb_wstart<=1'b1; fr<=0; frv<=0; kvf_st<=KF_F;
                 end
                 KF_F: begin
-                    if (kvf_grant) begin
+                    if (kvf_grant && ((fr == HR[$clog2(ROWSM+1)-1:0])
+                                      || (kvw_src < qkv_wrow))) begin
                         frd <= fr; frv <= (fr != HR[$clog2(ROWSM+1)-1:0]);
                         if (fr != HR[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
                     end else frv <= 1'b0;
@@ -774,10 +860,18 @@ module sequencer_vec #(
                     if (frv && frd==HR-1) begin fr<=0; frv<=0; kvf_st<=KF_W; end
                 end
                 KF_W: if (kb_wdone) begin
-                    if (!kvw_kv) begin kvw_kv<=1'b1; kvf_st<=KF_S; end
-                    else if (kvw_h != NHEAD-1) begin
-                        kvw_h<=kvw_h+2'd1; kvw_kv<=1'b0; kvf_st<=KF_S;
-                    end else begin kvf_active<=1'b0; kvf_st<=KF_IDLE; end
+                    kvp_done <= kvp_done + 4'd1;
+                    if (!kvw_kv) begin                       // K phase: h0->h1->h2->h3
+                        if (kvw_h != 2'd3) begin kvw_h<=kvw_h+2'd1; kvf_st<=KF_S; end
+                        else begin kvw_kv<=1'b1; kvw_h<=2'd1; kvf_st<=KF_S; end
+                    end else begin                           // V phase: h1->h0->h3->h2
+                        case (kvw_h)
+                            2'd1: begin kvw_h<=2'd0; kvf_st<=KF_S; end
+                            2'd0: begin kvw_h<=2'd3; kvf_st<=KF_S; end
+                            2'd3: begin kvw_h<=2'd2; kvf_st<=KF_S; end
+                            default: begin kvf_active<=1'b0; kvf_st<=KF_IDLE; end
+                        endcase
+                    end
                 end
                 default: ;
             endcase
