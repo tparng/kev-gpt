@@ -1365,3 +1365,30 @@ cyc, even ~150MHz board = 14.5k (> the 13,162 record). If 125-target ALSO fails
 to route, the trims are fundamentally too dense and the R5 build (13,162 @166.7,
 deployed) stands as the faithful ceiling — 20k then needs the K4/smaller-model
 lever, not more logic.
+
+## 43. NEW RECORD: 16,087.5 tok/s @166.7 — the looser-clock route worked
+
+The §42 retry at the 8ns (125MHz) target ROUTED — and MET, WNS +0.006ns (worst
+path the GEMV xmem→addend_r MAC stage). The looser target packed the placer
+tight enough that the §42 routing congestion (182k overlaps at 5ns) vanished:
+relaxing timing, not adding effort, is what fixed routability on the full device.
+
+Board (same trims RTL, 10,360 cyc/tok full-window, 3/3 bit-exact):
+- dbg sanity: qkv 0/768, ctx 0/256 ✓
+- **166.7 ✓ 16,087.5 tok/s MEASURED — NEW RECORD (+22% over 13,162)**
+- 200 ✗ 0/3 (real silicon Fmax is in (166.7,200), but the PS PLL only offers
+  166.7 and 200 — the 1000/N divider granularity; 175→snaps to 166.7,
+  183.3→snaps to 200, both verified). So 166.7 is the usable ceiling here.
+
+Deployed: kevkv.service ExecStartPre now loads gemv_seqkv_trims.bit.bin; live
+chat runs the 16k build at 166.7.
+
+20k MATH (honest): tok_s = 16,087.5·(clk/166.7); 20k needs ~207MHz, but the
+design FAILS at 200 — so 20k is NOT reachable with this RTL on the KV260 even
+with a perfect clock. The remaining levers:
+ (a) MMCM PL clock (clk_wiz in the BD) to hit ~187MHz between the PLL's 166.7/200
+     -> ~18.1k. A ~4h rebuild; bounded by the ~190 silicon Fmax (200 fails).
+ (b) FEWER cycles (K4/smaller model) -> 20k at a routable clock. The cycle lever,
+     not the clock — but K4 was PARKED (butterfly LUT bomb + long-T bug) and the
+     device is already unroutable with MORE logic, so K4 must REPLACE logic (its
+     half-size KV bank frees BRAM), not add. The real 20k path.

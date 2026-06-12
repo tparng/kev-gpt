@@ -75,8 +75,10 @@ LADDER = [
      "the T=1 degenerate attention — 119-tok real message, 12,594 cyc/tok avg, 3/3 bit-exact"),
     ("+ R5 cone ladder -> 166.7 MHz\n(7 paths pipelined, OOC MET @5ns)", 13162.3, "MEASURED",
      "the kv-quantise / attn-dot / min-max / AQ timing cones (12,662 cyc/tok, 3/3; 200 fails on the MAC floor)"),
-    ("+ schedule trims + MAC accumulate fix\n(-> 200 MHz silicon)", 20000.0, "PROJECTED",
-     "the last ~2.7k cyc (KVW overlap, dual-row RB, LN/AQ feeds) + the accb carry chain -> the 20k line"),
+    ("+ schedule trims + MAC stage\n(KVW/RB/LN overlap, 8ns-target route)", 16087.5, "MEASURED",
+     "~2.2k cyc (AQ/RUN + groupwise RB + KV feeder + LN fusion); 10,360 cyc/tok, 3/3 @166.7 (5ns build was unroutable; 200 fails)"),
+    ("x faster clock OR fewer cycles\n(MMCM ~187MHz, or K4/smaller model)", 20000.0, "PROJECTED",
+     "the PS PLL caps at 166.7 (200 fails timing); 20k needs ~207MHz on this design -> an MMCM ~187 gets ~18k, the K4/smaller-model cycle cut gets 20k"),
 ]
 
 # reference baselines (drawn as guide lines, not rungs) — all the same model, B=1 greedy
