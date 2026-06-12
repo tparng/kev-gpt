@@ -26,13 +26,13 @@ data tool and the model) for that project.
 
 | doc | what |
 |---|---|
-| [`0-master.md`](0-master.md) | the through-line, the four-piece map, the build order |
-| [`1-keviniser.md`](1-keviniser.md) | **the data tool** — POS-based telegraphic preprocessor |
-| [`2-llm-on-kria.md`](2-llm-on-kria.md) | **the platform** — on-chip systolic GEMV, fabric-native softmax/RMSNorm |
-| [`3-kevin-on-kria.md`](3-kevin-on-kria.md) | **the fusion** — train doc 2's model on doc 1's corpus |
-| [`4-live-chatbot.md`](4-live-chatbot.md) | **the stress test** — serve it behind a Cloudflare Tunnel, link on HN |
-| [`5-demo-prd.md`](5-demo-prd.md) | **the demo PRD** — speculative-typing chat + live load dashboard |
-| [`6-past-the-stream-ceiling.md`](6-past-the-stream-ceiling.md) | **the speed campaign** — split-brain + worst-path retirement past the stream ceiling, toward 100k |
+| [`0-master.md`](docs/0-master.md) | the through-line, the four-piece map, the build order |
+| [`1-keviniser.md`](docs/1-keviniser.md) | **the data tool** — POS-based telegraphic preprocessor |
+| [`2-llm-on-kria.md`](docs/2-llm-on-kria.md) | **the platform** — on-chip systolic GEMV, fabric-native softmax/RMSNorm |
+| [`3-kevin-on-kria.md`](docs/3-kevin-on-kria.md) | **the fusion** — train doc 2's model on doc 1's corpus |
+| [`4-live-chatbot.md`](docs/4-live-chatbot.md) | **the stress test** — serve it behind a Cloudflare Tunnel, link on HN |
+| [`5-demo-prd.md`](docs/5-demo-prd.md) | **the demo PRD** — speculative-typing chat + live load dashboard |
+| [`6-past-the-stream-ceiling.md`](docs/6-past-the-stream-ceiling.md) | **the speed campaign** — split-brain + worst-path retirement past the stream ceiling, toward 100k |
 
 ## Code
 
@@ -64,7 +64,7 @@ Past 25.7k, **N=16 is the stream ceiling**: 3 INT4×INT8 MACs/DSP is provably
 impossible (27-bit port vs 28 needed; 66 bits of neuron state vs a 48-bit
 accumulator — `fabric/stage3/research/dsp3_pack_proof.py`, 1.2M-trial verified),
 so the levers became **cycles and clock, not streams** — the second era, documented
-in [`6-past-the-stream-ceiling.md`](6-past-the-stream-ceiling.md): split-brain
+in [`6-past-the-stream-ceiling.md`](docs/6-past-the-stream-ceiling.md): split-brain
 (two N=8 cohorts on the true-dual-port URAM) plus a systematic worst-path-retirement
 campaign. **59,965.5 is the current MEASURED record** (16/16 bit-exact, 3/3); 100k
 is PROJECTED and needs both the cycle floor *and* 250 MHz on silicon.

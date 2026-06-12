@@ -51,7 +51,9 @@ dfx_runtime.txt
 
 # local scratch
 /blog/
+/docs/
 .claude/
+CLAUDE.md
 
 # Playwright + UI verification scratch
 .playwright-mcp/
