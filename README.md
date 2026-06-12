@@ -72,6 +72,26 @@ is PROJECTED and needs both the cycle floor *and* 250 MHz on silicon.
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
 CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop GPU ~78×.
 
+## The two ceilings (fabric vs round-trip)
+
+![The ceiling stack](fabric/ceilings.png)
+
+The fabric record and what a live chat user actually feels are two different
+numbers. The **fabric peak** (59,965.5 tok/s, N=16 @200 MHz) is pure PL cycles;
+the **faithful single stream** (N=1, the deployed doc-7 chat build) runs 16,227
+tok/s of fabric. But the **round-trip** a user sees is far below that — it's
+bound by serving, not silicon.
+
+The biggest round-trip tax was **sampling**: the host read 193 head logits per
+token back over `/dev/mem` to do temperature sampling on the A53 (~58 % of a
+reply). Moving it **on-chip via the Gumbel-max trick** — sampling from
+`softmax(logit/T)` is exactly `argmax(logit + T·g)`, `g ~ Gumbel`, so the
+existing argmax hardware does it and the host writes **one seed register per
+request** instead of 193 reads per token — lifted the localhost round-trip
+ceiling **~5.6× (1k → 5,600 tok/s)** while keeping the fabric record bit-exact
+(greedy 3/3, sampling 8/8 unique). The public number (~1,658 tok/s through the
+Cloudflare tunnel) is the remaining WAN+tunnel RTT, not fabric.
+
 ## What works today
 
 - **Keviniser**: POS-based so it keeps main-verb "do" and drops auxiliary "do".
