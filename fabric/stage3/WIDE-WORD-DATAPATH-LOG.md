@@ -1392,3 +1392,29 @@ with a perfect clock. The remaining levers:
      not the clock — but K4 was PARKED (butterfly LUT bomb + long-T bug) and the
      device is already unroutable with MORE logic, so K4 must REPLACE logic (its
      half-size KV bank frees BRAM), not add. The real 20k path.
+
+## 44. On-chip sampling (Gumbel-max) — kill the 58%-of-round-trip logit readback
+
+The chat's round-trip ceiling (~1k tok/s) is dominated by reading 193 head
+logits/token over /dev/mem for host-side temperature sampling (~58ms of a ~100ms
+reply; the fabric itself is 7ms = 16k tok/s). Move sampling ON-CHIP via the
+Gumbel-max trick: sampling from softmax(logit/T) is EXACTLY
+argmax_i(logit_i + T·g_i), g_i = -log(-log(u_i)) ~ Gumbel(0,1). So we reuse the
+existing S_ARGMAX hardware — add a precomputed noise value to each logit before
+the compare; the winning index IS the sample. No softmax, no readback, no host
+math. The host writes ONE seed register per request instead of 193 reads/token.
+
+DESIGN (T=0.85 baked):
+- gumbel_lut[idx] = round(0.85·(-log(-log((idx+0.5)/2^GLBITS)))·2^25), signed.
+- Deterministic seedable RNG (xorshift32), PERSISTS across a request's GOs
+  (loaded on SEED write, not per GO) so each token gets fresh noise; seed=0 =>
+  greedy (gumbel forced 0 => argmax(logit), bit-exact to today).
+- Resource-clean: precompute the per-logit gumbel into a small P-wide bank during
+  the head GEMV (ONE LUT read/cycle, hidden under the matmul) — avoids 8 parallel
+  LUT ports on a 92%-BRAM/92%-LUT device. S_ARGMAX adds bank[row] to head[row],
+  compare widened to int34.
+- SEED register at 0x30 in gemv_axi_seq_vec.v -> sequencer_vec.
+GATE: (a) seed=0 keeps the existing run_vec_kv bit-exact (no regression); (b)
+sample seed=fixed matches a Python Gumbel reference over a full generation.
+BOARD: pl_kv256 writes a random seed/request, reads tok_out (the sample), drops
+the logit readback. Expected: round-trip ~1k -> ~7k tok/s, serving ~10 -> ~65/s.
