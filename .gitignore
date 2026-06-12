@@ -56,3 +56,4 @@ dfx_runtime.txt
 # Playwright + UI verification scratch
 .playwright-mcp/
 kev-*-verified.png
+kevchat_*.png
