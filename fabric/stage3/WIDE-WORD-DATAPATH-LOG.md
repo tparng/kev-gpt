@@ -1418,3 +1418,28 @@ GATE: (a) seed=0 keeps the existing run_vec_kv bit-exact (no regression); (b)
 sample seed=fixed matches a Python Gumbel reference over a full generation.
 BOARD: pl_kv256 writes a random seed/request, reads tok_out (the sample), drops
 the logit readback. Expected: round-trip ~1k -> ~7k tok/s, serving ~10 -> ~65/s.
+
+## 45. On-chip sampling SHIPPED — MEASURED on silicon (2026-06-12)
+
+Built BD+impl at a 125MHz target (the 200-target trims build was unroutable at
+182k overlaps; the looser target packs tighter and routes — §43 congestion note).
+ROUTED clean: WNS +0.013ns MET, util LUT 93.4% / BRAM 94.4% / URAM 100% / DSP
+97.4% (gumbel_lut + the per-logit noise bank cost ~2 BRAM on the already-92%
+device and still fit). Bitstream gemv_seqkv_gum.bit.bin, idcode SQRV.
+
+GATES (all green on board @166.7MHz):
+- dbg readback: qkv 0/768, ctx 0/256 (deterministic datapath undisturbed).
+- GREEDY no-regression: 3/3 runs bit-identical to golden, 9292 cyc/tok,
+  17,936.6 tok/s (seed=0 => gumbel forced 0 => argmax, exactly as designed).
+- ON-CHIP SAMPLE variety: 6/6 unique coherent Kevin-speak from one prompt
+  ('once upon time' -> 'there be little girl name lily...', 'there be happy dog
+  name max...'). The fabric samples; no host softmax, no logit readback.
+
+ROUND-TRIP (the whole point); live daemon kevkv now loads gemv_seqkv_gum:
+- localhost: 17.8ms median / ~100-char reply -> ~5,600 trip tok/s, 8/8 unique;
+  fabric 7.21ms / 117 passes = 16,227 fabric tok/s (16k RECORD PRESERVED).
+- full public path (dev box -> Cloudflare -> Precision -> Kria -> back):
+  60.9ms median -> ~1,658 public tok/s, 6/6 unique. The +43ms over localhost is
+  WAN+tunnel RTT, not fabric.
+Round-trip ceiling lifted ~1k -> ~5.6k tok/s (localhost); the 58%-of-reply
+logit-readback tax is GONE. Deployed.
