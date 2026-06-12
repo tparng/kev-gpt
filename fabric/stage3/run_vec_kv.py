@@ -16,6 +16,7 @@ import os
 import subprocess
 
 from fabric.stage3 import seq_ref
+from fabric.stage3 import gumbel
 from fabric.stage3.run_sequencer import write_mems_wideword
 from model.goformer_kvq import IntKVQSequencer
 
@@ -40,15 +41,44 @@ def _decode(meta_path, ids):
     return "".join(itos.get(int(i), "?") for i in ids)
 
 
+def _sample_stream(gold_seq, prompt_ids, ngen, seed):
+    """The on-chip-sampling golden, mirroring the TB pass schedule EXACTLY.
+
+    The TB runs NPASS = PLEN+NGEN-1 passes (pos = 0..NPASS-1) and dumps the tok_out of
+    passes PLEN-1 .. PLEN+NGEN-2 (the NGEN tokens stream[PLEN..PLEN+NGEN-1]). The host
+    writes the SEED once before the gen GOs, so the prompt passes 0..PLEN-2 are GREEDY
+    (rng not yet advancing) and passes PLEN-1.. are SAMPLED. The xorshift persists, so
+    one GumbelRng(seed) advances across exactly the sampled passes (VOCAB draws each).
+
+    Sampling perturbs the SAME Q6.25 head logits the fabric argmax sees (step_head_q25).
+    Returns the NGEN sampled tokens."""
+    gold_seq.reset()
+    rng = gumbel.GumbelRng(seed)
+    # prompt passes 0..PLEN-2: greedy, output discarded (sampling not yet enabled)
+    for tok in prompt_ids[:-1]:
+        gold_seq.step_head_q25(int(tok))
+    # sampled passes: input = last prompt token, then the previous sampled token
+    out = []
+    cur = int(prompt_ids[-1])
+    for _ in range(ngen):
+        h_q25, _greedy = gold_seq.step_head_q25(cur)
+        cur = rng.sample_token(h_q25)
+        out.append(cur)
+    return out
+
+
 def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
-        npz="fabric/export/goformer.npz", meta=None):
+        npz="fabric/export/goformer.npz", meta=None, seed=0):
     os.makedirs(sim_dir, exist_ok=True)
     plen = len(prompt_ids)
     assert plen + ngen - 1 <= tmax, "prompt+gen must fit the KV window"
 
     p, cfg = seq_ref.build(npz)
     gold_seq = IntKVQSequencer(p, cfg, kbits=8, vbits=8, rotate=False, divfree=True)
-    gold = gold_seq.generate_greedy(list(prompt_ids), ngen)[plen:]
+    if seed == 0:
+        gold = gold_seq.generate_greedy(list(prompt_ids), ngen)[plen:]
+    else:
+        gold = _sample_stream(gold_seq, list(prompt_ids), ngen, seed)
 
     iseq = seq_ref.IntSequencer(p, cfg)
     write_mems_wideword(sim_dir, iseq, lanes, 4, P)
@@ -70,12 +100,20 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
     with open(os.path.join(sim_dir, "prompt.mem"), "w") as fh:
         for t in prompt_ids:
             fh.write(f"{int(t):03x}\n")
+    # gumbel_lut.mem: 1024 signed Q.25 noise entries, 8 hex chars/line (two's-complement
+    # int32, like inv_sact) — the ROM the RTL argmax perturbs head logits with. Built
+    # VERBATIM from gumbel.make_gumbel_lut() (the single source of truth shared by the
+    # bit-exact Python golden GumbelRng).
+    with open(os.path.join(sim_dir, "gumbel_lut.mem"), "w") as fh:
+        for g in gumbel.make_gumbel_lut():
+            fh.write(f"{g & 0xFFFFFFFF:08x}\n")
     with open(os.path.join(sim_dir, "wrom.mem")) as fh:
         wrom_n = sum(1 for ln in fh if ln.strip())
 
     vvp = os.path.join(sim_dir, "sim.vvp")
     defs = [f"-DPVAL={P}", f"-DLVAL={lanes}", f"-DWROMN={wrom_n}",
-            f"-DTMAXVAL={tmax}", f"-DPLEN={plen}", f"-DNGEN={ngen}"]
+            f"-DTMAXVAL={tmax}", f"-DPLEN={plen}", f"-DNGEN={ngen}",
+            f"-DSEEDVAL={seed & 0xFFFFFFFF}"]
     if os.environ.get("KVDBG"):
         defs.append("-DKVDBG")
     if os.environ.get("KVSTOP"):
@@ -115,9 +153,10 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
     if cycs:
         print(f"[cyc ] per-pass min..max = {min(cycs)}..{max(cycs)}, "
               f"avg = {sum(cycs)/len(cycs):.0f} (T grows 1..{plen+ngen-1})")
-    print(f"VEC_KV_VERDICT match={ok} plen={plen} ngen={ngen} "
+    mode = "greedy" if seed == 0 else f"sample(seed={seed & 0xFFFFFFFF})"
+    print(f"VEC_KV_VERDICT match={ok} mode={mode} plen={plen} ngen={ngen} "
           f"avg_cyc={sum(cycs)/len(cycs):.0f}" if cycs else
-          f"VEC_KV_VERDICT match={ok} plen={plen} ngen={ngen}")
+          f"VEC_KV_VERDICT match={ok} mode={mode} plen={plen} ngen={ngen}")
     return ok
 
 
@@ -129,6 +168,8 @@ def main(argv=None):
     ap.add_argument("--p", type=int, default=8)
     ap.add_argument("--lanes", type=int, default=16)
     ap.add_argument("--tmax", type=int, default=256)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="on-chip Gumbel-max sampling seed (0 => greedy argmax)")
     ap.add_argument("--npz", default="fabric/export/goformer.npz")
     ap.add_argument("--meta", default="fabric/export/goformer_meta.json")
     ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_vec_kv"))
@@ -137,7 +178,7 @@ def main(argv=None):
         ids = _encode(a.meta, a.prompt)
     else:
         ids = [48, 10, 100, 77, 5, 60, 120, 180][:a.plen]
-    ok = run(a.dir, ids, a.ngen, a.p, a.lanes, a.tmax, a.npz, a.meta)
+    ok = run(a.dir, ids, a.ngen, a.p, a.lanes, a.tmax, a.npz, a.meta, a.seed)
     raise SystemExit(0 if ok else 1)
 
 

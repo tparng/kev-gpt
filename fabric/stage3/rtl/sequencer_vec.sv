@@ -61,7 +61,13 @@ module sequencer_vec #(
     // DEBUG halt points (banks then hold a block-0 snapshot for board readback vs
     // seq_ref.block0_phase_signals): 1=after embed (xres=x_in), 2=after LN2 (xres=x_res1,
     // lnout2=ln2), 3=after block0 (xres=x_out). 0 = no stop (normal forward).
-    input  wire [1:0]  dbg_stop
+    input  wire [1:0]  dbg_stop,
+    // on-chip Gumbel-max sampling: seed_we loads the persistent xorshift state and
+    // enables sampling (state != 0). The argmax over the VOCAB head logits then adds
+    // a per-logit Gumbel noise (precomputed into gumbel_bank during the head GEMV).
+    // seed == 0 (or never written) => greedy argmax, bit-exact to the old behaviour.
+    input  wire [31:0] seed,
+    input  wire        seed_we
 );
     localparam integer ROWS  = D    / P;
     localparam integer ROWS3 = D3   / P;
@@ -84,6 +90,7 @@ module sequencer_vec #(
     localparam integer WB_HEAD = NLAYER*GW_BLK;                          // head weight base
     localparam integer DR_HEAD = (NLAYER*DQ_BLK)/P;                      // head dequant row base
     localparam integer ARROWS  = (VOCAB + P - 1)/P;                      // argmax rows
+    localparam signed [33:0] NEG_INF34 = {1'b1, 33'b0};                  // -2^33 (argmax -inf)
     localparam integer EROWS   = D / P;                                  // emb/gamma rows per set
 
     // ---- embed image in the resident weight URAM's SPARE DEPTH (log §36 plan 2) -
@@ -175,10 +182,24 @@ module sequencer_vec #(
     (* ram_style = "block" *) reg [P*32-1:0] mlp_bank   [0:ROWS-1];    // mlp_proj out Q6.25
     (* ram_style = "block" *) reg [P*32-1:0] head_bank  [0:ARROWS-1];  // head logits Q6.25
 
+    // ---- Gumbel-max on-chip sampling -------------------------------------------
+    // gumbel_lut: 1024-deep signed Q.25 noise ROM (ONE read port), gumbel_lut[idx] =
+    // round(temp*(-log(-log((idx+0.5)/1024)))*2^25). gumbel_bank: the per-logit noise
+    // (one wide P-packed word per argmax row) filled during the head GEMV using that
+    // single LUT port, so S_ARGMAX adds noise with NO extra read ports.
+    (* rom_style = "block" *) reg signed [31:0] gumbel_lut  [0:1023];
+    (* ram_style = "block" *) reg [P*32-1:0]    gumbel_bank [0:ARROWS-1];
+    initial $readmemh("gumbel_lut.mem", gumbel_lut);
+    reg [31:0]        rng_state;            // persistent xorshift32 state (loaded by seed_we)
+    reg               smp_en;               // sampling enabled (rng_state != 0)
+    reg signed [31:0] gumbel_lut_r;         // registered LUT read (1-cyc latency)
+    reg [P*32-1:0]    gpre_r;
+
     // ---- synchronous-read registers (BRAM output stage; declared before use) ---
     reg [P*32-1:0] xres_r, qkv_r, ctxv_r, attn_r, mlp_r, head_r;
     reg [P*64-1:0] lnout1_r, lnout2_r, mlpbuf_r;
     reg [P*32-1:0] gam_r;
+    reg [P*32-1:0] gumbel_r;                 // registered gumbel_bank read (S_ARGMAX)
 
     // ---- layernorm_vec ---------------------------------------------------------
     reg                ln_start, ln_vin;
@@ -368,18 +389,39 @@ module sequencer_vec #(
     // free-running registered inv_sact read (see isact_r note above)
     always @(posedge clk) isact_r <= inv_sact[g_asel];
 
-    reg signed [31:0] best_val; reg [8:0] best_idx, hidx;
+    // ---- gumbel precompute FSM (fills gumbel_bank during the head GEMV) ---------
+    // One LUT read/cycle: advance the xorshift, present (next_state>>22) as the LUT
+    // address, place the registered LUT value one cycle later into lane gj%P. After
+    // P lanes a wide word is written to gumbel_bank[row]. VOCAB advances total — the
+    // bit-exact match to gumbel.GumbelRng (state advances BEFORE each logit's noise).
+    reg                gpre_active, gpre_done;
+    reg [8:0]          gj;                  // logit counter 0..VOCAB (advance stage)
+    reg [8:0]          gj_d;                // delayed counter (place stage, LUT-read aligned)
+    reg                gj_dv;               // place-stage valid
+    reg [P*32-1:0]     gpre_word;           // P-wide staging word being assembled
+    integer            gl_lane;
+    // combinational xorshift32 of the live state (== gumbel.xorshift32)
+    wire [31:0] xs1   = rng_state ^ (rng_state << 13);
+    wire [31:0] xs2   = xs1 ^ (xs1 >> 17);
+    wire [31:0] xs_ns = xs2 ^ (xs2 << 5);            // next state
+    wire [9:0]  gpre_idx_w = xs_ns[31:22];           // LUT index = next_state >> 22
+
+    reg signed [33:0] best_val; reg [8:0] best_idx, hidx;  // widened: logit32 + gumbel32
     reg [$clog2(ARROWS+1)-1:0] ar;           // argmax row counter
-    reg signed [31:0] wm_val;  reg [8:0] wm_idx;        // word-max tree temporaries
-    reg signed [31:0] am_val;  reg [8:0] am_idx;        // stage-1 registers
+    // Compare values are WIDENED to signed 34-bit: a head logit (signed int32) plus a
+    // gumbel noise value (signed int32) can exceed int32; first-index-wins ties kept.
+    reg signed [33:0] wm_val;  reg [8:0] wm_idx;        // word-max tree temporaries
+    reg signed [33:0] am_val;  reg [8:0] am_idx;        // stage-1 registers
     reg [$clog2(ARROWS+1)-1:0] amd;  reg amv;
     // argmax 3-stage pipeline (the head_bank -> compare chain was the OOC critical path):
-    // stage A registers the row, stage B halves P -> P/2, stage C reduces + running best.
+    // stage A registers the row + its gumbel noise, stage B halves P -> P/2 (with noise
+    // added), stage C reduces + running best.
     reg [P*32-1:0] hw_r;
-    reg signed [31:0] pv0, pv1, pv2, pv3;     // P/2 pair maxima
+    reg [P*32-1:0] gw_r;                      // stage-A registered gumbel word for the row
+    reg signed [33:0] pv0, pv1, pv2, pv3;     // P/2 pair maxima
     reg [8:0]         pi0, pi1, pi2, pi3;
     reg [$clog2(ARROWS+1)-1:0] ad1;  reg av1;
-    reg signed [31:0] va, vb;
+    reg signed [33:0] va, vb;
     reg [8:0]         ia, ib;
 
 
@@ -415,6 +457,10 @@ module sequencer_vec #(
         mlp_r    <= mlp_bank   [mlp_ra];
         head_r   <= head_bank  [head_ra];
         gam_r    <= gamma_w  [l_gbase*EROWS + gam_fr];
+        // gumbel_bank read tracks head_bank in S_ARGMAX (same row); LUT read for the
+        // precompute is addressed by the new xorshift state (advance stage).
+        gumbel_r     <= gumbel_bank[head_ra];
+        gumbel_lut_r <= gumbel_lut[gpre_idx_w];
     end
 
     always @(posedge clk) begin
@@ -428,7 +474,13 @@ module sequencer_vec #(
             civ<=0; frv<=0; arv<=0; wiv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0;
             kvf_st<=KF_IDLE; kvf_active<=1'b0;
             kvp_done<=4'd0; qkv_wrow<=11'd0; vpA<=1'b0; vpB<=1'b0;
+            rng_state<=32'd0; smp_en<=1'b0;
+            gpre_active<=1'b0; gpre_done<=1'b0; gj<=9'd0; gj_dv<=1'b0;
         end else begin
+            // SEED write: load the persistent xorshift state + enable sampling. Lives
+            // OUTSIDE the FSM case (host writes it once between GOs, core idle). seed==0
+            // => greedy. Persists across gen GOs (the rng advances during each head GEMV).
+            if (seed_we) begin rng_state <= seed; smp_en <= (seed != 32'd0); end
             case (st)
                 S_IDLE: if (go) begin
                     fr<=0; frv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0; blk<=4'd0;
@@ -782,23 +834,35 @@ module sequencer_vec #(
                     g_wbase<=WB_HEAD; g_m<=VOCAB[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
                     g_asel<=4*NLAYER; g_frac<=7'd25; g_dqrow<=DR_HEAD[11:0]; g_dst<=3'd4;
                     g_ret<=S_ARGMAX; ci<=0; civ<=0; gv_ldrst<=1'b1;
-                    best_val<=32'sh80000000; best_idx<=9'd0; ar<=0; arv<=0; av1<=0; amv<=0; st<=G_AQ;
+                    best_val<=NEG_INF34; best_idx<=9'd0; ar<=0; arv<=0; av1<=0; amv<=0; st<=G_AQ;
+                    // arm the gumbel precompute (rides the head GEMV). Greedy => skip.
+                    if (smp_en) begin
+                        gpre_active<=1'b1; gpre_done<=1'b0; gj<=9'd0; gj_dv<=1'b0;
+                        gpre_word = {(P*32){1'b0}};   // blocking: matches the precompute block
+                    end else begin
+                        gpre_active<=1'b0; gpre_done<=1'b1;
+                    end
                 end
                 // ---- P-wide argmax over the VOCAB logits (Q6.25, sync read) --
                 // 3-stage pipeline (head_bank -> compare chain was the critical path):
                 // A: register the row; B: P -> P/2 pairwise maxima; C: reduce + best.
                 // First index wins ties (strict >), matching the scalar reference.
-                S_ARGMAX: begin
+                // Gumbel-max sampling folds in here: each logit gets gumbel_bank's
+                // precomputed noise (0 when greedy) added BEFORE the pair-max compare,
+                // on the widened signed-34 path. The winner IS the sample (Gumbel-max).
+                S_ARGMAX: if (gpre_done) begin
                     ard <= ar; arv <= (ar != ARROWS[$clog2(ARROWS+1)-1:0]);
                     if (ar != ARROWS[$clog2(ARROWS+1)-1:0]) ar <= ar + 1'b1;
-                    hw_r <= head_r; ad1 <= ard; av1 <= arv;          // stage A
+                    hw_r <= head_r; gw_r <= gumbel_r; ad1 <= ard; av1 <= arv;  // stage A
                     if (av1) begin                                   // stage B: 4 pair maxima
                         for (pp=0; pp<4; pp=pp+1) begin
-                            va = $signed(hw_r[pp*32 +: 32]);
-                            vb = $signed(hw_r[(pp+4)*32 +: 32]);
+                            va = $signed(hw_r[pp*32 +: 32])
+                                 + (smp_en ? $signed(gw_r[pp*32 +: 32]) : 34'sd0);
+                            vb = $signed(hw_r[(pp+4)*32 +: 32])
+                                 + (smp_en ? $signed(gw_r[(pp+4)*32 +: 32]) : 34'sd0);
                             ia = ad1*P + pp;  ib = ad1*P + pp + 4;
-                            if (ia >= VOCAB) va = 32'sh80000000;
-                            if (ib >= VOCAB) vb = 32'sh80000000;
+                            if (ia >= VOCAB) va = NEG_INF34;
+                            if (ib >= VOCAB) vb = NEG_INF34;
                             case (pp)
                                 0: begin pv0 <= (vb > va) ? vb : va; pi0 <= (vb > va) ? ib : ia; end
                                 1: begin pv1 <= (vb > va) ? vb : va; pi1 <= (vb > va) ? ib : ia; end
@@ -875,6 +939,30 @@ module sequencer_vec #(
                 end
                 default: ;
             endcase
+            // ---- gumbel precompute: ONE xorshift advance + ONE LUT read per cycle,
+            // filling gumbel_bank during the head GEMV (armed in S_HEADSET; greedy
+            // skips). Advance/place are 1 cycle apart (the LUT read is registered).
+            // ADVANCE stage: while gj < VOCAB, step the xorshift (rng_state <= xs_ns);
+            // the LUT address gpre_idx_w = xs_ns>>22 is read in the sync block, value
+            // lands next cycle in gumbel_lut_r. gj_d/gj_dv carry the lane to place at.
+            if (gpre_active) begin
+                if (gj != VOCAB[8:0]) begin
+                    rng_state <= xs_ns;          // persistent state advances once/logit
+                    gj_d  <= gj; gj_dv <= 1'b1;
+                    gj    <= gj + 9'd1;
+                end else gj_dv <= 1'b0;
+                // PLACE stage: gumbel_lut_r holds the noise for logit gj_d. Drop it in
+                // lane gj_d%P; flush the wide word to gumbel_bank[gj_d/P] when lane==P-1
+                // OR at the final logit (a partial last row).
+                if (gj_dv) begin
+                    gpre_word[(gj_d % P)*32 +: 32] = gumbel_lut_r;
+                    if ((gj_d % P)==P-1 || gj_d==VOCAB-1) begin
+                        gumbel_bank[gj_d / P] <= gpre_word;
+                        gpre_word = {(P*32){1'b0}};   // zero unused lanes of the next row
+                        if (gj_d==VOCAB-1) begin gpre_active<=1'b0; gpre_done<=1'b1; end
+                    end
+                end
+            end
         end
     end
 

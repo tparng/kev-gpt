@@ -30,7 +30,7 @@ set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"
 set root  [file normalize [file dirname [info script]]/../../..]
 set bdir  "C:/kevbuild/stage3_seqkv_bit"
-set mems  "C:/kevbuild/stage3_vec_kvk8t128"       ;# run_vec_kv sim dir — P-DEPENDENT (packed P/word)
+set mems  "C:/kevbuild/stage3_vec_kvk8t128_smp"   ;# run_vec_kv sim dir — P-DEPENDENT (packed P/word) + gumbel_lut.mem
 
 file mkdir $bdir
 create_project gemv_seqkv_pl "$bdir/gemv_seqkv_pl" -part $part -force
@@ -56,7 +56,7 @@ add_files -norecurse [list \
 # inv_lut_lo/hi the kv_bank dequant-inverse ROMs.
 set memfiles [list tok_emb_w.mem pos_emb_w.mem gamma_w.mem dqm_w.mem dqe_w.mem \
                    inv_sact.mem seed.mem exp_lut.mem gelu_lut_e.mem gelu_lut_o.mem \
-                   inv_lut_lo.mem inv_lut_hi.mem]
+                   inv_lut_lo.mem inv_lut_hi.mem gumbel_lut.mem]
 foreach mf $memfiles {
     # HARD ERROR, not a warning: a missing ROM init synthesises an all-zero LUT
     # (silent [Synth 8-4445]) — first silicon shipped with empty kv_bank inv ROMs

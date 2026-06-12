@@ -23,6 +23,9 @@
 `ifndef NGEN
  `define NGEN 6
 `endif
+`ifndef SEEDVAL
+ `define SEEDVAL 0
+`endif
 module tb;
     localparam integer P     = `PVAL;
     localparam integer LANES = `LVAL;
@@ -42,6 +45,7 @@ module tb;
     wire [8:0] tok_out;
     wire signed [63:0] rdata;
     reg wl_rst, wl_we; reg [31:0] wl_data;
+    reg [31:0] seed_r; reg seed_we_r;
 
 `ifndef KVSTOP
  `define KVSTOP 0
@@ -50,7 +54,8 @@ module tb;
     sequencer_vec #(.P(P), .LANES(LANES), .TMAX(TMAXP)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_id(tok), .pos(pos), .done(done),
         .tok_out(tok_out), .rd_sel(rsel), .rd_addr(raddr), .rd_data(rdata),
-        .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data), .dbg_stop(dbgstop_r));
+        .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data), .dbg_stop(dbgstop_r),
+        .seed(seed_r), .seed_we(seed_we_r));
 
     task dump(input [3:0] sel, input integer n, input [127:0] fname);
         integer k, ff;
@@ -75,6 +80,7 @@ module tb;
     initial begin
         rst = 1'b1; go = 1'b0; tok = 9'd0; pos = 9'd0; rsel = 0; raddr = 0;
         wl_rst = 1'b0; wl_we = 1'b0; wl_data = 32'b0;
+        seed_r = 32'b0; seed_we_r = 1'b0;
         $readmemh("wrom.mem", wimg);
         $readmemh("prompt.mem", prompt);
         for (i = 0; i < PLEN; i = i + 1) stream[i] = prompt[i];
@@ -88,8 +94,14 @@ module tb;
         end
         wl_we = 1'b0; @(posedge clk); #1;
 
+        // ON-CHIP SAMPLING: the host writes the SEED once, AFTER the prompt GOs and
+        // BEFORE the first gen GO (pass PLEN-1, whose tok_out is the first gen token).
+        // SEED=0 leaves sampling off (greedy, bit-exact). Persists across the gen GOs.
         fc = $fopen("cycs.out", "w");
         for (pi = 0; pi < NPASS; pi = pi + 1) begin
+            if (pi == PLEN-1 && `SEEDVAL != 0) begin
+                seed_r = `SEEDVAL; seed_we_r = 1'b1; @(posedge clk); #1; seed_we_r = 1'b0;
+            end
             tok = stream[pi]; pos = pi[8:0];
             dbgstop_r = (pi == NPASS-1) ? `KVSTOP : 2'b0;
             cyc0 = dbgcyc;

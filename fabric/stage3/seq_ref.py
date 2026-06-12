@@ -291,6 +291,26 @@ class IntSequencer:
         self.t += 1
         return logits_real, int(np.argmax(logits_real))
 
+    def step_head_q25(self, idx_t):
+        """Like step() but ALSO return the Q6.25 head-logit integers the fabric argmax
+        (and the on-chip Gumbel-max sampler) actually operate on: head_q25 =
+        _dequant_to_q(head, gemv_int, RESID_FRAC). The greedy argmax over head_q25 equals
+        argmax(logits_real) (argmax-equivalent dequant); the sampler perturbs head_q25.
+        Returns (head_q25_list, argmax_token). Advances KV/t exactly like step()."""
+        x = self.tok_emb_q[idx_t] + self.pos_emb_q[self.t]
+        x = np.asarray([int(v) for v in x], dtype=object)
+        for bi in range(self.nblocks):
+            attn_out = self._attn_step(x, bi)
+            x = x + np.asarray([int(v) for v in attn_out], dtype=object)
+            mlp_out = self._mlp_step(x, bi)
+            x = x + np.asarray([int(v) for v in mlp_out], dtype=object)
+        y_q22 = self._ln(x, self.ln_f_q)
+        ix = self._act_quant(y_q22, self.head["s_act"])
+        h_int = self._dequant_to_q(self.head, self._gemv_int(self.head, ix), RESID_FRAC)
+        self.t += 1
+        h_list = [int(v) for v in h_int]
+        return h_list, int(np.argmax(np.asarray(h_list)))
+
     def block0_signals(self, idx_t):
         """Run a single token through block 0 only and return the intermediate
         Q6.25 residual after the full block (LN1->attn->+res->LN2->mlp->+res).

@@ -18,7 +18,7 @@ assembler degenerates to a queue, doc-7 §6).
 Register map (gemv_axi_seq_vec.v):
   0x00 CTRL(b0 go,b1 wl_rst,b2 soft_reset)  0x04 STATUS(b0 done)
   0x08 TOK_ID  0x0C POS  0x10 W_DATA  0x24 TOK_OUT  0x28 CYCLES
-  0x2C IDCODE(0x53515256 "SQRV")
+  0x2C IDCODE(0x53515256 "SQRV")  0x30 SEED(nonzero => on-chip Gumbel-max sampling)
 
 Used by the A53 daemon:
     sudo ~/kevweb/venv/bin/python -m webchat.demo.a53_daemon --engine kv256 \
@@ -51,6 +51,7 @@ R_CTRL, R_STATUS = 0x00, 0x04
 R_TOKID, R_POS, R_WDATA = 0x08, 0x0C, 0x10
 R_RDSEL, R_RDADDR, R_RDLO, R_RDHI = 0x14, 0x18, 0x1C, 0x20
 R_TOKOUT, R_CYCLES, R_IDCODE = 0x24, 0x28, 0x2C
+R_SEED = 0x30            # on-chip Gumbel-max sampling seed (0 => greedy argmax)
 RD_SEL_HEAD = 8          # readback mux: final head logits (Q6.25), VOCAB lanes
 HEAD_FRAC = 25           # Q6.25 fixed point
 
@@ -100,22 +101,29 @@ class PLKV256Device:
 
     def __init__(self, *, lanes: int = 128, fclk: float = 125e6,
                  gen_chars: int = 48, tmax: int = 256,
-                 temp: float = 0.0, top_k: int = 0,
+                 temp: float = 0.0, top_k: int = 0, host_sample: bool = False,
                  npz: str | None = None, meta: str | None = None,
                  base: int = BASE, poll_timeout: float = 30.0):
         npz = npz or os.path.join(_REPO, "fabric", "export", "goformer.npz")
         meta = meta or os.path.join(_REPO, "fabric", "export", "goformer_meta.json")
         self.gen_chars = int(gen_chars)
         self.tmax = int(tmax)
-        # SAMPLING (chat variety): the fabric decodes GREEDILY on-chip (argmax ->
-        # TOK_OUT), so a fixed prompt is deterministic. temp>0 switches to
-        # host-side temperature/top-k sampling: after each forward we read the
-        # VOCAB head logits back through the debug readback port and sample on
-        # the A53. temp==0 keeps the fast bit-exact greedy path (TOK_OUT, no
-        # readback). The on-fabric decode and its gate are UNCHANGED — sampling
-        # is a presentation layer, not a correctness claim.
+        # SAMPLING (chat variety). temp==0 => fast bit-exact greedy (TOK_OUT, no
+        # readback). temp>0 => sampling, two paths:
+        #   ON-CHIP (default, host_sample=False): the fabric samples via the
+        #     Gumbel-max trick — we write ONE random nonzero seed to R_SEED before
+        #     the gen GOs, then read TOK_OUT directly (no per-token logit readback).
+        #     The seed loads + enables the fabric's persistent xorshift; the noise
+        #     LUT is baked at temp=0.85 (gumbel.make_gumbel_lut), so on-chip temp is
+        #     fixed by the bitstream. Saves the ~58ms/reply VOCAB-logit /dev/mem read.
+        #   HOST (host_sample=True, fallback): read the VOCAB head logits back
+        #     through the debug readback port and softmax/top-k sample on the A53
+        #     (honours self.temp/self.top_k at runtime). Used if a bitstream lacks
+        #     R_SEED, or to A/B the two samplers.
         self.temp = float(temp)
         self.top_k = int(top_k)
+        self.host_sample = bool(host_sample)
+        self._onchip = (self.temp > 0.0) and not self.host_sample
         self._rng = np.random.default_rng()
         self.poll_timeout = float(poll_timeout)
         self._launches = 0
@@ -146,8 +154,12 @@ class PLKV256Device:
             w = int(w)
             for s in range(subw):
                 self._dev.wr(R_WDATA, (w >> (32 * s)) & 0xFFFFFFFF)
-        mode = (f"sample temp={self.temp} top_k={self.top_k}"
-                if self.temp > 0 else "greedy")
+        if self.temp <= 0:
+            mode = "greedy"
+        elif self._onchip:
+            mode = "sample(on-chip Gumbel-max, LUT temp=0.85)"
+        else:
+            mode = f"sample(host temp={self.temp} top_k={self.top_k})"
         print(f"[kv256] weights: {len(words)*subw} chunks in {time.time()-t0:.2f}s "
               f"(fclk={self.fclk/1e6:.1f}MHz tmax={self.tmax} gen={self.gen_chars} "
               f"{mode})")
@@ -201,9 +213,21 @@ class PLKV256Device:
             p[drop] = 0.0; p /= p.sum()
         return int(self._rng.choice(p.size, p=p))
 
+    def _arm_onchip_seed(self):
+        """ON-CHIP sampling: write ONE random NONZERO seed to R_SEED. This loads the
+        fabric's persistent xorshift state and enables Gumbel-max sampling; it then
+        advances across the gen GOs (like the KV bank). Called ONCE per request, just
+        before the last prompt GO so that pass's TOK_OUT is already sampled (matching
+        the gate's pass schedule). seed must be nonzero (0 => greedy on the fabric)."""
+        s = int(self._rng.integers(1, 1 << 32))  # uniform in [1, 2^32-1], never 0
+        self._dev.wr(R_SEED, s)
+
     def _next(self, argmax_tok: int) -> int:
-        """The fabric's on-chip argmax (fast/greedy) or a host-side sample."""
-        return self._sample(self._read_logits()) if self.temp > 0 else argmax_tok
+        """The token to emit: the fabric's TOK_OUT (greedy argmax OR on-chip sample —
+        both land in TOK_OUT, no readback) or a host-side softmax/top-k sample."""
+        if self.host_sample and self.temp > 0:
+            return self._sample(self._read_logits())
+        return argmax_tok                        # greedy OR on-chip-sampled TOK_OUT
 
     def _stream_gen(self, prompt: str):
         """Generator: yield each decoded char AS the fabric produces it. Holds NO
@@ -215,11 +239,15 @@ class PLKV256Device:
         maxp = self.tmax - self.gen_chars        # prompt tail + reply <= window
         if len(ids) > maxp:
             ids = ids[-maxp:]
+        L = len(ids)
         am = 0
         for pos, tok in enumerate(ids):          # prompt phase: KV fills 0..L-1
-            am = self._go(tok, pos)              # argmax out at pos L-1
-        nxt = self._next(am)                     # 1st gen token (greedy or sampled)
-        L = len(ids)
+            # ON-CHIP sampling: arm the seed once, right before the LAST prompt GO,
+            # so the pos L-1 pass (1st gen token) is sampled on the fabric.
+            if self._onchip and pos == L - 1:
+                self._arm_onchip_seed()
+            am = self._go(tok, pos)              # argmax/sample out at pos L-1
+        nxt = self._next(am)                     # 1st gen token (TOK_OUT or host-sampled)
         text = ""
         for g in range(self.gen_chars):          # feedback phase
             ch = self._dec([nxt])
