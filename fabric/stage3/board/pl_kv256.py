@@ -119,6 +119,10 @@ class PLKV256Device:
         self._rng = np.random.default_rng()
         self.poll_timeout = float(poll_timeout)
         self._launches = 0
+        self._fab_cyc = 0          # PL CYCLES summed over the current request's GOs
+        self._fab_passes = 0       # forward passes (GOs) in the current request
+        self.last_fab_cyc = 0      # the completed batch's total fabric cycles
+        self.last_fab_passes = 0   # ...and its forward-pass count (for fabric tok/s)
         self._lock = threading.Lock()           # one stream -> strictly serial
 
         self._enc, self._dec, self.vocab = load_meta(meta)
@@ -160,7 +164,13 @@ class PLKV256Device:
                 raise RuntimeError(f"kv256 TIMEOUT at pos={pos} "
                                    f"STATUS=0x{d.rd(R_STATUS):08X}")
         self._launches += 1
+        self._fab_cyc += d.rd(R_CYCLES)          # pure-fabric cycles for this pass
+        self._fab_passes += 1
         return d.rd(R_TOKOUT) & 0x1FF
+
+    @property
+    def last_fabric_ms(self) -> float:
+        return self.last_fab_cyc / self.fclk * 1000.0 if self.fclk else 0.0
 
     def _read_logits(self) -> np.ndarray:
         """Read the VOCAB head logits of the just-finished forward back through
@@ -229,10 +239,13 @@ class PLKV256Device:
         uses this for the Enter-miss path so time-to-first-char is one token, not
         the full reply."""
         with self._lock:
+            self._fab_cyc = 0; self._fab_passes = 0
             text = ""
             for ch in self._stream_gen(prompt):
                 text += ch
                 on_char(ch)
+            self.last_fab_cyc = self._fab_cyc
+            self.last_fab_passes = self._fab_passes
             return self._tidy(text)
 
     @staticmethod
@@ -260,8 +273,12 @@ class PLKV256Device:
 
         def work():
             with self._lock:
-                return [self._gen_one(it[1] if isinstance(it, tuple) else it)
-                        for it in items]
+                self._fab_cyc = 0; self._fab_passes = 0
+                out = [self._gen_one(it[1] if isinstance(it, tuple) else it)
+                       for it in items]
+                self.last_fab_cyc = self._fab_cyc   # pure-fabric cyc for the batch
+                self.last_fab_passes = self._fab_passes
+                return out
 
         return await loop.run_in_executor(None, work)
 

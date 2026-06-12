@@ -128,7 +128,11 @@ class TcpPLBackend:
                     await on_chunk(frame["chunk"])
                 else:
                     comp = (frame.get("completions") or [""])[0]
-                    return comp, float(frame.get("busy_ms", 0.0)) / 1000.0
+                    fab = frame.get("fabric_ms")
+                    return (comp, float(frame.get("busy_ms", 0.0)) / 1000.0,
+                            (float(fab) / 1000.0 if fab else None),
+                            int(frame.get("tokens", len(comp))),
+                            int(frame.get("passes", 0)))
 
     async def infer_batch(self, reqs):
         from .backend import BatchOutcome, InferResult
@@ -148,8 +152,13 @@ class TcpPLBackend:
             for i, r in enumerate(reqs)
         ]
         busy_s = float(resp.get("busy_ms", 0.0)) / 1000.0
+        fab = resp.get("fabric_ms")
         return BatchOutcome(results=results, busy_s=busy_s,
-                            filled=len(reqs), capacity=self.capacity)
+                            filled=len(reqs), capacity=self.capacity,
+                            fabric_s=(float(fab) / 1000.0 if fab else None),
+                            tokens=int(resp.get("tokens",
+                                                sum(len(c) for c in comps))),
+                            passes=int(resp.get("passes", 0)))
 
     async def close(self) -> None:
         await self._reset()
@@ -212,9 +221,14 @@ async def _stream_one(dev, prompt, writer, use_msgpack):
                 await writer.drain()
             else:
                 dt = round((time.monotonic() - t0) * 1000.0, 2)
-                writer.write(encode(
-                    {"completions": [val if kind == "done" else ""],
-                     "busy_ms": dt, "done": True}, use_msgpack))
+                comp = val if kind == "done" else ""
+                frame = {"completions": [comp], "busy_ms": dt, "done": True,
+                         "tokens": len(comp)}
+                fab_ms = getattr(dev, "last_fabric_ms", None)
+                if fab_ms:
+                    frame["fabric_ms"] = round(fab_ms, 2)
+                    frame["passes"] = getattr(dev, "last_fab_passes", 0)
+                writer.write(encode(frame, use_msgpack))
                 await writer.drain()
                 break
     finally:
@@ -235,8 +249,13 @@ async def handle_conn(reader, writer, dev, use_msgpack):
             t0 = time.monotonic()
             comps = await dev.infer(prompts)
             dt_ms = (time.monotonic() - t0) * 1000.0
-            writer.write(encode({"completions": comps, "busy_ms": round(dt_ms, 2)},
-                                use_msgpack))
+            resp = {"completions": comps, "busy_ms": round(dt_ms, 2),
+                    "tokens": sum(len(c) for c in comps)}
+            fab_ms = getattr(dev, "last_fabric_ms", None)
+            if fab_ms:                                  # pure-fabric time (PL CYCLES)
+                resp["fabric_ms"] = round(fab_ms, 2)
+                resp["passes"] = getattr(dev, "last_fab_passes", 0)
+            writer.write(encode(resp, use_msgpack))
             await writer.drain()
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass

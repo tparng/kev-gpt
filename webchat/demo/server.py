@@ -81,6 +81,11 @@ class Hub:
         self._start_mono = time.monotonic()
         self.total_tokens = 0
         self.peak_tok_s = 0.0
+        # the two ceilings, smoothed over recent completions: FABRIC tok/s (pure
+        # PL decode, ~16k) vs ROUND-TRIP tok/s (host loop + readback + sampling,
+        # ~1k). EMA so the chat-page tiles don't jitter per request.
+        self.fabric_tok_s = 0.0
+        self.trip_tok_s = 0.0
         # rolling unique-visitor log: (open_ts, visitor_key) per connection, keyed
         # by the real client IP (CF-Connecting-IP behind the tunnel) so a refresh /
         # reconnect from the same person counts once. Pruned to the 30-min window.
@@ -99,6 +104,18 @@ class Hub:
     def new_client_id(self) -> str:
         self._next_id += 1
         return f"c{self._next_id}"
+
+    def _note_rates(self, tokens: int, passes: int, busy_s: float, fabric_s) -> None:
+        """EMA-update the two ceilings from a finished request: round-trip =
+        delivered chars / wall-time; fabric = forward PASSES / pure-PL time
+        (passes, not chars, so it matches the per-token decode record)."""
+        a = 0.3
+        if tokens and busy_s and busy_s > 0:
+            r = tokens / busy_s
+            self.trip_tok_s = r if self.trip_tok_s == 0 else (1 - a) * self.trip_tok_s + a * r
+        if passes and fabric_s and fabric_s > 0:
+            r = passes / fabric_s
+            self.fabric_tok_s = r if self.fabric_tok_s == 0 else (1 - a) * self.fabric_tok_s + a * r
 
     def note_visit(self, key: str, now: float) -> None:
         self._visits.append((now, key))
@@ -183,6 +200,7 @@ class Hub:
                 "infer_ms": round(outcome.busy_s * 1000.0, 2),
             })
         self.total_tokens += tokens
+        self._note_rates(tokens, outcome.passes, outcome.busy_s, outcome.fabric_s)
         self.tel.on_batch(busy_s=outcome.busy_s, filled=outcome.filled,
                           capacity=outcome.capacity, tokens=tokens)
 
@@ -197,7 +215,8 @@ class Hub:
             await self.send(cid, {"type": MSG_STREAM, "prompt": job.prompt,
                                   "text": text})
         try:
-            completion, busy_s = await self.backend.infer_stream(req, on_chunk)
+            completion, busy_s, fabric_s, ntok, npass = await self.backend.infer_stream(
+                req, on_chunk)
         except Exception:
             # release the client so a later Enter re-queues, and close the bubble
             self.asm.on_result(cid, None)
@@ -210,10 +229,12 @@ class Hub:
         self.asm.on_result(cid, job.prompt)
         elig = self._submit_t.get(cid, submitted_at)
         self.tel.add_latency((deliver_t - elig) * 1000.0)
-        self.total_tokens += len(completion)
+        tok = ntok or len(completion)
+        self.total_tokens += tok
+        self._note_rates(tok, npass, busy_s, fabric_s)
         self.tel.on_batch(busy_s=busy_s, filled=1,
                           capacity=getattr(self.backend, "capacity", 1),
-                          tokens=len(completion))
+                          tokens=tok)
         await self.send(cid, {"type": MSG_STREAM_END, "prompt": job.prompt,
                               "completion": completion})
 
@@ -264,6 +285,8 @@ class Hub:
             "live_users": rec.get("active_users"),
             "peak_users": rec.get("peak_active"),
             "users_30m": self.unique_visitors(now),
+            "fabric_tok_s": round(self.fabric_tok_s, 0),
+            "trip_tok_s": round(self.trip_tok_s, 0),
             "agg_tok_s": agg,
             "peak_tok_s": round(self.peak_tok_s, 1),
             "avg_tok_s": round(self.total_tokens / uptime, 1),

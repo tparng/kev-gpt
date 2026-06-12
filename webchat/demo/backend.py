@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+from typing import Optional
 
 
 @dataclasses.dataclass
@@ -46,6 +47,13 @@ class BatchOutcome:
     busy_s: float
     filled: int
     capacity: int
+    # PURE FABRIC time for this batch (sum of the PL CYCLES register / fclk),
+    # vs busy_s which is the ROUND-TRIP (host loop + readback + sampling). The two
+    # give the chat its honest "two ceilings": fabric tok/s vs round-trip tok/s.
+    # None when the backend can't measure it (stub, host-KV).
+    fabric_s: Optional[float] = None
+    tokens: int = 0
+    passes: int = 0          # forward passes (GOs) — fabric tok/s = passes / fabric_s
 
 
 class InferenceBackend(abc.ABC):
