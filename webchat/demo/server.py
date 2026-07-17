@@ -387,6 +387,21 @@ async def client_handler(ws, hub: Hub):
 
 
 async def serve(args):
+    # Lift the open-file soft limit toward the hard ceiling so the server can hold
+    # many concurrent WebSocket connections (one fd each) during a traffic spike
+    # without hitting EMFILE. The 16-slot batch time-slices the fabric across the
+    # active typists among them (the "pseudo-parallelism"); idle lurkers cost only
+    # an fd, so headroom here is what lets us push the serving ceiling.
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(65536, hard)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            print(f"[server] raised NOFILE soft limit {soft} -> {target}")
+    except Exception as e:
+        print(f"[server] could not raise NOFILE limit: {e}")
+
     if args.backend == "stub":
         backend = StubBackend(latency_ms=args.latency_ms, capacity=args.batch)
     elif args.backend == "pl":
@@ -443,6 +458,17 @@ async def serve(args):
 
     def process_request(connection, request):
         if request.headers.get("Upgrade", "").lower() == "websocket":
+            # Survival backstop: past the cap, refuse new WS upgrades with a 503 so
+            # the server process stays alive (idle lurkers still cost one fd each)
+            # instead of exhausting fds and crashing the whole demo. The client
+            # auto-reconnects, so a shed visitor keeps retrying until a slot frees.
+            if args.max_clients and len(hub.conns) >= args.max_clients:
+                body = b"at capacity\n"
+                return Response(503, "Service Unavailable", Headers([
+                    ("Content-Type", "text/plain; charset=utf-8"),
+                    ("Content-Length", str(len(body))),
+                    ("Retry-After", "3"),
+                ]), body)
             return None   # not an HTTP page request -> let the WS handshake run
         if client_html is not None and request.path.split("?")[0] in ("/", "/client.html"):
             return Response(200, "OK", Headers([
@@ -478,6 +504,11 @@ def build_parser():
     ap = argparse.ArgumentParser(description="i7 inference-plane WebSocket server")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8090)
+    ap.add_argument("--max-clients", type=int, default=0,
+                    help="survival backstop: cap concurrent WS connections "
+                         "(0 = unlimited). Over the cap, new WS upgrades get a 503 "
+                         "(client auto-reconnects) so the process survives a spike "
+                         "instead of exhausting file descriptors and crashing.")
     ap.add_argument("--backend", choices=["stub", "pl", "tcp", "kv"],
                     default="stub",
                     help="stub=fake; pl=local single-token /dev/mem; tcp=remote "
