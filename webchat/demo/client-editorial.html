@@ -1,0 +1,446 @@
+<!doctype html>
+<!--
+  client-editorial.html — a fine-small-press "story page" front end for the
+  Kevin-on-Kria live demo. Same WebSocket protocol as client.html; different
+  clothes. The conceit: a 3.3M-param toddler that runs entirely in FPGA fabric
+  is, absurdly, a *writer of stories* — so we typeset its output like a literary
+  quarterly. Serif body, drop cap, typewriter reveal, and the live fabric
+  telemetry set as a colophon at the foot of the page rather than a dashboard.
+
+  Protocol (unchanged):
+    out: {type:"keystroke", prompt, seq}          on debounced input change
+    out: {type:"enter", prompt, seq, blitted}     on Enter
+    in : {type:"hello", client_id}
+    in : {type:"speculation"|"authoritative", prompt, completion, infer_ms}
+    in : {type:"stream", prompt, text} / {type:"stream_end", prompt, completion}
+    in : {type:"stats", fabric_tok_s, trip_tok_s, users_30m, total_tokens,
+                        duty_cycle, ready_at_enter, model, model_label,
+                        rotating, switch_in}
+    in : {type:"blit_ok", prompt}
+-->
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kevin — a very small press</title>
+<style>
+ /* ---- palette: warm paper & ink, one oxblood spot colour. no gradients. ---- */
+ :root{
+   --paper:#f6f2e9; --paper-edge:#efe9db; --ink:#201c17; --ink-soft:#5c5346;
+   --rule:#d8cfbd; --rule-strong:#b7ab92; --spot:#8a2b1f; --spot-soft:#a9584d;
+   --shadow:0 1px 0 #fffdf7, 0 12px 34px -20px rgba(52,40,24,.5);
+   color-scheme:light dark;
+ }
+ @media (prefers-color-scheme:dark){
+   :root{
+     --paper:#17140f; --paper-edge:#1e1a13; --ink:#eee6d6; --ink-soft:#a89b83;
+     --rule:#332c20; --rule-strong:#4a4030; --spot:#d98a58; --spot-soft:#c07a4c;
+     --shadow:0 1px 0 #221d15, 0 18px 40px -24px rgba(0,0,0,.7);
+   }
+ }
+ *{box-sizing:border-box}
+ html,body{margin:0}
+ body{
+   background:var(--paper-edge);
+   color:var(--ink);
+   font-family:Georgia,'Iowan Old Style','Times New Roman',Times,serif;
+   font-size:18px; line-height:1.62;
+   min-height:100vh; min-height:100dvh;
+   display:flex; flex-direction:column; align-items:center;
+   -webkit-font-smoothing:antialiased;
+ }
+ .sheet{
+   background:var(--paper); box-shadow:var(--shadow);
+   width:100%; max-width:44rem; flex:1;
+   display:flex; flex-direction:column; min-height:100vh; min-height:100dvh;
+   border-left:1px solid var(--rule); border-right:1px solid var(--rule);
+ }
+ .smallcaps{font-variant:small-caps; letter-spacing:.09em}
+
+ /* ---------------------------- masthead --------------------------------- */
+ header{padding:2.1rem 2.4rem 1.1rem; text-align:center}
+ .eyebrow{
+   font-size:.68rem; text-transform:uppercase; letter-spacing:.32em;
+   color:var(--ink-soft); margin:0 0 .7rem;
+ }
+ h1{
+   margin:0; font-weight:400; letter-spacing:.02em;
+   font-size:clamp(2.6rem,10vw,3.9rem); line-height:.96;
+ }
+ h1 .on{font-style:italic; color:var(--spot); font-size:.62em; letter-spacing:.01em}
+ .standfirst{
+   margin:.8rem auto 0; max-width:30rem; font-style:italic;
+   color:var(--ink-soft); font-size:1.02rem; line-height:1.5;
+ }
+ .dateline{
+   margin-top:1.15rem; padding-top:.7rem; border-top:1px solid var(--rule);
+   display:flex; flex-wrap:wrap; gap:.5rem 1.1rem; justify-content:center; align-items:baseline;
+   font-size:.72rem; text-transform:uppercase; letter-spacing:.16em; color:var(--ink-soft);
+ }
+ .dateline .dot{color:var(--rule-strong)}
+ #status .live{color:var(--spot); font-weight:bold}
+ /* active-model badge / reconfiguration countdown */
+ #modelbadge{
+   display:none; margin-top:.9rem; padding:.4rem .85rem;
+   border:1px solid var(--rule-strong); border-radius:2px;
+   font-size:.7rem; text-transform:uppercase; letter-spacing:.14em; color:var(--ink-soft);
+ }
+ #modelbadge.show{display:inline-block}
+ #modelbadge.reconf{color:var(--spot); border-color:var(--spot-soft)}
+ #modelbadge b{color:var(--ink); font-weight:bold}
+
+ /* ------------------------------ the page ------------------------------- */
+ main{flex:1; min-height:0; overflow-y:auto; padding:.5rem 2.4rem 1rem}
+ .colnote{
+   margin:.4rem 0 1.6rem; padding:1rem 1.2rem; border:1px solid var(--rule);
+   background:var(--paper-edge); font-size:.92rem; line-height:1.55; color:var(--ink-soft);
+ }
+ .colnote b{color:var(--ink); font-style:normal}
+ .colnote .try{font-style:italic; color:var(--spot)}
+
+ .piece{margin:0 0 .4rem; animation:rise .5s ease both}
+ @keyframes rise{from{opacity:0; transform:translateY(6px)} to{opacity:1; transform:none}}
+ .asterism{ text-align:center; color:var(--rule-strong); margin:1.4rem 0; font-size:1rem; letter-spacing:.4em}
+ .asterism::before{content:"\2042"}
+
+ .story{margin:0; text-indent:0; hyphens:auto}
+ .story .dropcap{
+   float:left; font-size:3.15em; line-height:.72; padding:.06em .09em 0 0;
+   margin:.02em .02em 0 0; color:var(--spot); font-weight:400;
+ }
+ .lead{color:var(--ink)}                 /* the words the reader typed */
+ .cont{color:var(--ink)}                 /* Kevin's continuation */
+ .caret{
+   display:inline-block; width:.06em; height:1.02em; margin-left:.04em;
+   background:var(--spot); vertical-align:-.14em; animation:blink 1.05s step-end infinite;
+ }
+ @keyframes blink{50%{opacity:0}}
+ .lost{font-style:italic; color:var(--spot-soft)}
+
+ /* ------------------------------ compose -------------------------------- */
+ form{
+   padding:1.1rem 2.4rem 1.3rem; border-top:1px solid var(--rule);
+   background:var(--paper); position:sticky; bottom:0;
+ }
+ .compose-label{
+   font-size:.66rem; text-transform:uppercase; letter-spacing:.24em;
+   color:var(--ink-soft); margin-bottom:.5rem;
+ }
+ .compose-row{display:flex; align-items:flex-end; gap:.9rem; border-bottom:1.5px solid var(--ink)}
+ #p{
+   flex:1; border:0; background:transparent; color:var(--ink);
+   font-family:inherit; font-size:1.28rem; font-style:italic; line-height:1.5;
+   padding:.15rem 0 .5rem; outline:none;
+ }
+ #p::placeholder{color:var(--rule-strong); font-style:italic}
+ button{
+   border:0; background:transparent; color:var(--spot); cursor:pointer;
+   font-family:inherit; font-size:.8rem; text-transform:uppercase; letter-spacing:.18em;
+   padding:0 0 .55rem; white-space:nowrap;
+ }
+ button:hover{color:var(--ink)}
+ .latline{margin-top:.55rem; font-size:.68rem; letter-spacing:.1em; color:var(--ink-soft); min-height:1em}
+ .latline b{color:var(--spot)}
+
+ /* ----------------------------- colophon -------------------------------- */
+ footer{
+   padding:1.2rem 2.4rem 1.8rem; border-top:1px solid var(--rule-strong);
+   background:var(--paper-edge);
+ }
+ .colophon-title{
+   text-align:center; font-size:.66rem; text-transform:uppercase; letter-spacing:.28em;
+   color:var(--ink-soft); margin-bottom:1rem;
+ }
+ .stats{
+   display:grid; grid-template-columns:repeat(3,1fr); gap:1rem .5rem;
+   font-variant-numeric:tabular-nums; text-align:center;
+ }
+ .stat{display:flex; flex-direction:column; gap:.15rem; cursor:help}
+ .stat .n{font-size:1.35rem; color:var(--ink); line-height:1}
+ .stat.hero .n{color:var(--spot)}
+ .stat .k{font-size:.6rem; text-transform:uppercase; letter-spacing:.13em; color:var(--ink-soft)}
+ .imprint{
+   margin-top:1.15rem; padding-top:.85rem; border-top:1px solid var(--rule);
+   text-align:center; font-size:.72rem; line-height:1.6; color:var(--ink-soft); font-style:italic;
+ }
+ .imprint b{color:var(--ink); font-style:normal; font-variant-numeric:tabular-nums}
+
+ /* thin, unobtrusive scrollbar */
+ main::-webkit-scrollbar{width:9px}
+ main::-webkit-scrollbar-thumb{background:var(--rule-strong); border-radius:0}
+
+ /* ------------------------------ phones --------------------------------- */
+ @media (max-width:640px){
+   body{font-size:17px}
+   .sheet{border-left:0; border-right:0}
+   header{padding:1.5rem 1.3rem .9rem}
+   main{padding:.4rem 1.3rem 1rem}
+   form{padding:.9rem 1.3rem 1.1rem}
+   footer{padding:1.05rem 1.3rem 1.4rem}
+   .stats{grid-template-columns:repeat(2,1fr); gap:.95rem .5rem}
+   .story .dropcap{font-size:2.8em}
+   #p{font-size:1.14rem}
+ }
+ @media (prefers-reduced-motion:reduce){
+   .piece{animation:none} .caret{animation:none}
+ }
+</style></head>
+<body>
+<div class="sheet">
+ <header>
+   <p class="eyebrow">A Toddler-Model Quarterly</p>
+   <h1>Kevin <span class="on">on&nbsp;Kria</span></h1>
+   <p class="standfirst">Telegraphic tales, composed entirely inside the fabric of a
+      Xilinx&nbsp;Kria&nbsp;KV260 — no weights ever touch memory.</p>
+   <div class="dateline">
+     <span class="smallcaps">Edited in silicon</span>
+     <span class="dot">&bull;</span>
+     <span id="status">Connecting&hellip;</span>
+     <span class="dot">&bull;</span>
+     <span class="smallcaps">Zero&nbsp;DRAM Edition</span>
+   </div>
+   <div id="modelbadge"></div>
+ </header>
+
+ <main id="log">
+   <div class="colnote">
+     <b>A note from the press.</b> Kevin be a 3.3M-param toddler who only know
+     telegraphic TinyStories. Begin a tale below — <b>him finish it</b>, no ask
+     question. Try
+     <span class="try">&ldquo;once upon time&rdquo;</span>,
+     <span class="try">&ldquo;little girl find dog&rdquo;</span> or
+     <span class="try">&ldquo;one day big bear&rdquo;</span>.
+     The point be the speed, not the prose.
+   </div>
+ </main>
+
+ <form id="f" onsubmit="return onEnter(event)">
+   <div class="compose-label">Begin a story</div>
+   <div class="compose-row">
+     <input id="p" type="text" autocomplete="off" spellcheck="false"
+            placeholder="once upon time&hellip;" autofocus>
+     <button type="submit">Set in type &rarr;</button>
+   </div>
+   <div class="latline" id="lat"></div>
+ </form>
+
+ <footer>
+   <div class="colophon-title">Colophon &mdash; set live from the fabric</div>
+   <div class="stats">
+     <div class="stat hero" title="Pure on-chip decode rate of the latest reply — PL cycles / clock. The silicon ceiling (~16k); the fabric itself runs this fast.">
+       <span class="n" id="st_fab">&mdash;</span><span class="k">Fabric tok/s</span></div>
+     <div class="stat" title="Round-trip rate: chars / full request wall-time. Below fabric tok/s because per-token logit readback + the host loop dominate — what you actually get end-to-end.">
+       <span class="n" id="st_trip">&mdash;</span><span class="k">Round-trip tok/s</span></div>
+     <div class="stat" title="Distinct visitors (by IP) in the last 30 minutes.">
+       <span class="n" id="st_users">&mdash;</span><span class="k">Readers, 30m</span></div>
+     <div class="stat" title="Total characters Kevin has set in type since the server booted.">
+       <span class="n" id="st_total">&mdash;</span><span class="k">Chars set</span></div>
+     <div class="stat" title="Fabric busy fraction — a labelled software occupancy proxy, not a hardware counter.">
+       <span class="n" id="st_duty">&mdash;</span><span class="k">Press at work</span></div>
+     <div class="stat" title="Fraction of Enters answered straight from the speculation buffer with zero round trips.">
+       <span class="n" id="st_zrt">&mdash;</span><span class="k">Set in advance</span></div>
+   </div>
+   <div class="imprint">
+     Record impression: <b>16,087 tok/s</b> @&nbsp;166.7&nbsp;MHz &mdash;
+     measured on silicon, N=1, T=128 on-chip KV, 3/3 bit-exact.
+   </div>
+ </footer>
+</div>
+
+<script>
+"use strict";
+const log=document.getElementById('log'),
+      inp=document.getElementById('p'),
+      statusEl=document.getElementById('status'),
+      latEl=document.getElementById('lat'),
+      badge=document.getElementById('modelbadge');
+
+const DEBOUNCE_MS=20;   // client-side keystroke coalesce; the server adds its own.
+let ws, seq=0, debTimer=null, reconnectDelay=1200;
+// speculation buffer: the completion the server computed for `bufPrompt`.
+let bufPrompt=null, bufCompletion=null;
+let lastSentAt=0, lastSentPrompt=null;
+// FIFO of unfilled "pending" pieces (one per Enter that missed the buffer).
+let pendingWaits=[];
+
+function oldestWait(prompt){ for(const pw of pendingWaits){ if(pw.prompt===prompt) return pw; } return null; }
+function finishWait(pw){
+  if(pw.timer) clearTimeout(pw.timer);
+  if(pw.reveal) clearInterval(pw.reveal);
+  if(pw.caret) pw.caret.remove();
+  const i=pendingWaits.indexOf(pw); if(i>=0) pendingWaits.splice(i,1);
+}
+
+// ---- rendering a "piece": a set-in-type story with a drop cap ----------------
+function esc(s){ return s==null?'':s; }
+function newPiece(prompt){
+  if(log.querySelector('.piece')){
+    const a=document.createElement('div'); a.className='asterism'; log.appendChild(a);
+  }
+  const piece=document.createElement('article'); piece.className='piece';
+  const p=document.createElement('p'); p.className='story';
+  const first=prompt.slice(0,1), rest=prompt.slice(1);
+  const cap=document.createElement('span'); cap.className='dropcap'; cap.textContent=first;
+  const lead=document.createElement('span'); lead.className='lead'; lead.textContent=rest;
+  const cont=document.createElement('span'); cont.className='cont';
+  p.appendChild(cap); p.appendChild(lead); p.appendChild(cont);
+  piece.appendChild(p); log.appendChild(piece);
+  scrollDown();
+  return {piece, cont};
+}
+function scrollDown(){ log.scrollTop=log.scrollHeight; }
+
+function addCaret(cont){
+  const c=document.createElement('span'); c.className='caret';
+  cont.parentNode.appendChild(c); return c;
+}
+
+// Typewriter reveal for an instantly-known completion (the zero-round-trip blit),
+// so even the "already written" story arrives with a little press-and-ink theatre.
+function typeInto(cont, text, caret){
+  let i=0;
+  const step=Math.max(6, Math.min(22, Math.round(900/Math.max(text.length,1))));
+  const t=setInterval(()=>{
+    i+=1; cont.textContent=text.slice(0,i); scrollDown();
+    if(i>=text.length){ clearInterval(t); if(caret) caret.remove(); }
+  }, step);
+  return t;
+}
+
+// ---------------------------- socket lifecycle --------------------------------
+function connect(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  const url=(window.WS_URL)||(location.host?proto+'://'+location.host:'wss://chat.mikeayles.com');
+  ws=new WebSocket(url);
+  ws.onopen=()=>{ statusEl.innerHTML='<span class="live">In press</span>'; reconnectDelay=1200; };
+  ws.onclose=()=>{
+    statusEl.innerHTML='<span class="smallcaps">Off the wire &mdash; reconnecting&hellip;</span>';
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay=Math.min(reconnectDelay*1.7, 12000);   // gentle backoff, capped
+  };
+  ws.onerror=()=>{ try{ ws.close(); }catch(e){} };
+  ws.onmessage=(ev)=>{
+    let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
+    if(m.type==='hello'){
+      statusEl.innerHTML='<span class="live">In press</span>';
+    } else if(m.type==='speculation'||m.type==='authoritative'){
+      // the speculation stays invisible — it only primes the buffer so Enter
+      // resolves with no round trip. No preview: the magic is it is simply there.
+      bufPrompt=m.prompt; bufCompletion=m.completion;
+      if(m.prompt===lastSentPrompt && lastSentAt){
+        latEl.innerHTML='composed in <b>'+Math.round(performance.now()-lastSentAt)+' ms</b>';
+      }
+      if(m.type==='authoritative'){
+        const pw=oldestWait(m.prompt);
+        if(pw){ fillPending(pw, m.completion||'(the type case was empty)'); bufPrompt=null; bufCompletion=null; }
+        else { blit(m.prompt, m.completion); }
+      }
+    } else if(m.type==='stream'){
+      const pw=oldestWait(m.prompt);
+      if(pw){
+        if(!pw.streaming){ pw.cont.textContent=''; pw.streaming=true; }
+        pw.cont.textContent += m.text; scrollDown();
+      }
+    } else if(m.type==='stream_end'){
+      const pw=oldestWait(m.prompt);
+      if(pw){
+        if(m.completion) pw.cont.textContent=m.completion;
+        else if(!pw.streaming) pw.cont.innerHTML='<span class="lost">the type case was empty</span>';
+        finishWait(pw); bufPrompt=null; bufCompletion=null; scrollDown();
+      }
+    } else if(m.type==='stats'){ renderStats(m); }
+    else if(m.type==='blit_ok'){ /* server agreed; we already blitted */ }
+  };
+}
+
+function fillPending(pw, completion){
+  if(pw.reveal){ clearInterval(pw.reveal); pw.reveal=null; }
+  pw.streaming=true;
+  pw.cont.textContent=completion;
+  finishWait(pw); scrollDown();
+}
+
+// ------------------------- speculation stats (colophon) -----------------------
+function fmtN(n){ if(n==null)return '—';
+  if(n>=1e6)return (n/1e6).toFixed(1)+'M';
+  if(n>=1e3)return (n/1e3).toFixed(1)+'k'; return ''+Math.round(n); }
+function pct(x){ return x==null?'—':Math.round(x*100)+'%'; }
+function setStat(id,v){ const e=document.getElementById(id); if(e)e.textContent=v; }
+
+// rotating two-model demo: active-model badge + live reconfiguration countdown.
+let rot={model:'kevin',label:'Kevin — telegraphic, full speed',rotating:false,switch_in:null,t0:0};
+function updateBadge(){
+  if(!rot.rotating){ badge.className=''; badge.textContent=''; return; }
+  const rem = rot.switch_in==null ? null : Math.max(0, Math.round(rot.switch_in-(Date.now()-rot.t0)/1000));
+  if(rem!=null && rem<=2){
+    badge.className='show reconf';
+    badge.innerHTML='Reconfiguring FPGA… <b>a new edition is being set</b>';
+    return;
+  }
+  const other = rot.model==='legit' ? 'the plain-English press' : 'Kevin';
+  const mm = rem!=null ? (Math.floor(rem/60)+':'+String(rem%60).padStart(2,'0')) : '';
+  badge.className='show';
+  badge.innerHTML='Now setting &mdash; <b>'+esc(rot.label||rot.model)+'</b>'+
+                  (rem!=null ? ('  &middot; switching to '+other+' in '+mm) : '');
+}
+setInterval(updateBadge,1000);
+
+function renderStats(m){
+  if(m.rotating!==undefined){
+    rot={model:m.model,label:m.model_label,rotating:!!m.rotating,switch_in:m.switch_in,t0:Date.now()};
+    updateBadge();
+  }
+  setStat('st_fab',   m.fabric_tok_s? fmtN(m.fabric_tok_s):'—');
+  setStat('st_trip',  m.trip_tok_s?   fmtN(m.trip_tok_s):'—');
+  setStat('st_users', m.users_30m!=null?fmtN(m.users_30m):'—');
+  setStat('st_total', fmtN(m.total_tokens));
+  setStat('st_duty',  pct(m.duty_cycle));
+  setStat('st_zrt',   pct(m.ready_at_enter));
+}
+
+// ------------------------------ composing -------------------------------------
+function sendKeystroke(){
+  const p=inp.value.trim(); if(!p||!ws||ws.readyState!==1) return;
+  seq++; lastSentPrompt=p; lastSentAt=performance.now();
+  ws.send(JSON.stringify({type:'keystroke',prompt:p,seq:seq}));
+}
+inp.addEventListener('input',()=>{
+  clearTimeout(debTimer); debTimer=setTimeout(sendKeystroke,DEBOUNCE_MS);
+});
+
+function blit(prompt, completion){
+  const {cont}=newPiece(prompt);
+  const caret=addCaret(cont);
+  typeInto(cont, completion||'', caret);   // fast press-reveal of the finished tale
+  inp.value=''; bufPrompt=null; bufCompletion=null; latEl.textContent='';
+}
+
+function onEnter(e){
+  e.preventDefault();
+  const cur=inp.value.trim(); if(!cur) return false;
+  seq++;
+  // The CLIENT decides blit-vs-reply and TELLS the server, which obeys.
+  const fresh = (bufPrompt===cur && bufCompletion!=null);
+  if(ws && ws.readyState===1){
+    ws.send(JSON.stringify({type:'enter',prompt:cur,seq:seq,blitted:fresh}));
+  }
+  if(fresh){
+    blit(cur, bufCompletion);              // already set — instant, no round trip
+  } else {
+    // buffer not ready -> lay the seed and let Kevin type into it as it streams.
+    const {cont}=newPiece(cur);
+    const caret=addCaret(cont);
+    inp.value=''; latEl.textContent='';
+    const pw={cont, caret, prompt:cur, streaming:false, seq:seq};
+    pw.timer=setTimeout(()=>{
+      if(pendingWaits.includes(pw)){
+        if(!pw.streaming) pw.cont.innerHTML='<span class="lost">Kevin lost his train of thought &mdash; try again.</span>';
+        finishWait(pw);
+      }
+    }, 15000);
+    pendingWaits.push(pw);
+  }
+  return false;
+}
+
+connect();
+</script>
+</body></html>

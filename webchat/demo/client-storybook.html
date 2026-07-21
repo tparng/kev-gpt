@@ -1,0 +1,478 @@
+<!doctype html>
+<!--
+  client-storybook.html — a warm "picture-book" front end for the Kevin-on-Kria
+  live demo. Single self-contained file: inline CSS + JS + SVG, system fonts,
+  no external anything.
+
+  Speaks the exact demo protocol (see webchat/demo/client.html + server.py):
+    out: {type:"keystroke", prompt, seq}          on debounced input change
+    out: {type:"enter", prompt, seq, blitted}      on Enter
+    in : {type:"hello", client_id}
+    in : {type:"speculation"|"authoritative", prompt, completion, infer_ms}
+    in : {type:"stream", prompt, text}             fabric typing char chunks
+    in : {type:"stream_end", prompt, completion}
+    in : {type:"stats", fabric_tok_s, trip_tok_s, users_30m, total_tokens,
+                        duty_cycle, ready_at_enter, model, model_label,
+                        rotating, switch_in}
+    in : {type:"blit_ok", prompt}
+
+  The speculative-typing trick is unchanged: every keystroke primes an invisible
+  buffer; on Enter we blit locally with zero round trip if the buffer is fresh,
+  else we open a "…" line and stream the fabric's chars into it.
+-->
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kevin — a tiny storyteller on a chip</title>
+<style>
+ /* ---- warm storybook palette (light + dark), no gradients anywhere ---- */
+ :root{
+   --paper:#f6efe0; --paper-2:#fbf6ea; --card:#fffaf0;
+   --ink:#3b332a; --ink-soft:#7a6f60; --ink-faint:#a89b88;
+   --rule:#e4d9c4; --rule-2:#d8caae;
+   --accent:#c05f3c;      /* terracotta ink */
+   --accent-deep:#9c4426;
+   --sage:#6f7a55;        /* olive-green for "you" */
+   --gold:#b6862c;
+   --shadow:rgba(90,70,40,.16);
+   color-scheme:light;
+ }
+ @media (prefers-color-scheme:dark){
+   :root{
+     --paper:#211d18; --paper-2:#262019; --card:#2b251d;
+     --ink:#efe6d5; --ink-soft:#b8ab97; --ink-faint:#8a7d69;
+     --rule:#3a3227; --rule-2:#4a4032;
+     --accent:#e08a63; --accent-deep:#e5936d;
+     --sage:#a9b585; --gold:#d6ac5a;
+     --shadow:rgba(0,0,0,.4);
+     color-scheme:dark;
+   }
+ }
+ :root[data-theme="dark"]{
+   --paper:#211d18; --paper-2:#262019; --card:#2b251d;
+   --ink:#efe6d5; --ink-soft:#b8ab97; --ink-faint:#8a7d69;
+   --rule:#3a3227; --rule-2:#4a4032;
+   --accent:#e08a63; --accent-deep:#e5936d;
+   --sage:#a9b585; --gold:#d6ac5a;
+   --shadow:rgba(0,0,0,.4); color-scheme:dark;
+ }
+ :root[data-theme="light"]{
+   --paper:#f6efe0; --paper-2:#fbf6ea; --card:#fffaf0;
+   --ink:#3b332a; --ink-soft:#7a6f60; --ink-faint:#a89b88;
+   --rule:#e4d9c4; --rule-2:#d8caae;
+   --accent:#c05f3c; --accent-deep:#9c4426;
+   --sage:#6f7a55; --gold:#b6862c;
+   --shadow:rgba(90,70,40,.16); color-scheme:light;
+ }
+
+ *{box-sizing:border-box}
+ body{
+   margin:0; color:var(--ink);
+   font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+   background-color:var(--paper);
+   /* paper grain: generated SVG fractal noise (not an image file, no gradient) */
+   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+   background-blend-mode:multiply;
+   display:flex; flex-direction:column;
+   height:100vh; height:100dvh;
+ }
+ @media (prefers-color-scheme:dark){ body{background-blend-mode:soft-light} }
+ :root[data-theme="dark"] body{background-blend-mode:soft-light}
+
+ .serif{ font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif; }
+
+ /* ---------------- header ---------------- */
+ header{
+   flex:0 0 auto; padding:14px 20px 12px;
+   display:flex; align-items:center; gap:12px;
+   border-bottom:1.5px solid var(--rule);
+   background-color:var(--paper-2);
+ }
+ header .mark{ flex:0 0 auto; color:var(--accent); }
+ .title{ display:flex; flex-direction:column; line-height:1.05; min-width:0; }
+ .title h1{ font-size:22px; margin:0; font-weight:600; letter-spacing:.2px; }
+ .title h1 .light{ color:var(--ink-soft); font-weight:400; }
+ .title .tag{ font-size:12px; color:var(--ink-soft); margin-top:2px; }
+ header .right{ margin-left:auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap; justify-content:flex-end; }
+
+ /* connection dot */
+ .status{ display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--ink-soft); white-space:nowrap; }
+ .dot{ width:8px; height:8px; border-radius:50%; background:var(--ink-faint); box-shadow:0 0 0 3px transparent; }
+ .dot.live{ background:var(--sage); box-shadow:0 0 0 3px color-mix(in srgb,var(--sage) 22%,transparent); }
+ .dot.off{ background:var(--accent); }
+
+ /* model badge */
+ .badge{
+   display:inline-flex; align-items:center; gap:7px;
+   font-size:12.5px; color:var(--ink); background:var(--card);
+   border:1.5px solid var(--rule-2); border-radius:999px; padding:5px 12px;
+   box-shadow:0 1px 0 var(--shadow); white-space:nowrap;
+ }
+ .badge .swatch{ width:9px; height:9px; border-radius:2px; background:var(--accent); }
+ .badge.legit .swatch{ background:var(--gold); }
+ .badge .cd{ color:var(--ink-soft); font-variant-numeric:tabular-nums; }
+ .badge.reconf{ border-color:var(--accent); color:var(--accent-deep); }
+ .badge.reconf .swatch{ background:var(--accent); animation:pulse 1s ease-in-out infinite; }
+ @keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.3} }
+ .badge.hidden{ display:none; }
+
+ /* ---------------- reading column ---------------- */
+ #scroll{ flex:1; min-height:0; overflow-y:auto; }
+ #col{ max-width:640px; margin:0 auto; padding:26px 20px 30px; }
+
+ .intro{ text-align:center; margin:6px 0 26px; }
+ .intro .doodle{ color:var(--accent); margin-bottom:8px; }
+ .intro p{ margin:0 auto; max-width:34ch; color:var(--ink-soft); font-size:15px; line-height:1.55; }
+ .intro .lead{ color:var(--ink); font-size:19px; margin-bottom:8px; }
+ .intro .prompts{ margin-top:14px; font-size:13.5px; color:var(--ink-soft); }
+ .intro .chip{
+   display:inline-block; cursor:pointer; margin:4px 3px; padding:4px 11px;
+   border:1.5px solid var(--rule-2); border-radius:999px; background:var(--card);
+   color:var(--ink); font-size:13px; transition:border-color .15s,color .15s;
+ }
+ .intro .chip:hover{ border-color:var(--accent); color:var(--accent-deep); }
+
+ .divider{ display:block; margin:2px auto 22px; color:var(--rule-2); }
+
+ /* a story exchange */
+ .story{ margin:0 0 22px; }
+ .opening{ display:flex; align-items:baseline; gap:9px; margin-bottom:7px; }
+ .opening .who{ flex:0 0 auto; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-faint); padding-top:3px; }
+ .opening .text{
+   font-size:17px; line-height:1.5; color:var(--sage); font-weight:600;
+ }
+ .telling{
+   position:relative;
+   background:var(--card); border:1.5px solid var(--rule-2); border-radius:14px;
+   padding:14px 17px 15px 18px; box-shadow:0 2px 8px var(--shadow);
+   line-height:1.62; font-size:17px; white-space:pre-wrap; color:var(--ink);
+ }
+ .telling::before{ /* a little colored spine on the left, like a bookmark */
+   content:""; position:absolute; left:0; top:12px; bottom:12px; width:3px;
+   border-radius:3px; background:var(--accent); opacity:.7;
+ }
+ .telling.waiting{ color:var(--ink-soft); font-style:italic; }
+ .telling .caret{ display:inline-block; width:2px; background:var(--accent);
+   margin-left:1px; animation:blink 1s step-end infinite; }
+ @keyframes blink{ 50%{opacity:0} }
+ .telling.err{ color:var(--accent-deep); font-style:italic; }
+
+ /* the three dots while thinking */
+ .think{ display:inline-flex; gap:4px; align-items:center; }
+ .think i{ width:6px; height:6px; border-radius:50%; background:var(--ink-faint); animation:hop 1.1s infinite; }
+ .think i:nth-child(2){ animation-delay:.18s } .think i:nth-child(3){ animation-delay:.36s }
+ @keyframes hop{ 0%,60%,100%{transform:translateY(0);opacity:.4} 30%{transform:translateY(-4px);opacity:1} }
+
+ /* ---------------- composer ---------------- */
+ form{ flex:0 0 auto; border-top:1.5px solid var(--rule); background-color:var(--paper-2); }
+ .composer{ max-width:640px; margin:0 auto; padding:13px 20px; display:flex; gap:10px; align-items:center; }
+ input[type=text]{
+   flex:1; min-width:0; font:inherit; font-size:16px; color:var(--ink);
+   background:var(--card); border:1.5px solid var(--rule-2); border-radius:12px;
+   padding:12px 15px; outline:none; transition:border-color .15s,box-shadow .15s;
+ }
+ input[type=text]::placeholder{ color:var(--ink-faint); }
+ input[type=text]:focus{ border-color:var(--accent);
+   box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent); }
+ button{
+   flex:0 0 auto; font:inherit; font-weight:600; font-size:15px; cursor:pointer;
+   color:#fff; background:var(--accent); border:1.5px solid var(--accent-deep);
+   border-radius:12px; padding:12px 18px; display:inline-flex; align-items:center; gap:7px;
+   box-shadow:0 2px 0 var(--shadow); transition:background .15s,transform .06s;
+ }
+ button:hover{ background:var(--accent-deep); }
+ button:active{ transform:translateY(1px); }
+ .lat{ font-size:11px; color:var(--ink-faint); font-variant-numeric:tabular-nums; text-align:center;
+   padding:0 20px 6px; margin:0 auto; max-width:640px; min-height:14px; }
+ .lat b{ color:var(--sage); }
+
+ /* ---------------- "how it's made" footer strip ---------------- */
+ .colophon{ flex:0 0 auto; border-top:1.5px solid var(--rule); background-color:var(--paper); }
+ .colophon .inner{ max-width:760px; margin:0 auto; padding:11px 20px 13px; }
+ .colophon .heading{ font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:var(--ink-faint);
+   display:flex; align-items:center; gap:8px; margin-bottom:9px; }
+ .colophon .heading svg{ color:var(--rule-2); flex:1; }
+ .stats{ display:flex; flex-wrap:wrap; gap:8px 22px; align-items:flex-end; }
+ .stat{ display:flex; flex-direction:column; line-height:1.15; cursor:help; }
+ .stat b{ font-size:17px; font-weight:600; color:var(--ink); font-variant-numeric:tabular-nums; }
+ .stat.hero b{ color:var(--accent); }
+ .stat span{ font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--ink-faint); margin-top:1px; }
+ .record{ margin-left:auto; text-align:right; font-size:11px; line-height:1.4; color:var(--ink-faint); }
+ .record b{ color:var(--sage); font-variant-numeric:tabular-nums; }
+
+ @media (max-width:600px){
+   header{ padding:11px 14px; }
+   .title h1{ font-size:19px; } .title .tag{ font-size:11px; }
+   header .right{ gap:9px; }
+   #col{ padding:20px 15px 24px; }
+   .composer{ padding:11px 14px; } .lat{ padding:0 14px 6px; }
+   .colophon .inner{ padding:10px 14px 12px; }
+   .stats{ gap:7px 16px; } .stat b{ font-size:15px; } .stat span{ font-size:9px; }
+   .record{ flex-basis:100%; order:9; margin-left:0; text-align:left; margin-top:3px; }
+   button span.lbl{ display:none; }
+ }
+</style></head><body>
+
+<header>
+ <!-- hand-drawn open-book mark -->
+ <svg class="mark" width="34" height="34" viewBox="0 0 34 34" fill="none" aria-hidden="true">
+   <path d="M17 9.5C13.5 6.8 8.5 6.8 5 8.2v17.6c3.5-1.4 8.5-1.4 12 1.2 3.5-2.6 8.5-2.6 12-1.2V8.2c-3.5-1.4-8.5-1.4-12 1.3Z"
+         stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+   <path d="M17 10v17" stroke="currentColor" stroke-width="1.7"/>
+   <path d="M8.2 12.5c1.8-.5 3.8-.5 5.6.2M8.2 16c1.8-.5 3.8-.5 5.6.2M20.2 12.7c1.8-.7 3.8-.7 5.6-.2M20.2 16.2c1.8-.7 3.8-.7 5.6-.2"
+         stroke="currentColor" stroke-width="1.3" stroke-linecap="round" opacity=".75"/>
+ </svg>
+ <div class="title">
+   <h1 class="serif">Kevin <span class="light">on Kria</span></h1>
+   <div class="tag">a tiny storyteller living inside a chip</div>
+ </div>
+ <div class="right">
+   <span class="badge hidden" id="badge"><span class="swatch"></span><span id="badgeLabel"></span><span class="cd" id="badgeCd"></span></span>
+   <span class="status"><span class="dot" id="dot"></span><span id="statusTxt">connecting…</span></span>
+ </div>
+</header>
+
+<div id="scroll">
+ <div id="col">
+   <div class="intro">
+     <svg class="doodle" width="52" height="30" viewBox="0 0 52 30" fill="none" aria-hidden="true">
+       <path d="M3 20c6-9 12-9 15 0s9 9 13-1 9-10 15-3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+       <circle cx="45" cy="8" r="1.6" fill="currentColor"/><circle cx="49" cy="12" r="1.2" fill="currentColor"/>
+     </svg>
+     <p class="lead serif">Few word do trick.</p>
+     <p>Type the start of a little story. Kevin finishes it — telegraphically, and very, very fast.</p>
+     <div class="prompts">
+       try:
+       <span class="chip">once upon time</span>
+       <span class="chip">little girl find dog</span>
+       <span class="chip">one day big bear</span>
+     </div>
+   </div>
+   <!-- wavy hand-drawn divider -->
+   <svg class="divider" width="220" height="12" viewBox="0 0 220 12" fill="none" aria-hidden="true">
+     <path d="M2 6c9-6 18 6 27 0s18-6 27 0 18 6 27 0 18-6 27 0 18 6 27 0 18-6 27 0 18 6 27 0"
+           stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+   </svg>
+   <!-- stories are appended here -->
+ </div>
+</div>
+
+<form id="f" onsubmit="return onEnter(event)">
+ <div class="lat" id="lat"></div>
+ <div class="composer">
+   <input id="p" type="text" autocomplete="off" spellcheck="false" placeholder="once upon time…" autofocus>
+   <button type="submit">
+     <svg width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
+       <path d="M2 8.5h11M9 4.5l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+     </svg><span class="lbl">Tell it</span>
+   </button>
+ </div>
+</form>
+
+<footer class="colophon">
+ <div class="inner">
+   <div class="heading">
+     <span>how it's made</span>
+     <svg height="8" viewBox="0 0 200 8" preserveAspectRatio="none" fill="none" aria-hidden="true">
+       <path d="M0 4h200" stroke="currentColor" stroke-width="1.5" stroke-dasharray="1 5" stroke-linecap="round"/>
+     </svg>
+   </div>
+   <div class="stats">
+     <div class="stat hero" title="Pure on-chip decode rate of the latest reply — PL cycles ÷ clock. The silicon ceiling (~16k); the fabric itself runs this fast."><b id="st_fab">—</b><span>fabric tok/s</span></div>
+     <div class="stat" title="Round-trip rate: chars ÷ full request wall-time. Below fabric tok/s because each token's logit readback for sampling + the host loop dominate — what you actually get end-to-end."><b id="st_trip">—</b><span>round-trip tok/s</span></div>
+     <div class="stat" title="Distinct visitors (by IP) in the last 30 minutes — real reach, not the instantaneous count."><b id="st_users">—</b><span>readers (30m)</span></div>
+     <div class="stat" title="Total characters Kevin has told since the server booted."><b id="st_total">—</b><span>words told</span></div>
+     <div class="stat" title="Fabric busy fraction — a labelled software occupancy proxy, not a hardware counter."><b id="st_duty">—</b><span>fabric busy</span></div>
+     <div class="stat" title="Fraction of Enters answered straight from the speculation buffer with zero round trips."><b id="st_zrt">—</b><span>ready on enter</span></div>
+     <div class="record" title="The measured on-silicon faithful single-stream decode record (full T=128 on-chip KV window), 3/3 bit-exact.">
+       record <b>16,087 tok/s</b> @166.7 MHz<br>measured · N=1 · T=128 on-chip KV · zero DRAM
+     </div>
+   </div>
+ </div>
+</footer>
+
+<script>
+"use strict";
+const col   = document.getElementById('col'),
+      inp   = document.getElementById('p'),
+      dot   = document.getElementById('dot'),
+      statusTxt = document.getElementById('statusTxt'),
+      latEl = document.getElementById('lat');
+
+const DEBOUNCE_MS = 20;   // client-side keystroke coalesce; server adds its own settle
+let ws, seq = 0, debTimer = null;
+// speculation buffer: the completion the server computed for `bufPrompt`
+let bufPrompt = null, bufCompletion = null;
+let lastSentAt = 0, lastSentPrompt = null;
+// FIFO of "…" story bubbles awaiting an answer (one per Enter that missed the buffer)
+let pendingWaits = [];
+
+function oldestWait(prompt){ for(const pw of pendingWaits){ if(pw.prompt===prompt) return pw; } return null; }
+function finishWait(pw){ if(pw.timer) clearTimeout(pw.timer);
+  const i=pendingWaits.indexOf(pw); if(i>=0) pendingWaits.splice(i,1); }
+
+function scrollDown(){ const s=document.getElementById('scroll'); s.scrollTop=s.scrollHeight; }
+
+// build one story exchange: the opening line (the user) + the telling (Kevin)
+function addStory(prompt, completion, opts){
+  opts = opts || {};
+  const wrap = document.createElement('div'); wrap.className='story';
+  const op = document.createElement('div'); op.className='opening';
+  const who = document.createElement('div'); who.className='who'; who.textContent='you start';
+  const txt = document.createElement('div'); txt.className='text serif'; txt.textContent=prompt;
+  op.appendChild(who); op.appendChild(txt);
+  const tell = document.createElement('div'); tell.className='telling';
+  if(opts.waiting){
+    tell.classList.add('waiting');
+    tell.innerHTML='<span class="think"><i></i><i></i><i></i></span>';
+  } else {
+    tell.textContent = completion || '';
+  }
+  wrap.appendChild(op); wrap.appendChild(tell);
+  col.appendChild(wrap);
+  scrollDown();
+  return tell;
+}
+
+// ---------------- websocket ----------------
+function connect(){
+  const proto = location.protocol==='https:' ? 'wss' : 'ws';
+  const url = (window.WS_URL) || (location.host?proto+'://'+location.host:'wss://chat.mikeayles.com');
+  ws = new WebSocket(url);
+  ws.onopen = ()=>{ dot.className='dot live'; statusTxt.textContent='live'; };
+  ws.onclose = ()=>{ dot.className='dot off'; statusTxt.textContent='reconnecting…'; setTimeout(connect,1500); };
+  ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
+  ws.onmessage = (ev)=>{
+    let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
+    if(m.type==='hello'){ dot.className='dot live'; statusTxt.textContent='live'; }
+    else if(m.type==='speculation' || m.type==='authoritative'){
+      // speculation stays invisible — it just primes the buffer so Enter is instant
+      bufPrompt=m.prompt; bufCompletion=m.completion;
+      if(m.prompt===lastSentPrompt && lastSentAt){
+        latEl.innerHTML='Kevin was ready in <b>'+Math.round(performance.now()-lastSentAt)+' ms</b>';
+      }
+      if(m.type==='authoritative'){         // a buffer miss resolved (non-stream)
+        const pw=oldestWait(m.prompt);
+        if(pw){ fillTelling(pw, m.completion||'(Kevin went quiet)'); finishWait(pw);
+                bufPrompt=null; bufCompletion=null; scrollDown(); }
+        else { blit(m.prompt, m.completion); }
+      }
+    }
+    else if(m.type==='stream'){
+      // Enter-miss: fabric is streaming chars as it generates — append live
+      const pw=oldestWait(m.prompt);
+      if(pw){
+        if(!pw.streaming){ pw.el.classList.remove('waiting');
+          pw.el.innerHTML=''; pw.textNode=document.createTextNode('');
+          pw.caret=document.createElement('span'); pw.caret.className='caret'; pw.caret.innerHTML='&nbsp;';
+          pw.el.appendChild(pw.textNode); pw.el.appendChild(pw.caret); pw.streaming=true; }
+        pw.textNode.nodeValue += m.text; scrollDown();
+      }
+    }
+    else if(m.type==='stream_end'){
+      const pw=oldestWait(m.prompt);
+      if(pw){
+        if(m.completion) fillTelling(pw, m.completion);          // snap to tidied
+        else if(!pw.streaming) fillTelling(pw, '(Kevin went quiet)');
+        else if(pw.caret) pw.caret.remove();                     // drop the blinking caret
+        finishWait(pw); bufPrompt=null; bufCompletion=null; scrollDown();
+      }
+    }
+    else if(m.type==='stats'){ renderStats(m); }
+    else if(m.type==='blit_ok'){ /* server agreed; already blitted */ }
+  };
+}
+function fillTelling(pw, text){
+  pw.el.classList.remove('waiting'); pw.streaming=false;
+  pw.el.textContent = text;
+}
+
+// ---------------- live "how it's made" stats ----------------
+function fmtN(n){ if(n==null) return '—';
+  if(n>=1e6) return (n/1e6).toFixed(1)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(1)+'k';
+  return ''+Math.round(n); }
+function setStat(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; }
+function pct(x){ return x==null?'—':Math.round(x*100)+'%'; }
+
+// rotating two-model demo: active-model badge + live countdown / reconfiguring state
+let rot={model:'kevin',label:'Kevin — telegraphic, full speed',rotating:false,switch_in:null,t0:0};
+const badge=document.getElementById('badge'), badgeLabel=document.getElementById('badgeLabel'), badgeCd=document.getElementById('badgeCd');
+function updateBadge(){
+  if(!rot.rotating){ badge.className='badge hidden'; return; }
+  const rem = rot.switch_in==null ? null : Math.max(0, Math.round(rot.switch_in-(Date.now()-rot.t0)/1000));
+  if(rem!=null && rem<=2){
+    badge.className='badge reconf'; badgeLabel.textContent='reconfiguring FPGA…'; badgeCd.textContent=''; return;
+  }
+  const legit = rot.model==='legit';
+  badge.className='badge'+(legit?' legit':'');
+  badgeLabel.textContent = rot.label || rot.model;
+  if(rem!=null){
+    const other = legit?'Kevin':'the big model';
+    const mm = Math.floor(rem/60)+':'+String(rem%60).padStart(2,'0');
+    badgeCd.textContent = '· ↔ '+other+' in '+mm;
+  } else badgeCd.textContent='';
+}
+setInterval(updateBadge, 1000);
+function renderStats(m){
+  if(m.rotating!==undefined){
+    rot={model:m.model, label:m.model_label, rotating:!!m.rotating, switch_in:m.switch_in, t0:Date.now()};
+    updateBadge();
+  }
+  setStat('st_fab',  m.fabric_tok_s ? fmtN(m.fabric_tok_s):'—');
+  setStat('st_trip', m.trip_tok_s   ? fmtN(m.trip_tok_s):'—');
+  setStat('st_users', m.users_30m!=null ? fmtN(m.users_30m):'—');
+  setStat('st_total', fmtN(m.total_tokens));
+  setStat('st_duty', pct(m.duty_cycle));
+  setStat('st_zrt',  pct(m.ready_at_enter));
+}
+
+// ---------------- keystroke speculation ----------------
+function sendKeystroke(){
+  if(!ws || ws.readyState!==1) return;
+  const p=inp.value.trim(); if(!p) return;
+  seq++; lastSentPrompt=p; lastSentAt=performance.now();
+  ws.send(JSON.stringify({type:'keystroke',prompt:p,seq:seq}));
+}
+inp.addEventListener('input',()=>{ clearTimeout(debTimer); debTimer=setTimeout(sendKeystroke,DEBOUNCE_MS); });
+
+// example-prompt chips
+document.querySelectorAll('.intro .chip').forEach(c=>{
+  c.addEventListener('click',()=>{ inp.value=c.textContent; inp.focus();
+    clearTimeout(debTimer); debTimer=setTimeout(sendKeystroke,DEBOUNCE_MS); });
+});
+
+function blit(prompt, completion){
+  addStory(prompt, completion);
+  inp.value=''; bufPrompt=null; bufCompletion=null; scrollDown();
+}
+
+function onEnter(e){
+  e.preventDefault();
+  const cur=inp.value.trim(); if(!cur) return false;
+  seq++;
+  // CLIENT decides blit-vs-reply and TELLS the server, which obeys.
+  const fresh = (bufPrompt===cur && bufCompletion!=null);
+  if(ws && ws.readyState===1){
+    ws.send(JSON.stringify({type:'enter',prompt:cur,seq:seq,blitted:fresh}));
+  }
+  if(fresh){
+    blit(cur, bufCompletion);           // already there — instant, no round trip
+  } else {
+    const tell = addStory(cur, null, {waiting:true});
+    inp.value='';
+    const pw={el:tell, prompt:cur, streaming:false, seq:seq};
+    pw.timer=setTimeout(()=>{
+      if(pendingWaits.includes(pw)){
+        if(!pw.streaming){ pw.el.classList.remove('waiting'); pw.el.classList.add('err');
+          pw.el.textContent='(Kevin lost his train of thought — try again)'; }
+        finishWait(pw);
+      }
+    }, 15000);
+    pendingWaits.push(pw);
+  }
+  return false;
+}
+
+connect();
+</script>
+</body></html>

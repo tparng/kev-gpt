@@ -1,0 +1,380 @@
+<!doctype html>
+<!--
+  client-terminal.html — retro hardware/serial-console chat UI for "Kevin on Kria".
+
+  Same demo protocol as client.html (speculative typing + streaming):
+    out: {type:"keystroke", prompt, seq}          on each debounced input change
+    out: {type:"enter", prompt, seq, blitted}     on Enter (client decides blit)
+    in : {type:"hello", client_id}
+    in : {type:"speculation"|"authoritative", prompt, completion, infer_ms}
+    in : {type:"stream", prompt, text}            char chunks as the fabric decodes
+    in : {type:"stream_end", prompt, completion}
+    in : {type:"stats", ...}                       ~1s instrument frame
+    in : {type:"blit_ok", prompt}
+
+  The conceit: you are talking to a chip over a serial console — because you
+  literally are. Amber phosphor CRT, box-drawing frames, a blinking block cursor,
+  and a hardware status readout for the live fabric telemetry.
+-->
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV260 · KEVIN — serial console</title>
+<style>
+ :root{
+   color-scheme:dark;
+   --bg:#0a0a07;          /* near-black tube */
+   --panel:#100f0a;
+   --line:#2b2a1c;        /* dim rule */
+   --line2:#3d3a25;
+   --amber:#ffb000;       /* phosphor */
+   --amber-hi:#ffd25e;    /* highlight */
+   --amber-dim:#9a6f13;   /* faded trace */
+   --amber-ghost:#6b4e11; /* labels */
+   --red:#ff5a3c;         /* fault */
+   --mono:ui-monospace,"SF Mono",SFMono-Regular,"Cascadia Code","Cascadia Mono",
+          Menlo,Consolas,"DejaVu Sans Mono","Liberation Mono","Roboto Mono",monospace;
+ }
+ *{box-sizing:border-box}
+ html,body{height:100%}
+ body{
+   margin:0;background:var(--bg);color:var(--amber);
+   font-family:var(--mono);font-size:14px;line-height:1.5;
+   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+   display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden;
+   letter-spacing:.01em;
+ }
+ /* faint CRT scanlines — an SVG line pattern, NOT a gradient */
+ body::before{
+   content:"";position:fixed;inset:0;pointer-events:none;z-index:9;opacity:.35;
+   background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='3' height='3'><rect width='3' height='1' y='0' fill='%23000000' opacity='0.28'/></svg>");
+   background-size:100% 3px;
+   mix-blend-mode:multiply;
+ }
+ .glow{text-shadow:0 0 6px rgba(255,176,0,.32)}
+
+ /* ---- top banner: the device identity line -------------------------------- */
+ header{
+   flex:0 0 auto;background:var(--panel);border-bottom:1px solid var(--line);
+   padding:10px 14px 9px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;
+ }
+ header .brand{color:var(--amber-hi);font-weight:700;letter-spacing:.06em}
+ header .id{color:var(--amber-ghost);font-size:11.5px;letter-spacing:.04em}
+ header .id b{color:var(--amber-dim);font-weight:400}
+ header .conn{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:11.5px;
+   color:var(--amber-dim);text-transform:uppercase;letter-spacing:.08em}
+ .led{width:8px;height:8px;border-radius:50%;background:var(--amber);
+   box-shadow:0 0 7px var(--amber);}
+ .led.warn{background:var(--amber-dim);box-shadow:none;animation:blink 1s steps(2) infinite}
+ .led.down{background:var(--red);box-shadow:0 0 7px var(--red)}
+ @keyframes blink{50%{opacity:.15}}
+
+ /* ---- instrument strip: the hardware status readout ----------------------- */
+ #strip{
+   flex:0 0 auto;background:#0c0b07;border-bottom:1px solid var(--line);
+   padding:8px 12px 9px;overflow-x:auto;
+ }
+ .gauges{display:flex;gap:0;align-items:stretch;min-width:max-content}
+ .g{padding:2px 16px 1px;border-left:1px solid var(--line);display:flex;
+    flex-direction:column;justify-content:center;cursor:help;white-space:nowrap}
+ .g:first-child{border-left:0;padding-left:4px}
+ .g .lbl{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--amber-ghost)}
+ .g .val{font-size:16px;font-weight:700;color:var(--amber-hi);font-variant-numeric:tabular-nums;line-height:1.25}
+ .g.hero .val{font-size:22px}
+ .g.hero{padding-left:4px}
+ .g .val .u{font-size:10px;font-weight:400;color:var(--amber-dim);letter-spacing:.04em}
+ .g.record{margin-left:auto;border-left:1px solid var(--line);padding-right:4px}
+ .g.record .lbl{color:var(--amber-ghost)}
+ .g.record .val{font-size:12px;color:var(--amber-dim);font-weight:400}
+ .g.record .val b{color:var(--amber);font-weight:700}
+
+ /* ---- model badge line (rotation + FPGA reconfigure countdown) ------------ */
+ #badge{
+   flex:0 0 auto;background:var(--panel);border-bottom:1px solid var(--line);
+   padding:5px 14px;font-size:11.5px;color:var(--amber-dim);letter-spacing:.03em;
+   display:flex;align-items:center;gap:8px;min-height:26px;
+ }
+ #badge .tag{color:var(--amber-hi);font-weight:700}
+ #badge.reconf{color:var(--red)}
+ #badge.reconf .tag{color:var(--red)}
+ #badge .dots::after{content:"";animation:dots 1.2s steps(4) infinite}
+ @keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+
+ /* ---- the console log ----------------------------------------------------- */
+ #log{
+   flex:1 1 auto;min-height:0;overflow-y:auto;padding:14px 14px 6px;
+   scrollbar-color:var(--amber-dim) transparent;
+ }
+ #log::-webkit-scrollbar{width:9px}
+ #log::-webkit-scrollbar-thumb{background:var(--amber-ghost);border-radius:0}
+ .ln{white-space:pre-wrap;word-break:break-word;margin:0 0 3px}
+ .ln .pfx{color:var(--amber-dim);user-select:none}
+ .ln.sys{color:var(--amber-dim)}
+ .ln.sys .pfx{color:var(--amber-ghost)}
+ .ln.you{color:var(--amber-hi)}
+ .ln.you .pfx{color:var(--amber)}
+ .ln.kev{color:var(--amber)}
+ .ln.kev .pfx{color:var(--amber-dim)}
+ .ln.fault{color:var(--red)}.ln.fault .pfx{color:var(--red)}
+ .ln .lat{color:var(--amber-ghost);font-size:11px}
+ /* the "chip is emitting" block cursor, tacked onto a live kevin line */
+ .curs{display:inline-block;width:.6em;height:1.02em;margin-left:1px;
+   vertical-align:-.16em;background:var(--amber);box-shadow:0 0 6px var(--amber);
+   animation:cblink 1.06s steps(2) infinite}
+ @keyframes cblink{50%{opacity:0}}
+ .rule{color:var(--amber-ghost);white-space:pre;margin:2px 0 6px;user-select:none;overflow:hidden}
+
+ /* ---- the prompt / input line --------------------------------------------- */
+ form{
+   flex:0 0 auto;background:var(--panel);border-top:1px solid var(--line);
+   padding:10px 14px 12px;display:flex;align-items:baseline;gap:9px;
+ }
+ form .ps{color:var(--amber-hi);font-weight:700;flex:0 0 auto;white-space:nowrap}
+ #p{
+   flex:1 1 auto;min-width:0;background:transparent;border:0;outline:0;
+   color:var(--amber-hi);font:inherit;letter-spacing:inherit;padding:0;
+   caret-color:var(--amber);
+ }
+ #p::placeholder{color:var(--amber-ghost);opacity:.8}
+ button{
+   flex:0 0 auto;background:transparent;color:var(--amber);cursor:pointer;
+   border:1px solid var(--line2);padding:5px 13px;font:inherit;font-weight:700;
+   letter-spacing:.08em;text-transform:uppercase;font-size:12px;
+ }
+ button:hover{color:var(--amber-hi);border-color:var(--amber-dim)}
+ button:active{background:var(--amber);color:var(--bg)}
+
+ @media (max-width:600px){
+   body{font-size:13px}
+   header{padding:8px 11px}
+   header .id{flex-basis:100%;order:3;margin-top:1px}
+   header .conn{margin-left:auto}
+   #strip{padding:7px 10px}
+   .g{padding:2px 11px}
+   .g.hero .val{font-size:19px}
+   .g.record{flex-basis:auto}
+   #log{padding:12px 11px 4px}
+   form{padding:9px 11px 11px}
+ }
+</style></head><body>
+
+<header>
+ <span class="brand glow">KEVIN</span>
+ <span class="id"><b>tty0 //</b> XCK26-SFVC784 · 3.3M INT4 · <b>on-chip BRAM/URAM · zero DRAM</b></span>
+ <span class="conn"><span class="led warn" id="led"></span><span id="status">linking</span></span>
+</header>
+
+<div id="strip"><div class="gauges">
+ <div class="g hero" title="Pure on-chip decode rate of the latest reply — PL cycles / clock. The silicon ceiling; the fabric itself runs this fast.">
+   <span class="lbl">fabric</span><span class="val"><span id="st_fab">----</span> <span class="u">tok/s</span></span></div>
+ <div class="g" title="Round-trip rate: chars / full request wall-time. Below fabric tok/s because each token's logit readback + the host loop dominate — what you actually get end-to-end.">
+   <span class="lbl">round-trip</span><span class="val" id="st_trip">--</span></div>
+ <div class="g" title="Distinct visitors (by IP) in the last 30 minutes.">
+   <span class="lbl">users·30m</span><span class="val" id="st_users">--</span></div>
+ <div class="g" title="Total characters Kevin has emitted since the server booted.">
+   <span class="lbl">chars out</span><span class="val" id="st_total">--</span></div>
+ <div class="g" title="Fabric busy fraction — a labelled software occupancy proxy, not a hardware counter.">
+   <span class="lbl">duty</span><span class="val" id="st_duty">--</span></div>
+ <div class="g" title="Fraction of Enters answered straight from the speculation buffer, zero round trips.">
+   <span class="lbl">0-trip</span><span class="val" id="st_zrt">--</span></div>
+ <div class="g record" title="The measured on-silicon faithful single-stream record: full T=128 on-chip KV window, 3/3 bit-exact.">
+   <span class="lbl">si record</span><span class="val"><b>16,087</b> tok/s @166.7MHz</span></div>
+</div></div>
+
+<div id="badge"><span id="badge_txt">MODEL &mdash; awaiting telemetry</span></div>
+
+<div id="log">
+ <div class="ln sys"><span class="pfx"># </span>KV260 serial console ready. weights resident in fabric — nothing touches DDR.</div>
+ <div class="ln sys"><span class="pfx"># </span>kevin be 3.3M-param toddler. him only know telegraphic tinystories: start a story, no ask question.</div>
+ <div class="ln sys"><span class="pfx"># </span>try: <span class="glow">once upon time</span> &middot; <span class="glow">little girl find dog</span> &middot; <span class="glow">one day big bear</span>. the point be the speed, not the prose.</div>
+ <div class="rule" id="rule">────────────────────────────────────────────────────────</div>
+ <div class="ln kev"><span class="pfx">kevin&gt; </span>few word do trick. type story start. me finish it.</div>
+</div>
+
+<form id="f" autocomplete="off">
+ <span class="ps glow" id="ps">you&gt;</span>
+ <input id="p" type="text" autocomplete="off" spellcheck="false"
+        placeholder="once upon time..." autofocus aria-label="story prompt">
+ <button type="submit">send</button>
+</form>
+
+<script>
+"use strict";
+const log=document.getElementById('log'), inp=document.getElementById('p'),
+      statusEl=document.getElementById('status'), led=document.getElementById('led'),
+      badge=document.getElementById('badge'), badgeTxt=document.getElementById('badge_txt');
+
+const DEBOUNCE_MS=20;   // client-side keystroke coalesce; the server adds its own settle.
+let ws, seq=0, debTimer=null;
+let bufPrompt=null, bufCompletion=null;              // the speculation buffer
+let lastSentAt=0, lastSentPrompt=null, lastLatMs=null;
+let pendingWaits=[];                                 // FIFO of unfilled "…" lines
+
+function oldestWait(prompt){ for(const pw of pendingWaits){ if(pw.prompt===prompt) return pw; } return null; }
+function finishWait(pw){ if(pw.timer) clearTimeout(pw.timer);
+  const i=pendingWaits.indexOf(pw); if(i>=0) pendingWaits.splice(i,1); if(pw.cursor) pw.cursor.remove(); }
+
+// ---- console line rendering ---------------------------------------------------
+function addLine(cls, prefix, txt){
+  const d=document.createElement('div'); d.className='ln '+cls;
+  if(prefix){ const p=document.createElement('span'); p.className='pfx'; p.textContent=prefix; d.appendChild(p); }
+  const body=document.createElement('span'); body.className='body'; body.textContent=txt||''; d.appendChild(body);
+  log.appendChild(d); log.scrollTop=log.scrollHeight;
+  return {row:d, body:body};
+}
+function setBody(row, txt){ row.body.textContent=txt; log.scrollTop=log.scrollHeight; }
+function attachCursor(row){
+  if(row._curs) return row._curs;
+  const c=document.createElement('span'); c.className='curs'; row.row.appendChild(c); row._curs=c; return c;
+}
+
+// ---- WebSocket + reconnect ----------------------------------------------------
+function setConn(state){ // 'connecting' | 'live' | 'down'
+  if(state==='live'){ led.className='led'; statusEl.textContent='online'; }
+  else if(state==='down'){ led.className='led down'; statusEl.textContent='signal lost'; }
+  else { led.className='led warn'; statusEl.textContent='linking'; }
+}
+let reconnTimer=null;
+function connect(){
+  setConn('connecting');
+  const proto=location.protocol==='https:'?'wss':'ws';
+  const url=(window.WS_URL)||(location.host?proto+'://'+location.host:'wss://chat.mikeayles.com');
+  try{ ws=new WebSocket(url); }catch(e){ scheduleReconnect(); return; }
+  ws.onopen=()=>{ setConn('live'); };
+  ws.onerror=()=>{ /* onclose will follow */ };
+  ws.onclose=()=>{ setConn('down'); scheduleReconnect(); };
+  ws.onmessage=onMessage;
+}
+function scheduleReconnect(){ if(reconnTimer) return;
+  reconnTimer=setTimeout(()=>{ reconnTimer=null; connect(); }, 1500); }
+
+function onMessage(ev){
+  let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
+  if(m.type==='hello'){
+    setConn('live'); statusEl.textContent='online · '+m.client_id;
+  }
+  else if(m.type==='speculation'||m.type==='authoritative'){
+    // speculation stays INVISIBLE — it just primes the buffer so Enter is instant.
+    bufPrompt=m.prompt; bufCompletion=m.completion;
+    if(m.prompt===lastSentPrompt&&lastSentAt){ lastLatMs=Math.round(performance.now()-lastSentAt); }
+    if(m.type==='authoritative'){
+      const pw=oldestWait(m.prompt);
+      if(pw){ if(pw.cursor){pw.cursor.remove();pw.cursor=null;}
+              setBody(pw.row, m.completion||'(no reply)'); finishWait(pw);
+              bufPrompt=null; bufCompletion=null; }
+      else { blit(m.prompt, m.completion); }
+    }
+  }
+  else if(m.type==='stream'){
+    const pw=oldestWait(m.prompt);
+    if(pw){ if(!pw.streaming){ setBody(pw.row,''); pw.streaming=true; pw.cursor=attachCursor(pw.row); }
+            pw.row.body.textContent += m.text; log.scrollTop=log.scrollHeight; }
+  }
+  else if(m.type==='stream_end'){
+    const pw=oldestWait(m.prompt);
+    if(pw){ if(pw.cursor){ pw.cursor.remove(); pw.cursor=null; }
+            if(m.completion) setBody(pw.row, m.completion);
+            else if(!pw.streaming) setBody(pw.row,'(no reply)');
+            finishWait(pw); bufPrompt=null; bufCompletion=null; }
+  }
+  else if(m.type==='stats'){ renderStats(m); }
+  else if(m.type==='blit_ok'){ /* server agreed; already blitted */ }
+}
+
+// ---- instrument strip ---------------------------------------------------------
+function fmtN(n){ if(n==null||isNaN(n)) return '----';
+  if(n>=1e6) return (n/1e6).toFixed(1)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(1)+'k'; return ''+Math.round(n); }
+function pct(x){ return x==null?'--':Math.round(x*100)+'%'; }
+function setStat(id,v){ const e=document.getElementById(id); if(e) e.textContent=v; }
+
+// rotating two-model demo: active model + live FPGA-reconfigure countdown
+let rot={model:'kevin',label:'Kevin — telegraphic, full speed',rotating:false,switch_in:null,t0:0};
+function fmtMMSS(s){ return Math.floor(s/60)+':'+String(s%60).padStart(2,'0'); }
+function updateBadge(){
+  if(!rot.rotating){
+    badge.className=''; badgeTxt.innerHTML='MODEL <span class="tag">KEVIN</span> &middot; telegraphic single-stream, full speed';
+    return;
+  }
+  const rem = rot.switch_in==null ? null : Math.max(0, Math.round(rot.switch_in-(Date.now()-rot.t0)/1000));
+  if(rem!=null && rem<=2){
+    badge.className='reconf';
+    badgeTxt.innerHTML='<span class="tag">&#9622; reconfiguring FPGA fabric<span class="dots"></span></span> reloading weights into BRAM/URAM';
+    return;
+  }
+  badge.className='';
+  const isLegit = rot.model==='legit';
+  const tag = (rot.label||rot.model);
+  const other = isLegit ? 'KEVIN' : 'legit';
+  const when = rem!=null ? ('  ·  ⇄ swap to '+other+' in '+fmtMMSS(rem)) : '';
+  badgeTxt.innerHTML='MODEL <span class="tag">'+tag.replace(/</g,'&lt;')+'</span>'+when;
+}
+setInterval(updateBadge,1000);
+
+function renderStats(m){
+  if(m.rotating!==undefined){
+    rot={model:m.model,label:m.model_label,rotating:!!m.rotating,switch_in:m.switch_in,t0:Date.now()};
+    updateBadge();
+  }
+  setStat('st_fab',  m.fabric_tok_s? fmtN(m.fabric_tok_s):'----');
+  setStat('st_trip', m.trip_tok_s?   fmtN(m.trip_tok_s):'--');
+  setStat('st_users', m.users_30m!=null?fmtN(m.users_30m):'--');
+  setStat('st_total', fmtN(m.total_tokens));
+  setStat('st_duty', pct(m.duty_cycle));
+  setStat('st_zrt',  pct(m.ready_at_enter));
+}
+
+// ---- keystroke speculation ----------------------------------------------------
+function sendKeystroke(){
+  if(!ws||ws.readyState!==1) return;
+  const p=inp.value.trim(); if(!p) return;
+  seq++; lastSentPrompt=p; lastSentAt=performance.now();
+  ws.send(JSON.stringify({type:'keystroke',prompt:p,seq:seq}));
+}
+inp.addEventListener('input',()=>{ clearTimeout(debTimer); debTimer=setTimeout(sendKeystroke,DEBOUNCE_MS); });
+
+// ---- blit + enter -------------------------------------------------------------
+function blit(prompt, completion){
+  addLine('you','you> ',prompt);
+  const kv=addLine('kev','kevin> ',completion||'(no reply)');
+  if(lastLatMs!=null && prompt===lastSentPrompt){
+    const t=document.createElement('span'); t.className='lat'; t.textContent='   ['+lastLatMs+'ms · 0-trip]';
+    kv.row.appendChild(t);
+  }
+  inp.value=''; bufPrompt=null; bufCompletion=null; log.scrollTop=log.scrollHeight;
+}
+
+document.getElementById('f').addEventListener('submit',(e)=>{
+  e.preventDefault();
+  const cur=inp.value.trim(); if(!cur) return;
+  seq++;
+  // The CLIENT decides blit-vs-reply and TELLS the server, which obeys.
+  const fresh = (bufPrompt===cur && bufCompletion!=null);
+  if(ws&&ws.readyState===1){ ws.send(JSON.stringify({type:'enter',prompt:cur,seq:seq,blitted:fresh})); }
+  if(fresh && ws && ws.readyState===1){
+    blit(cur, bufCompletion);                     // already buffered — zero round trip
+  } else {
+    addLine('you','you> ',cur); inp.value='';
+    const kv=addLine('kev','kevin> ',''); const cursor=attachCursor(kv);
+    const pw={row:kv, prompt:cur, streaming:false, seq:seq, cursor:cursor};
+    pw.timer=setTimeout(()=>{
+      if(pendingWaits.includes(pw)){
+        if(pw.cursor){ pw.cursor.remove(); pw.cursor=null; }
+        if(!pw.streaming){ kv.row.className='ln fault';
+          setBody(kv,'(kevin lost his train of thought — try again)'); }
+        finishWait(pw);
+      }
+    }, 15000);
+    if(!(ws&&ws.readyState===1)){                 // offline: don't hang on a dead socket
+      if(pw.cursor){pw.cursor.remove();pw.cursor=null;}
+      kv.row.className='ln fault'; setBody(kv,'(no link to the chip — reconnecting…)'); finishWait(pw);
+    } else { pendingWaits.push(pw); }
+  }
+  return false;
+});
+
+// keep the fabric focus on the prompt (serial consoles never lose the cursor)
+document.addEventListener('click',(e)=>{ if(!e.target.closest('button')) inp.focus(); });
+
+connect();
+</script>
+</body></html>

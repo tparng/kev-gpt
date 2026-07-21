@@ -1,0 +1,525 @@
+<!doctype html>
+<!--
+  client-instrument.html — lab-instrument / oscilloscope skin for the Kevin-on-Kria
+  live demo. Same wire protocol as client.html, re-presented as an instrument cluster:
+  an animated scope trace for fabric tok/s, LCD-style numeric readouts, bar meters,
+  a hairline graticule. Self-contained: no external CDNs / fonts / libraries.
+
+  Protocol (unchanged):
+    out: {type:"keystroke", prompt, seq}          debounced input change
+    out: {type:"enter", prompt, seq, blitted}     Enter (blitted = client blitted locally)
+    in : {type:"hello", client_id}
+    in : {type:"speculation"|"authoritative", prompt, completion, infer_ms}
+    in : {type:"stream", prompt, text}            streamed chars (Enter-miss)
+    in : {type:"stream_end", prompt, completion}
+    in : {type:"stats", fabric_tok_s, trip_tok_s, users_30m, total_tokens,
+                        duty_cycle, ready_at_enter, uptime_s,
+                        model, model_label, rotating, switch_in, ...}
+    in : {type:"blit_ok", prompt}
+-->
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KEVIN · KV260 — fabric instrument</title>
+<style>
+ :root{
+   color-scheme:dark;
+   --bg:#070a0b;
+   --panel:#0c1214;
+   --panel-in:#080d0e;
+   --line:#16232a;      /* hairline graticule */
+   --line-lit:#20343d;  /* brighter hairline */
+   --ink:#cfe0e0;
+   --dim:#61797d;
+   --dimmer:#3d4f52;
+   --sig:#2fe08a;       /* phosphor signal green — the hero accent */
+   --sig-glow:rgba(47,224,138,.35);
+   --sig-track:#123024;
+   --cyan:#38c4cf;      /* round-trip / secondary channel */
+   --cyan-track:#0f2c30;
+   --amber:#f0a72b;     /* alert: reconfigure / countdown */
+   --amber-track:#33260a;
+   --mono:ui-monospace,"SF Mono","DejaVu Sans Mono",Menlo,Consolas,monospace;
+ }
+ *{box-sizing:border-box}
+ html,body{height:100%}
+ body{
+   margin:0;background:var(--bg);color:var(--ink);
+   font-family:var(--mono);font-size:14px;line-height:1.5;
+   -webkit-font-smoothing:antialiased;
+   display:flex;flex-direction:column;height:100vh;height:100dvh;
+   background-image:
+     linear-gradient(var(--line) 1px,transparent 1px),
+     linear-gradient(90deg,var(--line) 1px,transparent 1px);
+   background-size:26px 26px;background-position:-1px -1px;
+ }
+ /* ---- top instrument bezel ---- */
+ header{
+   display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+   padding:9px 14px;background:var(--panel);
+   border-bottom:1px solid var(--line-lit);
+ }
+ .brand{display:flex;align-items:center;gap:9px;font-weight:600;letter-spacing:.06em}
+ .brand .mark{
+   font-size:11px;color:var(--bg);background:var(--sig);
+   padding:2px 6px;border-radius:2px;letter-spacing:.12em;font-weight:700;
+ }
+ .brand .sub{color:var(--dim);font-weight:400;font-size:11px;letter-spacing:.02em}
+ .led{width:8px;height:8px;border-radius:50%;background:var(--dimmer);
+      box-shadow:0 0 0 1px #000 inset;flex:0 0 auto}
+ .led.on{background:var(--sig);box-shadow:0 0 6px var(--sig-glow)}
+ .led.warn{background:var(--amber);box-shadow:0 0 6px rgba(240,167,43,.5)}
+ .led.err{background:#e0503a;box-shadow:0 0 6px rgba(224,80,58,.5)}
+ .status{display:flex;align-items:center;gap:7px;font-size:11px;
+         letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+ .spacer{flex:1 1 auto}
+ /* model badge */
+ #badge{
+   display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.04em;
+   padding:5px 10px;border:1px solid var(--line-lit);border-radius:3px;
+   background:var(--panel-in);color:var(--ink);white-space:nowrap;
+ }
+ #badge.warn{border-color:var(--amber);color:var(--amber)}
+ #badge .tag{color:var(--dim);text-transform:uppercase;letter-spacing:.1em;font-size:9px}
+ #badge .cd{color:var(--sig);font-variant-numeric:tabular-nums}
+ #badge.warn .cd{color:var(--amber)}
+
+ main{flex:1;min-height:0;display:flex;flex-direction:column;gap:10px;padding:10px 12px;overflow:hidden}
+
+ /* ---- instrument cluster ---- */
+ .cluster{display:grid;grid-template-columns:minmax(0,2.1fr) minmax(0,1fr);gap:10px}
+ .bezel{
+   background:var(--panel);border:1px solid var(--line-lit);border-radius:4px;
+   position:relative;
+ }
+ .bezel-hd{
+   display:flex;align-items:baseline;justify-content:space-between;gap:8px;
+   padding:6px 10px 5px;border-bottom:1px solid var(--line);
+ }
+ .bezel-hd .name{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+ .bezel-hd .unit{font-size:10px;letter-spacing:.08em;color:var(--dimmer)}
+
+ /* scope */
+ .scope-wrap{padding:8px 10px 10px}
+ .scope-read{display:flex;align-items:baseline;gap:8px;margin-bottom:4px;padding-left:2px}
+ .scope-read .big{
+   font-size:30px;font-weight:700;color:var(--sig);letter-spacing:.02em;
+   font-variant-numeric:tabular-nums;text-shadow:0 0 10px var(--sig-glow);line-height:1;
+ }
+ .scope-read .u{font-size:11px;color:var(--dim);letter-spacing:.06em}
+ .scope-read .pk{margin-left:auto;font-size:10px;color:var(--dim);text-align:right;letter-spacing:.04em}
+ .scope-read .pk b{color:var(--cyan)}
+ canvas{display:block;width:100%;height:auto;border-radius:2px}
+
+ /* readout column */
+ .stack{display:flex;flex-direction:column;gap:10px;min-width:0}
+ .tiles{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);
+        border:1px solid var(--line-lit);border-radius:4px;overflow:hidden;flex:0 0 auto}
+ .tile{background:var(--panel);padding:8px 10px 9px}
+ .tile .k{font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);
+          display:flex;justify-content:space-between;align-items:center}
+ .tile .k .dot{width:5px;height:5px;border-radius:50%;background:var(--dimmer)}
+ .tile .k .dot.g{background:var(--sig)}
+ .tile .k .dot.c{background:var(--cyan)}
+ .lcd{font-size:22px;font-weight:700;letter-spacing:.04em;line-height:1.15;margin-top:3px;
+      font-variant-numeric:tabular-nums;color:var(--ink);
+      display:flex;align-items:baseline;gap:4px}
+ .lcd.g{color:var(--sig);text-shadow:0 0 8px var(--sig-glow)}
+ .lcd.c{color:var(--cyan);text-shadow:0 0 8px rgba(56,196,207,.28)}
+ .lcd .su{font-size:10px;font-weight:400;color:var(--dim);letter-spacing:.04em}
+
+ /* bar meters */
+ .meters{background:var(--panel);border:1px solid var(--line-lit);border-radius:4px;
+         padding:9px 10px 10px;display:flex;flex-direction:column;gap:9px;flex:0 0 auto}
+ .meter .ml{display:flex;justify-content:space-between;font-size:9.5px;letter-spacing:.1em;
+            text-transform:uppercase;color:var(--dim);margin-bottom:4px}
+ .meter .ml b{font-variant-numeric:tabular-nums;letter-spacing:.02em}
+ .meter.g .ml b{color:var(--sig)} .meter.c .ml b{color:var(--cyan)}
+ .track{height:8px;background:var(--panel-in);border:1px solid var(--line);border-radius:2px;
+        position:relative;overflow:hidden}
+ .track .fill{position:absolute;left:0;top:0;bottom:0;width:0;transition:width .5s ease}
+ .meter.g .track .fill{background:var(--sig)}
+ .meter.c .track .fill{background:var(--cyan)}
+ /* tick marks over the bar */
+ .track::after{content:"";position:absolute;inset:0;pointer-events:none;
+   background-image:repeating-linear-gradient(90deg,transparent 0,transparent 9px,var(--line) 9px,var(--line) 10px)}
+
+ /* ---- output pane (chat) ---- */
+ .out{flex:1;min-height:0;display:flex;flex-direction:column;
+      background:var(--panel);border:1px solid var(--line-lit);border-radius:4px;overflow:hidden}
+ .out-hd{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--line)}
+ .out-hd .name{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+ .out-hd .rt{margin-left:auto;font-size:10px;color:var(--dim);letter-spacing:.03em}
+ .out-hd .rt b{color:var(--sig);font-variant-numeric:tabular-nums}
+ #log{flex:1;min-height:0;overflow-y:auto;padding:12px 12px 14px;
+      display:flex;flex-direction:column;gap:8px;
+      scrollbar-width:thin;scrollbar-color:var(--line-lit) transparent}
+ #log::-webkit-scrollbar{width:8px}
+ #log::-webkit-scrollbar-thumb{background:var(--line-lit);border-radius:4px}
+ .msg{max-width:82%;padding:8px 12px;line-height:1.5;white-space:pre-wrap;
+      border-radius:3px;font-size:14px;word-wrap:break-word}
+ .you{align-self:flex-end;background:var(--panel-in);border:1px solid var(--line-lit);
+      color:var(--ink)}
+ .you::before{content:"IN \25B8  ";color:var(--cyan);font-size:10px;letter-spacing:.1em}
+ .kev{align-self:flex-start;background:transparent;border:1px solid var(--sig-track);
+      color:var(--ink)}
+ .kev::before{content:"\25C2 FABRIC  ";color:var(--sig);font-size:10px;letter-spacing:.1em}
+ .kev.streaming::after{content:"\258A";color:var(--sig);animation:blink 1s step-start infinite}
+ @keyframes blink{50%{opacity:0}}
+ .note{align-self:flex-start;max-width:92%;color:var(--dim);font-size:12px;
+       border:1px dashed var(--line-lit);border-radius:3px;padding:7px 11px;line-height:1.5}
+ .note b{color:var(--sig);font-weight:600}
+
+ /* ---- input console ---- */
+ form{display:flex;gap:8px;align-items:stretch}
+ .infield{flex:1;display:flex;align-items:center;gap:8px;background:var(--panel);
+          border:1px solid var(--line-lit);border-radius:4px;padding:0 12px}
+ .infield .pr{color:var(--sig);font-weight:700;font-size:13px;letter-spacing:.06em}
+ input[type=text]{flex:1;padding:12px 0;border:0;background:transparent;color:var(--ink);
+      font-family:var(--mono);font-size:15px;outline:none}
+ input[type=text]::placeholder{color:var(--dimmer)}
+ button{padding:0 18px;border:1px solid var(--sig);border-radius:4px;background:var(--sig-track);
+        color:var(--sig);font-family:var(--mono);font-weight:700;font-size:12px;letter-spacing:.14em;
+        cursor:pointer;text-transform:uppercase}
+ button:hover{background:var(--sig);color:var(--bg)}
+ button:active{transform:translateY(1px)}
+
+ /* responsive: stack the cluster, shrink chrome */
+ @media (max-width:720px){
+   .cluster{grid-template-columns:1fr}
+   .scope-read .big{font-size:26px}
+ }
+ @media (max-width:520px){
+   body{font-size:13px}
+   header{padding:8px 11px;gap:8px}
+   .brand .sub{display:none}
+   main{padding:8px;gap:8px}
+   .lcd{font-size:19px}
+   .scope-read .pk{display:none}
+   button{padding:0 13px}
+ }
+</style></head><body>
+
+<header>
+ <span class="brand">
+   <span class="mark">KV260</span>
+   <span>KEVIN</span>
+   <span class="sub">/ on-fabric decode</span>
+ </span>
+ <span class="spacer"></span>
+ <span id="badge"><span class="tag">MODEL</span><span id="badge-txt">&mdash;</span></span>
+ <span class="status"><span class="led" id="led"></span><span id="status">connecting</span></span>
+</header>
+
+<main>
+ <!-- instrument cluster -->
+ <section class="cluster">
+   <div class="bezel">
+     <div class="bezel-hd">
+       <span class="name">CH1 &middot; Fabric decode rate</span>
+       <span class="unit">tok &middot; s&#8315;&sup1; &nbsp;|&nbsp; on-chip, zero-DRAM</span>
+     </div>
+     <div class="scope-wrap">
+       <div class="scope-read">
+         <span class="big" id="scope-val">&mdash;</span>
+         <span class="u">tok/s</span>
+         <span class="pk">PEAK <b id="scope-pk">&mdash;</b><br>REF 16,087 @166.7 MHz</span>
+       </div>
+       <canvas id="scope" width="720" height="200"></canvas>
+     </div>
+   </div>
+
+   <div class="stack">
+     <div class="tiles">
+       <div class="tile">
+         <div class="k"><span>Round-trip</span><span class="dot c"></span></div>
+         <div class="lcd c"><span id="v-trip">&mdash;</span><span class="su">tok/s</span></div>
+       </div>
+       <div class="tile">
+         <div class="k"><span>0-trip hits</span><span class="dot g"></span></div>
+         <div class="lcd g"><span id="v-zrt">&mdash;</span></div>
+       </div>
+       <div class="tile">
+         <div class="k"><span>Visitors 30m</span><span class="dot"></span></div>
+         <div class="lcd"><span id="v-users">&mdash;</span></div>
+       </div>
+       <div class="tile">
+         <div class="k"><span>Chars served</span><span class="dot"></span></div>
+         <div class="lcd"><span id="v-total">&mdash;</span></div>
+       </div>
+     </div>
+     <div class="meters">
+       <div class="meter g">
+         <div class="ml"><span>Fabric busy</span><b id="v-duty">&mdash;</b></div>
+         <div class="track"><div class="fill" id="m-duty"></div></div>
+       </div>
+       <div class="meter c">
+         <div class="ml"><span>Ready-at-Enter</span><b id="v-zrt2">&mdash;</b></div>
+         <div class="track"><div class="fill" id="m-zrt"></div></div>
+       </div>
+       <div class="ml" style="text-transform:uppercase;letter-spacing:.1em;color:var(--dimmer);font-size:9px;margin-top:1px">
+         <span>UPTIME</span><b id="v-uptime" style="color:var(--dim);font-variant-numeric:tabular-nums">&mdash;</b>
+       </div>
+     </div>
+   </div>
+ </section>
+
+ <!-- output pane -->
+ <section class="out">
+   <div class="out-hd">
+     <span class="led on" style="width:6px;height:6px"></span>
+     <span class="name">Signal output</span>
+     <span class="rt">last spec RTT <b id="rtt">&mdash;</b></span>
+   </div>
+   <div id="log">
+     <div class="note">few word do trick. type story start &mdash; kevin finish it. him a <b>3.3M-param</b> toddler running whole inside the KV260 fabric. try &ldquo;once upon time&rdquo; &middot; &ldquo;little girl find dog&rdquo; &middot; &ldquo;one day big bear&rdquo;. the point be the <b>speed</b>, not the prose.</div>
+   </div>
+ </section>
+
+ <!-- input console -->
+ <form id="f" autocomplete="off">
+   <label class="infield"><span class="pr">&#9656;</span>
+     <input id="p" type="text" placeholder="once upon time..." autofocus>
+   </label>
+   <button type="submit">Send</button>
+ </form>
+</main>
+
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const log=$('log'), inp=$('p'), statusEl=$('status'), ledEl=$('led'), rttEl=$('rtt');
+
+/* ===================== scope: CH1 fabric tok/s ===================== */
+const cv=$('scope'), cx=cv.getContext('2d');
+const HIST=180;                       // samples retained (ring)
+const hist=new Array(HIST).fill(null);
+let easeFab=0, targetFab=0, fullScale=20000, peakFab=0;
+const REF=16087;                      // measured on-silicon record
+
+function pushSample(){
+  // ease toward the latest reported value so the trace glides between 1Hz frames
+  easeFab += (targetFab-easeFab)*0.18;
+  hist.push(easeFab); if(hist.length>HIST) hist.shift();
+  if(easeFab>peakFab){ peakFab=easeFab; }
+}
+setInterval(pushSample,140);
+
+function niceScale(v){
+  // dynamic full-scale: headroom above the max of (peak, ref) snapped to a round number
+  const top=Math.max(v*1.15, REF*1.1, 1);
+  const pow=Math.pow(10,Math.floor(Math.log10(top)));
+  const n=top/pow;
+  const s=n<=1?1:n<=2?2:n<=5?5:10;
+  return s*pow;
+}
+function fmtAxis(v){ if(v>=1000)return (v/1000).toFixed(v%1000?1:0)+'k'; return Math.round(v); }
+
+function drawScope(){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  const cssW=cv.clientWidth||720, cssH=Math.round(cssW*0.30);
+  if(cv.width!==Math.round(cssW*dpr)||cv.height!==Math.round(cssH*dpr)){
+    cv.width=Math.round(cssW*dpr); cv.height=Math.round(cssH*dpr);
+    cv.style.height=cssH+'px';
+  }
+  const W=cv.width, H=cv.height;
+  cx.setTransform(dpr,0,0,dpr,0,0);
+  const w=W/dpr, h=H/dpr;
+  cx.clearRect(0,0,w,h);
+  cx.fillStyle='#080d0e'; cx.fillRect(0,0,w,h);
+
+  fullScale=niceScale(Math.max(peakFab,targetFab));
+  const padL=0, padR=44, padB=16, padT=6;
+  const gw=w-padL-padR, gh=h-padT-padB;
+
+  // graticule
+  cx.lineWidth=1; cx.strokeStyle='#132025';
+  const cols=10, rows=4;
+  cx.beginPath();
+  for(let i=0;i<=cols;i++){const x=padL+gw*i/cols+0.5;cx.moveTo(x,padT);cx.lineTo(x,padT+gh);}
+  for(let j=0;j<=rows;j++){const y=padT+gh*j/rows+0.5;cx.moveTo(padL,y);cx.lineTo(padL+gw,y);}
+  cx.stroke();
+  // y ticks / labels
+  cx.fillStyle='#4c6266'; cx.font='9px '+getComputedStyle(document.body).fontFamily;
+  cx.textAlign='left'; cx.textBaseline='middle';
+  for(let j=0;j<=rows;j++){
+    const val=fullScale*(1-j/rows);
+    const y=padT+gh*j/rows;
+    cx.fillText(fmtAxis(val), padL+gw+5, y);
+  }
+  // reference line (measured record)
+  if(REF<=fullScale){
+    const yr=padT+gh*(1-REF/fullScale);
+    cx.strokeStyle='#2a4b3c'; cx.setLineDash([4,4]); cx.lineWidth=1;
+    cx.beginPath();cx.moveTo(padL,yr+0.5);cx.lineTo(padL+gw,yr+0.5);cx.stroke();
+    cx.setLineDash([]);
+  }
+
+  // trace
+  const yOf=v=>padT+gh*(1-Math.max(0,Math.min(1,(v||0)/fullScale)));
+  const xOf=i=>padL+gw*(i/(HIST-1));
+  cx.strokeStyle='rgba(47,224,138,.95)';
+  cx.lineWidth=1.6; cx.lineJoin='round';
+  cx.shadowColor='rgba(47,224,138,.55)'; cx.shadowBlur=6;
+  cx.beginPath();
+  let started=false, lastX=padL, lastY=yOf(0);
+  for(let i=0;i<HIST;i++){
+    const v=hist[i]; if(v==null) continue;
+    const x=xOf(i), y=yOf(v);
+    if(!started){cx.moveTo(x,y);started=true;} else cx.lineTo(x,y);
+    lastX=x; lastY=y;
+  }
+  cx.stroke();
+  cx.shadowBlur=0;
+  // beam dot at the leading edge
+  if(started){
+    cx.fillStyle='#2fe08a';
+    cx.beginPath();cx.arc(lastX,lastY,2.6,0,7);cx.fill();
+    cx.strokeStyle='rgba(47,224,138,.25)';cx.beginPath();cx.arc(lastX,lastY,5.5,0,7);cx.stroke();
+  }
+  requestAnimationFrame(drawScope);
+}
+requestAnimationFrame(drawScope);
+
+/* ===================== stats plumbing ===================== */
+function fmtN(n){ if(n==null||isNaN(n))return '—';
+  if(n>=1e6)return (n/1e6).toFixed(1)+'M';
+  if(n>=1e3)return (n/1e3).toFixed(1)+'k'; return ''+Math.round(n); }
+function fmtInt(n){ if(n==null||isNaN(n))return '—'; return Math.round(n).toLocaleString('en-US'); }
+function pct(x){ return x==null?'—':Math.round(x*100)+'%'; }
+function setTxt(id,v){ const e=$(id); if(e)e.textContent=v; }
+function fmtUptime(s){ if(s==null)return '—'; s=Math.round(s);
+  const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+  if(d)return d+'d '+h+'h'; if(h)return h+'h '+m+'m';
+  const ss=s%60; return m+'m '+String(ss).padStart(2,'0')+'s'; }
+
+function renderStats(m){
+  if(m.fabric_tok_s!=null){ targetFab=m.fabric_tok_s; setTxt('scope-val',fmtInt(m.fabric_tok_s)); }
+  if(m.peak_tok_s!=null){ peakFab=Math.max(peakFab,m.peak_tok_s); }
+  setTxt('scope-pk', peakFab?fmtN(peakFab):'—');
+  setTxt('v-trip',  m.trip_tok_s!=null?fmtInt(m.trip_tok_s):'—');
+  setTxt('v-zrt',   pct(m.ready_at_enter));
+  setTxt('v-users', m.users_30m!=null?fmtInt(m.users_30m):'—');
+  setTxt('v-total', fmtN(m.total_tokens));
+  setTxt('v-duty',  pct(m.duty_cycle));
+  setTxt('v-zrt2',  pct(m.ready_at_enter));
+  setTxt('v-uptime',fmtUptime(m.uptime_s));
+  const md=$('m-duty'); if(md&&m.duty_cycle!=null) md.style.width=Math.min(100,m.duty_cycle*100)+'%';
+  const mz=$('m-zrt'); if(mz&&m.ready_at_enter!=null) mz.style.width=Math.min(100,m.ready_at_enter*100)+'%';
+  if(m.rotating!==undefined){
+    rot={model:m.model,label:m.model_label,rotating:!!m.rotating,switch_in:m.switch_in,t0:Date.now()};
+    updateBadge();
+  }
+}
+
+/* rotating two-model badge + FPGA-reconfigure countdown */
+let rot={model:'kevin',label:'Kevin — telegraphic, full speed',rotating:false,switch_in:null,t0:0};
+function updateBadge(){
+  const b=$('badge'), t=$('badge-txt'); if(!b||!t)return;
+  if(!rot.rotating){ t.textContent=rot.label||'Kevin'; b.classList.remove('warn'); return; }
+  const rem = rot.switch_in==null ? null : Math.max(0, Math.round(rot.switch_in-(Date.now()-rot.t0)/1000));
+  if(rem!=null && rem<=2){
+    b.classList.add('warn');
+    t.innerHTML='reconfiguring FPGA<span class="cd"> …</span>';
+    return;
+  }
+  b.classList.remove('warn');
+  const other = rot.model==='legit' ? 'Kevin' : 'legit';
+  const mm = rem!=null ? (Math.floor(rem/60)+':'+String(rem%60).padStart(2,'0')) : '';
+  t.innerHTML=(rot.label||rot.model)+(rem!=null?(' <span class="cd">↔ '+other+' '+mm+'</span>'):'');
+}
+setInterval(updateBadge,1000);
+
+/* ===================== chat protocol (mirrors client.html) ===================== */
+const DEBOUNCE_MS=20;
+let ws, seq=0, debTimer=null;
+let bufPrompt=null, bufCompletion=null;
+let lastSentAt=0, lastSentPrompt=null;
+let pendingWaits=[];
+let reconnectT=null;
+
+function oldestWait(prompt){ for(const pw of pendingWaits){ if(pw.prompt===prompt) return pw; } return null; }
+function finishWait(pw){ if(pw.timer)clearTimeout(pw.timer);
+  const i=pendingWaits.indexOf(pw); if(i>=0)pendingWaits.splice(i,1); }
+function add(cls,txt){ const d=document.createElement('div'); d.className='msg '+cls;
+  d.textContent=txt||''; log.appendChild(d); log.scrollTop=log.scrollHeight; return d; }
+
+function setStatus(txt,cls){ statusEl.textContent=txt;
+  ledEl.className='led'+(cls?(' '+cls):''); }
+
+function connect(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  const url=(window.WS_URL)||(location.host?proto+'://'+location.host:'wss://chat.mikeayles.com');
+  try{ ws=new WebSocket(url); }catch(e){ scheduleReconnect(); return; }
+  ws.onopen=()=>{ setStatus('live','on'); };
+  ws.onclose=()=>{ setStatus('reconnecting','warn'); scheduleReconnect(); };
+  ws.onerror=()=>{ try{ws.close();}catch(e){} };
+  ws.onmessage=(ev)=>{
+    let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
+    if(m.type==='hello'){ setStatus('live · '+m.client_id,'on'); }
+    else if(m.type==='speculation'||m.type==='authoritative'){
+      bufPrompt=m.prompt; bufCompletion=m.completion;
+      if(m.prompt===lastSentPrompt&&lastSentAt){
+        rttEl.innerHTML='<b>'+Math.round(performance.now()-lastSentAt)+' ms</b>';
+      }
+      if(m.type==='authoritative'){
+        const pw=oldestWait(m.prompt);
+        if(pw){ pw.el.classList.remove('streaming'); pw.el.textContent=m.completion||'(no reply)';
+                finishWait(pw); bufPrompt=null; bufCompletion=null; log.scrollTop=log.scrollHeight; }
+        else { blit(m.prompt, m.completion); }
+      }
+    } else if(m.type==='stream'){
+      const pw=oldestWait(m.prompt);
+      if(pw){ if(!pw.streaming){ pw.el.textContent=''; pw.streaming=true; pw.el.classList.add('streaming'); }
+              pw.el.textContent+=m.text; log.scrollTop=log.scrollHeight; }
+    } else if(m.type==='stream_end'){
+      const pw=oldestWait(m.prompt);
+      if(pw){ pw.el.classList.remove('streaming');
+        if(m.completion) pw.el.textContent=m.completion;
+        else if(!pw.streaming) pw.el.textContent='(no reply)';
+        finishWait(pw); bufPrompt=null; bufCompletion=null; log.scrollTop=log.scrollHeight; }
+    } else if(m.type==='stats'){ renderStats(m); }
+    else if(m.type==='blit_ok'){ /* server agreed; already blitted */ }
+  };
+}
+function scheduleReconnect(){ if(reconnectT)return;
+  reconnectT=setTimeout(()=>{ reconnectT=null; connect(); },1500); }
+
+function sendKeystroke(){
+  if(!ws||ws.readyState!==1)return;
+  const p=inp.value.trim(); if(!p)return;
+  seq++; lastSentPrompt=p; lastSentAt=performance.now();
+  ws.send(JSON.stringify({type:'keystroke',prompt:p,seq:seq}));
+}
+inp.addEventListener('input',()=>{ clearTimeout(debTimer); debTimer=setTimeout(sendKeystroke,DEBOUNCE_MS); });
+
+function blit(prompt,completion){
+  add('you',prompt); add('kev',completion);
+  inp.value=''; bufPrompt=null; bufCompletion=null; log.scrollTop=log.scrollHeight;
+}
+
+$('f').addEventListener('submit',(e)=>{
+  e.preventDefault();
+  const cur=inp.value.trim(); if(!cur)return false;
+  seq++;
+  const fresh=(bufPrompt===cur && bufCompletion!=null);
+  if(ws&&ws.readyState===1) ws.send(JSON.stringify({type:'enter',prompt:cur,seq:seq,blitted:fresh}));
+  if(fresh){ blit(cur,bufCompletion); }
+  else{
+    add('you',cur); inp.value='';
+    const wait=add('kev','…'); wait.dataset.waiting='1';
+    const pw={el:wait,prompt:cur,streaming:false,seq:seq};
+    pw.timer=setTimeout(()=>{
+      if(pendingWaits.includes(pw)){
+        pw.el.classList.remove('streaming');
+        if(!pw.streaming) pw.el.textContent='(kevin lost his train of thought — try again)';
+        finishWait(pw);
+      }
+    },15000);
+    pendingWaits.push(pw);
+  }
+  return false;
+});
+
+connect();
+</script>
+</body></html>
