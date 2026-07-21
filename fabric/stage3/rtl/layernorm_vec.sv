@@ -54,9 +54,17 @@ module layernorm_vec #(
     localparam [31:0] SQRT2Q15 = 32'd46341;               // round(sqrt(2)*2^15)
     localparam [127:0] ONE_P5 = 128'd3 <<< (2*Y_FRAC - 1);
 
-    // ---- P-banked input storage: xbank[p][row], gbank[p][row] -----------------
-    reg signed [31:0] xbank [0:P-1][0:ROWS-1];
-    reg signed [31:0] gbank [0:P-1][0:ROWS-1];
+    // ---- P-banked input storage: wide-word rows (lane l = [l*32 +: 32]) -------
+    // Was reg [0:P-1][0:ROWS-1] (P separate row-addressed arrays) -> the project's
+    // own "wide-word banking, not [P][rows]" gotcha: a variable-row access to that
+    // shape synthesises to P per-lane row-muxes (MUXF7/LUT blow-up + huge CE-net
+    // fanout, the confirmed kv256 congestion hotspot). One row-addressed wide word
+    // per buffer makes the variable row a memory ADDRESS, not a mux. Bit-exact
+    // (same values, same layout on the wire): x_in/gamma_in are ALREADY the packed
+    // P-lane words, so the write is a single whole-row store. LUTRAM (distributed)
+    // frees ~16k FFs + the two 400+-fanout CE trees. Gated bit-exact by run_layernorm.
+    (* ram_style = "distributed" *) reg [P*32-1:0] xbank [0:ROWS-1];
+    (* ram_style = "distributed" *) reg [P*32-1:0] gbank [0:ROWS-1];
     reg [$clog2(ROWS+1)-1:0] wptr;              // 0..ROWS write/row pointer
 
     // ---- seed ROM (64 x Q1.16) -----------------------------------------------
@@ -149,6 +157,7 @@ module layernorm_vec #(
     reg signed [127:0] prod2_r [0:P-1];          // s2b: registered combined product
     reg                s0v, s1v, s2v, s2bv;
     reg signed [31:0]  xo, go;                   // plain-vector copies
+    reg [P*32-1:0]     xword, gword;             // plain-reg copies of a wide bank row
     reg signed [39:0]  xj;
     reg signed [95:0]  pj;
     reg signed [47:0]  pjhi;                     // s2 plain-vector copy: prod[95:48] (signed)
@@ -195,9 +204,9 @@ module layernorm_vec #(
                 // (C) on lv1 fold into sum/sumxx. Iteration is still 1 row/cycle. --------
                 S_LOAD: begin
                     if (valid_in) begin                       // stage A
+                        xbank[wptr] <= x_in;                  // one whole P-lane wide row
+                        gbank[wptr] <= gamma_in;
                         for (wp = 0; wp < P; wp = wp + 1) begin
-                            xbank[wp][wptr] <= x_in[wp*32 +: 32];
-                            gbank[wp][wptr] <= gamma_in[wp*32 +: 32];
                             xl              =  x_in[wp*32 +: 32];   // plain-vector copy
                             xe_r[wp]        <= $signed({{8{xl[31]}}, xl});
                             sq_r[wp]        <= $signed(xl) * $signed(xl);
@@ -298,9 +307,11 @@ module layernorm_vec #(
                     // stage 0: P centered lanes (x-mean) for row ridx — registered so
                     // the subtract is not chained into the DSP multiply (Fmax)
                     if (ridx < ROWS) begin
+                        xword = xbank[ridx];                    // read the wide row once
+                        gword = gbank[ridx];
                         for (lp = 0; lp < P; lp = lp + 1) begin
-                            xo = xbank[lp][ridx];               // plain-vector copy (iverilog-safe)
-                            go = gbank[lp][ridx];
+                            xo = xword[lp*32 +: 32];            // lane extract on a plain reg (iverilog-safe)
+                            go = gword[lp*32 +: 32];
                             xc[lp]     <= $signed({{8{xo[31]}}, xo}) - mean;
                             grow_0[lp] <= go;
                         end
