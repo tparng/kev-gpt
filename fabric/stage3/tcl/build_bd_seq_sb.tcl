@@ -48,7 +48,7 @@ add_files -norecurse [list \
     "$root/fabric/stage3/rtl/vec_gelu.sv" \
     "$root/fabric/stage3/rtl/gelu_lut.sv" \
     "$root/fabric/stage3/rtl/gelu_lut2.sv" \
-    "$root/fabric/stage3/rtl/softmax.sv" \
+    "$root/fabric/stage3/rtl/softmax_f.sv" \
     "$root/fabric/stage3/rtl/weight_bank_tdp.sv" \
     "$root/fabric/stage3/rtl/embed_bank_tdp.sv" \
     "$root/fabric/stage3/rtl/gemm_cohort_vec.sv" \

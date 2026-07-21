@@ -78,7 +78,11 @@ module vec_attn #(
     wire               sm_out_valid;
     wire [20:0]        sm_prob;
     wire               sm_done;
-    softmax #(.TMAX(TMAX)) u_sm (
+    // softmax_f: bit-identical drop-in (verbatim arithmetic/LUT/order) that
+    // pipelines PASS2/PASS3 to 1 elem/cycle, killing the 3-cyc/elem T-slope that
+    // dominates split-brain generation at T>1. The N=16 T=1 record is unmoved
+    // (slope*0). Gated bit-exact by run_vec_attn (T sweep) + run_sb_seq.
+    softmax_f #(.TMAX(TMAX)) u_sm (
         .clk(clk), .rst(rst), .start(sm_start), .t_count(sm_tcount),
         .in_valid(sm_in_valid), .score(sm_score), .in_ready(sm_in_ready),
         .out_valid(sm_out_valid), .prob(sm_prob), .done(sm_done)

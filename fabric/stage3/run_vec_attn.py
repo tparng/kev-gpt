@@ -127,7 +127,7 @@ def run(sim_dir, seed=0):
          f"-DPVAL={P}",
          os.path.join(HERE, "tb", "tb_vec_attn.sv"),
          os.path.join(HERE, "rtl", "vec_attn.sv"),
-         os.path.join(HERE, "rtl", "softmax.sv")],
+         os.path.join(HERE, "rtl", "softmax_f.sv")],
         capture_output=True, text=True)
     if cp.returncode != 0:
         print("IVERILOG_COMPILE_FAIL")
