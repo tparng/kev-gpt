@@ -165,20 +165,36 @@ class PLKV256Device:
               f"{mode})")
 
     # --- the fabric protocol ------------------------------------------------ #
+    # Word indices into the mmap uint32 view (off >> 2), precomputed so the hot
+    # loop is plain array indexing, not R_*/method-call arithmetic per pass.
+    _I_TOKID, _I_POS, _I_CTRL = R_TOKID >> 2, R_POS >> 2, R_CTRL >> 2
+    _I_STATUS, _I_CYCLES, _I_TOKOUT = R_STATUS >> 2, R_CYCLES >> 2, R_TOKOUT >> 2
+
     def _go(self, tok: int, pos: int) -> int:
-        d = self._dev
-        d.wr(R_TOKID, int(tok) & 0x1FF)
-        d.wr(R_POS, int(pos) & 0x1FF)
-        d.wr(R_CTRL, 0x1)                                      # go
+        # Interim host-tax micro-opt (bit-exact: identical register writes/reads,
+        # identical order -- only Python overhead drops). Hoist the numpy mmap
+        # view and index it directly, skipping the per-op wr()/rd() method call +
+        # np.uint32() cast; poll STATUS in a tight local spin, checking the wall
+        # clock only every 64 iterations (the timeout is a hang backstop, not a
+        # deadline). The kv256_drv.c C hot loop supersedes this (+120% vs +15-30%);
+        # this is the no-.so fallback. Values are already 9-bit/1-bit, so the
+        # implicit int->uint32 store is identical to the masked wr().
+        reg = self._dev.reg
+        reg[self._I_TOKID] = tok & 0x1FF
+        reg[self._I_POS]   = pos & 0x1FF
+        reg[self._I_CTRL]  = 0x1                               # go
+        i_st = self._I_STATUS
+        spins = 0
         t0 = time.time()
-        while not (d.rd(R_STATUS) & 0x1):
-            if time.time() - t0 > self.poll_timeout:
+        while not (reg[i_st] & 0x1):
+            spins += 1
+            if (spins & 0x3F) == 0 and time.time() - t0 > self.poll_timeout:
                 raise RuntimeError(f"kv256 TIMEOUT at pos={pos} "
-                                   f"STATUS=0x{d.rd(R_STATUS):08X}")
+                                   f"STATUS=0x{int(reg[i_st]):08X}")
         self._launches += 1
-        self._fab_cyc += d.rd(R_CYCLES)          # pure-fabric cycles for this pass
+        self._fab_cyc += int(reg[self._I_CYCLES])  # pure-fabric cycles for this pass
         self._fab_passes += 1
-        return d.rd(R_TOKOUT) & 0x1FF
+        return int(reg[self._I_TOKOUT]) & 0x1FF
 
     @property
     def last_fabric_ms(self) -> float:
