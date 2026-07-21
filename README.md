@@ -70,7 +70,7 @@ campaign. **59,965.5 is the current MEASURED record** (16/16 bit-exact, 3/3); 10
 is PROJECTED and needs both the cycle floor *and* 250 MHz on silicon.
 
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
-CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop GPU ~78×.
+CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop GPU ~83×.
 
 ## The two ceilings (fabric vs round-trip)
 
