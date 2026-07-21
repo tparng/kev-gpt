@@ -300,7 +300,7 @@ def make_device(args):
         return PLKV256Device(lanes=args.lanes, fclk=args.fclk,
                              gen_chars=args.gen_chars, tmax=args.tmax,
                              temp=(0.0 if args.greedy else args.temp),
-                             top_k=args.top_k)
+                             top_k=args.top_k, npz=args.npz, meta=args.meta)
     return PLDevice(args.lanes, args.fclk, args.gen_chars)
 
 
@@ -346,6 +346,14 @@ def main(argv=None):
     ap.add_argument("--top-k", type=int, default=40,
                     help="--engine kv256: keep only the top-k logits when sampling "
                          "(0 = full distribution)")
+    ap.add_argument("--npz", default=None,
+                    help="--engine kv256: model weights .npz to boot-stream "
+                         "(default: fabric/export/goformer.npz). Point at a "
+                         "different model to A/B — but its baked-ROM bitstream "
+                         "(gamma/inv_sact/dqm/dqe/pos_emb) MUST match this model.")
+    ap.add_argument("--meta", default=None,
+                    help="--engine kv256: tokenizer meta .json paired with --npz "
+                         "(default: fabric/export/goformer_meta.json)")
     ap.add_argument("--json", action="store_true",
                     help="force length-prefixed JSON even if msgpack is present")
     ap.add_argument("--bench", action="store_true",
