@@ -38,6 +38,22 @@ import websockets
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
+
+def _rotation_state(path=os.environ.get("KEV_ROTATION_STATE", "/home/mike/rotation_state.json"),
+                    ttl=90.0):
+    """Active-model + countdown for the rotating demo, from a state file the rotation
+    orchestrator pushes each switch. Returns {} (=> single model, not rotating) if the
+    file is absent or stale — so the demo shows plain Kevin when nothing is rotating."""
+    try:
+        if time.time() - os.path.getmtime(path) > ttl:
+            return {}
+        d = json.load(open(path))
+        ns = d.get("next_switch")
+        return {"model": d.get("model"), "label": d.get("label"),
+                "switch_in": max(0, int(ns - time.time())) if ns else None}
+    except Exception:
+        return {}
+
 from .backend import InferRequest
 from .backend_stub import StubBackend
 from .protocol import (MSG_AUTHORITATIVE, MSG_ENTER, MSG_KEYSTROKE,
@@ -266,6 +282,7 @@ class Hub:
                       f"tok/s={r['tok_s']} peak={r['peak_concurrent']} "
                       f"visitors30m={r['visitors_30m']}", flush=True)
 
+    # (defined below at module scope: _rotation_state)
     async def _broadcast_stats(self, rec: dict, now: float):
         """Push a compact, chat-page-shaped stat frame to every connected client.
 
@@ -280,8 +297,13 @@ class Hub:
             self.peak_tok_s = agg
         uptime = max(1e-6, now - self._start_mono)
         amp = rec.get("amplification") or {}
+        rot = _rotation_state()
         stats = {
             "type": "stats",
+            "model": rot.get("model", "kevin"),
+            "model_label": rot.get("label", "Kevin — telegraphic, full speed"),
+            "rotating": bool(rot),
+            "switch_in": rot.get("switch_in"),
             "live_users": rec.get("active_users"),
             "peak_users": rec.get("peak_active"),
             "users_30m": self.unique_visitors(now),

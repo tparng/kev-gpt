@@ -60,6 +60,7 @@
 </style></head><body>
 <header>
  <span>🧒 Kevin <small>on Kria · <span id="status">connecting…</span></small></span>
+ <span class="meta" id="modelbadge"></span>
  <span class="meta" id="lat">—</span>
 </header>
 <div id="stats">
@@ -153,7 +154,21 @@ function fmtN(n){ if(n==null)return '—';
  if(n>=1e3)return (n/1e3).toFixed(1)+'k'; return ''+Math.round(n); }
 function setStat(id,v){ const e=document.getElementById(id); if(e)e.textContent=v; }
 function pct(x){ return x==null?'—':Math.round(x*100)+'%'; }
+// --- rotating two-model demo: active-model badge + live countdown ---
+var rot={model:'kevin',label:'Kevin — telegraphic, full speed',rotating:false,switch_in:null,t0:0};
+function updateBadge(){
+ var b=document.getElementById('modelbadge'); if(!b) return;
+ if(!rot.rotating){ b.textContent=''; return; }
+ var rem = rot.switch_in==null ? null : Math.max(0, Math.round(rot.switch_in-(Date.now()-rot.t0)/1000));
+ var icon = rot.model==='legit' ? '📖' : '🧒';
+ if(rem!=null && rem<=2){ b.textContent='🔧 reconfiguring FPGA…'; return; }
+ var other = rot.model==='legit' ? 'Kevin' : 'legit';
+ var mm = rem!=null ? (Math.floor(rem/60)+':'+String(rem%60).padStart(2,'0')) : '';
+ b.textContent = icon+' '+(rot.label||rot.model)+(rem!=null?('  · ↔ '+other+' in '+mm):'');
+}
+setInterval(updateBadge,1000);
 function renderStats(m){
+ if(m.rotating!==undefined){ rot={model:m.model,label:m.model_label,rotating:!!m.rotating,switch_in:m.switch_in,t0:Date.now()}; updateBadge(); }
  setStat('st_fab',  m.fabric_tok_s? fmtN(m.fabric_tok_s):'—');
  setStat('st_trip', m.trip_tok_s?   fmtN(m.trip_tok_s):'—');
  setStat('st_users', m.users_30m!=null?fmtN(m.users_30m):'—');
