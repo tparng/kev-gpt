@@ -9,7 +9,7 @@
 # Prereqs on the board (already true per project notes): gcc 11.4, Python 3.10,
 # the resident bitstream loaded, the repo synced, root for /dev/mem.
 #
-#   ssh ubuntu@<kria-ip>          # (re-auth Tailscale first; expired right now)
+#   ssh ubuntu@<kria-ip>              # (re-auth Tailscale first if the session expired)
 #   bash run_on_board.sh              # build + gate; then it runs the real chat
 #
 # Edit REPO/VENV/BASE if your layout differs.

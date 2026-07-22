@@ -543,7 +543,7 @@ def build_parser():
                     help="--backend kv: argmax decode (reproducible) vs sampled")
     ap.add_argument("--daemon-host", default=None,
                     help="Kria A53 daemon address for --backend tcp "
-                         "(e.g. the Tailscale IP <kria-ip>)")
+                         "(e.g. the board's Tailscale IP)")
     ap.add_argument("--daemon-port", type=int, default=9099,
                     help="Kria A53 daemon port (a53_daemon --port)")
     ap.add_argument("--daemon-transport", choices=["json", "msgpack"],

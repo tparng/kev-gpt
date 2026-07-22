@@ -42,10 +42,10 @@ from fabric.stage3.run_layernorm import OUT_FRAC as LN_OUT_FRAC  # 22
 ISH = 40
 NSACT = 17  # 4 GEMV/block * 4 blocks + head
 
-# npz lives outside the worktree (gitignored); default to the main checkout.
+# npz is gitignored; regenerate via model.export_fabric or point GOFORMER_NPZ at it.
 DEFAULT_NPZ = os.environ.get(
     "GOFORMER_NPZ",
-    r"C:\Users\mikea\OneDrive\Desktop\Projects\kev-gpt\fabric\export\goformer.npz")
+    os.path.join(os.path.dirname(__file__), "..", "..", "export", "goformer.npz"))
 
 
 def signed_bits(mag: int) -> int:

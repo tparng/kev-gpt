@@ -23,7 +23,7 @@ whatever). You do NOT need to copy the raw 1.9 GB `TinyStories-train.txt` or the
 ## 2. Environment (Windows)
 
 ```
-git clone https://github.com/michaelayles/kev-gpt
+git clone https://github.com/MichaelAyles/kev-gpt
 cd kev-gpt
 python -m venv .venv
 .venv\Scripts\activate

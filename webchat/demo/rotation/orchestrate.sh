@@ -3,8 +3,7 @@
 # activate model on the fabric + reconnect the chat server. Guaranteed Kevin restore.
 #   orchestrate.sh <dur_s> <cycles>
 DUR=${1:-300}; CYCLES=${2:-3}
-S=/tmp/claude-1000/-home-mikeayles-Desktop-Projects-kev-gpt/348ee0b6-977c-4936-b584-6179d4de5e92/scratchpad
-LOG=$S/rotation_events.jsonl; : > "$LOG"
+LOG=${ROTATION_LOG:-/tmp/rotation_events.jsonl}; : > "$LOG"
 SSHK="ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 kria"
 SSHP="ssh -o ConnectTimeout=10 precision"
 ts(){ date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }; ep(){ date +%s; }

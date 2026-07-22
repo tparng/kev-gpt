@@ -18,6 +18,7 @@ data/
 
 # Fabric export artifacts (regenerable from a checkpoint via model.export_fabric)
 fabric/export/
+fabric/export_legit/
 fabric/roofline.png
 
 # Stage 1 sim/synth scratch (regenerable)

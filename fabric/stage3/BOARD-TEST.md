@@ -8,7 +8,7 @@ gated pieces onto the board and measures them.
 Re-auth first (the SSH check tonight hit an expired Tailscale session):
 ```
 # on the board console or after `tailscale up` re-login:
-ssh ubuntu@<kria-ip>          # alias: kria-kev ; pw <redacted> ; key auth set up
+ssh ubuntu@<kria-ip>              # alias: kria-kev ; Tailscale address, key auth set up
 ```
 
 ---
