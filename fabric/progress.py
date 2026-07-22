@@ -77,8 +77,8 @@ LADDER = [
      "the kv-quantise / attn-dot / min-max / AQ timing cones (12,662 cyc/tok, 3/3; 200 fails on the MAC floor)"),
     ("+ schedule trims + MAC stage\n(KVW/RB/LN overlap, 8ns-target route)", 16087.5, "MEASURED",
      "~2.2k cyc (AQ/RUN + groupwise RB + KV feeder + LN fusion); 10,360 cyc/tok, 3/3 @166.7 (5ns build was unroutable; 200 fails)"),
-    ("x faster clock OR fewer cycles\n(MMCM ~187MHz, or K4/smaller model)", 20000.0, "PROJECTED",
-     "the PS PLL caps at 166.7 (200 fails timing); 20k needs ~207MHz on this design -> an MMCM ~187 gets ~18k, the K4/smaller-model cycle cut gets 20k"),
+    ("+ LN wide-word cut -> 200 MHz silicon\n(WNS +0.012 @142.9, fclk0 1000/5)", 19242.0, "MEASURED",
+     "the route-congestion wall that capped 166.7: layernorm_vec [P][rows] FF arrays -> wide-word LUTRAM (LUT 92.96->89.5%, -11.9k FF, killed two 400+-fanout CE trees). STA closes +0.012 @142.9 (was -1.385); silicon bit-exact to 200 MHz. 10,394 cyc/tok MEASURED (127 passes / 6.6 ms fabric), 200 MHz 3/3 greedy bit-exact; 250 MHz = hard timing wall"),
 ]
 
 # reference baselines (drawn as guide lines, not rungs) — all the same model, B=1 greedy

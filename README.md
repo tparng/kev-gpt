@@ -33,6 +33,7 @@ data tool and the model) for that project.
 | [`4-live-chatbot.md`](docs/4-live-chatbot.md) | **the stress test** — serve it behind a Cloudflare Tunnel, link on HN |
 | [`5-demo-prd.md`](docs/5-demo-prd.md) | **the demo PRD** — speculative-typing chat + live load dashboard |
 | [`6-past-the-stream-ceiling.md`](docs/6-past-the-stream-ceiling.md) | **the speed campaign** — split-brain + worst-path retirement past the stream ceiling, toward 100k |
+| [`7-kevin-remembers.md`](docs/7-kevin-remembers.md) | **the faithful stream** — N=1 with the full T=256 trained context on-chip: real messages, not degenerate text |
 
 ## Code
 
@@ -70,7 +71,9 @@ campaign. **59,965.5 is the current MEASURED record** (16/16 bit-exact, 3/3); 10
 is PROJECTED and needs both the cycle floor *and* 250 MHz on silicon.
 
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
-CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop GPU ~83×.
+CPU 1,273 · RTX 3050 Ti 719. The FPGA's **16-stream aggregate** beats the laptop
+GPU ~83×; the fair single-stream comparison is the faithful N=1 build at ~19,240
+tok/s — **~27×** the GPU at the same B=1.
 
 ## The two ceilings (fabric vs round-trip)
 
@@ -78,9 +81,12 @@ CPU 1,273 · RTX 3050 Ti 719 — the FPGA beats a laptop GPU ~83×.
 
 The fabric record and what a live chat user actually feels are two different
 numbers. The **fabric peak** (59,965.5 tok/s, N=16 @200 MHz) is pure PL cycles;
-the **faithful single stream** (N=1, the deployed doc-7 chat build) runs 16,227
-tok/s of fabric. But the **round-trip** a user sees is far below that — it's
-bound by serving, not silicon.
+the **faithful single stream** (N=1, the deployed doc-7 chat build) runs **~19,240
+tok/s** of fabric (10,394 cyc/tok measured; the average falls as the attention
+window fills) — a LayerNorm wide-word congestion cut (−11.9k FF / −3.8k LUT)
+closed timing at 142.9 MHz (WNS +0.012, was −1.385) and overclocked bit-exact to
+200 MHz on silicon (up from the old 166.7 MHz / ~16.2k ceiling). But the
+**round-trip** a user sees is far below that — it's bound by serving, not silicon.
 
 The biggest round-trip tax was **sampling**: the host read 193 head logits per
 token back over `/dev/mem` to do temperature sampling on the A53 (~58 % of a
@@ -177,7 +183,7 @@ free Dropbox that lives next to the code:
 
 | release | asset | what |
 |---|---|---|
-| [`corpus-v1`](https://github.com/michaelayles/kev-gpt/releases/tag/corpus-v1) | `TinyStories-train.kevin.txt.gz` (394 MB) | the full Kevinised train corpus, gzipped |
+| [`corpus-v1`](https://github.com/MichaelAyles/kev-gpt/releases/tag/corpus-v1) | `TinyStories-train.kevin.txt.gz` (394 MB) | the full Kevinised train corpus, gzipped |
 
 **Pull an artifact (e.g. on the Dell):**
 
