@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 import sys
 
@@ -55,7 +57,7 @@ def main(argv=None):
     p.add_argument("--mmax", type=int, default=1024)
     p.add_argument("--kmax", type=int, default=1024)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_sim"))
+    p.add_argument("--dir", default=kevbuild("stage3_sim"))
     a = p.parse_args(argv)
     ok = run(a.M, a.K, a.lanes, a.mmax, a.kmax, a.seed, a.dir)
     raise SystemExit(0 if ok else 1)

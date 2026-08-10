@@ -23,6 +23,8 @@ import random
 import subprocess
 import sys
 
+from fabric.stage3._simdir import kevbuild
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 RTL_DP = os.path.join(HERE, "rtl", "mac_bank_dp.sv")
 RTL_REF = os.path.join(HERE, "rtl", "gemm_banked_resident_vec.sv")
@@ -148,7 +150,7 @@ def main(argv=None):
     p.add_argument("--K", type=int, default=1024)
     p.add_argument("--abits", type=int, default=24)
     p.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3, 4])
-    p.add_argument("--dir", default="C:/kevbuild/agent_dp0/macdp")
+    p.add_argument("--dir", default=kevbuild("agent_dp0", "macdp"))
     a = p.parse_args(argv)
     ok = run(a.lanes, a.K, a.abits, a.seeds, a.dir)
     raise SystemExit(0 if ok else 1)

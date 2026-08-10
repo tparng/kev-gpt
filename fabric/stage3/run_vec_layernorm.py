@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 
 import numpy as np
@@ -91,7 +93,7 @@ def main(argv=None):
     ap.add_argument("--p", type=int, default=8)
     ap.add_argument("--n", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_ln_vec"))
+    ap.add_argument("--dir", default=kevbuild("stage3_ln_vec"))
     a = ap.parse_args(argv)
     ok = run(a.dir, a.n, a.seed, a.p)
     raise SystemExit(0 if ok else 1)

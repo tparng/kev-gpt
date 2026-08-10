@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 import sys
 
@@ -88,7 +90,7 @@ def run_cfg(d, M, K, lanes, n, nd, seed, corner, dpump=False):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="fabric.stage3.run_gemm16")
     p.add_argument("--lanes", type=int, default=128)
-    p.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_gemm16"))
+    p.add_argument("--dir", default=kevbuild("stage3_gemm16"))
     p.add_argument("--lut-only", action="store_true",
                    help="DOUBLE-PUMP Stage 1a: gate the double-pumped LUT path "
                         "(DP=1) on ND=0 cases only.")

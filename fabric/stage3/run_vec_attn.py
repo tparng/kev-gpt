@@ -19,6 +19,8 @@ import subprocess
 
 import numpy as np
 
+from fabric.stage3._simdir import kevbuild
+
 from fabric.stage3.run_softmax import exp_table, int_softmax_q
 
 VFRAC = 16
@@ -190,7 +192,7 @@ def run(sim_dir, seed=0):
 
 
 def main():
-    sim_dir = os.path.join("C:\\kevbuild", "stage3_vec_attn")
+    sim_dir = kevbuild("stage3_vec_attn")
     raise SystemExit(0 if run(sim_dir) else 1)
 
 

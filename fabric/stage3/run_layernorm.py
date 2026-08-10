@@ -27,6 +27,8 @@ import subprocess
 
 import numpy as np
 
+from fabric.stage3._simdir import kevbuild
+
 # ---- pinned fixed-point formats ---------------------------------------------
 QX = 25                 # input x: Q6.25 (signed 32-bit residual stream)
 G_FRAC = 20             # gamma: signed Q4.20
@@ -264,7 +266,7 @@ def run(sim_dir, n_cases=64, seed=0):
 
 
 def main():
-    sim_dir = os.path.join("C:\\kevbuild", "stage3_ln")
+    sim_dir = kevbuild("stage3_ln")
     raise SystemExit(0 if run(sim_dir) else 1)
 
 

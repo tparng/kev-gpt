@@ -8,6 +8,7 @@ that only binds under ATT2=1. Gives the per-cohort GE-state cycle breakdown
 from __future__ import annotations
 import argparse, os, subprocess
 from fabric.stage3 import run_sb_seq
+from fabric.stage3._simdir import kevbuild
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 run_sb_seq.TB = os.path.join(HERE, "tb", "tb_seq_sb_geprof.sv")
@@ -31,7 +32,7 @@ def main(argv=None):
     ap.add_argument("--p", type=int, default=8)
     ap.add_argument("--lanes", type=int, default=128)
     ap.add_argument("--tmax", type=int, default=16)
-    ap.add_argument("--dir", default="C:/kevbuild/agent_rb/geprof")
+    ap.add_argument("--dir", default=kevbuild("agent_rb", "geprof"))
     a = ap.parse_args(argv)
     toks = [int(t) for t in a.toks.split(",")]
     # att2 fixed to 0 in the TB; pass att2=0 so run_sb_seq's -DATT2VAL matches.

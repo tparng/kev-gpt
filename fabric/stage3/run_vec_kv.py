@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 
 from fabric.stage3 import seq_ref
@@ -172,7 +174,7 @@ def main(argv=None):
                     help="on-chip Gumbel-max sampling seed (0 => greedy argmax)")
     ap.add_argument("--npz", default="fabric/export/goformer.npz")
     ap.add_argument("--meta", default="fabric/export/goformer_meta.json")
-    ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_vec_kv"))
+    ap.add_argument("--dir", default=kevbuild("stage3_vec_kv"))
     a = ap.parse_args(argv)
     if a.prompt:
         ids = _encode(a.meta, a.prompt)

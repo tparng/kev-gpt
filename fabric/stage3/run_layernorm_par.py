@@ -22,6 +22,8 @@ import subprocess
 
 import numpy as np
 
+from fabric.stage3._simdir import kevbuild
+
 # reuse the EXACT integer reference + stimulus the serial gate uses
 from fabric.stage3.run_layernorm import (
     _ln_int_quantized,
@@ -117,7 +119,7 @@ def run(sim_dir, n_cases=64, seed=0):
 
 
 def main():
-    sim_dir = os.path.join("C:\\kevbuild", "stage3_lnpar")
+    sim_dir = kevbuild("stage3_lnpar")
     raise SystemExit(0 if run(sim_dir) else 1)
 
 

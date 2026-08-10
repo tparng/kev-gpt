@@ -14,6 +14,8 @@ import os
 import subprocess
 import sys
 
+from fabric.stage3._simdir import kevbuild
+
 import numpy as np
 
 from model.goformer_full import gelu
@@ -117,7 +119,7 @@ def run(sim_dir, N=4096, seed=0):
 
 
 def main(argv=None):
-    sim_dir = os.path.join("C:\\kevbuild", "stage3_gelu")
+    sim_dir = kevbuild("stage3_gelu")
     raise SystemExit(0 if run(sim_dir) else 1)
 
 

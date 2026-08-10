@@ -26,6 +26,8 @@ import subprocess
 
 import numpy as np
 
+from fabric.stage3._simdir import kevbuild
+
 NHEAD = 4
 HEAD_DIM = 64
 KBITS = 4
@@ -183,7 +185,7 @@ def run(sim_dir, npz="fabric/export/goformer.npz", prompt_len=8, seed=0,
 
 
 def main():
-    sim_dir = os.path.join("C:\\kevbuild", "agent_kv4", "kv_dma")
+    sim_dir = kevbuild("agent_kv4", "kv_dma")
     raise SystemExit(0 if run(sim_dir) else 1)
 
 

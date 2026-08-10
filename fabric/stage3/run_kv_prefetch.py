@@ -25,6 +25,8 @@ import subprocess
 
 import numpy as np
 
+from fabric.stage3._simdir import kevbuild
+
 NHEAD = 4
 HEAD_DIM = 64
 KBITS = 4
@@ -239,7 +241,7 @@ def run(sim_dir, npz="fabric/export/goformer.npz", prompt_len=12, seed=0,
 
 
 def main():
-    base = os.path.join("C:\\kevbuild", "agent_kv4", "kv_prefetch")
+    base = kevbuild("agent_kv4", "kv_prefetch")
     # default warm window (T=8) sanity, then the full T=32 Kevin window: prove the
     # 2*T-row fill hides behind an ~18k-cyc token compute (per_head_cyc=4500 -> NHEAD*
     # 4500 = 18,000-cyc compute window, the single-token compute floor).

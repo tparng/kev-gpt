@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 
 from fabric.stage3 import seq_ref
@@ -110,7 +112,7 @@ def main(argv=None):
     ap.add_argument("--lanes", type=int, default=16)
     ap.add_argument("--tmax", type=int, default=256,
                     help="pos table depth baked into the RTL (64 = BRAM-budget build)")
-    ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_seq_vec"))
+    ap.add_argument("--dir", default=kevbuild("stage3_seq_vec"))
     a = ap.parse_args(argv)
     ok = run(a.dir, a.tok, a.p, a.lanes, a.tmax)
     raise SystemExit(0 if ok else 1)

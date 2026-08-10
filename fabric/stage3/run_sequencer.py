@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 import sys
 
@@ -516,7 +518,7 @@ def main(argv=None):
     ap.add_argument("--prompt-len", type=int, default=4)
     ap.add_argument("--ngen", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_seqmt"))
+    ap.add_argument("--dir", default=kevbuild("stage3_seqmt"))
     a = ap.parse_args(argv)
     # default layer count: the multi-token / AXI gates are for the REAL 4-layer model
     # (nlayer=1 multitoken is a non-physical single-layer config and is not supported);
@@ -525,8 +527,8 @@ def main(argv=None):
     if a.axi:
         if nlayer != 4:
             raise SystemExit("AXI gate requires --nlayer 4 (the real model)")
-        ok = run_axi(a.dir if a.dir != os.path.join("C:\\kevbuild", "stage3_seqmt")
-                     else os.path.join("C:\\kevbuild", "stage3_seqaxi"),
+        ok = run_axi(a.dir if a.dir != kevbuild("stage3_seqmt")
+                     else kevbuild("stage3_seqaxi"),
                      a.lanes, nlayer, a.prompt_len, a.ngen, a.seed)
     elif a.multitoken:
         if nlayer != 4:

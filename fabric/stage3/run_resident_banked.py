@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 import sys
 
@@ -173,7 +175,7 @@ def main(argv=None):
     p.add_argument("--wwords", type=int, default=16384)
     p.add_argument("--rlat", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_residentbanked"))
+    p.add_argument("--dir", default=kevbuild("stage3_residentbanked"))
     a = p.parse_args(argv)
     shapes = [tuple(int(v) for v in s.split("x")) for s in a.shapes.split(",")]
     ok = run(shapes, a.lanes, a.mmax, a.kmax, a.wwords, a.rlat, a.seed, a.dir)

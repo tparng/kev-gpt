@@ -140,18 +140,26 @@ Cloudflare tunnel) is the remaining WAN+tunnel RTT, not fabric.
   100k aggregate tok/s is ~3.89 GB/s (DERIVED) — under the ~6–7.5 GB/s sustained HP
   ceiling, so DDR is not the binding wall.
 
-## Quickstart
+## Getting started (reproducing it)
+
+There are three tiers of reproduction, in increasing hardware cost. **Tiers 1–2
+need no FPGA** — tier 2 is where the load-bearing "bit-honest" claim can be checked
+by anyone, in software.
 
 ```
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
+```
 
-# Kevinise the bundled sample
+### Tier 1 — the data tool and the model (CPU, or a GPU to go big)
+
+```
+# Kevinise the bundled sample (the whole joke in one line)
 python -m keviniser.harness samples/canonical.txt
 #  -> why us waste time say lot word when few word do trick
 
-# Or the real thing: fetch TinyStories, Kevinise it, train a tiny model
+# The real thing: fetch TinyStories, Kevinise it, train a tiny model, sample it
 python -m keviniser.fetch_tinystories                       # validation split (~20 MB)
 python -m keviniser.harness data/TinyStories-valid.txt \
     -o data/TinyStories-valid.kevin.txt --marker "<|endoftext|>"
@@ -165,6 +173,117 @@ python -m model.train --qat --init-from data/ckpt.pt --max-iters 2000 \
 
 Training the **full** corpus belongs on a CUDA GPU — see
 [`model/SETUP-DELL.md`](model/SETUP-DELL.md).
+
+### Tier 2 — the bit-exact fabric gates (needs `iverilog`, no board)
+
+This is the reproducible core of the honesty claim: **every RTL block is proven
+bit-identical (or cosine > 0.9999 for the transcendental LUTs) to a Python integer
+reference in [Icarus Verilog](https://steveicarus.github.io/iverilog/) simulation,
+before any silicon or speed number.** Each `run_*.py` harness writes the `.mem`
+weight images, compiles the RTL with `iverilog -g2012`, runs `vvp`, and diffs every
+intermediate against `seq_ref.py`, printing a one-line `*_VERDICT`.
+
+```
+# Debian/Ubuntu: sudo apt install iverilog   |   macOS: brew install icarus-verilog
+python -m fabric.stage3.run_gelu             # GELU LUT vs exact GELU  -> GELU_VERDICT bitexact=True
+python -m fabric.stage3.run_layernorm        # fabric-precision LayerNorm
+python -m fabric.stage3.run_softmax          # fabric-precision softmax
+python -m fabric.stage3.run_banked           # the systolic INT4 GEMV, bit-exact across PE widths
+python -m fabric.stage3.run_vec_seq          # a full single-token forward through the sequencer
+```
+
+Scratch build files default to `<system-temp>/kevbuild` (e.g. `/tmp/kevbuild`);
+override with `--dir <path>` where a harness accepts it, or set `KEV_SIM_DIR` for
+all of them. Green verdicts here are what the on-silicon tok/s numbers are measured
+*against* — if a gate is red, no speed number from that block is trusted.
+
+### Tier 3 — on the board (needs a Kria KV260 + Vivado 2025.2)
+
+Synthesis, implementation, bitstream, and the on-board `--fclk` sweep need the
+hardware and the Xilinx toolchain; the commands live in
+[`CLAUDE.md`](CLAUDE.md) and the engineering log
+[`fabric/stage3/WIDE-WORD-DATAPATH-LOG.md`](fabric/stage3/WIDE-WORD-DATAPATH-LOG.md).
+This tier is not reproducible without the ~$250 board, and that is stated honestly:
+the silicon numbers are ours, but the *method* that makes them trustworthy (tier 2)
+runs on your laptop.
+
+## How to read the Verilog (for software engineers)
+
+The fabric is hand-written RTL, not HLS. If you write software, three ideas get you
+most of the way, and the real modules in [`fabric/stage3/rtl/`](fabric/stage3/rtl/)
+are small enough to read. Verilog describes **hardware that all exists at once**, not
+a sequence of instructions.
+
+**1. A module is a function whose arguments are wires of a fixed bit-width.** Here is
+the whole GELU activation, as an 8192-entry lookup table
+([`rtl/gelu_lut.sv`](fabric/stage3/rtl/gelu_lut.sv)):
+
+```systemverilog
+module gelu_lut (
+    input  wire                clk,
+    input  wire signed [15:0]  x,      // Q4.12 fixed-point in
+    output reg  signed [15:0]  y       // Q4.12 fixed-point out
+);
+```
+
+`[15:0]` means a 16-bit bus — there are no ints, floats, or growable types; every
+value is a fixed pile of bits you size yourself. `signed` says how to interpret them.
+`Q4.12` is fixed-point: 4 integer bits, 12 fractional — floats cost too much fabric,
+so the whole model runs in scaled integers.
+
+**2. `always @(posedge clk)` is "do this on every rising clock edge."** It is the only
+notion of time. A `reg` updated inside one is a hardware register (a latch of flip-flops)
+that remembers its value between ticks; a `wire`/`assign` is just combinational logic that
+settles continuously. The GELU is a **3-stage pipeline** — each `always @(posedge clk)`
+is one stage, so a new `x` enters every cycle and its `y` pops out 3 cycles later, with
+three different inputs in flight at once:
+
+```systemverilog
+always @(posedge clk) u  <= x + 16'h8000;          // stage 0: recenter the index
+always @(posedge clk) begin                         // stage 1: two registered LUT reads
+    l0 <= lut[idx];  l1 <= lut[idx1];  f1 <= frac;
+end
+always @(posedge clk) y <= l0 + (step >>> 3);       // stage 2: linear interpolate
+```
+
+`<=` is not assignment — it schedules all the registers in a block to update *together*
+at the edge (that is why order inside the block does not matter). `>>>` is an arithmetic
+shift (a cheap divide-by-8). Reads and writes here are not statements that run in order;
+they are wires and latches that are all physically present and all active every cycle.
+
+**3. The parallelism is spatial — `generate`/`for` stamps out copies of hardware.** The
+heart of a neural net is multiply-accumulate, and here it is, one stream's 128 lanes
+([`rtl/gemm_banked_resident_vec.sv`](fabric/stage3/rtl/gemm_banked_resident_vec.sv)):
+
+```systemverilog
+generate
+    for (gl = 0; gl < LANES; gl = gl + 1) begin : g_l
+        reg signed [ABITS-1:0] a;                   // this lane's accumulator
+        always @(posedge clk) begin
+            if (clr)      a <= 0;
+            else if (en)  a <= a + $signed(w[gl*4 +: 4]) * x;   // a += w[gl] * x
+        end
+        assign acc[gl*ABITS +: ABITS] = a;
+    end
+endgenerate
+```
+
+That `for` loop is **not** a loop that runs 128 times in sequence — it lays down 128
+physical multiply-accumulate units that all fire on the same clock edge. Every cycle,
+one shared activation `x` is multiplied by 128 different INT4 weights and added into 128
+separate accumulators, simultaneously. `w[gl*4 +: 4]` is the part-select idiom: "4 bits
+starting at bit `gl*4`" — one INT4 weight sliced out of a packed bus. Speed on the fabric
+comes from doing more of these in parallel per cycle, and from clocking them faster — which
+is the entire speed ladder above.
+
+**Where it stops feeling like software: the memory layout is physical.** A naive 2-D array
+indexed by a runtime value (`buf[lane][row]`) synthesises to a giant per-lane mux tree that
+blows up the chip; the same data as one wide word per row (`reg [P*32-1:0] bank [0:ROWS-1]`,
+lane `l` at bits `[l*32 +: 32]`) makes the row a memory *address* instead of a mux, and fits.
+That refactor — same math, different physical shape — is a recurring move in this repo (see
+[`rtl/layernorm_vec.sv`](fabric/stage3/rtl/layernorm_vec.sv)) and the kind of thing that has
+no analogue in software. `GLOSSARY.md` and the `seq_ref.py` reference are the two files to
+keep open while reading the rest.
 
 ## Data & checkpoints (GitHub as Dropbox)
 

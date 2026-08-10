@@ -23,6 +23,8 @@ Pinned fixed-point datapath (bit-true to rtl/softmax.sv):
 from __future__ import annotations
 
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 
 import numpy as np
@@ -260,7 +262,7 @@ def _token_stream_gate(npz, exp_lut, n_gen=60, prompt_len=8, seed=0):
 def main():
     import argparse
     ap = argparse.ArgumentParser(prog="fabric.stage3.run_softmax")
-    ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_softmax"))
+    ap.add_argument("--dir", default=kevbuild("stage3_softmax"))
     a = ap.parse_args()
     raise SystemExit(0 if run(a.dir) else 1)
 

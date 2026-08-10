@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import os
+
+from fabric.stage3._simdir import kevbuild
 import subprocess
 
 from fabric.stage3 import seq_ref
@@ -127,7 +129,7 @@ def main(argv=None):
     ap.add_argument("--p", type=int, default=8)
     ap.add_argument("--lanes", type=int, default=128)
     ap.add_argument("--tmax", type=int, default=32)
-    ap.add_argument("--dir", default=os.path.join("C:\\kevbuild", "stage3_seq_gemm"))
+    ap.add_argument("--dir", default=kevbuild("stage3_seq_gemm"))
     a = ap.parse_args(argv)
     toks_s = a.toks if a.toks else (TOKS16 if a.n == 16 else TOKS8)
     toks = [int(t) for t in toks_s.split(",")]

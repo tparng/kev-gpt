@@ -25,6 +25,8 @@ import subprocess
 
 import numpy as np
 
+from fabric.stage3._simdir import kevbuild
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCALE_MANT_BITS = 24
 
@@ -159,7 +161,7 @@ def run_one(sim_dir, frac, P=8, N=2048, seed=0):
 
 
 def main():
-    base = os.path.join("C:\\kevbuild", "stage3_vec_dequant")
+    base = kevbuild("stage3_vec_dequant")
     all_ok = True
     for frac in (16, 25, 12):
         sim_dir = os.path.join(base, f"frac{frac}")

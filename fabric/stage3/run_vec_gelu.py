@@ -16,6 +16,8 @@ import subprocess
 
 import numpy as np
 
+from fabric.stage3._simdir import kevbuild
+
 from fabric.stage3.run_gelu import gelu_q, gelu_table
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -82,7 +84,7 @@ def run(sim_dir, N=1024, P=8, seed=0):
 
 
 def main(argv=None):
-    sim_dir = os.path.join("C:\\kevbuild", "stage3_vec_gelu")
+    sim_dir = kevbuild("stage3_vec_gelu")
     raise SystemExit(0 if run(sim_dir) else 1)
 
 
