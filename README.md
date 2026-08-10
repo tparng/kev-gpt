@@ -3,14 +3,18 @@
 > *Why waste BRAM say lot word when few word do trick.*
 
 A tiny language model that runs entirely inside the FPGA fabric of a Xilinx Kria
-KV260 — weights baked into on-chip BRAM/URAM so they never touch DDR — trained on
+KV260: weights resident in on-chip BRAM/URAM so they never touch DDR, trained on
 telegraphic text so it talks like Kevin Malone. The joke is the thesis: a model
 small enough to live on-chip is necessarily dumb, and on-chip residency is the
 *only* thing that beats the board's Arm cores. **Being dumb and being fast are
 the same property.**
 
-This repo holds both the **design notes** (the argument) and the **code** (the
-data tool and the model) for that project.
+Talk to it live at [chat.mikeayles.com](https://chat.mikeayles.com):
+
+![The live chat, straight from the fabric](webchat/kevchat.png)
+
+This repo holds the code end to end: the data tool, the model, the fabric RTL,
+and the serving stack.
 
 ## The two facts it hangs on
 
@@ -22,25 +26,15 @@ data tool and the model) for that project.
    smaller KV cache = more fits on-chip = faster. The compression is the comedy
    *and* the optimisation.
 
-## Design docs (read in order)
-
-| doc | what |
-|---|---|
-| [`0-master.md`](docs/0-master.md) | the through-line, the four-piece map, the build order |
-| [`1-keviniser.md`](docs/1-keviniser.md) | **the data tool** — POS-based telegraphic preprocessor |
-| [`2-llm-on-kria.md`](docs/2-llm-on-kria.md) | **the platform** — on-chip systolic GEMV, fabric-native softmax/RMSNorm |
-| [`3-kevin-on-kria.md`](docs/3-kevin-on-kria.md) | **the fusion** — train doc 2's model on doc 1's corpus |
-| [`4-live-chatbot.md`](docs/4-live-chatbot.md) | **the stress test** — serve it behind a Cloudflare Tunnel, link on HN |
-| [`5-demo-prd.md`](docs/5-demo-prd.md) | **the demo PRD** — speculative-typing chat + live load dashboard |
-| [`6-past-the-stream-ceiling.md`](docs/6-past-the-stream-ceiling.md) | **the speed campaign** — split-brain + worst-path retirement past the stream ceiling, toward 100k |
-| [`7-kevin-remembers.md`](docs/7-kevin-remembers.md) | **the faithful stream** — N=1 with the full T=256 trained context on-chip: real messages, not degenerate text |
-
 ## Code
 
 | dir | what |
 |---|---|
 | [`keviniser/`](keviniser/) | the Keviniser preprocessor + corpus harness + TinyStories fetcher ([README](keviniser/README.md)) |
 | [`model/`](model/) | a 2–4M-param nanoGPT-scale model, trainer, sampler, evolution renderer ([README](model/README.md)) |
+| [`fabric/`](fabric/) | the RTL, the integer golden reference, the bit-exact gate harnesses, and the engineering logs |
+| [`webchat/`](webchat/) | the serving stack: A53 daemon, WebSocket backend, speculative-typing client, load dashboard ([README](webchat/demo/README.md)) |
+| [`bench/`](bench/) | CPU/GPU reference benchmarks (ONNX Runtime, CUDA) for the comparison numbers |
 | [`tests/`](tests/) | pytest suite for the Keviniser |
 
 ## The speed ladder
@@ -52,28 +46,28 @@ vs the integer reference). The current state, all bit-honest:
 
 | What | tok/s | Tag |
 |---|---|---|
-| Single-pass N=8 — one weight pass serves all 8 streams (69,172 cyc / 8 tokens @166.7 MHz) | 19,275.6 | MEASURED |
-| N=16 — 12 DSP-packed banks + shared LN/attention (110,494 cyc / 16 tokens @166.7 MHz) | 24,134.0 | MEASURED |
-| + softmax latency cut (103,582 cyc / 16 tokens @166.7 MHz) — **the stream ceiling** | 25,744.5 | MEASURED |
-| **Split-brain** N=14 — two cohorts on the dual-ported URAM (63,113 cyc / 14 tokens @166.7 MHz) | 36,970.7 | MEASURED |
-| N=16 @ **200 MHz** — first 200-clean build (LN un-retime + AQ 32×48 range-proof) | 46,604.4 | MEASURED |
+| Single-pass N=8, one weight pass serves all 8 streams (69,172 cyc / 8 tokens @166.7 MHz) | 19,275.6 | MEASURED |
+| N=16, 12 DSP-packed banks + shared LN/attention (110,494 cyc / 16 tokens @166.7 MHz) | 24,134.0 | MEASURED |
+| + softmax latency cut (103,582 cyc / 16 tokens @166.7 MHz), **the stream ceiling** | 25,744.5 | MEASURED |
+| **Split-brain** N=14, two cohorts on the dual-ported URAM (63,113 cyc / 14 tokens @166.7 MHz) | 36,970.7 | MEASURED |
+| N=16 @ **200 MHz**, first 200-clean build (LN un-retime + AQ 32×48 range-proof) | 46,604.4 | MEASURED |
 | + schedule-pipelining wave (AQ/RUN overlap, stream-granular NL, attn call cuts; 56,876 cyc @200 MHz) | 56,262.7 | MEASURED |
 | + TMAX=16 architectural wave (TMAX 32→16, CTX cross-group stream, LN prod×gamma split; 53,364 cyc @200 MHz) | **59,965.5** | MEASURED |
-| Cycle floor (~53k → ~40k cyc) × 250 MHz silicon | →100k | the 100k identity: 16 × 250 MHz / 40k cyc, PROJECTED |
 
 Past 25.7k, **N=16 is the stream ceiling**: 3 INT4×INT8 MACs/DSP is provably
 impossible (27-bit port vs 28 needed; 66 bits of neuron state vs a 48-bit
-accumulator — `fabric/stage3/research/dsp3_pack_proof.py`, 1.2M-trial verified),
-so the levers became **cycles and clock, not streams** — the second era, documented
-in [`6-past-the-stream-ceiling.md`](docs/6-past-the-stream-ceiling.md): split-brain
-(two N=8 cohorts on the true-dual-port URAM) plus a systematic worst-path-retirement
-campaign. **59,965.5 is the current MEASURED record** (16/16 bit-exact, 3/3); 100k
-is PROJECTED and needs both the cycle floor *and* 250 MHz on silicon.
+accumulator; `fabric/stage3/research/dsp3_pack_proof.py`, 1.2M-trial verified),
+so the levers became **cycles and clock, not streams**: split-brain (two N=8
+cohorts on the true-dual-port URAM) plus a systematic worst-path-retirement
+campaign. **59,965.5 is the current MEASURED record** (16/16 bit-exact, 3/3).
+The 100k target was chased and honestly disowned: the cycle floor and the
+250 MHz hard wall (the fabric hangs) put the real ceiling of this architecture
+on this chip at 62k to 78k.
 
 References (same model, B=1 greedy): A53 char chat = 11 tok/s · XPS15 ONNX Runtime
 CPU 1,273 · RTX 3050 Ti 719. The FPGA's **16-stream aggregate** beats the laptop
 GPU ~83×; the fair single-stream comparison is the faithful N=1 build at ~19,240
-tok/s — **~27×** the GPU at the same B=1.
+tok/s, **~27×** the GPU at the same B=1.
 
 ## The two ceilings (fabric vs round-trip)
 
@@ -81,19 +75,22 @@ tok/s — **~27×** the GPU at the same B=1.
 
 The fabric record and what a live chat user actually feels are two different
 numbers. The **fabric peak** (59,965.5 tok/s, N=16 @200 MHz) is pure PL cycles;
-the **faithful single stream** (N=1, the deployed doc-7 chat build) runs **~19,240
-tok/s** of fabric (10,394 cyc/tok measured; the average falls as the attention
-window fills) — a LayerNorm wide-word congestion cut (−11.9k FF / −3.8k LUT)
-closed timing at 142.9 MHz (WNS +0.012, was −1.385) and overclocked bit-exact to
-200 MHz on silicon (up from the old 166.7 MHz / ~16.2k ceiling). But the
-**round-trip** a user sees is far below that — it's bound by serving, not silicon.
+the **faithful single stream** (N=1, the deployed chat build) runs **19,242
+tok/s** of fabric by counted cycles (10,394 cyc/tok measured; the average falls
+as the attention window fills). A LayerNorm wide-word congestion cut (−11.9k FF /
+−3.8k LUT) closed timing at 142.9 MHz (WNS +0.012, was −1.385) and overclocked
+bit-exact to 200 MHz on silicon (up from the old 166.7 MHz / ~16.2k ceiling).
+Live, a 2,000-connection bench holds **~21,300 tok/s** flat across the whole
+sweep (peak 21,479, ~12,000 replies, zero errors): longer replies amortize the
+fixed per-inference overhead. But the **round-trip** a user sees is far below
+all of that; it's bound by serving, not silicon.
 
 The biggest round-trip tax was **sampling**: the host read 193 head logits per
 token back over `/dev/mem` to do temperature sampling on the A53 (~58 % of a
-reply). Moving it **on-chip via the Gumbel-max trick** — sampling from
+reply). Moving it **on-chip via the Gumbel-max trick** (sampling from
 `softmax(logit/T)` is exactly `argmax(logit + T·g)`, `g ~ Gumbel`, so the
 existing argmax hardware does it and the host writes **one seed register per
-request** instead of 193 reads per token — lifted the localhost round-trip
+request** instead of 193 reads per token) lifted the localhost round-trip
 ceiling **~5.6× (1k → 5,600 tok/s)** while keeping the fabric record bit-exact
 (greedy 3/3, sampling 8/8 unique). The public number (~1,658 tok/s through the
 Cloudflare tunnel) is the remaining WAN+tunnel RTT, not fabric.
@@ -102,7 +99,7 @@ Cloudflare tunnel) is the remaining WAN+tunnel RTT, not fabric.
 
 - **Keviniser**: POS-based so it keeps main-verb "do" and drops auxiliary "do".
   The **full TinyStories train split is processed**: 2,119,718 stories,
-  371.7M → 260.5M words (**70.1%**), ~67% tokens (gpt2 proxy) — the headline
+  371.7M → 260.5M words (**70.1%**), ~67% tokens (gpt2 proxy), the headline
   compression metric, holding constant from the validation slice to the full
   corpus. ~2.9 h on the M1 with `--nproc 7`. Output is the ~1.3 GB Kevin training
   corpus the GPU run consumes.
@@ -125,25 +122,25 @@ Cloudflare tunnel) is the remaining WAN+tunnel RTT, not fabric.
   bandwidth-wall proof).
 
 - **Stage 3 on silicon**: the full forward (4 blocks + LN_f + head + argmax) runs
-  inside the PL with zero DRAM in the token loop — weights in URAM, activations and
+  inside the PL with zero DRAM in the token loop: weights in URAM, activations and
   KV in BRAM. Bit-honest gate ladder: every RTL block is iverilog bit-exact vs
   `seq_ref` before silicon, and tok/s claims need 3/3 bit-exact runs. Engineering
-  log: `fabric/stage3/WIDE-WORD-DATAPATH-LOG.md`; the narrative is doc 6. The current
-  design is **split-brain N=16**: two independent 8-stream cohorts each read the
-  resident weight image through their own true-dual-port URAM port, sharing only the
-  weight image and arbitrated non-linears — 59,965.5 tok/s @ 200 MHz, 16/16 streams
-  bit-exact, 3/3. The 16 streams double as keystroke-speculative completions (every
-  keypress forks a stream; Enter blits the precomputed answer — doc 5).
+  log: `fabric/stage3/WIDE-WORD-DATAPATH-LOG.md`. The current design is
+  **split-brain N=16**: two independent 8-stream cohorts each read the resident
+  weight image through their own true-dual-port URAM port, sharing only the
+  weight image and arbitrated non-linears; 59,965.5 tok/s @ 200 MHz, 16/16 streams
+  bit-exact, 3/3. The 16 streams double as keystroke-speculative completions
+  (every keypress forks a stream; Enter blits the precomputed answer).
 - **KV-to-DDR (sim-complete, bit-exact)**: `kv_dma` + `kv_prefetch` move the KV cache
   off-chip with double-buffered burst prefetch that fully hides DDR latency, restoring
   the context the on-chip window gives up. At K4/V4 quantized KV the read budget for
-  100k aggregate tok/s is ~3.89 GB/s (DERIVED) — under the ~6–7.5 GB/s sustained HP
+  100k aggregate tok/s is ~3.89 GB/s (DERIVED), under the ~6–7.5 GB/s sustained HP
   ceiling, so DDR is not the binding wall.
 
 ## Getting started (reproducing it)
 
 There are three tiers of reproduction, in increasing hardware cost. **Tiers 1–2
-need no FPGA** — tier 2 is where the load-bearing "bit-honest" claim can be checked
+need no FPGA**; tier 2 is where the load-bearing "bit-honest" claim can be checked
 by anyone, in software.
 
 ```
@@ -152,7 +149,7 @@ pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
-### Tier 1 — the data tool and the model (CPU, or a GPU to go big)
+### Tier 1: the data tool and the model (CPU, or a GPU to go big)
 
 ```
 # Kevinise the bundled sample (the whole joke in one line)
@@ -171,10 +168,10 @@ python -m model.train --qat --init-from data/ckpt.pt --max-iters 2000 \
     --out data/ckpt.qat.pt
 ```
 
-Training the **full** corpus belongs on a CUDA GPU — see
+Training the **full** corpus belongs on a CUDA GPU; see
 [`model/SETUP-DELL.md`](model/SETUP-DELL.md).
 
-### Tier 2 — the bit-exact fabric gates (needs `iverilog`, no board)
+### Tier 2: the bit-exact fabric gates (needs `iverilog`, no board)
 
 This is the reproducible core of the honesty claim: **every RTL block is proven
 bit-identical (or cosine > 0.9999 for the transcendental LUTs) to a Python integer
@@ -195,13 +192,12 @@ python -m fabric.stage3.run_vec_seq          # a full single-token forward throu
 Scratch build files default to `<system-temp>/kevbuild` (e.g. `/tmp/kevbuild`);
 override with `--dir <path>` where a harness accepts it, or set `KEV_SIM_DIR` for
 all of them. Green verdicts here are what the on-silicon tok/s numbers are measured
-*against* — if a gate is red, no speed number from that block is trusted.
+*against*: if a gate is red, no speed number from that block is trusted.
 
-### Tier 3 — on the board (needs a Kria KV260 + Vivado 2025.2)
+### Tier 3: on the board (needs a Kria KV260 + Vivado 2025.2)
 
 Synthesis, implementation, bitstream, and the on-board `--fclk` sweep need the
-hardware and the Xilinx toolchain; the commands live in
-[`CLAUDE.md`](CLAUDE.md) and the engineering log
+hardware and the Xilinx toolchain; the commands live in the engineering log
 [`fabric/stage3/WIDE-WORD-DATAPATH-LOG.md`](fabric/stage3/WIDE-WORD-DATAPATH-LOG.md).
 This tier is not reproducible without the ~$250 board, and that is stated honestly:
 the silicon numbers are ours, but the *method* that makes them trustworthy (tier 2)
@@ -226,15 +222,15 @@ module gelu_lut (
 );
 ```
 
-`[15:0]` means a 16-bit bus — there are no ints, floats, or growable types; every
+`[15:0]` means a 16-bit bus: there are no ints, floats, or growable types; every
 value is a fixed pile of bits you size yourself. `signed` says how to interpret them.
-`Q4.12` is fixed-point: 4 integer bits, 12 fractional — floats cost too much fabric,
+`Q4.12` is fixed-point: 4 integer bits, 12 fractional. Floats cost too much fabric,
 so the whole model runs in scaled integers.
 
 **2. `always @(posedge clk)` is "do this on every rising clock edge."** It is the only
 notion of time. A `reg` updated inside one is a hardware register (a latch of flip-flops)
 that remembers its value between ticks; a `wire`/`assign` is just combinational logic that
-settles continuously. The GELU is a **3-stage pipeline** — each `always @(posedge clk)`
+settles continuously. The GELU is a **3-stage pipeline**: each `always @(posedge clk)`
 is one stage, so a new `x` enters every cycle and its `y` pops out 3 cycles later, with
 three different inputs in flight at once:
 
@@ -246,12 +242,12 @@ end
 always @(posedge clk) y <= l0 + (step >>> 3);       // stage 2: linear interpolate
 ```
 
-`<=` is not assignment — it schedules all the registers in a block to update *together*
+`<=` is not assignment; it schedules all the registers in a block to update *together*
 at the edge (that is why order inside the block does not matter). `>>>` is an arithmetic
 shift (a cheap divide-by-8). Reads and writes here are not statements that run in order;
 they are wires and latches that are all physically present and all active every cycle.
 
-**3. The parallelism is spatial — `generate`/`for` stamps out copies of hardware.** The
+**3. The parallelism is spatial: `generate`/`for` stamps out copies of hardware.** The
 heart of a neural net is multiply-accumulate, and here it is, one stream's 128 lanes
 ([`rtl/gemm_banked_resident_vec.sv`](fabric/stage3/rtl/gemm_banked_resident_vec.sv)):
 
@@ -268,29 +264,29 @@ generate
 endgenerate
 ```
 
-That `for` loop is **not** a loop that runs 128 times in sequence — it lays down 128
+That `for` loop is **not** a loop that runs 128 times in sequence; it lays down 128
 physical multiply-accumulate units that all fire on the same clock edge. Every cycle,
 one shared activation `x` is multiplied by 128 different INT4 weights and added into 128
 separate accumulators, simultaneously. `w[gl*4 +: 4]` is the part-select idiom: "4 bits
-starting at bit `gl*4`" — one INT4 weight sliced out of a packed bus. Speed on the fabric
-comes from doing more of these in parallel per cycle, and from clocking them faster — which
+starting at bit `gl*4`", one INT4 weight sliced out of a packed bus. Speed on the fabric
+comes from doing more of these in parallel per cycle, and from clocking them faster, which
 is the entire speed ladder above.
 
 **Where it stops feeling like software: the memory layout is physical.** A naive 2-D array
 indexed by a runtime value (`buf[lane][row]`) synthesises to a giant per-lane mux tree that
 blows up the chip; the same data as one wide word per row (`reg [P*32-1:0] bank [0:ROWS-1]`,
 lane `l` at bits `[l*32 +: 32]`) makes the row a memory *address* instead of a mux, and fits.
-That refactor — same math, different physical shape — is a recurring move in this repo (see
+That refactor, same math but a different physical shape, is a recurring move in this repo (see
 [`rtl/layernorm_vec.sv`](fabric/stage3/rtl/layernorm_vec.sv)) and the kind of thing that has
-no analogue in software. `GLOSSARY.md` and the `seq_ref.py` reference are the two files to
-keep open while reading the rest.
+no analogue in software. The `seq_ref.py` integer reference is the file to keep open while
+reading the rest.
 
 ## Data & checkpoints (GitHub as Dropbox)
 
-This project spans two machines — the **M1** runs the Keviniser (CPU/spaCy) and
+This project spans two machines: the **M1** runs the Keviniser (CPU/spaCy) and
 the **XPS 15 / RTX 3050 Ti** does the training (CUDA). The handoff is a single
 ~1.3 GB corpus file, and the big artifacts (corpora, checkpoints) are gitignored
-and *not* in the repo. So we abuse **GitHub Releases as an artifact store** — a
+and *not* in the repo. So we abuse **GitHub Releases as an artifact store**, a
 free Dropbox that lives next to the code:
 
 - A direct `git commit` is the wrong tool: GitHub **hard-rejects files > 100 MB**,
@@ -319,15 +315,15 @@ shasum -a 256 data/ckpt.pt.gz          # put the hash in the notes
 gh release create ckpt-v1 data/ckpt.pt.gz --title "..." --notes "sha256: ..."
 ```
 
-The repo is **private**, so release assets are private too — `gh` auth (or a
-token) is required to download. Code and docs travel through normal git; only the
+The repo is public, so release assets are too: `gh release download` (or the
+browser) pulls them without auth. Code travels through normal git; only the
 multi-hundred-MB blobs go through Releases.
 
-## Conventions (project rules, honored in the docs)
+## Conventions (project rules)
 
 - **Mischief in the title, dry in the body.** The output prose is deliberately
   bad; the speed numbers carry the story.
-- **Honest-first.** Every doc states where the approach loses. The roofline
+- **Honest-first.** Every claim states where the approach loses. The roofline
   crossover (where the fabric stops winning) is a result, not a caveat.
 - **Bit-honest before fast.** Fabric output is validated against goformer to
   cosine > 0.9999 before any speed number is trusted.
@@ -335,5 +331,5 @@ multi-hundred-MB blobs go through Releases.
 ## Hardware split
 
 The Keviniser is CPU work (spaCy); training is GPU work (the 3050 Ti, where INT4
-QAT also lives); inference is the FPGA fabric. They don't compete — different
+QAT also lives); inference is the FPGA fabric. They don't compete: different
 machines for different stages.
