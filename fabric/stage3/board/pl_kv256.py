@@ -102,6 +102,7 @@ class PLKV256Device:
     def __init__(self, *, lanes: int = 128, fclk: float = 125e6,
                  gen_chars: int = 48, tmax: int = 256,
                  temp: float = 0.0, top_k: int = 0, host_sample: bool = False,
+                 min_chars: int = 12,
                  npz: str | None = None, meta: str | None = None,
                  base: int = BASE, poll_timeout: float = 30.0):
         npz = npz or os.path.join(_REPO, "fabric", "export", "goformer.npz")
@@ -124,6 +125,13 @@ class PLKV256Device:
         self.top_k = int(top_k)
         self.host_sample = bool(host_sample)
         self._onchip = (self.temp > 0.0) and not self.host_sample
+        # MIN-LENGTH MASK: inside the first min_chars generated chars, the
+        # utterance-ender chars (. ! ? \n) are disallowed, so a reply can never
+        # be "." or empty when the prompt already reads as a complete clause.
+        # On the on-chip-sampling path this re-picks host-side from the pass's
+        # head logits (readback port) ONLY when the fabric sampled an ender
+        # inside the window, so the common case stays readback-free.
+        self.min_chars = int(min_chars)
         self._rng = np.random.default_rng()
         self.poll_timeout = float(poll_timeout)
         self._launches = 0
@@ -134,6 +142,11 @@ class PLKV256Device:
         self._lock = threading.Lock()           # one stream -> strictly serial
 
         self._enc, self._dec, self.vocab = load_meta(meta)
+        # ender ids resolved by DECODE (enc maps unknown chars to id 0, which
+        # is a real char — encoding ".!?\n" would silently mask token 0)
+        self._stop_ids = np.array([i for i in range(self.vocab)
+                                   if self._dec([i]) in (".", "!", "?", "\n")],
+                                  dtype=np.int64)
         self.fclk = set_and_verify_fclk(float(fclk))
 
         p, cfg = seq_ref.build(npz)
@@ -162,7 +175,7 @@ class PLKV256Device:
             mode = f"sample(host temp={self.temp} top_k={self.top_k})"
         print(f"[kv256] weights: {len(words)*subw} chunks in {time.time()-t0:.2f}s "
               f"(fclk={self.fclk/1e6:.1f}MHz tmax={self.tmax} gen={self.gen_chars} "
-              f"{mode})")
+              f"min={self.min_chars} {mode})")
 
     # --- the fabric protocol ------------------------------------------------ #
     def _go(self, tok: int, pos: int) -> int:
@@ -203,10 +216,15 @@ class PLKV256Device:
         out[out >= (1 << 31)] -= (1 << 32)        # sign-extend the 32-bit logits
         return out / (1 << HEAD_FRAC)
 
-    def _sample(self, logits: np.ndarray) -> int:
+    def _sample(self, logits: np.ndarray, mask_stops: bool = False) -> int:
         """Temperature + optional top-k sample over the head logits."""
-        z = logits / max(self.temp, 1e-6)
-        z -= z.max()                              # stable softmax
+        if mask_stops and self._stop_ids.size:
+            logits = logits.copy()
+            logits[self._stop_ids] = -np.inf
+        if self.temp <= 0:                        # masked greedy (argmax) pick
+            return int(np.argmax(logits))
+        z = logits / self.temp
+        z -= z[np.isfinite(z)].max()              # stable softmax
         p = np.exp(z); p /= p.sum()
         if self.top_k and self.top_k < p.size:    # keep only the top-k mass
             drop = np.argpartition(p, -self.top_k)[:-self.top_k]
@@ -222,12 +240,20 @@ class PLKV256Device:
         s = int(self._rng.integers(1, 1 << 32))  # uniform in [1, 2^32-1], never 0
         self._dev.wr(R_SEED, s)
 
-    def _next(self, argmax_tok: int) -> int:
+    def _next(self, argmax_tok: int, gen_len: int) -> int:
         """The token to emit: the fabric's TOK_OUT (greedy argmax OR on-chip sample —
-        both land in TOK_OUT, no readback) or a host-side softmax/top-k sample."""
+        both land in TOK_OUT, no readback) or a host-side softmax/top-k sample.
+        gen_len = chars already emitted this reply; below min_chars the ender
+        chars are masked so the reply can't terminate degenerately early."""
+        masking = gen_len < self.min_chars
         if self.host_sample and self.temp > 0:
-            return self._sample(self._read_logits())
-        return argmax_tok                        # greedy OR on-chip-sampled TOK_OUT
+            return self._sample(self._read_logits(), mask_stops=masking)
+        tok = int(argmax_tok)                    # greedy OR on-chip-sampled TOK_OUT
+        if masking and self._stop_ids.size and tok in self._stop_ids:
+            # fabric picked an ender inside the min window: re-pick host-side
+            # from this pass's head logits (rare, ~one VOCAB readback per hit)
+            tok = self._sample(self._read_logits(), mask_stops=True)
+        return tok
 
     def _stream_gen(self, prompt: str):
         """Generator: yield each decoded char AS the fabric produces it. Holds NO
@@ -247,7 +273,7 @@ class PLKV256Device:
             if self._onchip and pos == L - 1:
                 self._arm_onchip_seed()
             am = self._go(tok, pos)              # argmax/sample out at pos L-1
-        nxt = self._next(am)                     # 1st gen token (TOK_OUT or host-sampled)
+        nxt = self._next(am, 0)                  # 1st gen token (TOK_OUT or host-sampled)
         text = ""
         for g in range(self.gen_chars):          # feedback phase
             ch = self._dec([nxt])
@@ -256,7 +282,7 @@ class PLKV256Device:
             if any(stp in text for stp in self._STOPS):
                 break                            # _tidy drops the rest anyway
             if g + 1 < self.gen_chars:
-                nxt = self._next(self._go(nxt, L + g))
+                nxt = self._next(self._go(nxt, L + g), g + 1)
 
     def _gen_one(self, prompt: str) -> str:
         return self._tidy("".join(self._stream_gen(prompt)))

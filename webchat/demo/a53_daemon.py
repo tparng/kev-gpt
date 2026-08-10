@@ -300,7 +300,8 @@ def make_device(args):
         return PLKV256Device(lanes=args.lanes, fclk=args.fclk,
                              gen_chars=args.gen_chars, tmax=args.tmax,
                              temp=(0.0 if args.greedy else args.temp),
-                             top_k=args.top_k, npz=args.npz, meta=args.meta)
+                             top_k=args.top_k, min_chars=args.min_chars,
+                             npz=args.npz, meta=args.meta)
     return PLDevice(args.lanes, args.fclk, args.gen_chars)
 
 
@@ -346,6 +347,10 @@ def main(argv=None):
     ap.add_argument("--top-k", type=int, default=40,
                     help="--engine kv256: keep only the top-k logits when sampling "
                          "(0 = full distribution)")
+    ap.add_argument("--min-chars", type=int, default=12,
+                    help="--engine kv256: mask the utterance-ender chars (.!?\\n) "
+                         "for the first N generated chars so a reply can't "
+                         "degenerate to '.' or empty (0 = off)")
     ap.add_argument("--npz", default=None,
                     help="--engine kv256: model weights .npz to boot-stream "
                          "(default: fabric/export/goformer.npz). Point at a "
