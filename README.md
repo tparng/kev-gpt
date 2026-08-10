@@ -205,7 +205,8 @@ runs on your laptop.
 
 ## How to read the Verilog (for software engineers)
 
-The fabric is hand-written RTL, not HLS. If you write software, three ideas get you
+The fabric is hand and LLM written RTL (me and Claude Code, no HLS). If you write
+software, three ideas get you
 most of the way, and the real modules in [`fabric/stage3/rtl/`](fabric/stage3/rtl/)
 are small enough to read. Verilog describes **hardware that all exists at once**, not
 a sequence of instructions.
