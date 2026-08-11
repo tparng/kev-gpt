@@ -90,6 +90,10 @@ def sample(model, meta, device, n_tokens=200, prompt="\n", seed=None):
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="model.train", description="Train the Kevin GPT.")
+    p.add_argument("--arch", choices=["gpt", "mamba2"], default="gpt",
+                   help="gpt = the nanoGPT-lineage transformer (default); "
+                        "mamba2 = the SSD recurrent model (model.mamba2), "
+                        "constant decode state instead of a KV cache.")
     p.add_argument("--corpus", default="data/TinyStories-valid.kevin.txt")
     p.add_argument("--data-dir", default="data/char")
     p.add_argument("--out", default="data/ckpt.pt")
@@ -134,13 +138,28 @@ def main(argv=None):
     splits = {"train": load_split(args.data_dir, "train"),
               "val": load_split(args.data_dir, "val")}
 
-    cfg = GPTConfig(
-        block_size=args.block_size, vocab_size=meta["vocab_size"],
-        n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
-        dropout=args.dropout,
-    )
-    if args.qat:
+    if args.arch == "mamba2":
+        if args.qat:
+            raise SystemExit("--qat is transformer-only for now (no QMamba2 yet)")
+        from .mamba2 import Mamba2, Mamba2Config
+        cfg = Mamba2Config(
+            block_size=args.block_size, vocab_size=meta["vocab_size"],
+            n_layer=args.n_layer, d_model=args.n_embd, dropout=args.dropout,
+        )
+        model = Mamba2(cfg).to(device)
+        print(f"params={model.num_params() / 1e6:.2f}M  "
+              f"(mamba2: state/stream {model.state_bytes(1)/1024:.0f} KB int8, constant in T)")
+        if args.init_from:
+            ck = torch.load(args.init_from, map_location=device, weights_only=False)
+            model.load_state_dict(ck["model"])
+            print(f"warm-start from {args.init_from} (iter {ck.get('iter')})")
+    elif args.qat:
         from .qgpt import QGPT, load_fp_into_qat
+        cfg = GPTConfig(
+            block_size=args.block_size, vocab_size=meta["vocab_size"],
+            n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
+            dropout=args.dropout,
+        )
         # Build on CPU, warm-start, run one dry forward to materialise
         # Brevitas's lazy scale buffers, THEN move to device. .to() picks up
         # everything (params + buffers, lazy or not) only after they exist.
@@ -161,6 +180,11 @@ def main(argv=None):
             model(torch.zeros((1, 1), dtype=torch.long))
         model.to(device)
     else:
+        cfg = GPTConfig(
+            block_size=args.block_size, vocab_size=meta["vocab_size"],
+            n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
+            dropout=args.dropout,
+        )
         model = GPT(cfg).to(device)
         print(f"params={model.num_params() / 1e6:.2f}M")
         if args.init_from:
@@ -220,7 +244,8 @@ def main(argv=None):
 
     def save_ckpt(path, it, val):
         torch.save({"model": model.state_dict(), "cfg": cfg.__dict__,
-                    "meta": meta, "iter": it, "val": val, "qat": args.qat}, path)
+                    "meta": meta, "iter": it, "val": val, "qat": args.qat,
+                    "arch": args.arch}, path)
 
     best_val = float("inf")
     t0 = time.perf_counter()
