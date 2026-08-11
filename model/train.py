@@ -116,6 +116,10 @@ def main(argv=None):
                    help="save a checkpoint at every eval here (ckpt_<iter>.pt) so "
                         "you can roll back to any point. Empty to disable.")
     p.add_argument("--compile", action="store_true", help="torch.compile (CUDA).")
+    p.add_argument("--const-lr", action="store_true",
+                   help="hold LR constant after warmup (no cosine decay) — the "
+                        "drift-onset discriminator: onset tracks either tokens "
+                        "seen or schedule position; this separates them.")
     p.add_argument("--z-loss", type=float, default=0.0,
                    help="--arch mamba2: PaLM-style logsumexp^2 coefficient "
                         "(try 1e-4) to pin logit scale; the M1/M1b drift is "
@@ -266,7 +270,8 @@ def main(argv=None):
     best_val = float("inf")
     t0 = time.perf_counter()
     for it in range(args.max_iters + 1):
-        lr = cosine_lr(it, args.lr, args.warmup, args.max_iters)
+        lr = (args.lr * min(1.0, (it + 1) / args.warmup) if args.const_lr
+              else cosine_lr(it, args.lr, args.warmup, args.max_iters))
         for g in opt.param_groups:
             g["lr"] = lr
 
