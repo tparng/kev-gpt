@@ -116,6 +116,11 @@ def main(argv=None):
                    help="save a checkpoint at every eval here (ckpt_<iter>.pt) so "
                         "you can roll back to any point. Empty to disable.")
     p.add_argument("--compile", action="store_true", help="torch.compile (CUDA).")
+    p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
+                   help="muon = Newton-Schulz orthogonalized momentum for the "
+                        "dense 2D matrices (embeddings/scalars/norms/conv stay "
+                        "on AdamW). Requires --no-amp. The drift ablation.")
+    p.add_argument("--muon-lr", type=float, default=0.02)
     p.add_argument("--const-lr", action="store_true",
                    help="hold LR constant after warmup (no cosine decay) — the "
                         "drift-onset discriminator: onset tracks either tokens "
@@ -211,10 +216,27 @@ def main(argv=None):
     # what drove the rung-0 run's late loss drift (doc 8 §5 M1).
     decay = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
     nodecay = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
-    opt = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": 0.1},
-         {"params": nodecay, "weight_decay": 0.0}],
-        lr=args.lr, betas=(0.9, 0.95))
+    if args.optimizer == "muon":
+        assert args.no_amp, "--optimizer muon requires --no-amp (MultiOpt + GradScaler untested)"
+        from .muon import Muon, MultiOpt
+        emb = {id(model.tok_emb.weight)}
+        muon_p = [p for p in decay if p.dim() == 2 and id(p) not in emb]
+        adam_p = [p for p in decay if p.dim() != 2 or id(p) in emb]
+        muon = Muon(muon_p, lr=args.muon_lr, momentum=0.95)
+        adam = torch.optim.AdamW(
+            [{"params": adam_p, "weight_decay": 0.1},
+             {"params": nodecay, "weight_decay": 0.0}],
+            lr=args.lr, betas=(0.9, 0.95))
+        opt = MultiOpt([muon, adam])
+        print(f"muon: {sum(p.numel() for p in muon_p)/1e6:.2f}M matrix params @ "
+              f"lr {args.muon_lr}; adamw: the rest @ lr {args.lr}")
+    else:
+        opt = torch.optim.AdamW(
+            [{"params": decay, "weight_decay": 0.1},
+             {"params": nodecay, "weight_decay": 0.0}],
+            lr=args.lr, betas=(0.9, 0.95))
+    for g in opt.param_groups:
+        g["base_lr"] = g["lr"]
     use_amp = dtype is not None
     ctx = (torch.autocast(device_type=device, dtype=dtype) if use_amp
            else torch.autocast(device_type="cpu", enabled=False))
@@ -273,7 +295,7 @@ def main(argv=None):
         lr = (args.lr * min(1.0, (it + 1) / args.warmup) if args.const_lr
               else cosine_lr(it, args.lr, args.warmup, args.max_iters))
         for g in opt.param_groups:
-            g["lr"] = lr
+            g["lr"] = g["base_lr"] * (lr / args.lr)
 
         if it % args.eval_interval == 0 or it == args.max_iters:
             losses = estimate_loss(model, splits, block, batch, device, args.eval_iters)
