@@ -116,6 +116,9 @@ def main(argv=None):
                    help="save a checkpoint at every eval here (ckpt_<iter>.pt) so "
                         "you can roll back to any point. Empty to disable.")
     p.add_argument("--compile", action="store_true", help="torch.compile (CUDA).")
+    p.add_argument("--no-amp", action="store_true",
+                   help="train in plain fp32 (no autocast). bf16's 8-bit mantissa "
+                        "is a suspect in the mamba2 late-run loss drift.")
     p.add_argument("--smoke", type=int, default=0,
                    help="run N iters, report tokens/sec and a time estimate, exit.")
     p.add_argument("--qat", action="store_true",
@@ -129,7 +132,7 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     device = pick_device(args.device)
-    dtype = amp_dtype(device)
+    dtype = None if args.no_amp else amp_dtype(device)
     torch.manual_seed(1337)
     print(f"device={device}  amp={dtype}")
 
