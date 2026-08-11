@@ -25,14 +25,23 @@ import torch.nn.functional as F
 
 NAMES = ["sam", "lily", "tom", "ben", "mia"]
 
-OPEN = "once upon time there be little bear name {name} {name} very happy bear "
-
-# neutral kevin-speak filler, no names — repeated/sliced to G chars
-FILLER = ("one day sun shine bird sing tree grow tall flower smell sweet "
-          "them walk park see big pond water very blue duck swim fast "
-          "wind blow soft cloud move slow day feel warm nice grass green ")
-
-QUERY = "then door open everyone shout look it be "
+STYLES = {
+    "kevin": dict(
+        open="once upon time there be little bear name {name} {name} very happy bear ",
+        filler=("one day sun shine bird sing tree grow tall flower smell sweet "
+                "them walk park see big pond water very blue duck swim fast "
+                "wind blow soft cloud move slow day feel warm nice grass green "),
+        query="then door open everyone shout look it be ",
+    ),
+    # matches the chatgen --style raw register (the rawchat corpus)
+    "raw": dict(
+        open="user: hello kevin! my name is {name}. kevin: hello! it is nice to meet you, {name}. ",
+        filler=("user: it is a nice day today. kevin: yes, the sun feels warm and nice. "
+                "user: i went to the park. kevin: the park is a fun place to play. "
+                "user: i saw a little bird. kevin: birds sing very pretty songs. "),
+        query="user: what is my name? kevin: your name is ",
+    ),
+}
 
 
 def load_model(path: str, device: str):
@@ -86,8 +95,10 @@ def cand_logprob_mamba(model, prompt_states, last_logits, cand_ids, device):
 
 
 @torch.no_grad()
-def run_probe(model, arch, meta, gaps, device):
+def run_probe(model, arch, meta, gaps, device, style="kevin"):
     stoi = meta["stoi"]
+    st = STYLES[style]
+    OPEN, FILLER, QUERY = st["open"], st["filler"], st["query"]
     rows = []
     for gap in gaps:
         filler = (FILLER * (gap // len(FILLER) + 1))[:gap]
@@ -111,7 +122,7 @@ def run_probe(model, arch, meta, gaps, device):
         # is the statement still inside the transformer's window?
         seen = "yes" if arch == "mamba2" else (
             "yes" if len(enc(OPEN.format(name=NAMES[0]) + filler + QUERY, stoi))
-            <= model.cfg.block_size else "NO (cropped)")
+            <= model.cfg.block_size else "NO (cropped)")  # noqa: F821
         rows.append((gap, hits, len(NAMES), seen))
     return rows
 
@@ -123,6 +134,9 @@ def main(argv=None):
                    help="filler lengths (chars) between statement and query")
     p.add_argument("--device", default="cpu",
                    help="cpu by default so it can run beside a GPU training job")
+    p.add_argument("--style", choices=list(STYLES), default="kevin",
+                   help="prompt register: kevin (telegraphic) or raw (the "
+                        "user:/kevin: chat framing of the rawchat corpus)")
     args = p.parse_args(argv)
     gaps = [int(g) for g in args.gaps.split(",")]
 
@@ -130,7 +144,8 @@ def main(argv=None):
         model, arch, meta = load_model(path, args.device)
         print(f"\n{path}  arch={arch}  params={model.num_params()/1e6:.2f}M")
         print(f"  gap  acc      name-in-window")
-        for gap, hits, n, seen in run_probe(model, arch, meta, gaps, args.device):
+        for gap, hits, n, seen in run_probe(model, arch, meta, gaps, args.device,
+                                            style=args.style):
             print(f"  {gap:4d}  {hits}/{n}      {seen}")
     print("\nchance = 1/5 = 20%")
 
