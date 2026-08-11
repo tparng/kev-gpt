@@ -28,6 +28,28 @@ TOYS = ["ball", "kite", "doll", "car", "block", "drum"]
 PLACES = ["park", "beach", "forest", "garden", "farm", "lake"]
 
 # fact key -> (statement template, query template, answer template)
+FACTS_RAW = {
+    "name":   ("my name is {v}.",             "what is my name?",       "your name is {v}."),
+    "colour": ("my favourite colour is {v}.", "what colour do i like?", "you like {v}."),
+    "pet":    ("i have a pet {v}.",           "what pet do i have?",    "you have a {v}."),
+    "toy":    ("my best toy is my {v}.",      "what is my best toy?",   "your best toy is your {v}."),
+    "place":  ("i love going to the {v}.",    "where do i love going?", "you love going to the {v}."),
+}
+SMALLTALK_RAW = [
+    ("how are you today?", "i feel good today, thank you for asking."),
+    ("tell me a story.", "once upon a time there was a little bear who found some honey. he was very happy."),
+    ("what did you do today?", "i sat on my chip and thought some very fast thoughts."),
+    ("do you like the sun?", "yes, the sun feels warm and nice."),
+    ("i feel happy today.", "that is good. being happy is the best thing."),
+    ("it is raining today.", "rain makes the flowers grow, so that is okay."),
+    ("i went to school today.", "school is a fun place to learn new things."),
+    ("i ate some cake.", "cake tastes sweet. lucky you!"),
+    ("you are very fast.", "i think quickly. few words do the trick."),
+    ("i am tired now.", "rest is a good idea. sleep well."),
+]
+ACKS_RAW = ["it is nice to meet you, {name}.", "that is nice.", "i will remember that.",
+            "that is good to know.", "that sounds fun.", "i like that too."]
+
 FACTS = {
     "name":   ("me name be {v}",        "what be me name",       "you name be {v}"),
     "colour": ("me favourite colour be {v}", "what colour me like", "you like {v}"),
@@ -54,26 +76,32 @@ ACKS = ["nice meet you {name}", "that be nice", "kevin remember that", "good kno
         "sound fun", "kevin like that too"]
 
 
-def dialogue(rng: random.Random, min_turns=4, max_turns=10) -> tuple[str, int]:
+def dialogue(rng: random.Random, min_turns=4, max_turns=10,
+             style: str = "kevin") -> tuple[str, int]:
     """One dialogue. Returns (text, gap_chars between fact statement and query)."""
-    fact = rng.choice(list(FACTS))
+    raw = style == "raw"
+    facts, smalltalk, acks = ((FACTS_RAW, SMALLTALK_RAW, ACKS_RAW) if raw
+                             else (FACTS, SMALLTALK, ACKS))
+    upre, kpre = ("user: ", "kevin: ") if raw else ("user say ", "kevin say ")
+    fact = rng.choice(list(facts))
     value = rng.choice(VALUES[fact])
-    stmt, query, answer = FACTS[fact]
+    stmt, query, answer = facts[fact]
     name = value if fact == "name" else rng.choice(NAMES)
 
-    turns = [("user say hello kevin " + stmt.format(v=value),
-              "kevin say hello " + rng.choice(ACKS).format(name=name))]
+    hello = "hello kevin! " if raw else "hello kevin "
+    turns = [(upre + hello + stmt.format(v=value),
+              kpre + ("hello! " if raw else "hello ")
+              + rng.choice(acks).format(name=name))]
     n_filler = rng.randint(min_turns, max_turns) - 2
-    fillers = rng.sample(SMALLTALK, k=min(n_filler, len(SMALLTALK)))
+    fillers = rng.sample(smalltalk, k=min(n_filler, len(smalltalk)))
     for q, a in fillers:
-        turns.append(("user say " + q, "kevin say " + a))
-    turns.append(("user say " + query,
-                  "kevin say " + answer.format(v=value)))
+        turns.append((upre + q, kpre + a))
+    turns.append((upre + query, kpre + answer.format(v=value)))
 
     flat = " ".join(u + " " + k for u, k in turns)
     # gap = chars between end of the fact statement and start of the query
     stmt_end = flat.index(turns[0][1])           # kevin's first reply starts
-    query_start = flat.rindex("user say " + query)
+    query_start = flat.rindex(upre + query)
     return flat, query_start - stmt_end
 
 
@@ -84,6 +112,9 @@ def main(argv=None):
     p.add_argument("--min-turns", type=int, default=4)
     p.add_argument("--max-turns", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--style", choices=["kevin", "raw"], default="kevin",
+                   help="kevin = telegraphic (kevinised corpus); raw = "
+                        "grammatical English (raw/legit corpus)")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args(argv)
 
@@ -91,7 +122,7 @@ def main(argv=None):
     out = open(args.o, "w", encoding="utf-8") if args.o else sys.stdout
     lens, gaps = [], []
     for _ in range(args.n):
-        text, gap = dialogue(rng, args.min_turns, args.max_turns)
+        text, gap = dialogue(rng, args.min_turns, args.max_turns, args.style)
         out.write(text + "\n<|endoftext|>\n")
         lens.append(len(text)); gaps.append(gap)
     if args.o:
