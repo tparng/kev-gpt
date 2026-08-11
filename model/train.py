@@ -194,7 +194,15 @@ def main(argv=None):
     if args.compile and device == "cuda":
         model = torch.compile(model)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    # decay only matrix-shaped params: norms / biases / scalars (mamba2's
+    # A_log, dt_bias, D) must not be pulled toward zero — decaying them is
+    # what drove the rung-0 run's late loss drift (doc 8 §5 M1).
+    decay = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+    nodecay = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+    opt = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": 0.1},
+         {"params": nodecay, "weight_decay": 0.0}],
+        lr=args.lr, betas=(0.9, 0.95))
     use_amp = dtype is not None
     ctx = (torch.autocast(device_type=device, dtype=dtype) if use_amp
            else torch.autocast(device_type="cpu", enabled=False))
