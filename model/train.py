@@ -116,6 +116,10 @@ def main(argv=None):
                    help="save a checkpoint at every eval here (ckpt_<iter>.pt) so "
                         "you can roll back to any point. Empty to disable.")
     p.add_argument("--compile", action="store_true", help="torch.compile (CUDA).")
+    p.add_argument("--z-loss", type=float, default=0.0,
+                   help="--arch mamba2: PaLM-style logsumexp^2 coefficient "
+                        "(try 1e-4) to pin logit scale; the M1/M1b drift is "
+                        "~2/3 logit-scale overconfidence.")
     p.add_argument("--no-amp", action="store_true",
                    help="train in plain fp32 (no autocast). bf16's 8-bit mantissa "
                         "is a suspect in the mamba2 late-run loss drift.")
@@ -148,6 +152,7 @@ def main(argv=None):
         cfg = Mamba2Config(
             block_size=args.block_size, vocab_size=meta["vocab_size"],
             n_layer=args.n_layer, d_model=args.n_embd, dropout=args.dropout,
+            z_loss=args.z_loss,
         )
         model = Mamba2(cfg).to(device)
         print(f"params={model.num_params() / 1e6:.2f}M  "

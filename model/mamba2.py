@@ -46,6 +46,10 @@ class Mamba2Config:
     expand: int = 2              # d_inner = expand * d_model
     headdim: int = 64            # P: channels per head
     dropout: float = 0.0
+    z_loss: float = 0.0          # PaLM-style logsumexp^2 coeff. The M1/M1b runs
+                                 # drift after ~5k iters and temperature-scaling
+                                 # shows ~2/3 of it is logit-scale overconfidence;
+                                 # this pins the scale. 0 = off.
 
     @property
     def d_inner(self) -> int:
@@ -215,6 +219,9 @@ class Mamba2(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            if self.cfg.z_loss > 0:
+                z = torch.logsumexp(logits.float(), dim=-1)
+                loss = loss + self.cfg.z_loss * (z * z).mean()
         return logits, loss
 
     def alloc_state(self, batch: int, device):
