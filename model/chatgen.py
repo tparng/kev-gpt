@@ -115,10 +115,19 @@ def main(argv=None):
     p.add_argument("--style", choices=["kevin", "raw"], default="kevin",
                    help="kevin = telegraphic (kevinised corpus); raw = "
                         "grammatical English (raw/legit corpus)")
+    p.add_argument("--names-file", default=None,
+                   help="one name per line (e.g. data/ts_names.txt mined from "
+                        "the corpus). Overrides the 10 built-ins — a big "
+                        "inventory kills the guess-the-frequent-name shortcut "
+                        "that v1 collapsed to.")
     p.add_argument("--stats", action="store_true")
     args = p.parse_args(argv)
 
     rng = random.Random(args.seed)
+    if args.names_file:
+        loaded = [l.strip().lower() for l in open(args.names_file) if l.strip()]
+        VALUES["name"] = loaded
+        NAMES[:] = loaded
     out = open(args.o, "w", encoding="utf-8") if args.o else sys.stdout
     lens, gaps = [], []
     for _ in range(args.n):
