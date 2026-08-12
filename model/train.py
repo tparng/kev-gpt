@@ -82,6 +82,13 @@ def sample(model, meta, device, n_tokens=200, prompt="\n", seed=None):
     from .data import decode
     if seed is not None:
         torch.manual_seed(seed)  # fixed seed -> comparable samples across evals
+    if meta.get("bpe"):
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(meta["tokenizer_file"])
+        pids = tok.encode(prompt).ids or [0]
+        ids = torch.tensor([pids], dtype=torch.long, device=device)
+        out = model.generate(ids, n_tokens, temperature=0.8, top_k=40)[0].tolist()
+        return tok.decode(out).replace("\n", " | ")
     stoi, itos = meta["stoi"], meta["itos"]
     ids = torch.tensor([[stoi.get(c, 0) for c in prompt]], dtype=torch.long, device=device)
     out = model.generate(ids, n_tokens, temperature=0.8, top_k=40)[0].tolist()
@@ -116,6 +123,9 @@ def main(argv=None):
                    help="save a checkpoint at every eval here (ckpt_<iter>.pt) so "
                         "you can roll back to any point. Empty to disable.")
     p.add_argument("--compile", action="store_true", help="torch.compile (CUDA).")
+    p.add_argument("--bpe-tokenizer", default=None, metavar="JSON",
+                   help="train token-level with this tokenizers BPE file "
+                        "(e.g. data/bpe_rawchat_1024.json) instead of char-level")
     p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
                    help="muon = Newton-Schulz orthogonalized momentum for the "
                         "dense 2D matrices (embeddings/scalars/norms/conv stay "
@@ -149,8 +159,14 @@ def main(argv=None):
     torch.manual_seed(1337)
     print(f"device={device}  amp={dtype}")
 
-    meta = prepare(args.corpus, args.data_dir)
-    print(f"vocab={meta['vocab_size']}  train_chars={meta['train_chars']:,}")
+    if args.bpe_tokenizer:
+        from .data_bpe import prepare_bpe
+        meta = prepare_bpe(args.corpus, args.data_dir, args.bpe_tokenizer)
+        print(f"vocab={meta['vocab_size']} (BPE, {meta['chars_per_token']} chars/tok)  "
+              f"train_tokens={meta['train_tokens']:,}")
+    else:
+        meta = prepare(args.corpus, args.data_dir)
+        print(f"vocab={meta['vocab_size']}  train_chars={meta['train_chars']:,}")
     splits = {"train": load_split(args.data_dir, "train"),
               "val": load_split(args.data_dir, "val")}
 
