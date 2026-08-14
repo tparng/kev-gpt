@@ -75,6 +75,130 @@ SMALLTALK = [
 ACKS = ["nice meet you {name}", "that be nice", "kevin remember that", "good know",
         "sound fun", "kevin like that too"]
 
+# --- v3 (raw style only): wider fact shapes, paraphrased queries, facts
+# stated anywhere in the dialogue, 1-3 facts per dialogue. The live demo
+# showed v2's holes exactly: "i like bikes" (shape not in inventory) and
+# facts stated after the greeting turn (position-locked binding) both fail.
+
+LIKES = ["bikes", "trains", "dogs", "cats", "ice cream", "football", "drawing",
+         "swimming", "singing", "apples", "robots", "the rain", "books",
+         "flowers", "trucks", "dancing"]
+FOODS = ["cake", "pizza", "apples", "soup", "bread", "ice cream", "cookies",
+         "pasta", "cheese", "bananas"]
+AGES = ["three", "four", "five", "six", "seven", "eight", "nine", "ten"]
+
+# key -> (statement variants, query variants, answer). First query is the
+# canonical phrasing (probe_recall depends on it staying put).
+FACTS_V3 = {
+    "name":   (["my name is {v}.", "i am called {v}."],
+               ["what is my name?", "what is my name again?",
+                "do you remember my name?", "who am i?"],
+               "your name is {v}."),
+    "colour": (["my favourite colour is {v}."],
+               ["what colour do i like?", "what is my favourite colour?"],
+               "you like {v}."),
+    "pet":    (["i have a pet {v}."],
+               ["what pet do i have?", "do you remember what pet i have?"],
+               "you have a {v}."),
+    "toy":    (["my best toy is my {v}."],
+               ["what is my best toy?", "what is my best toy again?"],
+               "your best toy is your {v}."),
+    "place":  (["i love going to the {v}."],
+               ["where do i love going?", "where do i like to go?"],
+               "you love going to the {v}."),
+    "like":   (["i like {v}.", "i really like {v}."],
+               ["what do i like?", "what do i like again?",
+                "do you remember what i like?"],
+               "you like {v}."),
+    "food":   (["my favourite food is {v}."],
+               ["what is my favourite food?", "what food do i like?"],
+               "your favourite food is {v}."),
+    "age":    (["i am {v} years old."],
+               ["how old am i?", "do you remember how old i am?"],
+               "you are {v} years old."),
+    "friend": (["my friend is called {v}."],
+               ["what is my friend called?", "who is my friend?"],
+               "your friend is called {v}."),
+    "live":   (["i live near the {v}."],
+               ["where do i live?", "do you remember where i live?"],
+               "you live near the {v}."),
+}
+VALUES_V3 = {"name": NAMES, "colour": COLOURS, "pet": PETS, "toy": TOYS,
+             "place": PLACES, "like": LIKES, "food": FOODS, "age": AGES,
+             "friend": NAMES, "live": PLACES}
+
+
+def dialogue_v3(rng: random.Random, min_turns=5, max_turns=12) -> tuple[str, int]:
+    """One raw-style dialogue with 1-3 facts at random positions.
+
+    Returns (text, max fact gap in chars).
+    """
+    n_facts = rng.randint(1, 3)
+    keys = rng.sample(list(FACTS_V3), k=n_facts)
+    insts = []
+    for key in keys:
+        stmts, queries, answer = FACTS_V3[key]
+        if key == "pet" and rng.random() < 0.4:  # pet-name: two-slot fact
+            p, n = rng.choice(PETS), rng.choice(NAMES)
+            insts.append((f"my {p} is called {n}.",
+                          rng.choice([f"what is my {p} called?",
+                                      f"what is the name of my {p}?"]),
+                          f"your {p} is called {n}.", None))
+        else:
+            v = rng.choice(VALUES_V3[key])
+            insts.append((rng.choice(stmts).format(v=v),
+                          rng.choice(queries).format(v=v),
+                          answer.format(v=v),
+                          v if key in ("name", "friend") else None))
+
+    n_filler = max(0, rng.randint(min_turns, max_turns) - 2 * n_facts)
+    # statements land early-ish, queries late-ish (long gaps are the point —
+    # they teach retention), but positions still vary so binding isn't
+    # greeting-locked like v2
+    order = []
+    for i in range(n_facts):
+        s = rng.uniform(0.0, 0.6)
+        order.append((s, ("s", i)))
+        order.append((rng.uniform(max(s + 0.15, 0.55), 1.0), ("q", i)))
+    for j in range(n_filler):
+        order.append((rng.uniform(0.0, 1.0), ("f", j)))
+    events = [e for _, e in sorted(order)]
+
+    fillers = rng.sample(SMALLTALK_RAW, k=min(n_filler, len(SMALLTALK_RAW)))
+    while len(fillers) < n_filler:
+        fillers.append(rng.choice(SMALLTALK_RAW))
+
+    turns, spans = [], {}
+    for kind, i in events:
+        if kind == "s":
+            stmt, _, _, name = insts[i]
+            ack = rng.choice(ACKS_RAW)
+            if "{name}" in ack:
+                ack = (ack.format(name=name) if name
+                       else rng.choice(ACKS_RAW[1:]))
+            turns.append((stmt, "hello! " + ack if not turns else ack))
+            spans[i] = [len(turns) - 1, None]
+        elif kind == "q":
+            _, query, answer, _ = insts[i]
+            turns.append((query, answer))
+            spans[i][1] = len(turns) - 1
+        else:
+            q, a = fillers[i]
+            turns.append((q, a))
+    if not events or events[0][0] != "s":
+        u, k = turns[0]
+        turns[0] = (u, "hello! " + k if not k.startswith("hello") else k)
+    turns[0] = ("hello kevin! " + turns[0][0], turns[0][1])
+
+    flat_turns = ["user: " + u + " kevin: " + k for u, k in turns]
+    flat = " ".join(flat_turns)
+    gap = 0
+    for si, qi in spans.values():
+        start = sum(len(t) + 1 for t in flat_turns[:si]) + len(flat_turns[si])
+        qstart = sum(len(t) + 1 for t in flat_turns[:qi])
+        gap = max(gap, qstart - start)
+    return flat, gap
+
 
 def dialogue(rng: random.Random, min_turns=4, max_turns=10,
              style: str = "kevin") -> tuple[str, int]:
@@ -115,6 +239,10 @@ def main(argv=None):
     p.add_argument("--style", choices=["kevin", "raw"], default="kevin",
                    help="kevin = telegraphic (kevinised corpus); raw = "
                         "grammatical English (raw/legit corpus)")
+    p.add_argument("--v3", action="store_true",
+                   help="raw style only: 1-3 facts per dialogue at random "
+                        "positions, paraphrased queries, wider fact shapes "
+                        "(like/food/age/friend/pet-name/live)")
     p.add_argument("--names-file", default=None,
                    help="one name per line (e.g. data/ts_names.txt mined from "
                         "the corpus). Overrides the 10 built-ins — a big "
@@ -130,8 +258,12 @@ def main(argv=None):
         NAMES[:] = loaded
     out = open(args.o, "w", encoding="utf-8") if args.o else sys.stdout
     lens, gaps = [], []
+    if args.v3 and args.style != "raw":
+        p.error("--v3 is raw style only")
     for _ in range(args.n):
-        text, gap = dialogue(rng, args.min_turns, args.max_turns, args.style)
+        text, gap = (dialogue_v3(rng, max(args.min_turns, 5), args.max_turns)
+                     if args.v3 else
+                     dialogue(rng, args.min_turns, args.max_turns, args.style))
         out.write(text + "\n<|endoftext|>\n")
         lens.append(len(text)); gaps.append(gap)
     if args.o:
