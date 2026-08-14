@@ -128,29 +128,83 @@ VALUES_V3 = {"name": NAMES, "colour": COLOURS, "pet": PETS, "toy": TOYS,
              "friend": NAMES, "live": PLACES}
 
 
+def _v3_inst(rng: random.Random, key: str):
+    stmts, queries, answer = FACTS_V3[key]
+    if key == "pet" and rng.random() < 0.4:  # pet-name: two-slot fact
+        p, n = rng.choice(PETS), rng.choice(NAMES)
+        return (f"my {p} is called {n}.",
+                rng.choice([f"what is my {p} called?",
+                            f"what is the name of my {p}?"]),
+                f"your {p} is called {n}.", None)
+    v = rng.choice(VALUES_V3[key])
+    return (rng.choice(stmts).format(v=v),
+            rng.choice(queries).format(v=v),
+            answer.format(v=v),
+            v if key in ("name", "friend") else None)
+
+
 def dialogue_v3(rng: random.Random, min_turns=5, max_turns=12) -> tuple[str, int]:
     """One raw-style dialogue with 1-3 facts at random positions.
 
     Returns (text, max fact gap in chars).
     """
-    n_facts = rng.randint(1, 3)
-    keys = rng.sample(list(FACTS_V3), k=n_facts)
-    insts = []
-    for key in keys:
-        stmts, queries, answer = FACTS_V3[key]
-        if key == "pet" and rng.random() < 0.4:  # pet-name: two-slot fact
-            p, n = rng.choice(PETS), rng.choice(NAMES)
-            insts.append((f"my {p} is called {n}.",
-                          rng.choice([f"what is my {p} called?",
-                                      f"what is the name of my {p}?"]),
-                          f"your {p} is called {n}.", None))
-        else:
-            v = rng.choice(VALUES_V3[key])
-            insts.append((rng.choice(stmts).format(v=v),
-                          rng.choice(queries).format(v=v),
-                          answer.format(v=v),
-                          v if key in ("name", "friend") else None))
+    insts = [_v3_inst(rng, key)
+             for key in rng.sample(list(FACTS_V3), k=rng.randint(1, 3))]
+    return _assemble(rng, insts, min_turns, max_turns)
 
+
+# v4: open-schema facts. The attribute AND value slots draw from a
+# corpus-mined noun inventory (~2.6k), so the (x, y) pair space is far too
+# big to memorize — the only compressive solution is the copy circuit, which
+# is what generalizes to attributes never seen in training. Gate: a held-out
+# attribute list excluded from generation entirely, probed after training.
+
+def dialogue_v4(rng: random.Random, nouns: list, min_turns=5, max_turns=12,
+                p_typed=0.3) -> tuple[str, int]:
+    insts, used = [], set()
+    for _ in range(rng.randint(1, 3)):
+        if rng.random() < p_typed:
+            # v3 "like" would collide with the open-schema like query
+            key = rng.choice([k for k in FACTS_V3 if k != "like"])
+            insts.append(_v3_inst(rng, key))
+            continue
+        fam = rng.choice(("fav", "fav", "called", "like", "have"))
+        if fam in used:  # "what do i like/have?" can't bind two answers
+            fam = "fav"
+        used.add(fam) if fam in ("like", "have") else None
+        x = rng.choice(nouns)
+        while x in used:
+            x = rng.choice(nouns)
+        used.add(x)
+        if fam == "fav":
+            y = rng.choice(nouns)
+            insts.append((f"my favourite {x} is {y}.",
+                          rng.choice([f"what is my favourite {x}?",
+                                      f"what is my favourite {x} again?",
+                                      f"do you remember my favourite {x}?"]),
+                          f"your favourite {x} is {y}.", None))
+        elif fam == "called":
+            n = rng.choice(NAMES)
+            insts.append((f"my {x} is called {n}.",
+                          rng.choice([f"what is my {x} called?",
+                                      f"what is the name of my {x}?",
+                                      f"what is my {x}s name?"]),
+                          f"your {x} is called {n}.", None))
+        elif fam == "like":
+            insts.append((rng.choice([f"i like {x}.", f"i really like {x}."]),
+                          rng.choice(["what do i like?",
+                                      "do you remember what i like?"]),
+                          f"you like {x}.", None))
+        else:  # have
+            q, a = rng.choice([("what do i have?", f"you have a {x}."),
+                               (f"do i have a {x}?", f"yes, you have a {x}.")])
+            insts.append((f"i have a {x}.", q, a, None))
+    return _assemble(rng, insts, min_turns, max_turns)
+
+
+def _assemble(rng: random.Random, insts: list, min_turns: int,
+              max_turns: int) -> tuple[str, int]:
+    n_facts = len(insts)
     n_filler = max(0, rng.randint(min_turns, max_turns) - 2 * n_facts)
     # statements land early-ish, queries late-ish (long gaps are the point —
     # they teach retention), but positions still vary so binding isn't
@@ -243,6 +297,15 @@ def main(argv=None):
                    help="raw style only: 1-3 facts per dialogue at random "
                         "positions, paraphrased queries, wider fact shapes "
                         "(like/food/age/friend/pet-name/live)")
+    p.add_argument("--v4", action="store_true",
+                   help="raw style only: open-schema facts — attribute and "
+                        "value slots drawn from --nouns-file so the pair "
+                        "space can't be memorized; 30% v3 typed facts mixed in")
+    p.add_argument("--nouns-file", default="data/ts_nouns.txt",
+                   help="corpus-mined noun inventory for the v4 open slots")
+    p.add_argument("--heldout-file", default=None,
+                   help="nouns NEVER used as v4 attributes (the "
+                        "generalization gate probes these after training)")
     p.add_argument("--names-file", default=None,
                    help="one name per line (e.g. data/ts_names.txt mined from "
                         "the corpus). Overrides the 10 built-ins — a big "
@@ -258,12 +321,23 @@ def main(argv=None):
         NAMES[:] = loaded
     out = open(args.o, "w", encoding="utf-8") if args.o else sys.stdout
     lens, gaps = [], []
-    if args.v3 and args.style != "raw":
-        p.error("--v3 is raw style only")
+    if (args.v3 or args.v4) and args.style != "raw":
+        p.error("--v3/--v4 are raw style only")
+    nouns = None
+    if args.v4:
+        nouns = [l.strip() for l in open(args.nouns_file) if l.strip()]
+        if args.heldout_file:
+            held = {l.strip() for l in open(args.heldout_file) if l.strip()}
+            nouns = [n for n in nouns if n not in held]
+        print(f"v4 noun inventory: {len(nouns)}", file=sys.stderr)
     for _ in range(args.n):
-        text, gap = (dialogue_v3(rng, max(args.min_turns, 5), args.max_turns)
-                     if args.v3 else
-                     dialogue(rng, args.min_turns, args.max_turns, args.style))
+        if args.v4:
+            text, gap = dialogue_v4(rng, nouns, max(args.min_turns, 5),
+                                    args.max_turns)
+        elif args.v3:
+            text, gap = dialogue_v3(rng, max(args.min_turns, 5), args.max_turns)
+        else:
+            text, gap = dialogue(rng, args.min_turns, args.max_turns, args.style)
         out.write(text + "\n<|endoftext|>\n")
         lens.append(len(text)); gaps.append(gap)
     if args.o:
