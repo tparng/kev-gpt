@@ -30,6 +30,7 @@ from .train import pick_device
 
 DEFAULT_CKPT = "data/ckpt.mamba2.bpe1024.pt"
 USER_MARK = "user:"
+KEVIN_MARK = "kevin:"
 _STORY = re.compile(r'(^|[.!?]["\']?\s+)([A-Z])')
 
 
@@ -91,6 +92,11 @@ class ChatSession:
         """Yield reply text chunks. Caller holds no lock; we do."""
         with self.lock:
             msg = " ".join(msg.strip().split()).lower()
+            # corpus user turns always end with punctuation; without it the
+            # model doesn't register the turn boundary and keeps writing the
+            # user's turn itself
+            if msg and msg[-1] not in ".!?":
+                msg += "."
             if self.user_mark_fed:
                 prefix = " " + msg + " kevin:"
             else:
@@ -111,31 +117,32 @@ class ChatSession:
                 out_ids.append(nxt)
                 text = self.codec.decode(out_ids)
 
-                # end of reply: the model starts the next user turn or a new story
-                cut = len(text)
-                done = False
-                mark = text.find(USER_MARK)
-                if mark >= 0:
-                    cut, done, self.user_mark_fed = mark, True, True
-                nl = text.find("\n")
-                if 0 <= nl < cut:
-                    cut, done = nl, True
-                    self.user_mark_fed = False
-                # story drift: dialogue register is all-lowercase, so a capital
-                # opening a sentence means the model wandered into TinyStories
-                m = _STORY.search(text)
-                if m and m.start(2) < cut:
-                    cut, done = m.start(2), True
-                    self.user_mark_fed = False
+                # end of reply: the model starts the next user turn, restates
+                # its own speaker tag, opens a new story line, or drifts into
+                # TinyStories register (capital opening a sentence — dialogue
+                # is all-lowercase)
+                stops = [(p, is_user) for mark, is_user in
+                         ((USER_MARK, True), (KEVIN_MARK, False))
+                         if (p := text.find(mark)) >= 0]
+                if (nl := text.find("\n")) >= 0:
+                    stops.append((nl, False))
+                if m := _STORY.search(text):
+                    stops.append((m.start(2), False))
+                if stops:
+                    cut, self.user_mark_fed = min(stops)
+                    done = True
+                else:
+                    cut, done = len(text), False
 
-                clean = text[:cut]
-                # hold back a partial "user:" match at the tail so we never
-                # stream half a marker to the client
+                clean = text[:cut].lstrip()
+                # hold back a partial speaker-tag match at the tail so we
+                # never stream half a marker to the client
                 if not done:
-                    for k in range(min(len(USER_MARK) - 1, len(clean)), 0, -1):
-                        if clean.endswith(USER_MARK[:k]):
-                            clean = clean[:-k]
-                            break
+                    for mark in (USER_MARK, KEVIN_MARK):
+                        for k in range(min(len(mark) - 1, len(clean)), 0, -1):
+                            if clean.endswith(mark[:k]):
+                                clean = clean[:-k]
+                                break
                 if clean.startswith(sent):
                     delta = clean[len(sent):]
                 else:  # tokenizer rewrote the prefix (rare); resend from scratch
@@ -346,7 +353,7 @@ def run_cli(session: ChatSession):
                 session.reset()
             print("(state wiped)")
             continue
-        print("kevin:", end="", flush=True)
+        print("kevin: ", end="", flush=True)
         for ev in session.stream(msg):
             if ev.get("text"):
                 print(ev["text"], end="", flush=True)
