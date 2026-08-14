@@ -32,6 +32,9 @@ DEFAULT_CKPT = "data/ckpt.mamba2.bpe1024.pt"
 USER_MARK = "user:"
 KEVIN_MARK = "kevin:"
 _STORY = re.compile(r'(^|[.!?]["\']?\s+)([A-Z])')
+_QWORDS = {"what", "where", "who", "when", "why", "how", "do", "does", "did",
+           "am", "is", "are", "was", "can", "could", "will", "would", "have",
+           "has", "should"}
 
 
 def load(path: str, device: str):
@@ -91,12 +94,16 @@ class ChatSession:
     def stream(self, msg: str, temperature=0.8, top_k=40, max_new=110):
         """Yield reply text chunks. Caller holds no lock; we do."""
         with self.lock:
+            # register normalization: the corpus is lowercase, unquoted, every
+            # turn ends with punctuation (questions with "?"), and every
+            # dialogue opens "hello kevin!" — align the input or recall misses
             msg = " ".join(msg.strip().split()).lower()
-            # corpus user turns always end with punctuation; without it the
-            # model doesn't register the turn boundary and keeps writing the
-            # user's turn itself
+            msg = msg.replace('"', "").replace("'", "")
             if msg and msg[-1] not in ".!?":
-                msg += "."
+                first = msg.split()[0]
+                msg += "?" if first in _QWORDS else "."
+            if not self.fed_any and not msg.startswith("hello"):
+                msg = "hello kevin! " + msg
             if self.user_mark_fed:
                 prefix = " " + msg + " kevin:"
             else:
@@ -205,8 +212,8 @@ PAGE = """<!doctype html>
   <button id="reset" class="ghost" type="button" title="wipe the recurrent state">forget</button>
 </div></form>
 <div id="knobs"><div>
-  <label>temp <input id="temp" type="range" min="0.1" max="1.3" step="0.05" value="0.8">
-    <span id="tv">0.8</span></label>
+  <label>temp <input id="temp" type="range" min="0.1" max="1.3" step="0.05" value="0.5">
+    <span id="tv">0.5</span></label>
   <label>top-k <input id="topk" type="range" min="1" max="200" step="1" value="40">
     <span id="kv">40</span></label>
   <label>max tokens <input id="maxn" type="range" min="20" max="400" step="10" value="110">
