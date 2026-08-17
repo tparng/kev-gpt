@@ -72,8 +72,12 @@ class Codec:
 class ChatSession:
     """One conversation: the model's recurrent state plus turn bookkeeping."""
 
-    def __init__(self, model: Mamba2, codec: Codec, device: str):
+    def __init__(self, model: Mamba2, codec: Codec, device: str,
+                 allow_stories: bool = False):
         self.model, self.codec, self.device = model, codec, device
+        # chat5+ checkpoints reply with capitalized story prose on request;
+        # older ones only produce capitals when drifting out of dialogue
+        self.allow_stories = allow_stories
         self.lock = threading.Lock()
         self.reset()
 
@@ -133,7 +137,7 @@ class ChatSession:
                          if (p := text.find(mark)) >= 0]
                 if (nl := text.find("\n")) >= 0:
                     stops.append((nl, False))
-                if m := _STORY.search(text):
+                if not self.allow_stories and (m := _STORY.search(text)):
                     stops.append((m.start(2), False))
                 if stops:
                     cut, self.user_mark_fed = min(stops)
@@ -375,12 +379,15 @@ def main(argv=None):
     p.add_argument("--device", default="auto")
     p.add_argument("--port", type=int, default=8017)
     p.add_argument("--cli", action="store_true", help="terminal REPL, no server")
+    p.add_argument("--allow-stories", action="store_true",
+                   help="don't cut replies at capitalized prose (chat5+ "
+                        "checkpoints tell stories on request)")
     args = p.parse_args(argv)
 
     device = pick_device(args.device)
     model, meta, it, val = load(args.ckpt, device)
     codec = Codec(meta)
-    session = ChatSession(model, codec, device)
+    session = ChatSession(model, codec, device, allow_stories=args.allow_stories)
     info = {
         "ckpt": args.ckpt, "iter": it, "val": round(val, 4) if val else None,
         "params_m": round(model.num_params() / 1e6, 2), "device": device,
