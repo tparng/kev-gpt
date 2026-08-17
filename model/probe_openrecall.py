@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 
 import torch
 
@@ -70,7 +71,8 @@ def main(argv=None):
             attr = attrs[i % len(attrs)] if cond == "heldout" else rng.choice(attrs)
             value = rng.choice(nouns)
             reply = probe(session, attr, value, args.fillers, rng)
-            ok = value in reply.split()
+            words = re.findall(r"[a-z]+", reply.lower())
+            ok = value in words
             hit += ok
             if args.verbose or not ok:
                 print(f"  [{cond}] {attr}={value} -> {reply!r}  "
