@@ -131,6 +131,13 @@ def main(argv=None):
                         "dense 2D matrices (embeddings/scalars/norms/conv stay "
                         "on AdamW). Requires --no-amp. The drift ablation.")
     p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--muon-momentum", type=float, default=0.95,
+                   help="higher = longer noise averaging window (drift lever)")
+    p.add_argument("--muon-wd", type=float, default=0.0,
+                   help="decoupled weight decay on the Muon group (drift lever)")
+    p.add_argument("--loss-clamp", type=float, default=0.0, metavar="NATS",
+                   help="soft-cap per-token CE gradients (drift lever for "
+                        "irreducible-entropy corpora); mamba2 only")
     p.add_argument("--const-lr", action="store_true",
                    help="hold LR constant after warmup (no cosine decay) — the "
                         "drift-onset discriminator: onset tracks either tokens "
@@ -178,6 +185,7 @@ def main(argv=None):
             block_size=args.block_size, vocab_size=meta["vocab_size"],
             n_layer=args.n_layer, d_model=args.n_embd, dropout=args.dropout,
             z_loss=args.z_loss,
+            loss_clamp=args.loss_clamp,
         )
         model = Mamba2(cfg).to(device)
         print(f"params={model.num_params() / 1e6:.2f}M  "
@@ -238,7 +246,8 @@ def main(argv=None):
         emb = {id(model.tok_emb.weight)}
         muon_p = [p for p in decay if p.dim() == 2 and id(p) not in emb]
         adam_p = [p for p in decay if p.dim() != 2 or id(p) in emb]
-        muon = Muon(muon_p, lr=args.muon_lr, momentum=0.95)
+        muon = Muon(muon_p, lr=args.muon_lr, momentum=args.muon_momentum,
+                    weight_decay=args.muon_wd)
         adam = torch.optim.AdamW(
             [{"params": adam_p, "weight_decay": 0.1},
              {"params": nodecay, "weight_decay": 0.0}],

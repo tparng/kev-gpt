@@ -35,9 +35,10 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5,
+                 weight_decay=0.0):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
-                        ns_steps=ns_steps)
+                        ns_steps=ns_steps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -56,6 +57,10 @@ class Muon(torch.optim.Optimizer):
                 g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
                 # scale so update RMS matches Adam-ish magnitudes across shapes
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                if group["weight_decay"] > 0:
+                    # decoupled decay: anchors the noise-driven random walk
+                    # (fixed-spectral-norm updates never let it settle otherwise)
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
                 p.add_(g, alpha=-group["lr"] * scale)
 
 

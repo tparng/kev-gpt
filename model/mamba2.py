@@ -50,6 +50,10 @@ class Mamba2Config:
                                  # drift after ~5k iters and temperature-scaling
                                  # shows ~2/3 of it is logit-scale overconfidence;
                                  # this pins the scale. 0 = off.
+    loss_clamp: float = 0.0      # >0: soft-cap per-token CE gradient at this many
+                                 # nats (k/loss weighting) so irreducible-entropy
+                                 # tokens (random fact values) stop feeding
+                                 # full-size noise into the optimizer. 0 = off.
 
     @property
     def d_inner(self) -> int:
@@ -218,7 +222,18 @@ class Mamba2(nn.Module):
         logits = self.head(self.norm_f(x))
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            per_tok = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                      targets.view(-1), reduction="none")
+            if self.cfg.loss_clamp > 0:
+                # soft-clamp: tokens with irreducible CE (random fact values on
+                # first mention) get their gradient scaled by k/loss instead of
+                # feeding full-size noise into the optimizer forever. Learnable
+                # tokens pass through untouched once they dip under k.
+                with torch.no_grad():
+                    w = (self.cfg.loss_clamp / per_tok.clamp(min=1e-6)).clamp(max=1.0)
+                loss = (w * per_tok).sum() / w.sum().clamp(min=1.0)
+            else:
+                loss = per_tok.mean()
             if self.cfg.z_loss > 0:
                 z = torch.logsumexp(logits.float(), dim=-1)
                 loss = loss + self.cfg.z_loss * (z * z).mean()
