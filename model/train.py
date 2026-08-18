@@ -131,6 +131,10 @@ def main(argv=None):
                         "dense 2D matrices (embeddings/scalars/norms/conv stay "
                         "on AdamW). Requires --no-amp. The drift ablation.")
     p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--d-state", type=int, default=64,
+                   help="mamba2 state dim N per head-channel (config-B gate "
+                        "runs 32 — halves state memory, questions the copy "
+                        "circuit's capacity)")
     p.add_argument("--muon-momentum", type=float, default=0.95,
                    help="higher = longer noise averaging window (drift lever)")
     p.add_argument("--muon-wd", type=float, default=0.0,
@@ -184,6 +188,7 @@ def main(argv=None):
         cfg = Mamba2Config(
             block_size=args.block_size, vocab_size=meta["vocab_size"],
             n_layer=args.n_layer, d_model=args.n_embd, dropout=args.dropout,
+            d_state=args.d_state,
             z_loss=args.z_loss,
             loss_clamp=args.loss_clamp,
         )
