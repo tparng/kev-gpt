@@ -78,6 +78,7 @@ class ChatSession:
         # chat5+ checkpoints reply with capitalized story prose on request;
         # older ones only produce capitals when drifting out of dialogue
         self.allow_stories = allow_stories
+        self.story_turn = False
         self.lock = threading.Lock()
         self.reset()
 
@@ -108,6 +109,10 @@ class ChatSession:
                 msg += "?" if first in _QWORDS else "."
             if not self.fed_any and not msg.startswith("hello"):
                 msg = "hello kevin! " + msg
+            # story prose is only welcome when this turn asked for it —
+            # otherwise the model's in-distribution story spills (chat5+
+            # corpora) run 200 tokens past the actual answer
+            self.story_turn = "story" in msg
             if self.user_mark_fed:
                 prefix = " " + msg + " kevin:"
             else:
@@ -137,7 +142,8 @@ class ChatSession:
                          if (p := text.find(mark)) >= 0]
                 if (nl := text.find("\n")) >= 0:
                     stops.append((nl, False))
-                if not self.allow_stories and (m := _STORY.search(text)):
+                if not (self.allow_stories and self.story_turn) \
+                        and (m := _STORY.search(text)):
                     stops.append((m.start(2), False))
                 if stops:
                     cut, self.user_mark_fed = min(stops)
