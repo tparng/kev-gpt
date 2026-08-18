@@ -19,8 +19,7 @@ import sys
 import numpy as np
 
 from fabric.stage3._simdir import kevbuild
-from model.mamba2_fixed_scan import (Q_A, Q_ACT, Q_STATE, a_from_dtA, quant,
-                                     scan_step_fixed)
+from model.mamba2_fixed_scan import scan_step_fixed2
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 P = N = 64
@@ -45,16 +44,14 @@ def main(argv=None):
     rng = np.random.default_rng(args.seed)
     T = args.steps
 
-    # stimulus in the measured envelope (see mamba2_fixed_scan.soak)
-    negA = rng.uniform(1.0, 16.0)
-    dts = np.exp(rng.uniform(np.log(1e-3), np.log(0.1), T))
-    xs = np.clip(np.round(rng.normal(0, 38, (T, P))), -127, 127).astype(np.int64)
-    Bs = np.clip(np.round(rng.normal(0, 38, (T, N))), -127, 127).astype(np.int64)
-    Cs = np.clip(np.round(rng.normal(0, 38, (T, N))), -127, 127).astype(np.int64)
-
-    a_qs = np.array([a_from_dtA(dt * negA) for dt in dts], dtype=np.int64)
-    dtxs = np.stack([quant(dts[t] * xs[t] / (1 << Q_ACT), Q_STATE)
-                     for t in range(T)])
+    # v3 contract stimulus: dtx/B/C full-range INT, a_q near 1, sh_i/sh_y
+    # spanning the calibrated ranges of the mamba2_fixed reference
+    dtxs = np.clip(np.round(rng.normal(0, 50, (T, P))), -127, 127).astype(np.int64)
+    Bs = np.clip(np.round(rng.normal(0, 50, (T, N))), -127, 127).astype(np.int64)
+    Cs = np.clip(np.round(rng.normal(0, 50, (T, N))), -127, 127).astype(np.int64)
+    a_qs = rng.integers(58000, 65536, T)
+    shis = rng.integers(2, 22, T)          # inject alignment
+    shys = rng.integers(-2, 8, T)          # y output shift
 
     def hexdump(path, vals, width):
         mask = (1 << width) - 1
@@ -63,17 +60,20 @@ def main(argv=None):
                 f.write(f"{int(v) & mask:0{width // 4}x}\n")
 
     hexdump(f"{sim}/ssm_a.mem", a_qs, 16)
+    hexdump(f"{sim}/ssm_shi.mem", shis, 8)
+    hexdump(f"{sim}/ssm_shy.mem", shys, 8)
     hexdump(f"{sim}/ssm_dtx.mem", dtxs, 16)
     hexdump(f"{sim}/ssm_b.mem", Bs, 8)
     hexdump(f"{sim}/ssm_c.mem", Cs, 8)
     with open(f"{sim}/ssm_cfg.mem", "w") as f:
         f.write(f"{T:08x}\n")
 
-    # reference (bit-true python)
+    # reference (bit-true python, v3 shift-algebra contract)
     h = np.zeros((P, N), dtype=np.int64)
     ref = np.zeros((T, P), dtype=np.int64)
     for t in range(T):
-        ref[t] = scan_step_fixed(h, xs[t], Bs[t], Cs[t], float(dts[t]), negA)
+        ref[t] = scan_step_fixed2(h, dtxs[t], Bs[t], Cs[t], int(a_qs[t]),
+                                  int(shis[t]), int(shys[t]))
 
     # compile + run
     src = [f"{REPO}/fabric/stage3/rtl/ssm_scan.sv",

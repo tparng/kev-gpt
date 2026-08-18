@@ -186,8 +186,15 @@ def scan_step_fixed2(h, dtx_q, B8, C8, a_q, sh_i, sh_y):
     shifts become ports.
     """
     inj = dtx_q[:, None] * B8[None, :]
-    inj = (inj << sh_i) if sh_i >= 0 else rsh(inj, -sh_i)
+    if sh_i > 0:
+        inj = inj << sh_i
+    elif sh_i < 0:
+        inj = rsh(inj, -sh_i)
     acc = a_q * h + inj
     h[:] = sat16(rsh(acc, Q_A))
     yacc = h @ C8
-    return sat16((yacc << -sh_y) if sh_y < 0 else rsh(yacc, sh_y))
+    if sh_y > 0:
+        yacc = rsh(yacc, sh_y)
+    elif sh_y < 0:
+        yacc = yacc << -sh_y
+    return sat16(yacc)

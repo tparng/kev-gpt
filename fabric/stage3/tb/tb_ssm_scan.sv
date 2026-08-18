@@ -16,6 +16,7 @@ module tb_ssm_scan;
     reg clk = 0, rst = 1, start = 0;
     wire done, ready;
     reg  [15:0] a_q;
+    reg  signed [5:0] sh_i, sh_y;
     reg         wr_dtx = 0, wr_b = 0, wr_c = 0;
     reg  [5:0]  wr_dtx_addr, wr_b_addr, wr_c_addr;
     reg  signed [15:0] wr_dtx_data;
@@ -28,6 +29,8 @@ module tb_ssm_scan;
     always #2 clk = ~clk;   // 250 MHz nominal, irrelevant in sim
 
     reg [15:0] a_mem   [0:TMAXV-1];
+    reg [7:0]  shi_mem [0:TMAXV-1];
+    reg [7:0]  shy_mem [0:TMAXV-1];
     reg [15:0] dtx_mem [0:TMAXV*P-1];
     reg [7:0]  b_mem   [0:TMAXV*N-1];
     reg [7:0]  c_mem   [0:TMAXV*N-1];
@@ -38,6 +41,8 @@ module tb_ssm_scan;
     initial begin
         $readmemh("ssm_cfg.mem", cfg);  T = cfg[0];
         $readmemh("ssm_a.mem",   a_mem,   0, T-1);
+        $readmemh("ssm_shi.mem", shi_mem, 0, T-1);
+        $readmemh("ssm_shy.mem", shy_mem, 0, T-1);
         $readmemh("ssm_dtx.mem", dtx_mem, 0, T*P-1);
         $readmemh("ssm_b.mem",   b_mem,   0, T*N-1);
         $readmemh("ssm_c.mem",   c_mem,   0, T*N-1);
@@ -62,7 +67,9 @@ module tb_ssm_scan;
                 wr_c <= 1; wr_c_addr <= i[5:0]; wr_c_data <= c_mem[t*N + i];
             end
             @(posedge clk); wr_b <= 0; wr_c <= 0;
-            a_q <= a_mem[t];
+            a_q  <= a_mem[t];
+            sh_i <= shi_mem[t][5:0];
+            sh_y <= shy_mem[t][5:0];
             @(posedge clk); start <= 1;
             @(posedge clk); start <= 0;
             wait (done);

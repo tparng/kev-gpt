@@ -36,6 +36,11 @@ module ssm_scan #(
     output reg                  done,
 
     input  wire [15:0]          a_q,        // UINT Q0.16 decay, this head/token
+    // shift-algebra contract (doc 9; mamba2_fixed_scan.scan_step_fixed2):
+    // inject scale = <<sh_i (signed: negative = rounded right shift),
+    // y output    = >>sh_y (signed: negative = left shift)
+    input  wire signed [5:0]    sh_i,
+    input  wire signed [5:0]    sh_y,
     input  wire                 wr_dtx,
     input  wire [$clog2(P)-1:0] wr_dtx_addr,
     input  wire signed [15:0]   wr_dtx_data,  // Q3.13
@@ -91,15 +96,17 @@ module ssm_scan #(
     // S0 (issue): sync-read h at {pi,ni}; register inj product + metadata
     reg                 v1;
     reg  [AW-1:0]       addr1;
-    reg  signed [23:0]  inj1;        // dtx*B, frac 20
+    reg  signed [23:0]  inj1;        // dtx*B (frac depends on sh_i contract)
     reg  signed [7:0]   c1;
     reg                 lastn1;
+
+    wire signed [41:0] inj1_x = inj1;   // sign-extend for the barrel shift
 
     // S1: decay product a*h (hq is the BRAM output reg), align inject
     reg                 v2;
     reg  [AW-1:0]       addr2;
     reg  signed [33:0]  mul2;        // a*h, frac 29
-    reg  signed [34:0]  inj2;        // (dtx*B) << (QA-QACT), frac 29
+    reg  signed [41:0]  inj2;        // (dtx*B) << sh_i, frac 16+qh
     reg  signed [7:0]   c2;
     reg                 lastn2;
 
@@ -111,11 +118,11 @@ module ssm_scan #(
 
     wire signed [16:0] a_s = {1'b0, a_q};
 
-    wire signed [34:0] acc  = mul2 + inj2;
-    wire signed [34:0] accr = acc + $signed(35'd1 << (QA - 1));
-    wire signed [18:0] shft = accr >>> QA;
-    wire signed [15:0] hnew = (shft > $signed(19'd32767))  ? 16'sd32767 :
-                              (shft < -$signed(19'd32768)) ? -16'sd32768 :
+    wire signed [42:0] acc  = mul2 + inj2;
+    wire signed [42:0] accr = acc + $signed(43'sd1 <<< (QA - 1));
+    wire signed [26:0] shft = accr >>> QA;
+    wire signed [15:0] hnew = (shft > $signed(27'sd32767))  ? 16'sd32767 :
+                              (shft < -$signed(27'sd32768)) ? -16'sd32768 :
                               shft[15:0];
 
     // S3: y product (registered — the mult+accumulate+round+sat cloud was
@@ -126,10 +133,13 @@ module ssm_scan #(
     reg signed [29:0]   yacc;
     reg [$clog2(P)-1:0] yp;          // which p the S4 stream is folding into
     wire signed [29:0] ysum  = yacc + yprod4;
-    wire signed [29:0] yrnd  = ysum + $signed(30'd1 << (QACT - 1));
-    wire signed [22:0] yshft = yrnd >>> QACT;
-    wire signed [15:0] yfin  = (yshft > $signed(23'd32767))  ? 16'sd32767 :
-                               (yshft < -$signed(23'd32768)) ? -16'sd32768 :
+    wire signed [30:0] ysx   = ysum;
+    wire signed [30:0] yrnd  = (sh_y > 0)
+                             ? ysx + ($signed(31'sd1) <<< (sh_y - 1)) : ysx;
+    wire signed [30:0] yshft = (sh_y >= 0) ? (yrnd >>> sh_y)
+                                           : (ysx <<< -sh_y);
+    wire signed [15:0] yfin  = (yshft > $signed(31'sd32767))  ? 16'sd32767 :
+                               (yshft < -$signed(31'sd32768)) ? -16'sd32768 :
                                yshft[15:0];
 
     always @(posedge clk) begin
@@ -173,7 +183,10 @@ module ssm_scan #(
             v2     <= v1;
             addr2  <= addr1;
             mul2   <= a_s * hq;
-            inj2   <= $signed({{11{inj1[23]}}, inj1}) <<< (QA - QACT);
+            if (sh_i >= 0)
+                inj2 <= inj1_x <<< sh_i;
+            else  // rounded right shift (round-to-nearest, matches rsh())
+                inj2 <= (inj1_x + ($signed(42'sd1) <<< (-sh_i - 1))) >>> -sh_i;
             c2     <= c1;
             lastn2 <= lastn1;
 
