@@ -131,6 +131,9 @@ def main(argv=None):
                         "dense 2D matrices (embeddings/scalars/norms/conv stay "
                         "on AdamW). Requires --no-amp. The drift ablation.")
     p.add_argument("--muon-lr", type=float, default=0.02)
+    p.add_argument("--qat-w4", action="store_true",
+                   help="mamba2: straight-through INT4 weight fake-quant "
+                        "(fine-tune from --init-from for the fabric contract)")
     p.add_argument("--d-state", type=int, default=64,
                    help="mamba2 state dim N per head-channel (config-B gate "
                         "runs 32 — halves state memory, questions the copy "
@@ -199,6 +202,26 @@ def main(argv=None):
             ck = torch.load(args.init_from, map_location=device, weights_only=False)
             model.load_state_dict(ck["model"])
             print(f"warm-start from {args.init_from} (iter {ck.get('iter')})")
+        if args.qat_w4:
+            # straight-through per-channel INT4 weight fake-quant on every
+            # Linear (PTQ probe: W4 alone costs +5.2%, A8 free — so QAT only
+            # needs the weights). Parametrization keeps the FP master copy;
+            # export quantizes the parametrized (already-robust) weights.
+            import torch.nn.utils.parametrize as parametrize
+
+            class W4STE(torch.nn.Module):
+                def forward(self, w):
+                    qmax = 7
+                    s = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / qmax
+                    q = (w / s).round().clamp(-8, 7) * s
+                    return w + (q - w).detach()
+
+            nq = 0
+            for mod in model.modules():
+                if isinstance(mod, torch.nn.Linear):
+                    parametrize.register_parametrization(mod, "weight", W4STE())
+                    nq += 1
+            print(f"qat-w4: STE fake-quant on {nq} Linear weights")
     elif args.qat:
         from .qgpt import QGPT, load_fp_into_qat
         cfg = GPTConfig(
