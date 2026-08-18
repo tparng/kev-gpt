@@ -32,8 +32,6 @@ from __future__ import annotations
 import argparse
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 Q_STATE = 13          # h, dtx, y fraction bits (Q3.13: range +-4 covers the
                       # MEASURED state absmax 0.5-2.2 with margin, 2x the
