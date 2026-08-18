@@ -80,7 +80,7 @@ def a_from_dtA(neg_dtA: np.ndarray) -> np.ndarray:
                       (1 << Q_A) - 1).astype(np.int64)
 
 
-def scan_step_fixed(h, x_i8, B_i8, C_i8, dt_f, negA_f):
+def scan_step_fixed(h, x_i8, B_i8, C_i8, dt_f, negA_f, e_h=0, y_sh=Q_ACT):
     """One integer scan step for one head.
 
     h      : (P, N) int64 holding INT16 Q3.13 state (mutated)
@@ -92,18 +92,24 @@ def scan_step_fixed(h, x_i8, B_i8, C_i8, dt_f, negA_f):
     returns y (P,) int64 INT16 Q4.12
     """
     a_q = a_from_dtA(dt_f * negA_f)                       # UINT16 Q0.16
-    # dtx: dt * x  -> Q4.12  (dt fp * INT8 act / 2^7)
-    dtx = quant(dt_f * x_i8 / (1 << Q_ACT), Q_STATE)      # (P,) INT16 Q4.12
+    # dtx: dt * x, pre-scaled by 2^e_h so small-dt heads keep resolution
+    # (e_h compensated in the inject alignment shift below; e_h=0 is the
+    # original contract). The NLL gate found dt~0.01 heads landing at ~3
+    # effective bits without this.
+    dtx = quant(dt_f * x_i8 / (1 << Q_ACT) * 2.0 ** e_h, Q_STATE)
     # fused update, ONE rounding (the DSP48E2 way — 48-bit accumulator):
     #   a*h            : Q0.16 x Q3.13 -> frac 29
     #   dtx*B << 9     : (Q3.13 x Q0.7 = frac 20) << 9 -> frac 29
     #   h' = rnd(sum >> 16) -> Q3.13
     # (a draft rounded the two terms separately; the +-0.5 LSB on the
     # few-LSB inject term dominated the noise floor — soak-caught)
-    acc = a_q * h + ((dtx[:, None] * B_i8[None, :]) << (Q_A - Q_ACT))
+    sh = Q_A - Q_ACT - e_h
+    inj = dtx[:, None] * B_i8[None, :]
+    inj = (inj << sh) if sh >= 0 else rsh(inj, -sh)
+    acc = a_q * h + inj
     h[:] = sat16(rsh(acc, Q_A))
     # y = rnd((h . C) >> 7)  (C INT8, 7 frac bits) -> Q4.12
-    y = sat16(rsh(h @ C_i8, Q_ACT))
+    y = sat16(rsh(h @ C_i8, y_sh))
     return y
 
 
@@ -165,3 +171,23 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+
+
+def scan_step_fixed2(h, dtx_q, B8, C8, a_q, sh_i, sh_y):
+    """Generalized integer scan step (the shift-algebra contract).
+
+    Real-value mapping (all scales powers of two, calibrated per layer):
+      x8 = x*2^bX, B8 = B*2^bB, C8 = C*2^bC, h = h_real*2^qh
+      dtx_q = dt*x8*2^eh (INT16; eh per head-token keeps resolution)
+      sh_i  = 16 + qh - bX - eh - bB   (inject alignment, +-)
+      sh_y  = qh + bC - 13             (y to Q3.13, +-)
+    Update: h' = rnd((a*h + (dtx*B) <<sh_i>>) >> 16), y = rnd((h'@C8) >> sh_y)
+    Same fused-single-rounding datapath as the silicon-proven core; the two
+    shifts become ports.
+    """
+    inj = dtx_q[:, None] * B8[None, :]
+    inj = (inj << sh_i) if sh_i >= 0 else rsh(inj, -sh_i)
+    acc = a_q * h + inj
+    h[:] = sat16(rsh(acc, Q_A))
+    yacc = h @ C8
+    return sat16((yacc << -sh_y) if sh_y < 0 else rsh(yacc, sh_y))
