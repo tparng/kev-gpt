@@ -14,7 +14,7 @@ module tb_ssm_scan;
     localparam int TMAXV = 4096;
 
     reg clk = 0, rst = 1, start = 0;
-    wire done;
+    wire done, ready;
     reg  [15:0] a_q;
     reg         wr_dtx = 0, wr_b = 0, wr_c = 0;
     reg  [5:0]  wr_dtx_addr, wr_b_addr, wr_c_addr;
@@ -45,6 +45,7 @@ module tb_ssm_scan;
 
         repeat (4) @(posedge clk);
         rst <= 0;
+        wait (ready);            // clear-FSM sweeps the state BRAM first
         @(posedge clk);
 
         for (t = 0; t < T; t = t + 1) begin

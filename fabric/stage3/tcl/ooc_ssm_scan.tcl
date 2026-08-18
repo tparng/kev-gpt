@@ -21,4 +21,5 @@ route_design
 report_utilization -file ssm_scan_util.rpt
 report_timing_summary -file ssm_scan_timing.rpt
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
-puts "SSM_SCAN_OOC: period=$period wns=$wns [expr {$wns >= 0 ? \"MET\" : \"FAILED\"}]"
+if {$wns >= 0} { set verdict "MET" } else { set verdict "FAILED" }
+puts "SSM_SCAN_OOC: period=$period wns=$wns $verdict"
