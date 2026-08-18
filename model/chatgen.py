@@ -202,6 +202,64 @@ def dialogue_v4(rng: random.Random, nouns: list, min_turns=5, max_turns=12,
     return _assemble(rng, insts, min_turns, max_turns)
 
 
+# v5: interleaved fact-story dialogues (the state-retention corpus). The
+# payoff model recalls facts 28/30 but a story flowing through the recurrent
+# state flushes them (post-story "what is my name?" -> wrong). No training
+# example ever required retention ACROSS a generated story; these do: facts
+# stated, a real story told mid-dialogue, facts queried after it.
+
+def dialogue_v5(rng: random.Random, nouns: list, pairs: list,
+                min_turns=5, max_turns=10) -> tuple[str, int]:
+    insts = [_v3_inst(rng, rng.choice([k for k in FACTS_V3 if k != "like"]))
+             if rng.random() < 0.4 else _open_inst(rng, nouns)
+             for _ in range(rng.randint(1, 2))]
+    topic, story = rng.choice(pairs)
+    ask = rng.choice(["tell me a story about a {x}.",
+                      "can you tell me a story about a {x}?",
+                      "tell me a story."]).format(x=topic)
+    story_turn = ("user: " + ask + " kevin: " + story)
+
+    n_filler = max(0, rng.randint(min_turns, max_turns) - 2 * len(insts) - 1)
+    fillers = rng.sample(SMALLTALK_RAW, k=min(n_filler, len(SMALLTALK_RAW)))
+    turns = []
+    for stmt, _, _, name in insts:            # facts first (with greeting)
+        ack = rng.choice(ACKS_RAW)
+        if "{name}" in ack:
+            ack = ack.format(name=name) if name else rng.choice(ACKS_RAW[1:])
+        turns.append("user: " + stmt + " kevin: " + ("hello! " if not turns else "") + ack)
+    for q, a in fillers[: n_filler // 2]:
+        turns.append("user: " + q + " kevin: " + a)
+    turns.append(story_turn)                  # the story flows through the state
+    for q, a in fillers[n_filler // 2:]:
+        turns.append("user: " + q + " kevin: " + a)
+    for _, query, answer, _ in insts:         # queries AFTER the story
+        turns.append("user: " + query + " kevin: " + answer)
+    turns[0] = "user: hello kevin! " + turns[0][len("user: "):]
+
+    flat = " ".join(turns)
+    gap = flat.rindex("user: " + insts[0][1]) if insts else 0
+    return flat, gap
+
+
+def _open_inst(rng: random.Random, nouns: list):
+    fam = rng.choice(("fav", "called", "like"))
+    x = rng.choice(nouns)
+    if fam == "fav":
+        y = rng.choice(nouns)
+        return (f"my favourite {x} is {y}.",
+                rng.choice([f"what is my favourite {x}?",
+                            f"do you remember my favourite {x}?"]),
+                f"your favourite {x} is {y}.", None)
+    if fam == "called":
+        n = rng.choice(NAMES)
+        return (f"my {x} is called {n}.",
+                rng.choice([f"what is my {x} called?", f"what is my {x}s name?"]),
+                f"your {x} is called {n}.", None)
+    return (rng.choice([f"i like {x}.", f"i really like {x}."]),
+            rng.choice(["what do i like?", "do you remember what i like?"]),
+            f"you like {x}.", None)
+
+
 def _assemble(rng: random.Random, insts: list, min_turns: int,
               max_turns: int) -> tuple[str, int]:
     n_facts = len(insts)
@@ -301,6 +359,12 @@ def main(argv=None):
                    help="raw style only: open-schema facts — attribute and "
                         "value slots drawn from --nouns-file so the pair "
                         "space can't be memorized; 30% v3 typed facts mixed in")
+    p.add_argument("--v5", action="store_true",
+                   help="raw style only: facts stated, a REAL story told "
+                        "mid-dialogue, facts queried after it (state "
+                        "retention through generation)")
+    p.add_argument("--stories-file", default="data/story_pairs.tsv",
+                   help="topic<TAB>story pairs for --v5 story turns")
     p.add_argument("--nouns-file", default="data/ts_nouns.txt",
                    help="corpus-mined noun inventory for the v4 open slots")
     p.add_argument("--heldout-file", default=None,
@@ -321,17 +385,28 @@ def main(argv=None):
         NAMES[:] = loaded
     out = open(args.o, "w", encoding="utf-8") if args.o else sys.stdout
     lens, gaps = [], []
-    if (args.v3 or args.v4) and args.style != "raw":
-        p.error("--v3/--v4 are raw style only")
-    nouns = None
-    if args.v4:
+    if (args.v3 or args.v4 or args.v5) and args.style != "raw":
+        p.error("--v3/--v4/--v5 are raw style only")
+    nouns = pairs = None
+    if args.v5:
+        nouns = [l.strip() for l in open(args.nouns_file) if l.strip()]
+        if args.heldout_file:
+            held = {l.strip() for l in open(args.heldout_file) if l.strip()}
+            nouns = [n for n in nouns if n not in held]
+        pairs = [tuple(l.rstrip("\n").split("\t", 1))
+                 for l in open(args.stories_file, encoding="utf-8")]
+        print(f"v5: {len(nouns)} nouns, {len(pairs)} stories", file=sys.stderr)
+    elif args.v4:
         nouns = [l.strip() for l in open(args.nouns_file) if l.strip()]
         if args.heldout_file:
             held = {l.strip() for l in open(args.heldout_file) if l.strip()}
             nouns = [n for n in nouns if n not in held]
         print(f"v4 noun inventory: {len(nouns)}", file=sys.stderr)
     for _ in range(args.n):
-        if args.v4:
+        if args.v5:
+            text, gap = dialogue_v5(rng, nouns, pairs,
+                                    max(args.min_turns, 5), args.max_turns)
+        elif args.v4:
             text, gap = dialogue_v4(rng, nouns, max(args.min_turns, 5),
                                     args.max_turns)
         elif args.v3:
