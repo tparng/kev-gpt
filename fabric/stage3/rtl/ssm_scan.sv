@@ -132,14 +132,21 @@ module ssm_scan #(
     reg signed [23:0]   yprod4;
     reg signed [29:0]   yacc;
     reg [$clog2(P)-1:0] yp;          // which p the S4 stream is folding into
-    wire signed [29:0] ysum  = yacc + yprod4;
-    wire signed [30:0] ysx   = ysum;
-    wire signed [30:0] yrnd  = (sh_y > 0)
-                             ? ysx + ($signed(31'sd1) <<< (sh_y - 1)) : ysx;
-    wire signed [30:0] yshft = (sh_y >= 0) ? (yrnd >>> sh_y)
+
+    // S5: registered fold — the shift+round+sat on ysum fires once per row,
+    // in its own cycle (v3's single-cycle DSP->acc->barrel->sat->write path
+    // missed 4ns by 0.74)
+    reg                 v5, v6;
+    reg  signed [29:0]  yfold5;
+    reg  signed [15:0]  yfin6;
+    reg  [$clog2(P)-1:0] yp5, yp6;
+    wire signed [37:0] ysx   = yfold5;
+    wire signed [37:0] yrnd  = (sh_y > 0)
+                             ? ysx + ($signed(38'sd1) <<< (sh_y - 1)) : ysx;
+    wire signed [37:0] yshft = (sh_y >= 0) ? (yrnd >>> sh_y)
                                            : (ysx <<< -sh_y);
-    wire signed [15:0] yfin  = (yshft > $signed(31'sd32767))  ? 16'sd32767 :
-                               (yshft < -$signed(31'sd32768)) ? -16'sd32768 :
+    wire signed [15:0] yfin  = (yshft > $signed(38'sd32767))  ? 16'sd32767 :
+                               (yshft < -$signed(38'sd32768)) ? -16'sd32768 :
                                yshft[15:0];
 
     always @(posedge clk) begin
@@ -148,7 +155,7 @@ module ssm_scan #(
 
         if (rst) begin
             st <= CLEARING; ready <= 1'b0; clr_addr <= '0;
-            v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0; v4 <= 1'b0;
+            v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0; v4 <= 1'b0; v5 <= 1'b0; v6 <= 1'b0;
         end else begin
             case (st)
               CLEARING: begin
@@ -169,7 +176,7 @@ module ssm_scan #(
                     if (pi == P-1) st <= DRAIN; else pi <= pi + 1'b1;
                 end else ni <= ni + 1'b1;
               end
-              DRAIN: if (!v3 && !v4) begin st <= IDLE; done <= 1'b1; end
+              DRAIN: if (!v3 && !v4 && !v5 && !v6) begin st <= IDLE; done <= 1'b1; end
             endcase
 
             // S0 -> S1
@@ -204,15 +211,23 @@ module ssm_scan #(
             lastn4 <= lastn3;
             yprod4 <= hnew3 * c3;
 
-            // S4: accumulate y, fold at each row end
+            // S4: accumulate y; hand the row total to S5 at each row end
+            v5 <= 1'b0;
             if (v4) begin
                 if (lastn4) begin
-                    yout[yp] <= yfin;
-                    yacc     <= 30'sd0;
-                    yp       <= yp + 1'b1;
+                    yfold5 <= yacc + yprod4;
+                    yp5    <= yp;
+                    v5     <= 1'b1;
+                    yacc   <= 30'sd0;
+                    yp     <= yp + 1'b1;
                 end else
-                    yacc <= ysum;
+                    yacc <= yacc + yprod4;
             end
+
+            // S5 -> S6: register the shifted/saturated value; write next cycle
+            v6 <= v5;
+            if (v5) begin yfin6 <= yfin; yp6 <= yp5; end
+            if (v6) yout[yp6] <= yfin6;
         end
     end
 

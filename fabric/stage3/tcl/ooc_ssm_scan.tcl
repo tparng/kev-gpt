@@ -10,16 +10,18 @@ set part "xck26-sfvc784-2LV-c"
 set root [file normalize [file dirname [info script]]/../../..]
 set rtl  "$root/fabric/stage3/rtl"
 
-read_verilog -sv "$rtl/ssm_scan.sv"
+set top [lindex $argv 1]
+if {$top eq ""} { set top ssm_scan }
+read_verilog -sv "$rtl/$top.sv"
 
-synth_design -top ssm_scan -part $part -mode out_of_context
+synth_design -top $top -part $part -mode out_of_context
 create_clock -name clk -period $period [get_ports clk]
 opt_design
 place_design
 route_design
 
-report_utilization -file ssm_scan_util.rpt
-report_timing_summary -file ssm_scan_timing.rpt
+report_utilization -file ${top}_util.rpt
+report_timing_summary -file ${top}_timing.rpt
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]
 if {$wns >= 0} { set verdict "MET" } else { set verdict "FAILED" }
-puts "SSM_SCAN_OOC: period=$period wns=$wns $verdict"
+puts "SSM_SCAN_OOC top=$top period=$period wns=$wns $verdict"
