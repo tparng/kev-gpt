@@ -79,36 +79,39 @@ module ssm_scan_row #(
     reg [PW-1:0] pi, clr_addr;
     wire issue = (st == RUN);
 
-    // ---- pipeline ----
-    reg              v1, v2;
-    reg [PW-1:0]     p1, p2;
+    // ---- pipeline (one op per stage; II=1, write lags read by 4) ----
+    reg              v1, v2, v3, v4;
+    reg [PW-1:0]     p1, p2, p3, p4;
     reg signed [15:0] dtx1;
-    reg signed [23:0] injl [0:N-1];       // dtx*B per lane (S1)
-    reg signed [32:0] mull [0:N-1];       // a*h per lane (S1)
+    reg signed [23:0] injl  [0:N-1];      // S1: dtx*B per lane
+    reg signed [32:0] mull  [0:N-1];      // S1: a*h per lane
+    reg signed [41:0] injs  [0:N-1];      // S2: barrel-shifted inject
+    reg signed [32:0] mul2l [0:N-1];      // S2: delayed a*h
+    reg signed [15:0] hnl   [0:N-1];      // S3: saturated new state
+    reg signed [23:0] yprodl[0:N-1];      // S4: hnew * C
 
     wire signed [16:0] a_s = {1'b0, a_q};
 
-    // S2 combinational per lane: fused single rounding + sat
+    // S3 combinational per lane: fused single rounding + sat
     wire [N*16-1:0] hnew_w;
-    wire signed [23:0] yprod [0:N-1];
     genvar g;
     generate for (g = 0; g < N; g = g + 1) begin : lane
-        wire signed [41:0] inj_x = injl[g];
-        wire signed [41:0] inj_sh = (sh_i >= 0) ? (inj_x <<< sh_i)
-                     : ((inj_x + ($signed(42'sd1) <<< (-sh_i - 1))) >>> -sh_i);
-        wire signed [42:0] acc  = mull[g] + inj_sh;
+        wire signed [42:0] acc  = mul2l[g] + injs[g];
         wire signed [42:0] accr = acc + $signed(43'sd1 <<< (QA - 1));
         wire signed [26:0] shft = accr >>> QA;
         wire signed [15:0] hn = (shft > $signed(27'sd32767))  ? 16'sd32767 :
                                 (shft < -$signed(27'sd32768)) ? -16'sd32768 :
                                 shft[15:0];
         assign hnew_w[g*16 +: 16] = hn;
-        assign yprod[g] = hn * cvec[g];
+    end endgenerate
+    wire [N*16-1:0] hnl_w;
+    generate for (g = 0; g < N; g = g + 1) begin : lanew
+        assign hnl_w[g*16 +: 16] = hnl[g];
     end endgenerate
 
-    // y adder tree: 64 -> 16 -> 4 -> 1, registered every level-pair
-    reg               v3, v4, v5, v6;
-    reg [PW-1:0]      p3, p4, p5, p6;
+    // y adder tree: 64 -> 16 -> 4 -> 1, one level-pair per stage
+    reg               v5, v6, v7, v8, v9;
+    reg [PW-1:0]      p5, p6, p7, p8, p9;
     reg signed [27:0] t16 [0:15];
     reg signed [29:0] t4  [0:3];
     reg signed [31:0] ysum5;
@@ -130,6 +133,7 @@ module ssm_scan_row #(
         if (rst) begin
             st <= CLEARING; ready <= 1'b0; clr_addr <= '0;
             v1 <= 0; v2 <= 0; v3 <= 0; v4 <= 0; v5 <= 0; v6 <= 0;
+            v7 <= 0; v8 <= 0; v9 <= 0;
         end else begin
             case (st)
               CLEARING: begin
@@ -142,39 +146,56 @@ module ssm_scan_row #(
                 raddr <= pi + 1'b1;
                 if (pi == P-1) st <= DRAIN; else pi <= pi + 1'b1;
               end
-              DRAIN: if (!v1 && !v2 && !v3 && !v4 && !v5 && !v6) begin
+              DRAIN: if (!v1 && !v2 && !v3 && !v4 && !v5 && !v6 && !v7
+                          && !v8 && !v9) begin
                 st <= IDLE; done <= 1'b1;
               end
             endcase
 
             // S0 -> S1: row read lands in hq; register per-lane products
             v1 <= issue; p1 <= pi; dtx1 <= dtx[pi];
-            // S1 -> S2
+            // S1 -> S2: products
             v2 <= v1; p2 <= p1;
             for (k = 0; k < N; k = k + 1) begin
                 mull[k] <= a_s * $signed(hq[k*16 +: 16]);
                 injl[k] <= dtx1 * bvec[k];
             end
-            // S2: writeback + first tree level pair (64 products -> 16)
+            // S2 -> S3: barrel shift only
             v3 <= v2; p3 <= p2;
-            if (v2) begin
-                we <= 1'b1; waddr <= p2; wdata <= hnew_w;
-                for (k = 0; k < 16; k = k + 1)
-                    t16[k] <= yprod[4*k] + yprod[4*k+1]
-                            + yprod[4*k+2] + yprod[4*k+3];
+            for (k = 0; k < N; k = k + 1) begin
+                mul2l[k] <= mull[k];
+                injs[k]  <= (sh_i >= 0)
+                          ? ($signed({{18{injl[k][23]}}, injl[k]}) <<< sh_i)
+                          : (($signed({{18{injl[k][23]}}, injl[k]})
+                              + ($signed(42'sd1) <<< (-sh_i - 1))) >>> -sh_i);
             end
-            // S3: 16 -> 4
+            // S3 -> S4: register saturated state; write back
             v4 <= v3; p4 <= p3;
-            if (v3)
+            for (k = 0; k < N; k = k + 1)
+                hnl[k] <= hnew_w[k*16 +: 16];
+            if (v3) begin we <= 1'b1; waddr <= p3; wdata <= hnew_w; end
+            // S4 -> S5: y products
+            v5 <= v4; p5 <= p4;
+            for (k = 0; k < N; k = k + 1)
+                yprodl[k] <= hnl[k] * cvec[k];
+            // S5: tree 64 -> 16
+            v6 <= v5; p6 <= p5;
+            if (v5)
+                for (k = 0; k < 16; k = k + 1)
+                    t16[k] <= yprodl[4*k] + yprodl[4*k+1]
+                            + yprodl[4*k+2] + yprodl[4*k+3];
+            // S6: 16 -> 4
+            v7 <= v6; p7 <= p6;
+            if (v6)
                 for (k = 0; k < 4; k = k + 1)
                     t4[k] <= t16[4*k] + t16[4*k+1] + t16[4*k+2] + t16[4*k+3];
-            // S4: 4 -> 1
-            v5 <= v4; p5 <= p4;
-            if (v4) ysum5 <= t4[0] + t4[1] + t4[2] + t4[3];
-            // S5: shift + sat; S6 write
-            v6 <= v5; p6 <= p5;
-            if (v5) yfin6 <= yfin;
-            if (v6) yout[p6] <= yfin6;
+            // S7: 4 -> 1
+            v8 <= v7; p8 <= p7;
+            if (v7) ysum5 <= t4[0] + t4[1] + t4[2] + t4[3];
+            // S8: shift + sat; S9 write
+            v9 <= v8; p9 <= p8;
+            if (v8) yfin6 <= yfin;
+            if (v9) yout[p9] <= yfin6;
         end
     end
 
