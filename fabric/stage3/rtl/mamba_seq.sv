@@ -198,7 +198,7 @@ module mamba_seq #(
 
     // ---------------------------------------------------------- FSM ---------
     localparam [4:0]
-        S_IDLE=0, S_EMB=1, S_NIN_LD=2, S_NIN=3, S_QIN=4, S_GIN_LD=5,
+        S_IDLE=0, S_EMB=1, S_LUTLD=28, S_NIN_LD=2, S_NIN=3, S_QIN=4, S_GIN_LD=5,
         S_GIN=6, S_GIN_RD=7, S_CONV_LDW=8, S_CONV_LDX=9, S_CONV=10,
         S_CONV_RD=11, S_SCAN_PREP=12, S_SCAN_H=13, S_SCAN_RD=14,
         S_NG_LD=15, S_NG=16, S_QOUT=17, S_GOUT_LD=18, S_GOUT=19,
@@ -206,6 +206,7 @@ module mamba_seq #(
         S_GHD=25, S_GHD_RD=26, S_DONE=27;
 
     reg [4:0]  st;
+    reg        luts_done;   // sub-core SiLU LUTs streamed once before token 1
     reg [2:0]  li;                            // layer index
     reg [3:0]  hi;                            // head index
     reg [11:0] i;                             // generic element counter
@@ -256,9 +257,20 @@ module mamba_seq #(
 
         if (rst) begin
             st <= S_IDLE;
+            luts_done <= 1'b0;
         end else case (st)
           S_IDLE: if (start && s_ready) begin
-              li <= 0; i <= 0; sub <= 0; st <= S_EMB;
+              li <= 0; i <= 0; sub <= 0;
+              st <= luts_done ? S_EMB : S_LUTLD;
+          end
+
+          // ---- one-time: stream the SiLU LUT into conv + norm cores --------
+          S_LUTLD: begin
+              c_wrl <= 1; c_wrl_a <= i[7:0]; c_wrd <= slut[i[7:0]];
+              n_wrl <= 1; n_wrl_a <= i[7:0]; n_wrd <= slut[i[7:0]];
+              if (i == 255) begin
+                  i <= 0; luts_done <= 1'b1; st <= S_EMB;
+              end else i <= i + 1;
           end
 
           // ---- embed: x[c] = nib(emb[tok])*escale, Q3.12 --------------------
