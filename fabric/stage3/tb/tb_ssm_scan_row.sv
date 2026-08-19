@@ -24,7 +24,8 @@ module tb_ssm_scan_row;
     reg  [5:0]  rd_y_addr;
     wire signed [15:0] rd_y_data;
 
-    ssm_scan_row #(.P(P), .N(N)) dut (.*);
+    reg [1:0] pbase = 0;
+    ssm_scan_row #(.P(P), .N(N), .CTX(4)) dut (.*);
 
     always #2 clk = ~clk;   // 250 MHz nominal, irrelevant in sim
 

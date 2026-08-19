@@ -14,8 +14,13 @@ Outputs (to --out, default data/fabric_mamba/):
   l<i>_conv_w.mem / l<i>_conv_b.mem   INT16 Q1.14  (w row-major (conv_dim, k))
   silu_lut.mem                        256 x INT16 Q3.12, grid (i-128)/32
   l<i>_alut.mem                       n_heads*256 x UINT16 Q0.16 decay
-                                      index i -> v=(i-128)/16 (dt_raw+bias,
-                                      top 8 bits of Q3.12 over [-8,8))
+                                      exp(-softplus(grid+dt_bias_h)*|A_h|);
+                                      index = RAW (pre-bias) dt_raw Q3.12
+                                      top 8 bits, (v_q312+32768)>>8, grid
+                                      [-8,8) step 1/16 — bias folded in
+  l<i>_dtlut.mem                      n_heads*256 x UINT16 Q1.14 dt =
+                                      softplus(grid+dt_bias_h), same raw
+                                      indexing, clamped [1,32767] (never 0)
   l<i>_ln_g.mem / l<i>_norm_g.mem     INT16 Q1.14 gammas
   normf_g.mem                         INT16 Q2.13 (values ~2.3-3.0 clip Q1.14;
                                       DEVIATION from the Q1.14 spec, flagged
@@ -110,16 +115,34 @@ def _softplus(v: np.ndarray) -> np.ndarray:
     return np.where(v > 20.0, v, np.log1p(np.exp(np.minimum(v, 20.0))))
 
 
-def alut_table(negA: np.ndarray) -> np.ndarray:
+ALUT_GRID = (np.arange(256) - 128) / 16.0   # RAW dt_raw domain [-8,8) step
+                                            # 1/16: idx = (v_q312+32768)>>8
+
+
+def alut_table(negA: np.ndarray, dt_bias: np.ndarray) -> np.ndarray:
     """Per-head fused softplus*exp decay LUT, heads concatenated.
-    Index i -> v = (i-128)/16 (the top 8 bits of a Q3.12 dt_raw+dt_bias in
-    [-8,8)); entry = round(exp(-softplus(v)*|A_h|)*2^16) clamped to 65535."""
-    v = (np.arange(256) - 128) / 16.0
-    dt = _softplus(v)
+    Indexed by the RAW (pre-bias) Q3.12 dt projection's top 8 bits; the
+    per-head dt_bias is folded INTO the table:
+      entry_h[i] = round(exp(-softplus(grid[i]+dt_bias[h])*|A_h|)*2^16),
+    clamped to 65535."""
     out = []
-    for a in np.asarray(negA, dtype=np.float64):
+    for a, b in zip(np.asarray(negA, dtype=np.float64),
+                    np.asarray(dt_bias, dtype=np.float64)):
+        dt = _softplus(ALUT_GRID + b)
         e = np.round(np.exp(-dt * a) * (1 << Q_A))
         out.append(np.minimum(e, (1 << Q_A) - 1).astype(np.int64))
+    return np.concatenate(out)
+
+
+def dtlut_table(dt_bias: np.ndarray) -> np.ndarray:
+    """Per-head dt LUT (same indexing as the alut: RAW dt_raw Q3.12 top 8
+    bits, bias folded in): entry_h[i] = clamp(round(softplus(grid[i] +
+    dt_bias[h]) * 2^14), 1, 32767) — UINT16 Q1.14, min 1 never 0 (the RTL
+    derives a shift from bit_length; a zero entry would break it)."""
+    out = []
+    for b in np.asarray(dt_bias, dtype=np.float64):
+        e = np.round(_softplus(ALUT_GRID + b) * (1 << 14))
+        out.append(np.clip(e, 1, (1 << 15) - 1).astype(np.int64))
     return np.concatenate(out)
 
 
@@ -145,8 +168,12 @@ def export(ckpt_path: str, out_dir: str, val_bin: str, calib_tokens: int) -> boo
                   "row-major (row = output channel)",
             "scale": "per-output-channel FP16 bit pattern (uint16 hex)",
             "conv": f"INT16 Q1.{Q_CONV}", "silu_lut": f"INT16 Q3.{Q_SILU}",
-            "alut": "UINT16 Q0.16, index=(dt_raw+dt_bias) top-8b of Q3.12 "
-                    "[-8,8) step 1/16, heads concatenated",
+            "alut": "UINT16 Q0.16, index = RAW dt_raw (pre-bias) top-8b of "
+                    "Q3.12 ((v_q312+32768)>>8), domain [-8,8) step 1/16, "
+                    "dt_bias folded into the table, heads concatenated",
+            "dtlut": "UINT16 Q1.14 softplus(dt_raw+dt_bias), same indexing "
+                     "as alut (raw pre-bias index, bias folded in), "
+                     "clamped [1, 32767] (never 0: RTL bit_length shift)",
             "ln_g/norm_g": f"INT16 Q1.{Q_NORM}",
             "normf_g": f"INT16 Q2.{Q_NORMF} (DEVIATION: spec said Q1.14 but "
                        "the baked gamma_f is 2.3-3.0 everywhere and would "
@@ -218,22 +245,32 @@ def export(ckpt_path: str, out_dir: str, val_bin: str, calib_tokens: int) -> boo
     ok = bool(np.array_equal(r, slut))
     checks.append(("silu_lut round-trip", 0.0 if ok else 1.0, 0.5, ok))
 
-    # 4) per-layer per-head decay LUTs + spot check
+    # 4) per-layer per-head decay + dt LUTs (both indexed by RAW pre-bias
+    #    dt_raw Q3.12 top-8b; dt_bias folded into the tables) + spot checks
     rng = np.random.default_rng(0)
     for l in range(L):
         negA = fx.layers[l]["negA"]
-        t = alut_table(negA)
-        emit(f"l{l}_alut.mem", _hex16(t), int(H * 256),
+        bias = fx.layers[l]["dt_bias"]
+        emit(f"l{l}_alut.mem", _hex16(alut_table(negA, bias)), int(H * 256),
              qformat="UINT16 Q0.16", heads=int(H))
-        r = _load_hex(os.path.join(out_dir, f"l{l}_alut.mem"))
-        worst = 0
+        emit(f"l{l}_dtlut.mem", _hex16(dtlut_table(bias)), int(H * 256),
+             qformat="UINT16 Q1.14", heads=int(H))
+        ra = _load_hex(os.path.join(out_dir, f"l{l}_alut.mem"))
+        rd = _load_hex(os.path.join(out_dir, f"l{l}_dtlut.mem"))
+        worst_a = worst_d = 0
         for _ in range(100):
             h = int(rng.integers(0, H)); i = int(rng.integers(0, 256))
-            v = (i - 128) / 16.0
-            exp = min(round(float(np.exp(-_softplus(v) * negA[h])) * (1 << Q_A)),
-                      (1 << Q_A) - 1)
-            worst = max(worst, abs(int(r[h * 256 + i]) - exp))
-        checks.append((f"l{l}_alut 100-pt spot", float(worst), 1.0, worst <= 1))
+            v = (i - 128) / 16.0 + float(bias[h])     # grid is RAW dt_raw
+            dt = float(_softplus(v))
+            exp_a = min(round(np.exp(-dt * float(negA[h])) * (1 << Q_A)),
+                        (1 << Q_A) - 1)
+            exp_d = int(np.clip(round(dt * (1 << 14)), 1, (1 << 15) - 1))
+            worst_a = max(worst_a, abs(int(ra[h * 256 + i]) - exp_a))
+            worst_d = max(worst_d, abs(int(rd[h * 256 + i]) - exp_d))
+        checks.append((f"l{l}_alut 100-pt spot", float(worst_a), 1.0, worst_a <= 1))
+        checks.append((f"l{l}_dtlut 100-pt spot", float(worst_d), 1.0, worst_d <= 1))
+        nz = bool((rd > 0).all())
+        checks.append((f"l{l}_dtlut nonzero", 0.0 if nz else 1.0, 0.5, nz))
 
     # 6) shifts.json — everything the sequencer needs beyond the .mem images
     shifts = {

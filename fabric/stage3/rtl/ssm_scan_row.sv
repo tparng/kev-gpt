@@ -18,10 +18,13 @@
 `default_nettype none
 
 module ssm_scan_row #(
-    parameter int P  = 64,
+    parameter int P  = 64,               // rows per CALL (one head-slice)
     parameter int N  = 64,
-    parameter int QA = 16
+    parameter int QA = 16,
+    parameter int CTX = 1                // state contexts (layers*heads)
 ) (
+    // which context this call updates: state rows [pbase*P .. +P)
+    input  wire [$clog2(CTX)-1:0]  pbase,
     input  wire                 clk,
     input  wire                 rst,
     output reg                  ready,
@@ -46,14 +49,16 @@ module ssm_scan_row #(
     output wire signed [15:0]   rd_y_data
 );
     localparam int PW = $clog2(P);
+    localparam int AW = (CTX > 1) ? $clog2(CTX*P) : PW;
 
-    // state: one wide word per channel (lane n in bits [n*16 +: 16])
-    (* ram_style = "block" *)
-    reg [N*16-1:0] h [0:P-1];
-    reg [PW-1:0]   raddr;
+    // state: one wide word per channel (lane n in bits [n*16 +: 16]);
+    // CTX contexts stacked (URAM when CTX*P*N*16 is large)
+    (* ram_style = "ultra" *)
+    reg [N*16-1:0] h [0:CTX*P-1];
+    reg [AW-1:0]   raddr;
     reg [N*16-1:0] hq;
     reg            we;
-    reg [PW-1:0]   waddr;
+    reg [AW-1:0]   waddr;
     reg [N*16-1:0] wdata;
 
     always @(posedge clk) begin
@@ -76,7 +81,9 @@ module ssm_scan_row #(
     // ---- control ----
     localparam [1:0] CLEARING = 2'd0, IDLE = 2'd1, RUN = 2'd2, DRAIN = 2'd3;
     reg [1:0]    st;
-    reg [PW-1:0] pi, clr_addr;
+    reg [PW-1:0] pi;
+    reg [AW-1:0] clr_addr;
+    wire [AW-1:0] ctx_off = pbase * P;
     wire issue = (st == RUN);
 
     // ---- pipeline (one op per stage; II=1, write lags read by 4) ----
@@ -138,12 +145,12 @@ module ssm_scan_row #(
             case (st)
               CLEARING: begin
                 we <= 1'b1; waddr <= clr_addr; wdata <= '0;
-                if (clr_addr == {PW{1'b1}}) begin st <= IDLE; ready <= 1'b1; end
+                if (clr_addr == {AW{1'b1}}) begin st <= IDLE; ready <= 1'b1; end
                 clr_addr <= clr_addr + 1'b1;
               end
-              IDLE: if (start) begin st <= RUN; pi <= '0; raddr <= '0; end
+              IDLE: if (start) begin st <= RUN; pi <= '0; raddr <= ctx_off; end
               RUN: begin
-                raddr <= pi + 1'b1;
+                raddr <= ctx_off + pi + 1'b1;
                 if (pi == P-1) st <= DRAIN; else pi <= pi + 1'b1;
               end
               DRAIN: if (!v1 && !v2 && !v3 && !v4 && !v5 && !v6 && !v7
@@ -173,7 +180,7 @@ module ssm_scan_row #(
             v4 <= v3; p4 <= p3;
             for (k = 0; k < N; k = k + 1)
                 hnl[k] <= hnew_w[k*16 +: 16];
-            if (v3) begin we <= 1'b1; waddr <= p3; wdata <= hnew_w; end
+            if (v3) begin we <= 1'b1; waddr <= ctx_off + p3; wdata <= hnew_w; end
             // S4 -> S5: y products
             v5 <= v4; p5 <= p4;
             for (k = 0; k < N; k = k + 1)
