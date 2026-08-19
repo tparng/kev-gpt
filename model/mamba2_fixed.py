@@ -234,11 +234,20 @@ class FixedMamba2:
                 C8 = quant_act(Cv, 2.0 ** -bC)
                 y = np.zeros(d_in)
                 for hh in range(H):
+                    # fabric dt path: dt through a Q1.14 LUT (dt_q), eh from
+                    # dt_q's magnitude (leading zeros), dtx from the integer
+                    # product — all reproducible in RTL from the dtlut export
                     dtv = float(dt[hh])
                     a_q = int(a_from_dtA(dtv * float(lay["negA"][hh])))
+                    dt_q = min(int(round(dtv * 16384)), 32767)   # Q1.14, clamp
+                    if dt_q == 0:
+                        dt_q = 1
+                    eh = int(np.clip(21 - dt_q.bit_length(), 0, 20))
                     x8h = x8[hh * self.P:(hh + 1) * self.P]
-                    eh = int(np.clip(7 - np.ceil(np.log2(max(dtv, 1e-9) * 127)), 0, 20))
-                    dtx_q = quant(dtv * x8h * 2.0 ** eh, 0)
+                    # dtx = dt*x*2^eh: (dt_q * x8) has frac 14; >> (14-eh) rnd
+                    prod = dt_q * x8h
+                    sh = 14 - eh
+                    dtx_q = rsh(prod, sh) if sh > 0 else (prod << -sh)
                     if rng_ is not None:
                         lay.setdefault("maxH", np.zeros(H))
                         # track real h range via the float shadow update
