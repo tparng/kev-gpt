@@ -36,7 +36,7 @@ module mamba_seq #(
     // table writes: sel picks the target memory
     input  wire        wr_en,
     input  wire [3:0]  wr_sel,
-    input  wire [17:0] wr_addr,
+    input  wire [18:0] wr_addr,
     input  wire [31:0] wr_data,
 
     // debug reads (combinational): sel picks the buffer
@@ -110,10 +110,10 @@ module mamba_seq #(
     // ---------------------------------------------------------- sub-cores ---
     // gemv
     reg         g_start;  wire g_done;
-    reg  [17:0] g_base;   reg [10:0] g_rows;  reg [6:0] g_wpr;
+    reg  [18:0] g_base;   reg [10:0] g_rows;  reg [6:0] g_wpr;
     reg         g_wrx;    reg [8:0] g_wrx_a;  reg signed [7:0] g_wrx_d;
     reg  [10:0] g_rda;    wire signed [31:0] g_acc;
-    gemv_i4i8 #(.ROWS(INROWS), .D_IN(DIN), .WMEM(262144)) u_gemv (
+    gemv_i4i8 #(.ROWS(INROWS), .D_IN(DIN), .WMEM(524288)) u_gemv (
         .clk(clk), .rst(rst), .start(g_start), .done(g_done),
         .base(g_base), .rows(g_rows), .wpr(g_wpr),
         .wr_w(wr_en && wr_sel == WSEL_GW), .wr_w_addr(wr_addr), .wr_w_data(wr_data),
@@ -274,7 +274,7 @@ module mamba_seq #(
                 2: begin
                      // x = nib * fp16 -> Q3.12: shift = 13 - exp (see notes)
                      xbuf[i[7:0]] <= sat16f(rshr(mul_m11(acc_t, fp_t),
-                                    $signed({3'b0, fp_t[14:10]}) - 8'sd2));
+                                    8'sd13 - $signed({3'b0, fp_t[14:10]})));
                      sub <= 0;
                      if (i == D-1) begin i <= 0; st <= S_NIN_LD; end
                      else i <= i + 1;
@@ -337,7 +337,7 @@ module mamba_seq #(
                 end
                 2: begin  // stage 1: acc * row-scale mantissa, shift by exp
                      t1 <= rshr(mul_m11(acc_t, fp_t),
-                                8'sd25 - $signed({3'b0, fp_t[14:10]}) + 8'sd15);
+                                8'sd10 - $signed({3'b0, fp_t[14:10]}));
                      sub <= 3;
                 end
                 3: begin  // stage 2: * act scale (m,e) -> Q3.12
@@ -521,7 +521,7 @@ module mamba_seq #(
               g_wrx <= 1; g_wrx_a <= i[8:0]; g_wrx_d <= q8buf[i[8:0]];
               if (i == DIN-1) begin
                   i <= 0; st <= S_GOUT;
-                  g_base <= 18'd101500 + li * (D * (DIN/8));
+                  g_base <= consts[120][18:0] + li * (D * (DIN/8));
                   g_rows <= D; g_wpr <= DIN/8;
                   g_start <= 1;
               end else i <= i + 1;
@@ -533,7 +533,7 @@ module mamba_seq #(
                 1: begin fp_t <= rsout[li*D + i[7:0]]; acc_t <= g_acc; sub <= 2; end
                 2: begin
                      t1 <= rshr(mul_m11(acc_t, fp_t),
-                                8'sd25 - $signed({3'b0, fp_t[14:10]}) + 8'sd15);
+                                8'sd10 - $signed({3'b0, fp_t[14:10]}));
                      sub <= 3;
                 end
                 3: begin
@@ -590,7 +590,7 @@ module mamba_seq #(
               g_wrx <= 1; g_wrx_a <= i[8:0]; g_wrx_d <= q8buf[i[8:0]];
               if (i == DIN-1) begin
                   i <= 0; st <= S_GHD;
-                  g_base <= 18'd216060;         // head image base
+                  g_base <= consts[121][18:0];  // head image base
                   g_rows <= V; g_wpr <= D/8;
                   g_start <= 1;
               end else i <= i + 1;
@@ -603,7 +603,7 @@ module mamba_seq #(
                 1: begin fp_t <= rshd[i[9:0]]; acc_t <= g_acc; sub <= 2; end
                 2: begin
                      t1 <= rshr(mul_m11(acc_t, fp_t),
-                                8'sd25 - $signed({3'b0, fp_t[14:10]}) + 8'sd15);
+                                8'sd10 - $signed({3'b0, fp_t[14:10]}));
                      sub <= 3;
                 end
                 3: begin
