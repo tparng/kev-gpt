@@ -15,7 +15,9 @@ module tb_rmsnorm_gated;
     reg signed [15:0] wr_y_data, wr_z_data, wr_g_data, wr_lut_data;
     wire signed [15:0] rd_o_data;
 
+    wire short_len = 1'b0;
     rmsnorm_gated #(.D(D)) dut (
+        .short_len(short_len),
         .clk(clk), .rst(rst), .start(start), .gated(gated), .done(done),
         .wr_y(wr_y), .wr_y_addr(wr_y_addr), .wr_y_data(wr_y_data),
         .wr_z(wr_z), .wr_z_addr(wr_z_addr), .wr_z_data(wr_z_data),

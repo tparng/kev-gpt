@@ -32,6 +32,9 @@ module rmsnorm_gated #(
     input  wire                    rst,
     input  wire                    start,      // pulse; y/z/gamma/lut written
     input  wire                    gated,      // 1: g=y*silu(z)  0: g=y
+    input  wire                    short_len,  // 1: operate on D/2 elements
+                                               // (the engine's pre/final norms
+                                               // are 256-wide; gated norm 512)
     output reg                     done,
 
     // per-token inputs, written before start
@@ -167,13 +170,14 @@ module rmsnorm_gated #(
                     state <= S_GATE;
                 end
                 S_GATE: begin
-                    if (ci == D-1) state <= S_GDRAIN;
+                    if (ci == (short_len ? D/2-1 : D-1)) state <= S_GDRAIN;
                     ci <= ci + 1'b1;
                 end
                 S_GDRAIN: if (!v1 && !v2) state <= S_A;
                 // ---- A = mean(g^2) + eps  (Q.26): the LN core minus mean --
                 S_A: begin
-                    A <= ($signed(sumsq) >>> A_SH) + $signed(EPS_A);
+                    A <= ($signed(sumsq) >>> (short_len ? A_SH-1 : A_SH))
+                         + $signed(EPS_A);
                     state <= S_MSB;
                 end
                 S_MSB: begin
@@ -220,7 +224,7 @@ module rmsnorm_gated #(
                 end
                 S_OUT: begin
                     // o-stage 0: fetch g / gamma
-                    if (oi < D) begin
+                    if (oi < (short_len ? D/2 : D)) begin
                         go1 <= gbuf[oi[LOG2D-1:0]];
                         gm1 <= grom[oi[LOG2D-1:0]];
                         oc1 <= oi[LOG2D-1:0];

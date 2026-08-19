@@ -155,7 +155,7 @@ module mamba_seq #(
 
     // gated rmsnorm
     reg         n_start;  wire n_done;
-    reg         n_gated;
+    reg         n_gated, n_short;
     reg         n_wry, n_wrz, n_wrg, n_wrl;
     reg  [8:0]  n_wry_a, n_wrz_a, n_wrg_a, n_rda;
     reg  [7:0]  n_wrl_a;
@@ -163,6 +163,7 @@ module mamba_seq #(
     wire signed [15:0] n_out;
     rmsnorm_gated #(.D(DIN)) u_norm (
         .clk(clk), .rst(rst), .start(n_start), .done(n_done), .gated(n_gated),
+        .short_len(n_short),
         .wr_y(n_wry), .wr_y_addr(n_wry_a), .wr_y_data(n_wrd),
         .wr_z(n_wrz), .wr_z_addr(n_wrz_a), .wr_z_data(n_wrd),
         .wr_g(n_wrg), .wr_g_addr(n_wrg_a), .wr_g_data(n_wrd),
@@ -238,6 +239,9 @@ module mamba_seq #(
     endfunction
 
     // temp regs used across cycles inside states
+    reg [31:0] word_t;      // plain-reg staging (variable part-selects on
+                            // unpacked-array ELEMENTS read X in iverilog —
+                            // the documented repo gotcha; stage via this reg)
     reg signed [31:0] acc_t;
     reg signed [47:0] t1;
     reg [15:0] fp_t;
@@ -263,12 +267,14 @@ module mamba_seq #(
               case (sub)
                 0: begin acc_t <= 32'sd0; sub <= 1;
                      fp_t <= esc[tok_in];
+                     word_t <= emb[tok_in*(D/8) + i[11:3]];  // stage the word
                      t1 <= 0;
                 end
                 1: begin
-                     // read word, extract nibble i%8, sign-extend
-                     acc_t <= $signed({{28{emb[tok_in*(D/8) + i[11:3]][(i[2:0])*4+3]}},
-                               emb[tok_in*(D/8) + i[11:3]][(i[2:0])*4 +: 4]});
+                     // nibble i%8 from the STAGED word (plain reg: variable
+                     // part-select is safe here)
+                     acc_t <= $signed({{28{word_t[(i[2:0])*4+3]}},
+                               word_t[(i[2:0])*4 +: 4]});
                      sub <= 2;
                 end
                 2: begin
@@ -289,7 +295,7 @@ module mamba_seq #(
 
           // ---- pre-norm: stream x + ln gamma into norm core (ungated) ------
           S_NIN_LD: begin
-              n_gated <= 0;
+              n_gated <= 0; n_short <= 1;      // pre-norm is 256-wide
               case (sub)
                 0: begin n_wry <= 1; n_wry_a <= i[9:0]; n_wrd <= xbuf[i[7:0]];
                      sub <= 1; end
@@ -507,7 +513,7 @@ module mamba_seq #(
 
           // ---- gated norm ----------------------------------------------------
           S_NG_LD: begin
-              n_gated <= 1;
+              n_gated <= 1; n_short <= 0;      // gated norm is 512-wide
               case (sub)
                 0: begin n_wry <= 1; n_wry_a <= i[9:0]; n_wrd <= ybuf[i[8:0]];
                      sub <= 1; end
@@ -579,7 +585,7 @@ module mamba_seq #(
           //      exporting gamma pre-scaled; norm core treats gamma Q1.14, so
           //      nfg values are stored HALVED by the exporter contract) ------
           S_NF_LD: begin
-              n_gated <= 0;
+              n_gated <= 0; n_short <= 1;      // final norm is 256-wide
               case (sub)
                 0: begin n_wry <= 1; n_wry_a <= i[9:0]; n_wrd <= xbuf[i[7:0]];
                      sub <= 1; end
