@@ -57,6 +57,29 @@ def quant_act(x: np.ndarray, s: float):
     return np.clip(np.round(x / s), -128, 127).astype(np.int64)
 
 
+def scale_me(s: float):
+    """Split a positive float scale into (m, e): s = m * 2^-e, m UINT16 Q0.15
+    in [16384, 32767] — the fabric's dequant multiplier format."""
+    e = 0
+    while s < 0.5:
+        s *= 2.0; e += 1
+    while s >= 1.0:
+        s /= 2.0; e -= 1
+    return int(round(s * 32768)), e + 15
+
+
+def dequant_fx(acc: np.ndarray, m: int, e: int, out_frac: int = 12):
+    """Fabric dequant: INT32 acc * (m*2^-e), emitted at Q?.out_frac, sat16.
+    acc*m is INT48; shift = e - out_frac with round-to-nearest."""
+    prod = acc.astype(np.int64) * m
+    sh = e - out_frac
+    if sh > 0:
+        prod = (prod + (1 << (sh - 1))) >> sh
+    elif sh < 0:
+        prod = prod << -sh
+    return np.clip(prod, -32768, 32767)
+
+
 # ------------------------------------------------------------- non-linears ---
 
 _SILU_LUT = None

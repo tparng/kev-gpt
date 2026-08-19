@@ -12,17 +12,24 @@
 `default_nettype none
 
 module gemv_i4i8 #(
-    parameter int ROWS  = 1160,
-    parameter int D_IN  = 256,
-    parameter int WPR   = D_IN / 8          // words per row
+    parameter int ROWS  = 1160,             // MAX geometry (buffer sizing)
+    parameter int D_IN  = 512,
+    parameter int WPR   = D_IN / 8,
+    parameter int WMEM  = 262144            // weight words (URAM budget)
 ) (
     input  wire                     clk,
     input  wire                     rst,
     input  wire                     start,
     output reg                      done,
 
+    // runtime geometry: this call reads `rows` rows of `wpr` words starting
+    // at weight word `base` (one banked image serves every projection)
+    input  wire [$clog2(WMEM)-1:0]  base,
+    input  wire [$clog2(ROWS+1)-1:0] rows,
+    input  wire [$clog2(WPR+1)-1:0]  wpr,
+
     input  wire                     wr_w,
-    input  wire [$clog2(ROWS*WPR)-1:0] wr_w_addr,
+    input  wire [$clog2(WMEM)-1:0]  wr_w_addr,
     input  wire [31:0]              wr_w_data,
 
     input  wire                     wr_x,
@@ -35,8 +42,9 @@ module gemv_i4i8 #(
     localparam int RW = $clog2(ROWS);
     localparam int WW = $clog2(WPR);
 
-    (* ram_style = "block" *)
-    reg [31:0] wrom [0:ROWS*WPR-1];
+    (* ram_style = "ultra" *)
+    reg [31:0] wrom [0:WMEM-1];
+    reg [$clog2(WMEM)-1:0] wptr;            // running word pointer
     reg [63:0] xin  [0:WPR-1];              // x packed 8 lanes/word (INT8)
     reg signed [31:0] accs [0:ROWS-1];
 
@@ -81,19 +89,22 @@ module gemv_i4i8 #(
             st <= IDLE; v1 <= 0; v2 <= 0;
         end else begin
             case (st)
-              IDLE: if (start) begin st <= RUN; ri <= '0; wi <= '0; end
+              IDLE: if (start) begin
+                st <= RUN; ri <= '0; wi <= '0; wptr <= base;
+              end
               RUN: begin
-                if (wi == WPR-1) begin
+                wptr <= wptr + 1'b1;
+                if (wi == wpr-1) begin
                     wi <= '0;
-                    if (ri == ROWS-1) st <= DRAIN; else ri <= ri + 1'b1;
+                    if (ri == rows-1) st <= DRAIN; else ri <= ri + 1'b1;
                 end else wi <= wi + 1'b1;
               end
               DRAIN: if (!v1 && !v2) begin st <= IDLE; done <= 1'b1; end
             endcase
 
             // S0 -> S1
-            v1 <= issue; r1 <= ri; last1 <= (wi == WPR-1);
-            w1 <= wrom[ri*WPR + wi];
+            v1 <= issue; r1 <= ri; last1 <= (wi == wpr-1);
+            w1 <= wrom[wptr];
             x1 <= xin[wi];
 
             // S1 -> S2: 8 nibble products

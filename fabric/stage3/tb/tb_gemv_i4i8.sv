@@ -14,8 +14,19 @@ module tb_gemv_i4i8;
     reg signed [7:0] wr_x_data;
     reg [$clog2(ROWS)-1:0] rd_acc_addr;
     wire signed [31:0] rd_acc_data;
+    localparam int WMEM = 262144;
+    reg [$clog2(WMEM)-1:0] base = 0;
+    reg [$clog2(ROWS+1)-1:0] rows = ROWS;
+    reg [$clog2(WPR+1)-1:0] wpr = WPR;
 
-    gemv_i4i8 #(.ROWS(ROWS), .D_IN(D_IN)) dut (.*);
+    gemv_i4i8 #(.ROWS(ROWS), .D_IN(D_IN*2), .WMEM(WMEM)) dut (
+        .clk(clk), .rst(rst), .start(start), .done(done),
+        .base(base), .rows(rows), .wpr(wpr),
+        .wr_w(wr_w), .wr_w_addr(wr_w_addr2), .wr_w_data(wr_w_data),
+        .wr_x(wr_x), .wr_x_addr(wr_x_addr2), .wr_x_data(wr_x_data),
+        .rd_acc_addr(rd_acc_addr), .rd_acc_data(rd_acc_data));
+    wire [$clog2(WMEM)-1:0] wr_w_addr2 = wr_w_addr;
+    wire [$clog2(D_IN*2)-1:0] wr_x_addr2 = wr_x_addr;
     always #2 clk = ~clk;
 
     reg [31:0] wmem [0:ROWS*WPR-1];
