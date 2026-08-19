@@ -1,0 +1,142 @@
+// conv_silu.sv — Mamba-2 depthwise conv1d (k taps) + SiLU LUT (doc 9 §4).
+//
+// Per channel c: y[c] = silu( sum_{j<k} shift[c][j]*w[c][j] + bias[c] )
+// where shift[c] is the (k-1)-deep history + the incoming sample (decode
+// mode: one new sample per channel per token).
+//
+// Formats (contract = mamba2_fixed at LUT resolution):
+//   x in       : INT16 Q3.12 (the dequantized in_proj output slice)
+//   w, bias    : INT16 Q1.14 (conv weights are small; exported per channel)
+//   MAC        : INT32, product Q4.26 -> rnd >> 14 -> Q3.12
+//   SiLU       : 256-entry LUT over [-4,4) Q3.12 input (top 8 bits + sat),
+//                INT16 Q3.12 out; |x|>=4 tails: y=x (pos) / 0 (neg)
+//
+// Sequential: one channel per cycle (CONV_DIM cycles/token) — conv is ~2% of
+// the token budget; wide comes later if ever needed.
+
+`default_nettype none
+
+module conv_silu #(
+    parameter int CH = 640,          // d_inner + 2*d_state
+    parameter int K  = 4,
+    parameter int QF = 12            // Q3.12 activations
+) (
+    input  wire                  clk,
+    input  wire                  rst,       // clears the shift history
+    input  wire                  start,
+    output reg                   done,
+
+    // weight/bias load (once): addr = c*K+j for weights, c for bias
+    input  wire                  wr_w,
+    input  wire [$clog2(CH*K)-1:0] wr_w_addr,
+    input  wire signed [15:0]    wr_w_data,
+    input  wire                  wr_b,
+    input  wire [$clog2(CH)-1:0] wr_b_addr,
+    input  wire signed [15:0]    wr_b_data,
+
+    // per-token input samples, written before start
+    input  wire                  wr_x,
+    input  wire [$clog2(CH)-1:0] wr_x_addr,
+    input  wire signed [15:0]    wr_x_data,
+
+    // silu LUT init
+    input  wire                  wr_lut,
+    input  wire [7:0]            wr_lut_addr,
+    input  wire signed [15:0]    wr_lut_data,
+
+    input  wire [$clog2(CH)-1:0] rd_y_addr,
+    output wire signed [15:0]    rd_y_data
+);
+    localparam int CW = $clog2(CH);
+
+    // history: one wide word per channel (K-1 samples of 16b), doc-6 layout
+    reg [(K-1)*16-1:0] hist [0:CH-1];
+    reg signed [15:0]  xin  [0:CH-1];
+    reg signed [15:0]  wrom [0:CH*K-1];
+    reg signed [15:0]  brom [0:CH-1];
+    reg signed [15:0]  lut  [0:255];
+    reg signed [15:0]  yout [0:CH-1];
+
+    assign rd_y_data = yout[rd_y_addr];
+
+    always @(posedge clk) begin
+        if (wr_w)   wrom[wr_w_addr] <= wr_w_data;
+        if (wr_b)   brom[wr_b_addr] <= wr_b_data;
+        if (wr_x)   xin [wr_x_addr] <= wr_x_data;
+        if (wr_lut) lut [wr_lut_addr] <= wr_lut_data;
+    end
+
+    localparam [1:0] IDLE = 2'd0, RUN = 2'd1, DRAIN = 2'd2;
+    reg [1:0]  st;
+    reg [CW-1:0] ci, clr;
+    reg        clearing;
+    wire issue = (st == RUN);
+
+    // S0: read channel operands -> regs
+    reg               v1;
+    reg [CW-1:0]      c1;
+    reg [(K-1)*16-1:0] h1;
+    reg signed [15:0] x1, b1;
+    reg signed [15:0] w1 [0:K-1];
+
+    // S1: MAC across K taps (K small: one adder tree level)
+    reg               v2;
+    reg [CW-1:0]      c2;
+    reg signed [35:0] acc2;
+
+    integer j;
+    // S2 comb: round >> (14) to Q3.12, sat, LUT index
+    wire signed [21:0] pre  = (acc2 + $signed(36'sd1 <<< 13)) >>> 14;
+    wire signed [15:0] prs  = (pre > $signed(22'sd32767))  ? 16'sd32767 :
+                              (pre < -$signed(22'sd32768)) ? -16'sd32768 :
+                              pre[15:0];
+    // LUT domain [-4,4) in Q3.12: index = top 8 bits of prs+16384 clamped
+    wire signed [16:0] biased = prs + $signed(17'sd16384);
+    wire [7:0] idx = (biased < 0) ? 8'd0 :
+                     (biased > $signed(17'sd32767)) ? 8'd255 : biased[14:7];
+    wire signed [15:0] ylut = (prs >= $signed(16'sd16384)) ? prs :
+                              (prs < -$signed(16'sd16384)) ? 16'sd0 :
+                              lut[idx];
+
+    always @(posedge clk) begin
+        done <= 1'b0;
+        if (rst) begin
+            st <= IDLE; v1 <= 0; v2 <= 0; clearing <= 1'b1; clr <= '0;
+        end else begin
+            if (clearing) begin
+                hist[clr] <= '0;
+                if (clr == CH-1) clearing <= 1'b0;
+                clr <= clr + 1'b1;
+            end
+            case (st)
+              IDLE: if (start && !clearing) begin st <= RUN; ci <= '0; end
+              RUN:  begin
+                if (ci == CH-1) st <= DRAIN;
+                ci <= ci + 1'b1;
+              end
+              DRAIN: if (!v1 && !v2) begin st <= IDLE; done <= 1'b1; end
+            endcase
+
+            // S0 -> S1
+            v1 <= issue; c1 <= ci;
+            h1 <= hist[ci]; x1 <= xin[ci]; b1 <= brom[ci];
+            for (j = 0; j < K; j = j + 1) w1[j] <= wrom[ci*K + j];
+            if (issue)   // shift history: drop oldest, append current sample
+                hist[ci] <= {xin[ci], hist[ci][(K-1)*16-1:16]};
+
+            // S1 -> S2: K-tap MAC (K=4: 3 taps from history + current)
+            v2 <= v1; c2 <= c1;
+            acc2 <= $signed(h1[15:0])  * w1[0]
+                  + $signed(h1[31:16]) * w1[1]
+                  + $signed(h1[47:32]) * w1[2]
+                  + x1 * w1[3]
+                  + (b1 <<< 12);       // bias Q1.14 -> frac 26 (products Q3.12 x Q1.14)
+
+            // S2: LUT + write
+            if (v2) yout[c2] <= ylut;
+        end
+    end
+
+endmodule
+
+`default_nettype wire
