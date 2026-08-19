@@ -240,7 +240,7 @@ module rmsnorm_gated #(
                     // o-stage 3: round >>> 40, sat, write
                     if (ov3) begin
                         obuf[oc3] <= osat;
-                        if (oc3 == D-1) state <= S_DONE;
+                        if (oc3 == (short_len ? D/2-1 : D-1)) state <= S_DONE;
                     end
                 end
                 S_DONE: begin done <= 1'b1; state <= S_IDLE; end
