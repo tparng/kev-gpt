@@ -452,8 +452,11 @@ module mamba_seq #(
           // ---- per-head: dt/a lookup, dtx write, scan run --------------------
           S_SCAN_H: begin
               case (sub)
-                0: begin  // LUT index from dtraw (Q3.12): (v+32768)>>8
-                     fp_t <= zxbuf[2*DIN + 2*NST + hi[2:0]] + 16'sd32768 >> 8;
+                0: begin  // LUT index from dtraw (Q3.12): offset-binary top 8
+                     // bits ({~sign, v[14:8]}). (The first draft wrote
+                     // +16'sd32768 which overflows 16-bit signed to -32768.)
+                     fp_t <= {8'b0, ~zxbuf[2*DIN + 2*NST + hi[2:0]][15],
+                              zxbuf[2*DIN + 2*NST + hi[2:0]][14:8]};
                      sub <= 1;
                 end
                 1: begin
@@ -487,13 +490,22 @@ module mamba_seq #(
                      end else begin i <= i + 1; sub <= 3; end
                 end
                 6: begin
+`ifdef MSEQ_TRACE
+                     $display("TR DTX l=%0d h=%0d dtq=%0d eh=%0d dtx0=%0d dtx63=%0d bC=%0d",
+                              li, hi, dtq_h, eh_h, $signed(s_dtx_d), 0, bC);
+`endif
                      s_pbase <= li*H + hi[2:0];
                      s_shi <= 6'sd16 + 6'sd13 - $signed({2'b0, bX})
                               - $signed({1'b0, eh_h}) - $signed({2'b0, bB});
                      s_shy <= $signed({2'b0, bC}) + 6'sd13 - 6'sd13;
                      s_start <= 1; sub <= 7;
                 end
-                7: if (s_done) begin st <= S_SCAN_RD; i <= 0; sub <= 0; end
+                7: if (s_done) begin st <= S_SCAN_RD; i <= 0; sub <= 0;
+`ifdef MSEQ_TRACE
+                    $display("TR SCANCALL l=%0d h=%0d pbase=%0d shy=%0d yraw0=%0d",
+                             li, hi, s_pbase, s_shy, $signed(u_scan.yout[0]));
+`endif
+                end
               endcase
           end
           S_SCAN_RD: begin  // y = rnd(yq>>1) + rnd(D_q*xv>>13), Q3.12

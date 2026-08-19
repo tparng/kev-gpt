@@ -185,6 +185,12 @@ module ssm_scan_row #(
             v5 <= v4; p5 <= p4;
             for (k = 0; k < N; k = k + 1)
                 yprodl[k] <= hnl[k] * cvec[k];
+`ifdef ROW_TRACE
+            if (v4 && p4 == 0)
+                $display("RT p0: hq0=%0d mull0=%0d injs0=%0d hnl0=%0d cvec0=%0d yprod0=%0d",
+                         $signed(hq[15:0]), mull[0], injs[0],
+                         hnl[0], cvec[0], yprodl[0]);
+`endif
             // S5: tree 64 -> 16
             v6 <= v5; p6 <= p5;
             if (v5)
