@@ -76,6 +76,10 @@ module ssm_scan_row #(
         if (wr_dtx) dtx [wr_dtx_addr] <= wr_dtx_data;
         if (wr_b)   bvec[wr_b_addr]   <= wr_b_data;
         if (wr_c)   cvec[wr_c_addr]   <= wr_c_data;
+`ifdef ROW_TRACE
+        if (wr_b && wr_b_addr < 2) $display("RTW B[%0d]=%0d", wr_b_addr, wr_b_data);
+        if (wr_c && wr_c_addr < 2) $display("RTW C[%0d]=%0d", wr_c_addr, wr_c_data);
+`endif
     end
 
     // ---- control ----

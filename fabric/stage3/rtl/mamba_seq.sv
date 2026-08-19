@@ -101,7 +101,7 @@ module mamba_seq #(
 
     // ------------------------------------------------------------ buffers ---
     reg signed [15:0] xbuf  [0:D-1];          // residual, Q3.12
-    reg signed [15:0] xnbuf [0:DIN-1];        // normed (D used) / yn (DIN)
+    reg signed [15:0] xnbuf [0:CONVD-1];      // conv output (640 ch: x|B|C)
     reg signed [15:0] zxbuf [0:INROWS-1];     // dequantized in_proj out Q3.12
     reg signed [15:0] ybuf  [0:DIN-1];        // scan out + D-skip, Q3.12
     reg signed [7:0]  q8buf [0:DIN-1];        // quantized activations
@@ -428,6 +428,10 @@ module mamba_seq #(
                      sub <= 1;
                 end
                 1: begin
+`ifdef MSEQ_TRACE
+                     if (i < 2) $display("TR PREP i=%0d xn=%0d bB=%0d t1=%0d",
+                              i, $signed(xnbuf[DIN + i[6:0]]), bB, t1);
+`endif
                      s_wrb <= 1; s_wrb_a <= i[5:0];
                      s_bc_d <= (t1 > 48'sd127) ? 8'sd127 :
                                (t1 < -48'sd128) ? -8'sd128 : t1[7:0];
