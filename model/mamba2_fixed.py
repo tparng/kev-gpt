@@ -95,7 +95,9 @@ def silu_lut(x: np.ndarray):
     x = np.asarray(x, dtype=np.float64)
     out = np.where(x >= 4.0, x, 0.0)                           # asymptotic tails:
     inside = np.abs(x) < 4.0                                   # silu(x)~x / ~0
-    idx = np.clip(np.round(x[inside] * 32.0) + 128, 0, 255).astype(np.int64)
+    # FLOOR to the grid (the RTL indexes with a shift, which floors) — the
+    # rmsnorm agent measured the round-vs-floor half-bin mismatch at ~1e-4
+    idx = np.clip(np.floor(x[inside] * 32.0) + 128, 0, 255).astype(np.int64)
     out[inside] = _SILU_LUT[idx]
     return out
 

@@ -1,0 +1,164 @@
+"""Gate harness for rmsnorm_gated (Mamba-2 gated RMSNorm, cosine gate).
+
+Reference = model.mamba2_fixed.rmsnorm_fixed at fabric resolution: the float
+path g = y * silu_lut(z), rms = 1/sqrt(mean(g^2)+1e-5), out = g * rms * gamma,
+per-token cosine > 0.9999 (house rule for LUT/transcendental phases). The RTL
+is ALSO checked bit-exact against an integer replica of its own datapath (the
+conv_silu-style floor-indexed SiLU + the layernorm.sv rsqrt minus the mean).
+
+Two contract adaptations to the float reference (documented, both are the
+fixed-point contract, not RTL slack):
+  * silu_lut is evaluated at the floor-quantized LUT grid point the RTL
+    actually indexes ((z+16384)>>7, the pinned conv_silu contract) —
+    silu_lut itself rounds to the grid, a half-bin contract mismatch that
+    otherwise caps per-token cosine at ~0.9998 for off-grid z.
+  * the gated product and the output are clipped to the INT16 Q3.12
+    saturating range (+-8), which the RTL contract pins.
+
+Both modes are gated: gated=1 (g = y*silu(z)) and gated=0 (g = y; the
+engine's pre-norm / final norm have no z-gate).
+
+    python -m fabric.stage3.run_rmsnorm_gated --tokens-per-mode 8
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+import numpy as np
+
+from fabric.stage3._simdir import kevbuild
+from fabric.stage3.run_layernorm import rsqrt_int, seed_table
+from model.mamba2_fixed import silu_lut
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+D = 512
+LOG2D = 9
+QF = 12
+EPS_A = 671                      # round(1e-5 * 2^26)
+OUT_SH = 26 + 14                 # Yr Q.26 * gamma Q1.14 back to Q3.12
+SAT_HI = 32767 / 4096.0
+SAT_LO = -8.0
+
+
+def tool(name):
+    t = shutil.which(name) or os.path.expanduser(f"~/.local/bin/{name}")
+    if not os.path.exists(t):
+        sys.exit(f"missing tool: {name}")
+    return t
+
+
+def silu_table():
+    grid = (np.arange(256) - 128) / 32.0
+    return np.round(grid / (1.0 + np.exp(-grid)) * 4096).astype(np.int64)
+
+
+def ref_int(yq, zq, gq, lut, mode):
+    """Bit-true integer replica of the RTL datapath (one token)."""
+    if mode:
+        idx = np.clip((zq + 16384) >> 7, 0, 255)
+        sil = np.where(zq >= 16384, zq, np.where(zq < -16384, 0, lut[idx]))
+    else:
+        sil = np.full(D, 4096, dtype=np.int64)         # 1.0 Q3.12 -> g = y exact
+    g = np.clip((yq * sil + (1 << (QF - 1))) >> QF, -32768, 32767)
+    A = (int((g * g).sum()) >> (LOG2D + 2 * QF - 26)) + EPS_A
+    Yr = rsqrt_int(A)                                   # layernorm.sv rsqrt, Q.26
+    out = np.empty(D, dtype=np.int64)
+    rnd = 1 << (OUT_SH - 1)
+    for i in range(D):                                  # >int64: python ints
+        t = int(g[i]) * Yr * int(gq[i])
+        out[i] = min(32767, max(-32768, (t + rnd) >> OUT_SH))
+    return out
+
+
+def ref_float(yq, zq, gq, mode):
+    """Float-path reference (rmsnorm_fixed recipe at contract resolution)."""
+    yf, gf = yq / 4096.0, gq / 16384.0
+    if mode:
+        z_grid = np.floor(zq / 128.0) / 32.0            # the indexed LUT grid point
+        g = yf * silu_lut(z_grid)
+    else:
+        g = yf.copy()
+    g = np.clip(g, SAT_LO, SAT_HI)                      # Q3.12 sat contract
+    rms = 1.0 / np.sqrt((g * g).mean() + 1e-5)
+    return np.clip(g * rms * gf, SAT_LO, SAT_HI)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fabric.stage3.run_rmsnorm_gated")
+    ap.add_argument("--tokens-per-mode", type=int, default=8)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dir", default=None)
+    args = ap.parse_args(argv)
+
+    sim = args.dir or kevbuild("stage3_rmsn")
+    os.makedirs(sim, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
+    TPM = args.tokens_per_mode
+    T = 2 * TPM
+    modes = np.array([1] * TPM + [0] * TPM)
+
+    ys = np.clip(np.round(rng.normal(0, 1.2, (T, D)) * 4096), -32768, 32767).astype(np.int64)
+    zs = np.clip(np.round(rng.normal(0, 1.2, (T, D)) * 4096), -32768, 32767).astype(np.int64)
+    gq = np.clip(np.round(rng.normal(1, 0.2, D) * 16384), -32768, 32767).astype(np.int64)
+    lut = silu_table()
+
+    def hexdump(path, vals, nib=4):
+        mask = (1 << (4 * nib)) - 1
+        with open(path, "w") as f:
+            for v in np.asarray(vals).ravel():
+                f.write(f"{int(v) & mask:0{nib}x}\n")
+
+    hexdump(f"{sim}/rg_lut.mem", lut)
+    hexdump(f"{sim}/rg_gamma.mem", gq)
+    hexdump(f"{sim}/rg_y.mem", ys)
+    hexdump(f"{sim}/rg_z.mem", zs)
+    hexdump(f"{sim}/rg_mode.mem", modes, nib=1)
+    hexdump(f"{sim}/rg_cfg.mem", [T], nib=8)
+    hexdump(f"{sim}/seed.mem", seed_table(), nib=5)     # layernorm.sv ROM format
+
+    src = [f"{REPO}/fabric/stage3/rtl/rmsnorm_gated.sv",
+           f"{REPO}/fabric/stage3/tb/tb_rmsnorm_gated.sv"]
+    subprocess.run([tool("iverilog"), "-g2012", "-o", "rg.vvp"] + src,
+                   cwd=sim, check=True)
+    out = subprocess.run([tool("vvp"), "rg.vvp"], cwd=sim, check=True,
+                         capture_output=True, text=True)
+    if "TB_RG_DONE" not in out.stdout:
+        sys.exit(f"sim incomplete:\n{out.stdout[-400:]}")
+
+    got = np.array([int(l, 16) for l in open(f"{sim}/rg_o.out")], dtype=np.int64)
+    got = np.where(got >= 1 << 15, got - (1 << 16), got).reshape(T, D)
+
+    mism = 0
+    min_cos = {1: 1.0, 0: 1.0}
+    max_rel = 0.0
+    max_abs = 0.0
+    for t in range(T):
+        m = int(modes[t])
+        mism += int((got[t] != ref_int(ys[t], zs[t], gq, lut, m)).sum())
+        ref = ref_float(ys[t], zs[t], gq, m)
+        gf = got[t] / 4096.0
+        cos = float(gf @ ref / ((np.linalg.norm(gf) * np.linalg.norm(ref)) or 1.0))
+        min_cos[m] = min(min_cos[m], cos)
+        err = np.abs(gf - ref)
+        max_abs = max(max_abs, float(err.max()))
+        max_rel = max(max_rel, float((err / np.maximum(np.abs(ref), 1e-2)).max()))
+
+    ok = min_cos[1] > 0.9999 and min_cos[0] > 0.9999 and mism == 0
+    print(f"RMSNORM_GATED_INFO: max_abs_err {max_abs:.6f}  "
+          f"max_rel_err {max_rel:.6f} (den floor 1e-2)  "
+          f"int_replica_mismatches {mism}")
+    print(f"RMSNORM_GATED_VERDICT: {'PASS' if ok else 'FAIL'} "
+          f"gated_min_cos={min_cos[1]:.8f} ungated_min_cos={min_cos[0]:.8f} "
+          f"max_rel_err={max_rel:.6f} "
+          f"({TPM}+{TPM} tokens x {D}, bar cos>0.9999 both modes + bit-exact "
+          f"vs int replica)  [{sim}]")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
