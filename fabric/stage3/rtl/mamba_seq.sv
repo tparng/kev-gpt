@@ -276,7 +276,12 @@ module mamba_seq #(
                      xbuf[i[7:0]] <= sat16f(rshr(mul_m11(acc_t, fp_t),
                                     8'sd13 - $signed({3'b0, fp_t[14:10]})));
                      sub <= 0;
-                     if (i == D-1) begin i <= 0; st <= S_NIN_LD; end
+                     if (i == D-1) begin i <= 0; st <= S_NIN_LD;
+`ifdef MSEQ_TRACE
+                         $display("TR EMB x0=%0d x1=%0d x255=%0d",
+                                  $signed(xbuf[0]), $signed(xbuf[1]), $signed(xbuf[255]));
+`endif
+                     end
                      else i <= i + 1;
                 end
               endcase
@@ -296,7 +301,11 @@ module mamba_seq #(
                 end
               endcase
           end
-          S_NIN: if (n_done) begin st <= S_QIN; i <= 0; end
+          S_NIN: if (n_done) begin st <= S_QIN; i <= 0;
+`ifdef MSEQ_TRACE
+              $display("TR NIN done l=%0d", li);
+`endif
+          end
 
           // ---- quantize xn -> INT8 via in-recip ----------------------------
           S_QIN: begin
@@ -345,7 +354,13 @@ module mamba_seq #(
                          t1 * $signed({1'b0, c_ins[15:0]}),
                          $signed({1'b0, c_ins[23:16]}) + 8'sd15 - 8'sd12));
                      sub <= 0;
-                     if (i == INROWS-1) begin i <= 0; st <= S_CONV_LDW; end
+                     if (i == INROWS-1) begin i <= 0; st <= S_CONV_LDW;
+`ifdef MSEQ_TRACE
+                         $display("TR GIN l=%0d zx0=%0d zx512=%0d dtraw0=%0d",
+                                  li, $signed(zxbuf[0]), $signed(zxbuf[512]),
+                                  $signed(zxbuf[1152]));
+`endif
+                     end
                      else i <= i + 1;
                 end
               endcase
@@ -375,7 +390,12 @@ module mamba_seq #(
               case (sub)
                 0: begin c_rda <= i[9:0]; sub <= 1; end
                 1: begin xnbuf[i[9:0]] <= c_y; sub <= 0;
-                     if (i == CONVD-1) begin i <= 0; st <= S_SCAN_PREP; sub <= 0; end
+                     if (i == CONVD-1) begin i <= 0; st <= S_SCAN_PREP; sub <= 0;
+`ifdef MSEQ_TRACE
+                         $display("TR CONV l=%0d y0=%0d y639=%0d", li,
+                                  $signed(c_y), $signed(xnbuf[0]));
+`endif
+                     end
                      else i <= i + 1;
                 end
               endcase
@@ -474,6 +494,10 @@ module mamba_seq #(
                      sub <= 0;
                      if (i == 63) begin
                          i <= 0;
+`ifdef MSEQ_TRACE
+                         $display("TR SCAN l=%0d h=%0d y0=%0d aq=%0d shi=%0d",
+                                  li, hi, $signed(ybuf[hi[2:0]*64]), s_aq, s_shi);
+`endif
                          if (hi == H-1) begin hi <= 0; st <= S_NG_LD; sub <= 0; end
                          else begin hi <= hi + 1; st <= S_SCAN_H; sub <= 0; end
                      end else i <= i + 1;
