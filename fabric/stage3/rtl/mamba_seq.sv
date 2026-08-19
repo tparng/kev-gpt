@@ -208,7 +208,7 @@ module mamba_seq #(
     reg [2:0]  li;                            // layer index
     reg [3:0]  hi;                            // head index
     reg [11:0] i;                             // generic element counter
-    reg [1:0]  sub;                           // sub-step within a state
+    reg [2:0]  sub;                           // sub-step within a state
     reg signed [15:0] best;
     reg [9:0]  besti;
 
