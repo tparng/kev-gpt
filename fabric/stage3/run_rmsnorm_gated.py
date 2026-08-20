@@ -77,21 +77,30 @@ def ref_float_short(yq, gq):
     return np.clip(yf * rms * gf, SAT_LO, SAT_HI)
 
 
+GSH = 6                                                 # gated-product headroom
+A_SH = LOG2D + 2 * QF - 26                               # 7
+
+
 def ref_int(yq, zq, gq, lut, mode):
-    """Bit-true integer replica of the RTL datapath (one token)."""
+    """Bit-true integer replica of the RTL datapath (one token). Gated mode
+    right-shifts the product by GSH (RMS scale-invariant) so |g| up to ~512
+    real does not saturate Q3.12; A left-shifts and OUT_SH-=GSH to compensate."""
     if mode:
         idx = np.clip((zq + 16384) >> 7, 0, 255)
         sil = np.where(zq >= 16384, zq, np.where(zq < -16384, 0, lut[idx]))
+        gsh, out_sh = QF + GSH, OUT_SH - GSH
     else:
         sil = np.full(D, 4096, dtype=np.int64)         # 1.0 Q3.12 -> g = y exact
-    g = np.clip((yq * sil + (1 << (QF - 1))) >> QF, -32768, 32767)
-    A = (int((g * g).sum()) >> (LOG2D + 2 * QF - 26)) + EPS_A
+        gsh, out_sh = QF, OUT_SH
+    g = np.clip((yq * sil + (1 << (gsh - 1))) >> gsh, -32768, 32767)
+    ss = int((g * g).sum())
+    A = (ss << (2 * GSH - A_SH) if mode else ss >> A_SH) + EPS_A
     Yr = rsqrt_int(A)                                   # layernorm.sv rsqrt, Q.26
     out = np.empty(D, dtype=np.int64)
-    rnd = 1 << (OUT_SH - 1)
+    rnd = 1 << (out_sh - 1)
     for i in range(D):                                  # >int64: python ints
         t = int(g[i]) * Yr * int(gq[i])
-        out[i] = min(32767, max(-32768, (t + rnd) >> OUT_SH))
+        out[i] = min(32767, max(-32768, (t + rnd) >> out_sh))
     return out
 
 
@@ -103,7 +112,10 @@ def ref_float(yq, zq, gq, mode):
         g = yf * silu_lut(z_grid)
     else:
         g = yf.copy()
-    g = np.clip(g, SAT_LO, SAT_HI)                      # Q3.12 sat contract
+    # gated g now has GSH headroom (real range +-8*2^GSH); only the OUTPUT is
+    # Q3.12-saturated. Clipping g at +-8 here was the scale-blind bug's twin.
+    g = np.clip(g, -8.0 * (1 << GSH), 8.0 * (1 << GSH)) if mode \
+        else np.clip(g, SAT_LO, SAT_HI)
     rms = 1.0 / np.sqrt((g * g).mean() + 1e-5)
     return np.clip(g * rms * gf, SAT_LO, SAT_HI)
 
@@ -124,6 +136,15 @@ def main(argv=None):
 
     ys = np.clip(np.round(rng.normal(0, 1.2, (T, D)) * 4096), -32768, 32767).astype(np.int64)
     zs = np.clip(np.round(rng.normal(0, 1.2, (T, D)) * 4096), -32768, 32767).astype(np.int64)
+    # SATURATING-GATE rows (gated mode): a few channels with large product
+    # y*silu(z) (real |g| ~ 40-150) — the engine's actual regime, which Q3.12
+    # clipped and no cosine gate could see. These exercise the GSH headroom.
+    for t in range(min(3, TPM)):
+        big = rng.choice(D, 5, replace=False)
+        # y, silu(z) each up to ~8 (Q3.12 INT16 ceiling) -> product g up to ~64,
+        # which Q3.12 saturates at 8 and GSH must carry. Clip to INT16.
+        ys[t, big] = rng.choice([-1, 1], 5) * np.minimum(rng.integers(6, 8, 5) * 4096, 32767)
+        zs[t, big] = np.minimum(rng.integers(5, 8, 5) * 4096, 32767)  # z>=4 -> silu=z
     # short-mode rows: Q6.9 residual-view values. Cover the eps-sensitive
     # small-magnitude case (layer-0 emb ~ +-0.02 -> ~10 counts) and the wide
     # late-layer case (up to ~+-30).
@@ -162,8 +183,8 @@ def main(argv=None):
 
     mism = 0
     min_cos = {1: 1.0, 0: 1.0, 2: 1.0}
+    max_abs = {1: 0.0, 0: 0.0, 2: 0.0}
     max_rel = 0.0
-    max_abs = 0.0
     for t in range(T):
         m = int(modes[t])
         if m == 2:
@@ -177,19 +198,24 @@ def main(argv=None):
         cos = float(gf @ ref / ((np.linalg.norm(gf) * np.linalg.norm(ref)) or 1.0))
         min_cos[m] = min(min_cos[m], cos)
         err = np.abs(gf - ref)
-        max_abs = max(max_abs, float(err.max()))
+        max_abs[m] = max(max_abs[m], float(err.max()))
         max_rel = max(max_rel, float((err / np.maximum(np.abs(ref), 1e-2)).max()))
 
-    ok = min_cos[1] > 0.9999 and min_cos[0] > 0.9999 and min_cos[2] > 0.9999 \
-        and mism == 0
-    print(f"RMSNORM_GATED_INFO: max_abs_err {max_abs:.6f}  "
-          f"max_rel_err {max_rel:.6f} (den floor 1e-2)  "
-          f"int_replica_mismatches {mism}")
+    # ABSOLUTE-scale gate (not just cosine): a scale/saturation error is
+    # invisible to cosine but shows as large abs error. The Q3.12 output is in
+    # [-8,8]; a real scale bug produces abs errors ~O(1). Bar 0.05 (~205 LSB)
+    # passes LUT/rsqrt jitter, catches the gated-product saturation class.
+    ABS_BAR = 0.05
+    ok = (min(min_cos.values()) > 0.9999 and mism == 0
+          and all(v < ABS_BAR for v in max_abs.values()))
+    print(f"RMSNORM_GATED_INFO: max_abs_err gated={max_abs[1]:.6f} "
+          f"ungated={max_abs[0]:.6f} short={max_abs[2]:.6f}  "
+          f"max_rel_err {max_rel:.6f}  int_replica_mismatches {mism}")
     print(f"RMSNORM_GATED_VERDICT: {'PASS' if ok else 'FAIL'} "
-          f"gated_min_cos={min_cos[1]:.8f} ungated_min_cos={min_cos[0]:.8f} "
-          f"short_min_cos={min_cos[2]:.8f} max_rel_err={max_rel:.6f} "
-          f"({TPM}x3 tokens, bar cos>0.9999 all modes + bit-exact "
-          f"vs int replica)  [{sim}]")
+          f"gated_cos={min_cos[1]:.8f} ungated_cos={min_cos[0]:.8f} "
+          f"short_cos={min_cos[2]:.8f} max_abs={max(max_abs.values()):.5f} "
+          f"({TPM}x3 tokens; bar cos>0.9999 + abs<{ABS_BAR} all modes + "
+          f"bit-exact vs int replica)  [{sim}]")
     return 0 if ok else 1
 
 

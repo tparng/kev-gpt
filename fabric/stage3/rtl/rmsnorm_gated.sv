@@ -118,8 +118,20 @@ module rmsnorm_gated #(
     // ungated bypass: operand 1.0 (Q3.12) -> (y<<QF + 2^(QF-1))>>>QF == y exact
     wire signed [15:0] silsel = g_mode ? silw : 16'sd4096;
 
-    // stage-2 comb: round >>> QF, saturate, square
-    wire signed [20:0] pre = (prod2 + $signed(32'sd1 <<< (QF-1))) >>> QF;
+    // GATED-PRODUCT HEADROOM (GSH): g = y*silu(z) reaches |g|~150 (real) on the
+    // per-layer gated norm — the gate values are large (z>=4 -> silu(z)=z up to
+    // ~8, y up to ~10). Q3.12 saturates at +-8, and just 2-3 saturating channels
+    // (g^2 ~ 150^2) collapse mean(g^2) ~10x, inflating rsqrt ~3.2x (the gate6-8
+    // FAIL). RMSNorm is SCALE-INVARIANT in g, so storing g>>GSH (Q(3+GSH).12,
+    // real range +-8*2^GSH = +-512) cancels out of out = g*rsqrt(mean g^2)*gamma
+    // exactly, with the A and output shifts compensated below. Only gated mode
+    // shifts (ungated short/final norms have bounded inputs, no saturation).
+    localparam integer GSH = 6;
+    wire [5:0] gate_sh = g_mode ? (QF + GSH) : QF;   // 18 gated / 12 ungated
+
+    // stage-2 comb: round >>> gate_sh, saturate, square
+    wire signed [31:0] grnd = $signed(32'sd1) <<< (gate_sh - 1);
+    wire signed [20:0] pre = (prod2 + grnd) >>> gate_sh;
     wire signed [15:0] gw  = (pre > $signed(21'sd32767))  ? 16'sd32767 :
                              (pre < -$signed(21'sd32768)) ? -16'sd32768 :
                              pre[15:0];
@@ -157,7 +169,10 @@ module rmsnorm_gated #(
     // short mode: g is Q6.9 and Yr is true-scale (8x smaller than the Q3.12
     // path), so shift 3 less to land the output back in Q3.12 exactly:
     // y*2^9 * Yr*2^26 * gamma*2^14 >>> 37 = y*gamma*rsqrt * 2^12.
-    wire [5:0] out_sh_n = short_len ? OUT_SH - 3 : OUT_SH;
+    // gated: g stored 2^GSH smaller -> Yr is 2^GSH larger (A shifted below), so
+    // g*Yr keeps scale; shift OUT_SH-GSH to land Q3.12. short: -3 (Q6.9 g).
+    wire [5:0] out_sh_n = short_len ? OUT_SH - 3 :
+                          g_mode    ? OUT_SH - GSH : OUT_SH;
     wire signed [111:0] ornd = 112'sd1 <<< (out_sh_n - 1);
     wire signed [112:0] osh  = (prod_gyg + ornd) >>> out_sh_n;
     wire signed [15:0]  osat = (osh > $signed(113'sd32767))  ? 16'sd32767 :
@@ -188,7 +203,10 @@ module rmsnorm_gated #(
                 // old A_SH-1 shift left eps effectively 64x too large — a
                 // -5..8% norm shrink on small-residual layers (gate6 FAIL).
                 S_A: begin
+                    // gated: gw is 2^GSH smaller -> sumsq 2^(2*GSH) smaller, so
+                    // LEFT-shift (2*GSH - A_SH) to restore mean*2^26 in Q.26.
                     A <= (short_len ? $signed(sumsq)
+                          : g_mode  ? ($signed(sumsq) <<< (2*GSH - A_SH))
                                     : ($signed(sumsq) >>> A_SH))
                          + $signed(EPS_A);
                     state <= S_MSB;
