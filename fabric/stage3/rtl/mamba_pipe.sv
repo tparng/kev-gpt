@@ -1,0 +1,893 @@
+// mamba_pipe.sv — the PIPELINED (wave) multi-stream Mamba-2 engine (doc 9 Rung C).
+//
+// Realizes the mamba_pipe_ref wave schedule in hardware: NC INDEPENDENT token
+// streams share ONE instance each of the four sub-cores (gemv_i4i8, conv_silu,
+// ssm_scan_row, rmsnorm_gated) — but instead of the monolithic mamba_seq FSM
+// that runs them strictly serially (75% core idle), FIVE concurrent WORKERS
+// (EMB / NORM / GEMV / CONV / SCAN) each drive their own core and serve one
+// stream's whole op at a time. A round-robin scheduler advances each stream
+// through its op-chain and hands a DIFFERENT stream to each free worker, so the
+// gemv MAC of stream A overlaps the scan of stream B overlaps the conv of C —
+// the plateau-breaking overlap the phase-major cohort could not get.
+//
+// BIT-EXACTNESS: every datapath here is lifted VERBATIM from mamba_seq.sv (same
+// shifts / saturations / LUT indices / Q-formats). The schedule changes only
+// WHICH stream occupies a core each cycle, never the arithmetic — so each
+// stream's per-token logits/residual are bit-identical to single-stream
+// mamba_seq_ref.step() (gated by run_mamba_pipe.py).
+//
+// STATE BANKING: per-stream residual (xbuf), working buffers (zxbuf/xnbuf/
+// ybuf/q8buf/logit) are banked x NC (flat stream-major arrays). The scan h
+// state is banked via ssm_scan_row's CTX=NC*L*H (pbase=stream*L*H+li*H+hi); the
+// conv history via conv_silu's L=NC*L (layer=stream*L+li). Weights/LUTs/consts
+// are shared read-only (the weight-stationary amortization).
+//
+// Each sub-core is driven by EXACTLY ONE worker, so there is NO port arbitration
+// — the only shared resource a scheduler guards is "one stream per worker, one
+// worker per stream." Ops within a stream stay strictly ordered (data deps);
+// tokens are serial within a stream (state carry); overlap is only across the
+// NC streams.
+
+`default_nettype none
+
+module mamba_pipe #(
+    parameter int D     = 256,
+    parameter int DIN   = 512,
+    parameter int NST   = 64,
+    parameter int H     = 8,
+    parameter int LR    = 7,                  // real layers
+    parameter int V     = 1024,
+    parameter int NC    = 2,                  // streams (wave width)
+    parameter int TMAX  = 4,                  // max tokens/stream (dump sizing)
+    parameter int T_TOKENS = 2,               // tokens each stream decodes
+    parameter int CONVD = DIN + 2*NST,        // 640
+    parameter int INROWS = 2*DIN + 2*NST + H  // 1160
+) (
+    input  wire        clk,
+    input  wire        rst,
+    output wire        ready,                 // both cores' clear sweeps done
+    input  wire        start,                 // begin decoding the loaded streams
+    output reg         done,                  // all streams finished all tokens
+    output reg [31:0]  cyc_count,             // MEASURED cyc from first dispatch
+
+    // table writes: sel picks the target memory (same map as mamba_seq)
+    input  wire        wr_en,
+    input  wire [3:0]  wr_sel,
+    input  wire [18:0] wr_addr,
+    input  wire [31:0] wr_data,
+
+    // per-(stream,token) input token load
+    input  wire        tw_en,
+    input  wire [TW-1:0] tw_addr,
+    input  wire [9:0]  tw_data,
+
+    // dump reads (combinational): sel 0 = dump_x (32b), 1 = dump_logit (16b)
+    input  wire [3:0]  dbg_sel,
+    input  wire [17:0] dbg_addr,
+    output reg  signed [31:0] dbg_data
+);
+    localparam int SL   = NC*LR;              // conv history banks
+    localparam int SCTX = NC*LR*H;            // scan state contexts
+    localparam int SW   = (NC <= 1) ? 1 : $clog2(NC);   // stream-index width
+    localparam int TW   = (NC*TMAX <= 1) ? 1 : $clog2(NC*TMAX);
+    // write selectors (identical to mamba_seq)
+    localparam [3:0] WSEL_GW = 0, WSEL_EMB = 1, WSEL_ESC = 2, WSEL_CW = 3,
+                     WSEL_CB = 4, WSEL_SLUT = 5, WSEL_ALUT = 6, WSEL_DLUT = 7,
+                     WSEL_LNG = 8, WSEL_NRMG = 9, WSEL_NFG = 10,
+                     WSEL_RSIN = 11, WSEL_RSOUT = 12, WSEL_RSHD = 13,
+                     WSEL_CONST = 14;
+
+    // ------------------------------------------------------------ tables ----
+    (* ram_style = "ultra", cascade_height = 4 *)
+    reg [63:0] emb  [0:V*D/8/2-1];
+    reg [31:0] emb_wlo;
+    reg [15:0] esc   [0:V-1];
+    reg [15:0] convw [0:LR*CONVD*4-1];
+    reg [15:0] convb [0:LR*CONVD-1];
+    reg [15:0] slut  [0:255];
+    reg [15:0] alut  [0:LR*H*256-1];
+    reg [15:0] dlut  [0:LR*H*256-1];
+    reg [15:0] lng   [0:LR*D-1];
+    reg [15:0] nrmg  [0:LR*DIN-1];
+    reg [15:0] nfg   [0:D-1];
+    reg [15:0] rsin  [0:LR*INROWS-1];
+    reg [15:0] rsout [0:LR*D-1];
+    reg [15:0] rshd  [0:V-1];
+    reg [31:0] consts[0:127];
+
+    always @(posedge clk) if (wr_en) begin
+        case (wr_sel)
+            WSEL_GW:    ;
+            WSEL_EMB:   if (~wr_addr[0]) emb_wlo <= wr_data;
+                        else emb[wr_addr[14:1]] <= {wr_data, emb_wlo};
+            WSEL_ESC:   esc  [wr_addr[9:0]]  <= wr_data[15:0];
+            WSEL_CW:    convw[wr_addr[14:0]] <= wr_data[15:0];
+            WSEL_CB:    convb[wr_addr[12:0]] <= wr_data[15:0];
+            WSEL_SLUT:  slut [wr_addr[7:0]]  <= wr_data[15:0];
+            WSEL_ALUT:  alut [wr_addr[14:0]] <= wr_data[15:0];
+            WSEL_DLUT:  dlut [wr_addr[14:0]] <= wr_data[15:0];
+            WSEL_LNG:   lng  [wr_addr[10:0]] <= wr_data[15:0];
+            WSEL_NRMG:  nrmg [wr_addr[11:0]] <= wr_data[15:0];
+            WSEL_NFG:   nfg  [wr_addr[7:0]]  <= wr_data[15:0];
+            WSEL_RSIN:  rsin [wr_addr[12:0]] <= wr_data[15:0];
+            WSEL_RSOUT: rsout[wr_addr[10:0]] <= wr_data[15:0];
+            WSEL_RSHD:  rshd [wr_addr[9:0]]  <= wr_data[15:0];
+            WSEL_CONST: consts[wr_addr[6:0]] <= wr_data;
+            default: ;
+        endcase
+    end
+
+    // token sequences (per stream, teacher-forced)
+    reg [9:0] tok_seq [0:NC*TMAX-1];
+    always @(posedge clk) if (tw_en) tok_seq[tw_addr] <= tw_data;
+
+    // ------------------------------------------ per-stream banked buffers ----
+    reg signed [31:0] xbuf  [0:NC*D-1];       // residual Q6.19
+    reg signed [15:0] xnbuf [0:NC*CONVD-1];   // conv out Q4.11
+    reg signed [15:0] zxbuf [0:NC*INROWS-1];  // in_proj dequant Q6.9
+    reg signed [15:0] ybuf  [0:NC*DIN-1];     // scan out Q4.11
+    reg signed [7:0]  q8buf [0:NC*DIN-1];     // quantized activations
+    reg signed [15:0] logit [0:NC*V-1];
+
+    // dumps: per (stream,token) snapshot for the gate
+    reg signed [15:0] dump_logit [0:NC*TMAX*V-1];
+    reg signed [31:0] dump_x     [0:NC*TMAX*D-1];
+
+    // ------------------------------------------------------- scale helpers --
+    function automatic signed [47:0] mul_m11(input signed [31:0] a,
+                                             input [15:0] fp16);
+        reg [10:0] m;
+        begin m = {1'b1, fp16[9:0]}; mul_m11 = a * $signed({1'b0, m}); end
+    endfunction
+    function automatic signed [15:0] sat16f(input signed [47:0] v);
+        sat16f = (v > 48'sd32767) ? 16'sd32767 :
+                 (v < -48'sd32768) ? -16'sd32768 : v[15:0];
+    endfunction
+    function automatic signed [31:0] sat32f(input signed [47:0] v);
+        sat32f = (v > 48'sd2147483647) ? 32'sd2147483647 :
+                 (v < -48'sd2147483648) ? -32'sd2147483648 : v[31:0];
+    endfunction
+    function automatic signed [47:0] rshr(input signed [47:0] v,
+                                          input signed [7:0] n);
+        if (n <= 0)      rshr = v <<< (-n);
+        else             rshr = (v + (48'sd1 <<< (n - 1))) >>> n;
+    endfunction
+    function automatic [4:0] bitlen15(input [14:0] v);
+        integer b;
+        begin
+            bitlen15 = 0;
+            for (b = 14; b >= 0; b = b - 1)
+                if (v[b] && bitlen15 == 0) bitlen15 = b + 1;
+        end
+    endfunction
+
+    // ---------------------------------------------------------- sub-cores ---
+    // gemv (driven only by the GEMV worker)
+    reg         g_start;  wire g_done;
+    reg  [18:0] g_base;   reg [10:0] g_rows;  reg [6:0] g_wpr;
+    reg         g_wrx;    reg [8:0] g_wrx_a;  reg signed [7:0] g_wrx_d;
+    reg  [10:0] g_rda;    wire signed [31:0] g_acc;
+    reg  [10:0] g_rdaw;   wire [4*32-1:0] g_accw;
+    gemv_i4i8 #(.PE(16), .ROWS(INROWS), .D_IN(DIN), .WMEM(409600), .RDP(4)) u_gemv (
+        .clk(clk), .rst(rst), .start(g_start), .done(g_done),
+        .base(g_base), .rows(g_rows), .wpr(g_wpr),
+        .wr_w(wr_en && wr_sel == WSEL_GW), .wr_w_addr(wr_addr), .wr_w_data(wr_data),
+        .wr_x(g_wrx), .wr_x_addr(g_wrx_a), .wr_x_data(g_wrx_d),
+        .rd_acc_addr(g_rda), .rd_acc_data(g_acc),
+        .rd_accw_base(g_rdaw), .rd_accw_data(g_accw));
+
+    // conv+silu (driven only by the CONV worker); NC*LR history banks
+    reg         c_start;  wire c_done;  wire c_ready;
+    reg  [$clog2(SL)-1:0] c_layer;
+    reg         c_wrw, c_wrb, c_wrx, c_wrl;
+    reg  [11:0] c_wrw_a;  reg [9:0] c_wrb_a, c_wrx_a, c_rda;
+    reg  [7:0]  c_wrl_a;
+    reg signed [15:0] c_wrd;
+    wire signed [15:0] c_y;
+    conv_silu #(.CH(CONVD), .K(4), .L(SL)) u_conv (
+        .clk(clk), .rst(rst), .start(c_start), .done(c_done), .ready(c_ready),
+        .layer(c_layer),
+        .wr_w(c_wrw), .wr_w_addr(c_wrw_a), .wr_w_data(c_wrd),
+        .wr_b(c_wrb), .wr_b_addr(c_wrb_a), .wr_b_data(c_wrd),
+        .wr_x(c_wrx), .wr_x_addr(c_wrx_a), .wr_x_data(c_wrd),
+        .wr_lut(c_wrl), .wr_lut_addr(c_wrl_a), .wr_lut_data(c_wrd),
+        .rd_y_addr(c_rda), .rd_y_data(c_y));
+
+    // scan row (driven only by the SCAN worker); NC*LR*H state contexts
+    reg         s_start;  wire s_done, s_ready;
+    reg  [$clog2(SCTX)-1:0] s_pbase;
+    reg  [15:0] s_aq;     reg signed [5:0] s_shi, s_shy;
+    reg         s_wrdtx, s_wrb, s_wrc;
+    reg  [5:0]  s_wrdtx_a, s_wrb_a, s_wrc_a, s_rda;
+    reg signed [15:0] s_dtx_d;
+    reg signed [7:0]  s_bc_d;
+    wire signed [15:0] s_y;
+    ssm_scan_row #(.P(64), .N(NST), .CTX(SCTX)) u_scan (
+        .clk(clk), .rst(rst), .ready(s_ready), .start(s_start), .done(s_done),
+        .pbase(s_pbase), .a_q(s_aq), .sh_i(s_shi), .sh_y(s_shy),
+        .wr_dtx(s_wrdtx), .wr_dtx_addr(s_wrdtx_a), .wr_dtx_data(s_dtx_d),
+        .wr_b(s_wrb), .wr_b_addr(s_wrb_a), .wr_b_data(s_bc_d),
+        .wr_c(s_wrc), .wr_c_addr(s_wrc_a), .wr_c_data(s_bc_d),
+        .rd_y_addr(s_rda), .rd_y_data(s_y));
+    assign ready = s_ready & c_ready;
+
+    // gated rmsnorm (driven only by the NORM worker)
+    reg         n_start;  wire n_done;
+    reg         n_gated, n_short;
+    reg         n_wry, n_wrz, n_wrg, n_wrl;
+    reg  [8:0]  n_wry_a, n_wrz_a, n_wrg_a, n_rda;
+    reg  [7:0]  n_wrl_a;
+    reg signed [15:0] n_wrd;
+    wire signed [15:0] n_out;
+    reg  [8:0]  n_rdaw;   wire [4*16-1:0] n_ow;
+    rmsnorm_gated #(.D(DIN), .RDP(4)) u_norm (
+        .clk(clk), .rst(rst), .start(n_start), .done(n_done), .gated(n_gated),
+        .short_len(n_short),
+        .wr_y(n_wry), .wr_y_addr(n_wry_a), .wr_y_data(n_wrd),
+        .wr_z(n_wrz), .wr_z_addr(n_wrz_a), .wr_z_data(n_wrd),
+        .wr_g(n_wrg), .wr_g_addr(n_wrg_a), .wr_g_data(n_wrd),
+        .wr_lut(n_wrl), .wr_lut_addr(n_wrl_a), .wr_lut_data(n_wrd),
+        .rd_o_addr(n_rda), .rd_o_data(n_out),
+        .rd_ow_base(n_rdaw), .rd_ow_data(n_ow));
+
+    // ============================================================ scheduler ==
+    // op-chain: pc 0 = EMB; pc 1..42 = 7 x [NPRE,GIN,CONV,SCAN,NGATE,GOUT];
+    // pc 43 = NFIN; pc 44 = GHD; pc 45 = token complete.
+    localparam int NPC = 45;
+    localparam [3:0] OP_EMB=0, OP_NPRE=1, OP_GIN=2, OP_CONV=3, OP_SCAN=4,
+                     OP_NGATE=5, OP_GOUT=6, OP_NFIN=7, OP_GHD=8, OP_DONE=9;
+
+    function automatic [3:0] op_of(input [7:0] pc);
+        reg [7:0] k; reg [2:0] ph;
+        begin
+            if (pc == 0)       op_of = OP_EMB;
+            else if (pc <= 42) begin
+                k = pc - 8'd1; ph = k % 6;
+                op_of = (ph==0)?OP_NPRE:(ph==1)?OP_GIN:(ph==2)?OP_CONV:
+                        (ph==3)?OP_SCAN:(ph==4)?OP_NGATE:OP_GOUT;
+            end
+            else if (pc == 43) op_of = OP_NFIN;
+            else if (pc == 44) op_of = OP_GHD;
+            else               op_of = OP_DONE;
+        end
+    endfunction
+    function automatic [3:0] layer_of(input [7:0] pc);
+        if (pc >= 1 && pc <= 42) layer_of = (pc - 8'd1) / 6;
+        else                     layer_of = 0;
+    endfunction
+    // 0 none,1 emb,2 norm,3 gemv,4 conv,5 scan
+    function automatic [2:0] wrk_of(input [3:0] op);
+        case (op)
+            OP_EMB:  wrk_of = 1;
+            OP_NPRE, OP_NGATE, OP_NFIN: wrk_of = 2;
+            OP_GIN, OP_GOUT, OP_GHD:    wrk_of = 3;
+            OP_CONV: wrk_of = 4;
+            OP_SCAN: wrk_of = 5;
+            default: wrk_of = 0;
+        endcase
+    endfunction
+
+    reg [7:0]  op_pc  [0:NC-1];
+    reg [$clog2(TMAX+1)-1:0] tokcnt [0:NC-1];
+    reg        active [0:NC-1];               // still has tokens to decode
+    reg        busy   [0:NC-1];               // currently held by a worker
+    reg [SW-1:0] rr [0:5];            // per-worker round-robin ptr
+
+    reg started; reg all_done;
+
+    // ------------------------------------------------------------- init ------
+    // one-time: stream the SiLU LUT into conv + norm cores (mamba_seq S_LUTLD)
+    reg [1:0]  ist;                            // 0 idle,1 lutld,2 ready
+    reg [7:0]  i_i;
+
+    // ---------------------------------------------------------- workers ------
+    integer kk, ss;
+    reg found; reg [SW-1:0] pick;
+
+    // EMB worker
+    localparam [1:0] E_IDLE=0, E_RUN=1;
+    reg [1:0]  est; reg [SW-1:0] e_st_s;
+    reg [11:0] e_i; reg [2:0] e_sub;
+    reg signed [31:0] e_acc; reg [15:0] e_fp; reg [63:0] e_embq; reg e_embsel;
+    reg [9:0]  e_tok;
+    wire [14:0] e_emb_wa = e_tok*(D/8) + e_i[11:3];
+    wire [31:0] e_word = e_embsel ? e_embq[63:32] : e_embq[31:0];
+
+    // NORM worker
+    localparam [2:0] N_IDLE=0, N_LD=1, N_RUN=2, N_QUANT=3;
+    reg [2:0]  nst; reg [SW-1:0] n_st_s; reg [3:0] n_li; reg [1:0] n_op;
+    reg [11:0] n_i; reg [2:0] n_sub;
+    reg signed [47:0] n_t14 [0:3];
+    reg [$clog2(TMAX+1)-1:0] n_tok;
+    wire [31:0] n_c_inr  = consts[n_li*16 + 0];
+    wire [31:0] n_c_outr = consts[n_li*16 + 2];
+    wire [31:0] n_c_hdr  = consts[112];
+    // pre(0)->in-act recip, gate(1)->out-act recip (the P=4 wide-quant path);
+    // pre-selected into a wire so the requant multiply avoids a ternary inside a
+    // concatenation (iverilog-legal but Vivado's parser rejects that form).
+    wire [31:0] n_qrecip = (n_op == 2'd0) ? n_c_inr : n_c_outr;
+
+    // GEMV worker
+    localparam [2:0] G_IDLE=0, G_LD=1, G_RUN=2, G_RD=3;
+    reg [2:0]  gst; reg [SW-1:0] g_st_s; reg [3:0] g_li; reg [1:0] g_op;
+    reg [11:0] g_i; reg [2:0] g_sub;
+    reg signed [31:0] g_acc4 [0:3];
+    reg        [15:0] g_fp4  [0:3];
+    reg signed [47:0] g_t14  [0:3];
+    reg signed [15:0] g_lv0, g_lv1, g_lv2, g_lv3;
+    reg signed [15:0] g_best; reg [9:0] g_besti;
+    reg signed [15:0] g_nb;   reg [9:0] g_ni;
+    reg [$clog2(TMAX+1)-1:0] g_tok;
+    wire [31:0] g_c_ins  = consts[g_li*16 + 1];
+    wire [31:0] g_c_outs = consts[g_li*16 + 3];
+    wire [31:0] g_c_hds  = consts[113];
+
+    // CONV worker
+    localparam [2:0] C_IDLE=0, C_LDW=1, C_LDX=2, C_RUN=3, C_RD=4;
+    reg [2:0]  cst; reg [SW-1:0] c_st_s; reg [3:0] c_li;
+    reg [11:0] c_i; reg [2:0] c_sub; reg signed [47:0] c_t1;
+
+    // SCAN worker
+    localparam [3:0] SC_IDLE=0, SC_PREP=1, SC_H=2, SC_HWAIT=3, SC_RD=4;
+    reg [3:0]  sst; reg [SW-1:0] s_st_s; reg [3:0] s_li; reg [3:0] s_hi;
+    reg [11:0] sc_i; reg [3:0] sc_sub;
+    reg [15:0] sc_dtq; reg [4:0] sc_eh;
+    reg signed [31:0] sc_acc; reg signed [47:0] sc_t1; reg [15:0] sc_fp;
+    reg signed [15:0] sc_dtq3;
+    wire [3:0] s_bB = consts[s_li*16 + 4][3:0];
+    wire [3:0] s_bC = consts[s_li*16 + 4][7:4];
+    wire [3:0] s_bX = consts[s_li*16 + 4][11:8];
+    wire signed [15:0] s_dtraw = zxbuf[s_st_s*INROWS + 2*DIN + 2*NST + s_hi[2:0]];
+
+    // ---- per-stream token boundary + dispatch helpers -----------------------
+    // (computed in the clocked block below)
+
+    integer w;
+    always @(posedge clk) begin
+        done <= 1'b0;
+        g_start <= 0; c_start <= 0; s_start <= 0; n_start <= 0;
+        g_wrx <= 0; c_wrw <= 0; c_wrb <= 0; c_wrx <= 0; c_wrl <= 0;
+        s_wrdtx <= 0; s_wrb <= 0; s_wrc <= 0;
+        n_wry <= 0; n_wrz <= 0; n_wrg <= 0; n_wrl <= 0;
+
+        if (rst) begin
+            ist <= 0; i_i <= 0; started <= 0; all_done <= 0; cyc_count <= 0;
+            est <= E_IDLE; nst <= N_IDLE; gst <= G_IDLE; cst <= C_IDLE;
+            sst <= SC_IDLE;
+            for (w = 0; w < NC; w = w + 1) begin
+                op_pc[w] <= 0; tokcnt[w] <= 0; active[w] <= 0; busy[w] <= 0;
+            end
+            for (w = 0; w < 6; w = w + 1) rr[w] <= 0;
+        end else begin
+            // measured cycle counter: from first dispatch to all-done
+            if (started && !all_done) cyc_count <= cyc_count + 1;
+
+            // ---------- init: SiLU LUT into conv + norm, then arm streams -----
+            if (ist == 0) begin
+                if (start && ready) begin ist <= 1; i_i <= 0; end
+            end else if (ist == 1) begin
+                c_wrl <= 1; c_wrl_a <= i_i; c_wrd <= slut[i_i];
+                n_wrl <= 1; n_wrl_a <= i_i; n_wrd <= slut[i_i];
+                if (i_i == 255) begin
+                    ist <= 2;
+                    for (w = 0; w < NC; w = w + 1) begin
+                        active[w] <= 1; op_pc[w] <= 0; tokcnt[w] <= 0; busy[w] <= 0;
+                    end
+                end else i_i <= i_i + 1;
+            end
+
+            // =============================================== DISPATCH =========
+            // For each idle worker, round-robin pick a ready stream whose next op
+            // targets that worker. A stream held by a worker is `busy`; a stream
+            // whose op_pc reached NPC is retired/advanced by the token-boundary
+            // block below. Dispatch reads registered state (1-cycle handoff bubble).
+            if (ist == 2) begin
+                // ---- EMB worker ----
+                if (est == E_IDLE) begin
+                    found = 0; pick = 0;
+                    for (kk = 0; kk < NC; kk = kk + 1) begin
+                        ss = (rr[1] + 1 + kk) % NC;
+                        if (!found && active[ss] && !busy[ss]
+                            && wrk_of(op_of(op_pc[ss])) == 3'd1) begin
+                            found = 1; pick = ss[SW-1:0];
+                        end
+                    end
+                    if (found) begin
+                        busy[pick] <= 1; rr[1] <= pick; started <= 1;
+                        e_st_s <= pick; e_tok <= tok_seq[pick*TMAX + tokcnt[pick]];
+                        e_i <= 0; e_sub <= 0; est <= E_RUN;
+                    end
+                end
+                // ---- NORM worker ----
+                if (nst == N_IDLE) begin
+                    found = 0; pick = 0;
+                    for (kk = 0; kk < NC; kk = kk + 1) begin
+                        ss = (rr[2] + 1 + kk) % NC;
+                        if (!found && active[ss] && !busy[ss]
+                            && wrk_of(op_of(op_pc[ss])) == 3'd2) begin
+                            found = 1; pick = ss[SW-1:0];
+                        end
+                    end
+                    if (found) begin
+                        busy[pick] <= 1; rr[2] <= pick; started <= 1;
+                        n_st_s <= pick; n_li <= layer_of(op_pc[pick]);
+                        n_tok <= tokcnt[pick];
+                        n_op <= (op_of(op_pc[pick])==OP_NPRE) ? 2'd0 :
+                                (op_of(op_pc[pick])==OP_NGATE)? 2'd1 : 2'd2;
+                        n_i <= 0; n_sub <= 0; nst <= N_LD;
+                        n_gated <= (op_of(op_pc[pick])==OP_NGATE);
+                        n_short <= (op_of(op_pc[pick])!=OP_NGATE);
+                    end
+                end
+                // ---- GEMV worker ----
+                if (gst == G_IDLE) begin
+                    found = 0; pick = 0;
+                    for (kk = 0; kk < NC; kk = kk + 1) begin
+                        ss = (rr[3] + 1 + kk) % NC;
+                        if (!found && active[ss] && !busy[ss]
+                            && wrk_of(op_of(op_pc[ss])) == 3'd3) begin
+                            found = 1; pick = ss[SW-1:0];
+                        end
+                    end
+                    if (found) begin
+                        busy[pick] <= 1; rr[3] <= pick; started <= 1;
+                        g_st_s <= pick; g_li <= layer_of(op_pc[pick]);
+                        g_tok <= tokcnt[pick];
+                        g_op <= (op_of(op_pc[pick])==OP_GIN) ? 2'd0 :
+                                (op_of(op_pc[pick])==OP_GOUT)? 2'd1 : 2'd2;
+                        g_i <= 0; g_sub <= 0; gst <= G_LD;
+                    end
+                end
+                // ---- CONV worker ----
+                if (cst == C_IDLE) begin
+                    found = 0; pick = 0;
+                    for (kk = 0; kk < NC; kk = kk + 1) begin
+                        ss = (rr[4] + 1 + kk) % NC;
+                        if (!found && active[ss] && !busy[ss]
+                            && wrk_of(op_of(op_pc[ss])) == 3'd4) begin
+                            found = 1; pick = ss[SW-1:0];
+                        end
+                    end
+                    if (found) begin
+                        busy[pick] <= 1; rr[4] <= pick; started <= 1;
+                        c_st_s <= pick; c_li <= layer_of(op_pc[pick]);
+                        c_i <= 0; c_sub <= 0; cst <= C_LDW;
+                    end
+                end
+                // ---- SCAN worker ----
+                if (sst == SC_IDLE) begin
+                    found = 0; pick = 0;
+                    for (kk = 0; kk < NC; kk = kk + 1) begin
+                        ss = (rr[5] + 1 + kk) % NC;
+                        if (!found && active[ss] && !busy[ss]
+                            && wrk_of(op_of(op_pc[ss])) == 3'd5) begin
+                            found = 1; pick = ss[SW-1:0];
+                        end
+                    end
+                    if (found) begin
+                        busy[pick] <= 1; rr[5] <= pick; started <= 1;
+                        s_st_s <= pick; s_li <= layer_of(op_pc[pick]);
+                        sc_i <= 0; sc_sub <= 0; s_hi <= 0; sst <= SC_PREP;
+                    end
+                end
+
+                // ---- token-boundary / all-done check --------------------------
+                all_done <= 1'b1;
+                for (w = 0; w < NC; w = w + 1) begin
+                    if (active[w]) all_done <= 1'b0;
+                end
+                if (started && all_done) done <= 1'b1;
+            end
+
+            // ===================================================== EMB ========
+            case (est)
+              E_RUN: begin
+                case (e_sub)
+                  0: begin e_acc <= 32'sd0; e_sub <= 1;
+                       e_fp <= esc[e_tok];
+                       e_embq   <= emb[e_emb_wa[14:1]];
+                       e_embsel <= e_emb_wa[0];
+                  end
+                  1: begin
+                       e_acc <= $signed({{28{e_word[(e_i[2:0])*4+3]}},
+                                 e_word[(e_i[2:0])*4 +: 4]});
+                       e_sub <= 2;
+                  end
+                  2: begin
+                       xbuf[e_st_s*D + e_i[7:0]] <= sat32f(rshr(mul_m11(e_acc, e_fp),
+                                      8'sd6 - $signed({3'b0, e_fp[14:10]})));
+                       e_sub <= 0;
+                       if (e_i == D-1) begin
+                           est <= E_IDLE;
+                           op_pc[e_st_s] <= op_pc[e_st_s] + 1;
+                           busy[e_st_s] <= 0;
+                       end else e_i <= e_i + 1;
+                  end
+                endcase
+              end
+              default: ;
+            endcase
+
+            // ===================================================== NORM =======
+            case (nst)
+              N_LD: begin
+                if (n_op == 2'd1) begin       // gated (512)
+                  case (n_sub)
+                    0: begin n_wry <= 1; n_wry_a <= n_i[9:0];
+                         n_wrd <= ybuf[n_st_s*DIN + n_i[8:0]]; n_sub <= 1; end
+                    1: begin n_wrz <= 1; n_wrz_a <= n_i[9:0];
+                         n_wrd <= zxbuf[n_st_s*INROWS + n_i[8:0]]; n_sub <= 2; end
+                    2: begin n_wrg <= 1; n_wrg_a <= n_i[9:0];
+                         n_wrd <= nrmg[n_li*DIN + n_i[8:0]]; n_sub <= 0;
+                         if (n_i == DIN-1) begin n_i <= 0; nst <= N_RUN; n_start <= 1; end
+                         else n_i <= n_i + 1;
+                    end
+                  endcase
+                end else begin                // pre / final (256), ungated
+                  case (n_sub)
+                    0: begin n_wry <= 1; n_wry_a <= n_i[9:0];
+                         n_wrd <= sat16f(rshr($signed({{16{xbuf[n_st_s*D+n_i[7:0]][31]}},
+                                          xbuf[n_st_s*D+n_i[7:0]]}), 8'sd10));
+                         // final-norm: snapshot residual (l6.x_out) into the dump
+                         if (n_op == 2'd2)
+                             dump_x[(n_st_s*TMAX + n_tok)*D + n_i[7:0]]
+                                 <= xbuf[n_st_s*D + n_i[7:0]];
+                         n_sub <= 1; end
+                    1: begin n_wrg <= 1; n_wrg_a <= n_i[9:0];
+                         n_wrd <= (n_op==2'd2) ? nfg[n_i[7:0]] : lng[n_li*D + n_i[7:0]];
+                         n_sub <= 0;
+                         if (n_i == D-1) begin n_i <= 0; nst <= N_RUN; n_start <= 1; end
+                         else n_i <= n_i + 1;
+                    end
+                  endcase
+                end
+              end
+              N_RUN: if (n_done) begin nst <= N_QUANT; n_i <= 0; n_sub <= 0; end
+              N_QUANT: begin
+                if (n_op == 2'd2) begin       // final: P=1, c_hdr -> q8buf
+                  case (n_sub)
+                    0: begin n_rda <= n_i[9:0]; n_sub <= 1; end
+                    1: begin
+                         n_t14[0] <= rshr($signed(n_out) * $signed({1'b0, n_c_hdr[15:0]}),
+                                     $signed({1'b0, n_c_hdr[23:16]}) + 8'sd11);
+                         n_sub <= 2;
+                    end
+                    2: begin
+                         q8buf[n_st_s*DIN + n_i[8:0]] <=
+                             (n_t14[0] > 48'sd127) ? 8'sd127 :
+                             (n_t14[0] < -48'sd128) ? -8'sd128 : n_t14[0][7:0];
+                         n_sub <= 0;
+                         if (n_i == D-1) begin
+                             nst <= N_IDLE; op_pc[n_st_s] <= op_pc[n_st_s] + 1;
+                             busy[n_st_s] <= 0;
+                         end else n_i <= n_i + 1;
+                    end
+                  endcase
+                end else begin                // pre(256)/gate(512): P=4, wide read
+                  case (n_sub)
+                    0: begin n_rdaw <= n_i[8:0]; n_sub <= 1; end
+                    1: begin
+                         n_t14[0] <= rshr($signed(n_ow[15:0])  * $signed({1'b0, n_qrecip[15:0]}), $signed({1'b0, n_qrecip[23:16]}) + 8'sd12);
+                         n_t14[1] <= rshr($signed(n_ow[31:16]) * $signed({1'b0, n_qrecip[15:0]}), $signed({1'b0, n_qrecip[23:16]}) + 8'sd12);
+                         n_t14[2] <= rshr($signed(n_ow[47:32]) * $signed({1'b0, n_qrecip[15:0]}), $signed({1'b0, n_qrecip[23:16]}) + 8'sd12);
+                         n_t14[3] <= rshr($signed(n_ow[63:48]) * $signed({1'b0, n_qrecip[15:0]}), $signed({1'b0, n_qrecip[23:16]}) + 8'sd12);
+                         n_sub <= 2;
+                    end
+                    2: begin
+                         q8buf[n_st_s*DIN + n_i[8:0]]     <= (n_t14[0] > 48'sd127) ? 8'sd127 : (n_t14[0] < -48'sd128) ? -8'sd128 : n_t14[0][7:0];
+                         q8buf[n_st_s*DIN + n_i[8:0] + 1] <= (n_t14[1] > 48'sd127) ? 8'sd127 : (n_t14[1] < -48'sd128) ? -8'sd128 : n_t14[1][7:0];
+                         q8buf[n_st_s*DIN + n_i[8:0] + 2] <= (n_t14[2] > 48'sd127) ? 8'sd127 : (n_t14[2] < -48'sd128) ? -8'sd128 : n_t14[2][7:0];
+                         q8buf[n_st_s*DIN + n_i[8:0] + 3] <= (n_t14[3] > 48'sd127) ? 8'sd127 : (n_t14[3] < -48'sd128) ? -8'sd128 : n_t14[3][7:0];
+                         n_sub <= 0;
+                         if (n_i >= (n_op==2'd1 ? DIN-4 : D-4)) begin
+                             nst <= N_IDLE; op_pc[n_st_s] <= op_pc[n_st_s] + 1;
+                             busy[n_st_s] <= 0;
+                         end else n_i <= n_i + 4;
+                    end
+                  endcase
+                end
+              end
+              default: ;
+            endcase
+
+            // ===================================================== GEMV =======
+            case (gst)
+              G_LD: begin
+                g_wrx <= 1; g_wrx_a <= g_i[8:0];
+                g_wrx_d <= q8buf[g_st_s*DIN + g_i[8:0]];
+                if (g_i == DIN-1) begin
+                    g_i <= 0; gst <= G_RUN; g_start <= 1;
+                    if (g_op == 2'd0) begin
+                        g_base <= g_li * (INROWS * (D/8));
+                        g_rows <= INROWS; g_wpr <= D/8;
+                    end else if (g_op == 2'd1) begin
+                        g_base <= consts[120][18:0] + g_li * (D * (DIN/8));
+                        g_rows <= D; g_wpr <= DIN/8;
+                    end else begin
+                        g_base <= consts[121][18:0];
+                        g_rows <= V; g_wpr <= D/8;
+                    end
+                end else g_i <= g_i + 1;
+              end
+              G_RUN: if (g_done) begin
+                  gst <= G_RD; g_i <= 0; g_sub <= 0;
+                  g_best <= -16'sd32768; g_besti <= 0;
+              end
+              G_RD: begin
+                if (g_op == 2'd0) begin        // in_proj dequant -> zxbuf
+                  case (g_sub)
+                    0: begin g_rdaw <= g_i[10:0]; g_sub <= 1; end
+                    1: begin
+                         g_acc4[0] <= $signed(g_accw[ 31:  0]);
+                         g_acc4[1] <= $signed(g_accw[ 63: 32]);
+                         g_acc4[2] <= $signed(g_accw[ 95: 64]);
+                         g_acc4[3] <= $signed(g_accw[127: 96]);
+                         g_fp4[0]  <= rsin[g_li*INROWS + g_i[10:0]];
+                         g_fp4[1]  <= rsin[g_li*INROWS + g_i[10:0] + 1];
+                         g_fp4[2]  <= rsin[g_li*INROWS + g_i[10:0] + 2];
+                         g_fp4[3]  <= rsin[g_li*INROWS + g_i[10:0] + 3];
+                         g_sub <= 2;
+                    end
+                    2: begin
+                         g_t14[0] <= rshr(mul_m11(g_acc4[0], g_fp4[0]), 8'sd10 - $signed({3'b0, g_fp4[0][14:10]}));
+                         g_t14[1] <= rshr(mul_m11(g_acc4[1], g_fp4[1]), 8'sd10 - $signed({3'b0, g_fp4[1][14:10]}));
+                         g_t14[2] <= rshr(mul_m11(g_acc4[2], g_fp4[2]), 8'sd10 - $signed({3'b0, g_fp4[2][14:10]}));
+                         g_t14[3] <= rshr(mul_m11(g_acc4[3], g_fp4[3]), 8'sd10 - $signed({3'b0, g_fp4[3][14:10]}));
+                         g_sub <= 3;
+                    end
+                    3: begin
+                         zxbuf[g_st_s*INROWS + g_i[10:0]]     <= sat16f(rshr(g_t14[0] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                         zxbuf[g_st_s*INROWS + g_i[10:0] + 1] <= sat16f(rshr(g_t14[1] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                         zxbuf[g_st_s*INROWS + g_i[10:0] + 2] <= sat16f(rshr(g_t14[2] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                         zxbuf[g_st_s*INROWS + g_i[10:0] + 3] <= sat16f(rshr(g_t14[3] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                         g_sub <= 0;
+                         if (g_i >= INROWS-4) begin
+                             gst <= G_IDLE; op_pc[g_st_s] <= op_pc[g_st_s] + 1;
+                             busy[g_st_s] <= 0;
+                         end else g_i <= g_i + 4;
+                    end
+                  endcase
+                end else if (g_op == 2'd1) begin   // out_proj dequant + residual
+                  case (g_sub)
+                    0: begin g_rdaw <= g_i[10:0]; g_sub <= 1; end
+                    1: begin
+                         g_acc4[0] <= $signed(g_accw[ 31:  0]);
+                         g_acc4[1] <= $signed(g_accw[ 63: 32]);
+                         g_acc4[2] <= $signed(g_accw[ 95: 64]);
+                         g_acc4[3] <= $signed(g_accw[127: 96]);
+                         g_fp4[0]  <= rsout[g_li*D + g_i[7:0]];
+                         g_fp4[1]  <= rsout[g_li*D + g_i[7:0] + 1];
+                         g_fp4[2]  <= rsout[g_li*D + g_i[7:0] + 2];
+                         g_fp4[3]  <= rsout[g_li*D + g_i[7:0] + 3];
+                         g_sub <= 2;
+                    end
+                    2: begin
+                         g_t14[0] <= rshr(mul_m11(g_acc4[0], g_fp4[0]), 8'sd10 - $signed({3'b0, g_fp4[0][14:10]}));
+                         g_t14[1] <= rshr(mul_m11(g_acc4[1], g_fp4[1]), 8'sd10 - $signed({3'b0, g_fp4[1][14:10]}));
+                         g_t14[2] <= rshr(mul_m11(g_acc4[2], g_fp4[2]), 8'sd10 - $signed({3'b0, g_fp4[2][14:10]}));
+                         g_t14[3] <= rshr(mul_m11(g_acc4[3], g_fp4[3]), 8'sd10 - $signed({3'b0, g_fp4[3][14:10]}));
+                         g_sub <= 3;
+                    end
+                    3: begin
+                         xbuf[g_st_s*D + g_i[7:0]]     <= sat32f($signed({{16{xbuf[g_st_s*D+g_i[7:0]][31]}},     xbuf[g_st_s*D+g_i[7:0]]})     + rshr(g_t14[0] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                         xbuf[g_st_s*D + g_i[7:0] + 1] <= sat32f($signed({{16{xbuf[g_st_s*D+g_i[7:0]+1][31]}}, xbuf[g_st_s*D+g_i[7:0]+1]}) + rshr(g_t14[1] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                         xbuf[g_st_s*D + g_i[7:0] + 2] <= sat32f($signed({{16{xbuf[g_st_s*D+g_i[7:0]+2][31]}}, xbuf[g_st_s*D+g_i[7:0]+2]}) + rshr(g_t14[2] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                         xbuf[g_st_s*D + g_i[7:0] + 3] <= sat32f($signed({{16{xbuf[g_st_s*D+g_i[7:0]+3][31]}}, xbuf[g_st_s*D+g_i[7:0]+3]}) + rshr(g_t14[3] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                         g_sub <= 0;
+                         if (g_i >= D-4) begin
+                             gst <= G_IDLE; op_pc[g_st_s] <= op_pc[g_st_s] + 1;
+                             busy[g_st_s] <= 0;
+                         end else g_i <= g_i + 4;
+                    end
+                  endcase
+                end else begin                 // head dequant + argmax -> logit/dump
+                  case (g_sub)
+                    0: begin g_rdaw <= g_i[10:0]; g_sub <= 1; end
+                    1: begin
+                         g_acc4[0] <= $signed(g_accw[ 31:  0]);
+                         g_acc4[1] <= $signed(g_accw[ 63: 32]);
+                         g_acc4[2] <= $signed(g_accw[ 95: 64]);
+                         g_acc4[3] <= $signed(g_accw[127: 96]);
+                         g_fp4[0]  <= rshd[g_i[9:0]];
+                         g_fp4[1]  <= rshd[g_i[9:0] + 1];
+                         g_fp4[2]  <= rshd[g_i[9:0] + 2];
+                         g_fp4[3]  <= rshd[g_i[9:0] + 3];
+                         g_sub <= 2;
+                    end
+                    2: begin
+                         g_t14[0] <= rshr(mul_m11(g_acc4[0], g_fp4[0]), 8'sd10 - $signed({3'b0, g_fp4[0][14:10]}));
+                         g_t14[1] <= rshr(mul_m11(g_acc4[1], g_fp4[1]), 8'sd10 - $signed({3'b0, g_fp4[1][14:10]}));
+                         g_t14[2] <= rshr(mul_m11(g_acc4[2], g_fp4[2]), 8'sd10 - $signed({3'b0, g_fp4[2][14:10]}));
+                         g_t14[3] <= rshr(mul_m11(g_acc4[3], g_fp4[3]), 8'sd10 - $signed({3'b0, g_fp4[3][14:10]}));
+                         g_sub <= 3;
+                    end
+                    3: begin
+                         g_lv0 = sat16f(rshr(g_t14[0] * $signed({1'b0, g_c_hds[15:0]}), $signed({1'b0, g_c_hds[23:16]}) + 8'sd15 - 8'sd12));
+                         g_lv1 = sat16f(rshr(g_t14[1] * $signed({1'b0, g_c_hds[15:0]}), $signed({1'b0, g_c_hds[23:16]}) + 8'sd15 - 8'sd12));
+                         g_lv2 = sat16f(rshr(g_t14[2] * $signed({1'b0, g_c_hds[15:0]}), $signed({1'b0, g_c_hds[23:16]}) + 8'sd15 - 8'sd12));
+                         g_lv3 = sat16f(rshr(g_t14[3] * $signed({1'b0, g_c_hds[15:0]}), $signed({1'b0, g_c_hds[23:16]}) + 8'sd15 - 8'sd12));
+                         logit[g_st_s*V + g_i[9:0]]     <= g_lv0;
+                         logit[g_st_s*V + g_i[9:0] + 1] <= g_lv1;
+                         logit[g_st_s*V + g_i[9:0] + 2] <= g_lv2;
+                         logit[g_st_s*V + g_i[9:0] + 3] <= g_lv3;
+                         dump_logit[(g_st_s*TMAX+g_tok)*V + g_i[9:0]]     <= g_lv0;
+                         dump_logit[(g_st_s*TMAX+g_tok)*V + g_i[9:0] + 1] <= g_lv1;
+                         dump_logit[(g_st_s*TMAX+g_tok)*V + g_i[9:0] + 2] <= g_lv2;
+                         dump_logit[(g_st_s*TMAX+g_tok)*V + g_i[9:0] + 3] <= g_lv3;
+                         g_nb = g_best; g_ni = g_besti;
+                         if (g_lv0 > g_nb) begin g_nb = g_lv0; g_ni = g_i[9:0];     end
+                         if (g_lv1 > g_nb) begin g_nb = g_lv1; g_ni = g_i[9:0] + 1; end
+                         if (g_lv2 > g_nb) begin g_nb = g_lv2; g_ni = g_i[9:0] + 2; end
+                         if (g_lv3 > g_nb) begin g_nb = g_lv3; g_ni = g_i[9:0] + 3; end
+                         g_best <= g_nb; g_besti <= g_ni;
+                         g_sub <= 0;
+                         if (g_i >= V-4) begin
+                             gst <= G_IDLE; op_pc[g_st_s] <= NPC;  // token complete
+                             busy[g_st_s] <= 0;
+                         end else g_i <= g_i + 4;
+                    end
+                  endcase
+                end
+              end
+              default: ;
+            endcase
+
+            // ===================================================== CONV =======
+            case (cst)
+              C_LDW: begin
+                c_wrw <= 1; c_wrw_a <= c_i[11:0];
+                c_wrd <= convw[c_li*CONVD*4 + c_i[11:0]];
+                c_layer <= c_st_s*LR + c_li;
+                if (c_i == CONVD*4-1) begin c_i <= 0; cst <= C_LDX; c_sub <= 0; end
+                else c_i <= c_i + 1;
+              end
+              C_LDX: begin
+                case (c_sub)
+                  0: begin c_wrb <= 1; c_wrb_a <= c_i[9:0];
+                       c_wrd <= convb[c_li*CONVD + c_i[9:0]]; c_sub <= 1; end
+                  1: begin c_wrx <= 1; c_wrx_a <= c_i[9:0];
+                       c_wrd <= zxbuf[c_st_s*INROWS + DIN + c_i[9:0]]; c_sub <= 0;
+                       if (c_i == CONVD-1) begin c_i <= 0; cst <= C_RUN; c_start <= 1; end
+                       else c_i <= c_i + 1;
+                  end
+                endcase
+              end
+              C_RUN: if (c_done) begin cst <= C_RD; c_i <= 0; c_sub <= 0; end
+              C_RD: begin
+                case (c_sub)
+                  0: begin c_rda <= c_i[9:0]; c_sub <= 1; end
+                  1: begin xnbuf[c_st_s*CONVD + c_i[9:0]] <= c_y; c_sub <= 0;
+                       if (c_i == CONVD-1) begin
+                           cst <= C_IDLE; op_pc[c_st_s] <= op_pc[c_st_s] + 1;
+                           busy[c_st_s] <= 0;
+                       end else c_i <= c_i + 1;
+                  end
+                endcase
+              end
+              default: ;
+            endcase
+
+            // ===================================================== SCAN =======
+            case (sst)
+              SC_PREP: begin
+                case (sc_sub)
+                  0: begin
+                       sc_t1 <= rshr($signed(xnbuf[s_st_s*CONVD + DIN + sc_i[6:0]]),
+                                  $signed(8'sd11) - $signed({4'b0, s_bB}));
+                       sc_sub <= 1;
+                  end
+                  1: begin s_wrb <= 1; s_wrb_a <= sc_i[5:0];
+                       s_bc_d <= (sc_t1 > 48'sd127) ? 8'sd127 :
+                                 (sc_t1 < -48'sd128) ? -8'sd128 : sc_t1[7:0];
+                       sc_sub <= 2;
+                  end
+                  2: begin
+                       sc_t1 <= rshr($signed(xnbuf[s_st_s*CONVD + DIN + NST + sc_i[6:0]]),
+                                  $signed(8'sd11) - $signed({4'b0, s_bC}));
+                       sc_sub <= 3;
+                  end
+                  3: begin s_wrc <= 1; s_wrc_a <= sc_i[5:0];
+                       s_bc_d <= (sc_t1 > 48'sd127) ? 8'sd127 :
+                                 (sc_t1 < -48'sd128) ? -8'sd128 : sc_t1[7:0];
+                       sc_sub <= 0;
+                       if (sc_i == NST-1) begin sc_i <= 0; s_hi <= 0; sst <= SC_H; sc_sub <= 0; end
+                       else sc_i <= sc_i + 1;
+                  end
+                endcase
+              end
+              SC_H: begin
+                case (sc_sub)
+                  0: begin
+                       sc_dtq3 = sat16f($signed({{32{s_dtraw[15]}}, s_dtraw}) <<< 3);
+                       sc_fp <= {8'b0, ~sc_dtq3[15], sc_dtq3[14:8]};
+                       sc_sub <= 1;
+                  end
+                  1: begin
+                       sc_dtq <= dlut[s_li*H*256 + s_hi[2:0]*256 + sc_fp[7:0]];
+                       s_aq   <= alut[s_li*H*256 + s_hi[2:0]*256 + sc_fp[7:0]];
+                       sc_sub <= 2;
+                  end
+                  2: begin
+                       sc_eh <= (21 - bitlen15(sc_dtq[14:0]) > 20) ? 5'd20 :
+                                (bitlen15(sc_dtq[14:0]) > 21) ? 5'd0 :
+                                5'd21 - bitlen15(sc_dtq[14:0]);
+                       sc_sub <= 3;
+                  end
+                  3: begin
+                       sc_t1 <= rshr($signed(xnbuf[s_st_s*CONVD + s_hi[2:0]*64 + sc_i[5:0]]),
+                                  $signed(8'sd11) - $signed({4'b0, s_bX}));
+                       sc_sub <= 4;
+                  end
+                  4: begin
+                       sc_acc <= (sc_t1 > 48'sd127) ? 32'sd127 :
+                                 (sc_t1 < -48'sd128) ? -32'sd128 : sc_t1[31:0];
+                       sc_sub <= 5;
+                  end
+                  5: begin
+                       s_wrdtx <= 1; s_wrdtx_a <= sc_i[5:0];
+                       s_dtx_d <= sat16f(rshr(sc_acc * $signed({1'b0, sc_dtq}),
+                                          8'sd14 - $signed({3'b0, sc_eh})));
+                       if (sc_i == 63) begin sc_i <= 0; sc_sub <= 6; end
+                       else begin sc_i <= sc_i + 1; sc_sub <= 3; end
+                  end
+                  6: begin
+                       s_pbase <= s_st_s*LR*H + s_li*H + s_hi[2:0];
+                       s_shi <= 6'sd16 + 6'sd13 - $signed({2'b0, s_bX})
+                                - $signed({1'b0, sc_eh}) - $signed({2'b0, s_bB});
+                       s_shy <= $signed({2'b0, s_bC});
+                       s_start <= 1; sst <= SC_HWAIT; sc_sub <= 0;
+                  end
+                endcase
+              end
+              SC_HWAIT: if (s_done) begin sst <= SC_RD; sc_i <= 0; sc_sub <= 0; end
+              SC_RD: begin
+                case (sc_sub)
+                  0: begin s_rda <= sc_i[5:0]; sc_sub <= 1; end
+                  1: begin
+                       sc_acc <= s_y; sc_sub <= 2;
+                       sc_t1 <= $signed(consts[s_li*16 + 5 + {2'b0, s_hi[2:1]}]
+                                >> (s_hi[0] ? 16 : 0)) & 32'shFFFF;
+                  end
+                  2: begin
+                       ybuf[s_st_s*DIN + s_hi[2:0]*64 + sc_i[5:0]] <= sat16f(
+                          rshr({{32{sc_acc[15]}}, sc_acc[15:0]}, 8'sd2)
+                        + rshr($signed(sc_t1[15:0]) * $signed(xnbuf[s_st_s*CONVD + s_hi[2:0]*64 + sc_i[5:0]]),
+                               8'sd13));
+                       sc_sub <= 0;
+                       if (sc_i == 63) begin
+                           sc_i <= 0;
+                           if (s_hi == H-1) begin
+                               sst <= SC_IDLE; op_pc[s_st_s] <= op_pc[s_st_s] + 1;
+                               busy[s_st_s] <= 0;
+                           end else begin s_hi <= s_hi + 1; sst <= SC_H; sc_sub <= 0; end
+                       end else sc_i <= sc_i + 1;
+                  end
+                endcase
+              end
+              default: ;
+            endcase
+
+            // ---- token-boundary: a stream whose op_pc reached NPC finishes a
+            //      token; carry state and advance to the next token or retire ---
+            for (w = 0; w < NC; w = w + 1) begin
+                if (active[w] && !busy[w] && op_pc[w] == NPC) begin
+                    if (tokcnt[w] + 1 < TMAX && tokcnt[w] + 1 < T_TOKENS) begin
+                        tokcnt[w] <= tokcnt[w] + 1; op_pc[w] <= 0;
+                    end else begin
+                        active[w] <= 0;
+                    end
+                end
+            end
+        end
+
+        // ---------------------------------------------------- dump read mux ---
+        case (dbg_sel)
+            4'd0: dbg_data <= dump_x[dbg_addr];
+            4'd1: dbg_data <= {{16{dump_logit[dbg_addr][15]}}, dump_logit[dbg_addr]};
+            default: dbg_data <= 32'sd0;
+        endcase
+    end
+
+endmodule
+
+`default_nettype wire

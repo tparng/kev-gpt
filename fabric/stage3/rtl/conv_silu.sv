@@ -28,6 +28,7 @@ module conv_silu #(
     input  wire                  rst,       // clears the shift history
     input  wire                  start,
     output reg                   done,
+    output reg                   ready,      // 1 once the initial clear finished
 
     // per-layer history bank select: hist for this token's conv lives in
     // bank `layer` (rows layer*CH .. layer*CH+CH-1), persistent across tokens.
@@ -136,9 +137,10 @@ module conv_silu #(
         done <= 1'b0;
         if (rst) begin
             st <= IDLE; v1 <= 0; v2 <= 0; clearing <= 1'b1; clr <= '0;
+            ready <= 1'b0;
         end else begin
             if (clearing) begin
-                if (clr == LCH-1) clearing <= 1'b0;
+                if (clr == LCH-1) begin clearing <= 1'b0; ready <= 1'b1; end
                 clr <= clr + 1'b1;
             end
             // hist SDP write port (muxed clear-sweep / deferred-shift)
