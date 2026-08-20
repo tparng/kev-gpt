@@ -1,17 +1,27 @@
-// gemv_i4i8.sv — bring-up INT4xINT8 GEMV for the mamba engine (doc 9 §7).
+// gemv_i4i8.sv — WIDE (P-lane) INT4xINT8 GEMV for the mamba engine (doc 9 §7).
 //
-// One packed weight word (8 x INT4) per cycle: out[r] = sum_c w[r][c]*x[c],
-// INT32 accumulator, raw accumulator output (dequant happens downstream in
-// the sequencer's scale unit — this core is pure integer, gated bit-exact
-// against mamba2_fixed.gemv_i4i8's acc).
+// Reduce-parallel wide GEMV: reads PE 32-bit weight words per cycle (PE*8
+// nibble INT4xINT8 MACs) and folds them into ONE row accumulator, so a row of
+// `wpr` words completes in wpr/PE cycles instead of wpr. out[r] = sum_c
+// w[r][c]*x[c], INT32 accumulator, raw output (dequant happens downstream in
+// the sequencer's scale unit). Bit-exact against the single-lane predecessor
+// and mamba2_fixed.gemv_i4i8's acc: integer addition is associative, so
+// summing PE*8 products/cycle yields the identical row sum as 8/cycle.
 //
-// Weight image: row-major, D_IN/8 words per row (LSB-first nibbles,
-// two's-complement INT4), loaded once via wr_w. ROWS x D_IN up to
-// 1160 x 256 (in_proj). Sequential: ROWS * D_IN/8 cycles per call.
+// Weight image (UNCHANGED external contract): row-major, D_IN/8 words per row
+// (LSB-first nibbles, two's-complement INT4), word-addressed (base/wr_w_addr).
+// Internally the image is banked PE words wide (WBITS = PE*32) in URAM so PE
+// words read in one cycle. REQUIREMENTS on the runtime geometry:
+//   * PE is a power of two,
+//   * wpr is a multiple of PE (mamba: 32,64 both divisible by 8 and 16),
+//   * base is a multiple of PE (mamba bases 0, li*37120, 259840+.., 374528 are),
+//   * WMEM is a multiple of PE.
+// ROWS x D_IN up to 1160 x 512; PE*8 parallel nibble-MACs per cycle.
 
 `default_nettype none
 
 module gemv_i4i8 #(
+    parameter int PE    = 16,               // weight WORDS read per cycle (pow2)
     parameter int ROWS  = 1160,             // MAX geometry (buffer sizing)
     parameter int D_IN  = 512,
     parameter int WPR   = D_IN / 8,
@@ -39,70 +49,96 @@ module gemv_i4i8 #(
     input  wire [$clog2(ROWS)-1:0]  rd_acc_addr,
     output wire signed [31:0]       rd_acc_data
 );
-    localparam int RW = $clog2(ROWS);
-    localparam int WW = $clog2(WPR);
-    localparam int AWM   = $clog2(WMEM);
-    localparam int WROWS = WMEM/2;          // 2 words packed per 64-bit URAM row
+    localparam int LP    = $clog2(PE);          // log2 words/cycle
+    localparam int WBITS = PE * 32;             // wide weight word width
+    localparam int WWW   = WMEM / PE;           // wide words in the image
+    localparam int AWM   = $clog2(WMEM);        // word-address width (external)
+    localparam int AWW   = $clog2(WWW);         // wide-word-address width
+    localparam int RW    = $clog2(ROWS);
+    localparam int WSW   = $clog2(WPR/PE + 1);  // wide-step counter width
 
-    // wrom: SDP URAM. Two 32b weight words per 64b row (low=even word address,
-    // high=odd). Write is the one-time init pair-staging path (even word staged
-    // in wlo, committed with the odd word); read is 1-cycle, the low/high word
-    // chosen combinationally by the pointer LSB. The external WORD-address
-    // interface (base / wr_w_addr are word addresses) is unchanged.
+    // -------- weight image: PE words per wide URAM word, SDP (write init +
+    // 1-cycle read in one always block). Assembly places incoming word
+    // wr_w_addr[LP-1:0] into wbuf[slot*32 +: 32] (variable part-select WRITE on
+    // a PLAIN reg is iverilog-safe); the PE-th word commits the wide row with a
+    // CONSTANT concat (the PE-th word always lands in the top slot under the
+    // contiguous ascending load the sequencer/tb performs).
     (* ram_style = "ultra" *)
-    reg [63:0] wrom [0:WROWS-1];
-    reg [31:0] wlo;                         // even-word staging
-    reg [63:0] wq;                          // registered row read
-    reg        wsel1;                       // registered pointer LSB
-    wire [31:0] w1 = wsel1 ? wq[63:32] : wq[31:0];
+    reg [WBITS-1:0] wrom [0:WWW-1];
+    reg [WBITS-1:0] wbuf;                        // wide-word assembly buffer
+    reg [WBITS-1:0] wq;                          // registered wide read
 
-    reg [AWM-1:0] wptr;                     // running word pointer
-    reg [63:0] xin  [0:WPR-1];              // x packed 8 lanes/word (INT8)
-    reg signed [31:0] accs [0:ROWS-1];
+    wire [LP-1:0]     wsub  = wr_w_addr[LP-1:0];
+    wire [AWW-1:0]    wwide = wr_w_addr[AWM-1:LP];
+    reg  [AWW-1:0]    wptr;                       // running wide read pointer
 
-    assign rd_acc_data = accs[rd_acc_addr];
-
-    // SDP wrom: write (init) + 1-cycle read in ONE always block (URAM inference)
     always @(posedge clk) begin
         if (wr_w) begin
-            if (~wr_w_addr[0]) wlo <= wr_w_data;
-            else wrom[wr_w_addr[AWM-1:1]] <= {wr_w_data, wlo};
+            wbuf[wsub*32 +: 32] <= wr_w_data;
+            if (wsub == PE-1)
+                wrom[wwide] <= {wr_w_data, wbuf[(PE-1)*32-1:0]};
         end
-        wq    <= wrom[wptr[AWM-1:1]];
-        wsel1 <= wptr[0];
+        wq <= wrom[wptr];
     end
 
+    // -------- x: INT8 lanes, 8 per 64-bit word (write path unchanged) ---------
+    reg [63:0] xin [0:WPR-1];
     always @(posedge clk) begin
         if (wr_x) xin[wr_x_addr[$clog2(D_IN)-1:3]][(wr_x_addr[2:0])*8 +: 8]
                       <= wr_x_data;
     end
 
+    reg signed [31:0] accs [0:ROWS-1];
+    assign rd_acc_data = accs[rd_acc_addr];
+
+    // -------- FSM: iterate rows x wide-steps, PE words per cycle --------------
     localparam [1:0] IDLE = 2'd0, RUN = 2'd1, DRAIN = 2'd2;
     reg [1:0]  st;
     reg [RW-1:0] ri;
-    reg [WW-1:0] wi;
+    reg [WSW-1:0] wi;                            // wide-step within a row
+    wire [WSW-1:0] wprw = wpr >> LP;             // wide steps per row (exact)
     wire issue = (st == RUN);
 
-    // S0: read weight word + x word
-    reg          v1, last1;
-    reg [RW-1:0] r1;
-    reg [63:0]   x1;
-    reg [$clog2(ROWS*WPR)-1:0] waddr_r;
+    // S0 -> S1: registered x wide word (PE 64-bit lanes) + tags
+    reg               v1, last1;
+    reg [RW-1:0]      r1;
+    reg [PE*64-1:0]   x1;
 
-    // S1: 8 nibble MACs (comb) -> registered partial
-    reg          v2, last2;
-    reg [RW-1:0] r2;
-    reg signed [15:0] p2 [0:7];
+    // S1 -> S2: PE partial sums (each = 8 nibble products of one word)
+    reg               v2, last2;
+    reg [RW-1:0]      r2;
+    reg signed [15:0] ps [0:PE-1];
 
-    // S2: sum 8 partials into the row accumulator
+    // S2 accumulator
     reg signed [31:0] racc;
 
-    integer k;
-    // nibble decode: two's complement INT4
+    // nibble decode: two's complement INT4 -> signed 5
     function automatic signed [4:0] nib(input [3:0] n);
-        nib = {n[3], n};                     // sign-extend 4 -> 5
+        nib = {n[3], n};
     endfunction
 
+    // sum racc + all PE partials (associative => bit-exact vs 8/cycle)
+    function automatic signed [31:0] sum_ps(input signed [31:0] a);
+        integer j;
+        begin
+            sum_ps = a;
+            for (j = 0; j < PE; j = j + 1) sum_ps = sum_ps + ps[j];
+        end
+    endfunction
+
+    // build the PE-wide x word for wide-step `wi` from xin[wi*PE .. +PE-1]
+    // (whole-element indexed reads are iverilog-safe; only part-selects of an
+    // unpacked-array element read X).
+    integer xk;
+    reg [PE*64-1:0] xrow;
+    always @(*) begin
+        xrow = {(PE*64){1'b0}};
+        for (xk = 0; xk < PE; xk = xk + 1)
+            xrow[xk*64 +: 64] = xin[wi*PE + xk];
+    end
+
+    integer p, k;
+    reg signed [15:0] acc8;
     always @(posedge clk) begin
         done <= 1'b0;
         if (rst) begin
@@ -110,11 +146,11 @@ module gemv_i4i8 #(
         end else begin
             case (st)
               IDLE: if (start) begin
-                st <= RUN; ri <= '0; wi <= '0; wptr <= base;
+                st <= RUN; ri <= '0; wi <= '0; wptr <= base >> LP;
               end
               RUN: begin
                 wptr <= wptr + 1'b1;
-                if (wi == wpr-1) begin
+                if (wi == wprw-1) begin
                     wi <= '0;
                     if (ri == rows-1) st <= DRAIN; else ri <= ri + 1'b1;
                 end else wi <= wi + 1'b1;
@@ -122,25 +158,29 @@ module gemv_i4i8 #(
               DRAIN: if (!v1 && !v2) begin st <= IDLE; done <= 1'b1; end
             endcase
 
-            // S0 -> S1 (w1 is the combinational half-select of the wrom row,
-            // registered in the dedicated wrom always block -> same S1 timing)
-            v1 <= issue; r1 <= ri; last1 <= (wi == wpr-1);
-            x1 <= xin[wi];
+            // S0 -> S1: latch x wide word + tags (weight read = wq, registered
+            // in the wrom always block above -> aligned to this stage)
+            v1 <= issue; r1 <= ri; last1 <= (wi == wprw-1);
+            x1 <= xrow;
 
-            // S1 -> S2: 8 nibble products
+            // S1 -> S2: PE partial sums, each 8 nibble INT4xINT8 products of
+            // word p summed (wq is a plain reg -> constant part-selects safe)
             v2 <= v1; r2 <= r1; last2 <= last1;
-            for (k = 0; k < 8; k = k + 1)
-                p2[k] <= $signed(nib(w1[k*4 +: 4])) * $signed(x1[k*8 +: 8]);
+            for (p = 0; p < PE; p = p + 1) begin
+                acc8 = 16'sd0;
+                for (k = 0; k < 8; k = k + 1)
+                    acc8 = acc8 + $signed(nib(wq[p*32 + k*4 +: 4]))
+                                * $signed(x1[p*64 + k*8 +: 8]);
+                ps[p] <= acc8;
+            end
 
-            // S2: accumulate into racc; on row end, store and clear
+            // S2: fold PE partials into the row accumulator; on row end store
             if (v2) begin
                 if (last2) begin
-                    accs[r2] <= racc + p2[0] + p2[1] + p2[2] + p2[3]
-                                     + p2[4] + p2[5] + p2[6] + p2[7];
+                    accs[r2] <= sum_ps(racc);
                     racc <= 32'sd0;
                 end else
-                    racc <= racc + p2[0] + p2[1] + p2[2] + p2[3]
-                                 + p2[4] + p2[5] + p2[6] + p2[7];
+                    racc <= sum_ps(racc);
             end else
                 racc <= 32'sd0;
         end

@@ -126,7 +126,7 @@ module mamba_seq #(
     // WMEM sized to the packed weight image (7*37120 in + 7*16384 out + 32768
     // head = 407296 words) rounded up to an even 409600 -> 204800 x 64b rows =
     // exactly 50 URAM, leaving URAM headroom for the emb table.
-    gemv_i4i8 #(.ROWS(INROWS), .D_IN(DIN), .WMEM(409600)) u_gemv (
+    gemv_i4i8 #(.PE(16), .ROWS(INROWS), .D_IN(DIN), .WMEM(409600)) u_gemv (
         .clk(clk), .rst(rst), .start(g_start), .done(g_done),
         .base(g_base), .rows(g_rows), .wpr(g_wpr),
         .wr_w(wr_en && wr_sel == WSEL_GW), .wr_w_addr(wr_addr), .wr_w_data(wr_data),

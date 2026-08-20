@@ -27,6 +27,8 @@ module tb_mamba_seq;
     reg [31:0] cfg [0:15];
     reg [15:0] toks [0:255];
     integer T, t, i, s, n, fd, fdx;
+    integer cyc = 0, c0 = 0;
+    always @(posedge clk) cyc <= cyc + 1;   // free-running cycle counter
 
     task load_sel(input integer sel, input integer count, input [1023:0] fname);
         begin
@@ -89,9 +91,11 @@ module tb_mamba_seq;
         for (t = 0; t < T; t = t + 1) begin
             @(posedge clk); tok_in <= toks[t][9:0];
             @(posedge clk); start <= 1;
+            c0 = cyc;
             @(posedge clk); start <= 0;
             wait (done);
             @(posedge clk);
+            $display("TOKCYC %0d cyc=%0d", t, cyc - c0);
             $display("TOK %0d -> %0d", toks[t], tok_out);
             dbg_sel <= 6;                       // logits
             for (i = 0; i < V; i = i + 1) begin
