@@ -21,12 +21,18 @@
 module conv_silu #(
     parameter int CH = 640,          // d_inner + 2*d_state
     parameter int K  = 4,
+    parameter int L  = 7,            // layers: one persistent history bank each
     parameter int QF = 12            // Q3.12 activations
 ) (
     input  wire                  clk,
     input  wire                  rst,       // clears the shift history
     input  wire                  start,
     output reg                   done,
+
+    // per-layer history bank select: hist for this token's conv lives in
+    // bank `layer` (rows layer*CH .. layer*CH+CH-1), persistent across tokens.
+    // Constant for the duration of one start..done run.
+    input  wire [$clog2(L)-1:0]  layer,
 
     // weight/bias load (once): addr = c*K+j for weights, c for bias
     input  wire                  wr_w,
@@ -49,10 +55,15 @@ module conv_silu #(
     input  wire [$clog2(CH)-1:0] rd_y_addr,
     output wire signed [15:0]    rd_y_data
 );
-    localparam int CW = $clog2(CH);
+    localparam int CW  = $clog2(CH);
+    localparam int LCH = L*CH;               // total history rows across banks
+    localparam int AW  = $clog2(LCH);
 
-    // history: one wide word per channel (K-1 samples of 16b), doc-6 layout
-    reg [(K-1)*16-1:0] hist [0:CH-1];
+    // history: one wide word per channel (K-1 samples of 16b), doc-6 layout.
+    // PER-LAYER banks: row = layer*CH + ch, so the variable row is a memory
+    // ADDRESS (not a per-lane mux). Cleared once at rst (all L banks), then each
+    // layer reads/updates ONLY its own bank, carried across tokens.
+    reg [(K-1)*16-1:0] hist [0:LCH-1];
     reg signed [15:0]  xin  [0:CH-1];
     reg signed [15:0]  wrom [0:CH*K-1];
     reg signed [15:0]  brom [0:CH-1];
@@ -70,9 +81,13 @@ module conv_silu #(
 
     localparam [1:0] IDLE = 2'd0, RUN = 2'd1, DRAIN = 2'd2;
     reg [1:0]  st;
-    reg [CW-1:0] ci, clr;
+    reg [CW-1:0] ci;
+    reg [AW-1:0] clr;                        // clears all L*CH history rows
     reg        clearing;
     wire issue = (st == RUN);
+
+    // history row address for the current channel in the current layer's bank
+    wire [AW-1:0] haddr = layer*CH + ci;
 
     // S0: read channel operands -> regs
     reg               v1;
@@ -108,7 +123,7 @@ module conv_silu #(
         end else begin
             if (clearing) begin
                 hist[clr] <= '0;
-                if (clr == CH-1) clearing <= 1'b0;
+                if (clr == LCH-1) clearing <= 1'b0;
                 clr <= clr + 1'b1;
             end
             case (st)
@@ -122,10 +137,10 @@ module conv_silu #(
 
             // S0 -> S1
             v1 <= issue; c1 <= ci;
-            h1 <= hist[ci]; x1 <= xin[ci]; b1 <= brom[ci];
+            h1 <= hist[haddr]; x1 <= xin[ci]; b1 <= brom[ci];
             for (j = 0; j < K; j = j + 1) w1[j] <= wrom[ci*K + j];
-            if (issue)   // shift history: drop oldest, append current sample
-                hist[ci] <= {xin[ci], hist[ci][(K-1)*16-1:16]};
+            if (issue)   // shift this layer's history: drop oldest, append current
+                hist[haddr] <= {xin[ci], hist[haddr][(K-1)*16-1:16]};
 
             // S1 -> S2: K-tap MAC (K=4: 3 taps from history + current)
             v2 <= v1; c2 <= c1;

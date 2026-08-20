@@ -21,7 +21,7 @@ import numpy as np
 from fabric.stage3._simdir import kevbuild
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CH, K = 640, 4
+CH, K, L = 640, 4, 7
 
 
 def tool(name):
@@ -57,6 +57,9 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dir", default=None)
+    ap.add_argument("--interleave", action="store_true",
+                    help="assign token t to history bank t%%L (round-robin) to "
+                         "prove the L per-layer banks stay independent")
     args = ap.parse_args(argv)
 
     sim = args.dir or kevbuild("stage3_conv_silu")
@@ -76,15 +79,23 @@ def main(argv=None):
             for v in np.asarray(vals).ravel():
                 f.write(f"{int(v) & 0xFFFF:04x}\n")
 
+    # per-token history bank: all bank 0 (default) or round-robin over L banks
+    lyr = np.array([(t % L) if args.interleave else 0 for t in range(T)],
+                   dtype=np.int64)
+
     hexdump(f"{sim}/cs_w.mem", w_q)
     hexdump(f"{sim}/cs_b.mem", b_q)
     hexdump(f"{sim}/cs_lut.mem", lut)
     hexdump(f"{sim}/cs_x.mem", xs)
+    hexdump(f"{sim}/cs_layer.mem", lyr)
     with open(f"{sim}/cs_cfg.mem", "w") as f:
         f.write(f"{T:08x}\n")
 
-    hist = np.zeros((CH, K - 1), dtype=np.int64)
-    ref = np.stack([ref_step(hist, xs[t], w_q, b_q, lut) for t in range(T)])
+    # one persistent history per bank — token t reads/updates only bank lyr[t],
+    # mirroring conv_silu.sv's L independent history banks
+    banks = [np.zeros((CH, K - 1), dtype=np.int64) for _ in range(L)]
+    ref = np.stack([ref_step(banks[lyr[t]], xs[t], w_q, b_q, lut)
+                    for t in range(T)])
 
     src = [f"{REPO}/fabric/stage3/rtl/conv_silu.sv",
            f"{REPO}/fabric/stage3/tb/tb_conv_silu.sv"]

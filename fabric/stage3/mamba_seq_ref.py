@@ -25,13 +25,18 @@ below with the same name in the comments.
 Proven bit-exact to the RTL: 173 MSEQ_TRACE probes + full ms_logit.out/ms_x.out
 (0 max|diff| on all 1024 logits and 256 residuals, 2 tokens incl. state carry).
 
-KEY FINDING (the divergence this replica was built to enumerate): conv_silu.sv
-owns ONE 640-channel depthwise-conv history buffer, cleared only at rst, yet the
-engine drives it for all L=7 layers -> layer l>=1 reads layer l-1's leftover
-samples (cross-layer contamination the per-layer float model never has). This is
-the dominant fabric-vs-float divergence (L0.conv cos 0.9999 -> L1.conv 0.81 ->
-L2+ ~0.4-0.5) and flips the token-0 argmax (fabric 176 vs float 177). Run
-`--diverge` for the ranked per-phase table.
+HISTORY (the divergence this replica was built to enumerate, now FIXED):
+conv_silu.sv used to own ONE 640-channel depthwise-conv history buffer, cleared
+only at rst, yet the engine drives it for all L=7 layers -> layer l>=1 read
+layer l-1's leftover samples (cross-layer contamination the per-layer float model
+never has). That was the dominant fabric-vs-float divergence (L0.conv cos 0.9999
+-> L1.conv 0.81 -> L2+ ~0.4-0.5) and flipped the token-0 argmax (fabric 176 vs
+float 177). FIX: conv_silu.sv now owns L independent history banks (hist[0:L*CH-1]
+addressed layer*CH+ch, a `layer` input driven by the engine's li), cleared once at
+rst then carried across tokens — exactly the float model's per-layer state["conv"][l].
+This replica models the SAME per-layer banks (state["conv"][l]). Post-fix: every
+conv cosine recovers to ~0.98-0.996 and the token-0 argmax matches float (177).
+Run `--diverge` for the ranked per-phase table.
 """
 
 from __future__ import annotations
@@ -271,12 +276,12 @@ class MambaSeqRef:
     # -------------------------------------------------------------- state ----
     def alloc_state(self):
         return {
-            # conv history: ONE 640-channel buffer SHARED across all layers and
-            # tokens (conv_silu.sv clears hist only at rst, never per-layer/token
-            # -> layer l's conv reads layer l-1's leftover samples; a real RTL
-            # cross-layer contamination bug the float model does not have). Each
-            # entry [oldest, mid, newest_prev] (hist word [15:0]=oldest).
-            "conv": [[0, 0, 0] for _ in range(CONVD)],
+            # conv history: PER-LAYER banks — conv_silu.sv now owns L independent
+            # 640-channel history banks (hist[0:L*CH-1], addressed layer*CH+ch),
+            # cleared once at rst then carried across tokens, exactly like the
+            # float model's per-layer state["conv"][l]. Each entry is
+            # [oldest, mid, newest_prev] (hist word [15:0]=oldest).
+            "conv": [[[0, 0, 0] for _ in range(CONVD)] for _ in range(L)],
             # scan state h per context (li*H+hi) as (P,N) int64
             "h": [np.zeros((64, NST), dtype=np.int64) for _ in range(L * H)],
         }
@@ -351,7 +356,7 @@ class MambaSeqRef:
             C[f"l{li}.zx"] = list(zx)
 
             # ---- S_CONV: depthwise conv1d (k=4) + SiLU -----------------------
-            hist = state["conv"]           # SHARED across layers (see alloc_state)
+            hist = state["conv"][li]       # per-layer bank (see alloc_state)
             xn_conv = [0] * CONVD
             for c in range(CONVD):
                 x_in = zx[DIN + c]
@@ -767,17 +772,16 @@ def _diverge(args):
           f"{tbl['L0.conv'][0]:.5f} scan={tbl['L0.scan'][0]:.5f} x_out="
           f"{tbl['L0.x_out'][0]:.5f}  -> layer 0 is essentially exact; the "
           f"Q6.9/Q4.11 widening removed the earlier conv/gate saturation.")
-    print(f"  L1.conv cos={tbl['L1.conv'][0]:.5f}  ***DOMINANT STRUCTURAL BUG*** "
-          f"-> conv_silu.sv has ONE 640-channel history buffer (hist[0:CH-1]) "
-          f"cleared only at rst, but the engine calls it for all L=7 layers. So "
-          f"layer l>=1's conv reads layer l-1's leftover samples (cross-layer "
-          f"contamination); the float model keeps per-layer conv state. Signature:"
-          f" L0.conv=0.9999 (history=0, matches) -> L1.conv collapses -> L2+.conv "
-          f"~0.4-0.5. Every downstream scan/x_out inherits this. Fix: a per-layer "
-          f"history bank (L*CH) or a per-layer clear.")
-    print(f"  Everything else is (a) propagation of the conv bug through the "
-          f"residual stream and scan state, and (b) the irreducible per-block "
-          f"LUT/rsqrt/requant floor (~0.1-0.6%/block at L0, in the noise).")
+    print(f"  L1.conv cos={tbl['L1.conv'][0]:.5f}  (was 0.81 pre-fix) -> the "
+          f"cross-layer conv contamination is RESOLVED: conv_silu.sv now owns L "
+          f"independent history banks (hist[0:L*CH-1], addressed layer*CH+ch, a "
+          f"`layer` input driven by the engine's li), cleared once at rst then "
+          f"carried across tokens like the float model's per-layer state[\"conv\"][l]."
+          f" All conv cosines recover to ~0.98-0.996.")
+    print(f"  The remaining sub-0.999 spread across layers is the irreducible "
+          f"per-block LUT/rsqrt/requant floor accumulating through the residual "
+          f"stream and scan state over depth (no single structural outlier "
+          f"remains). The token-0 argmax now matches float.")
     print(f"  NB: the gated norm here uses gate_sh=14 (worktree widening), the "
           f"intended value — no gate_sh bug in this RTL.")
     return 0

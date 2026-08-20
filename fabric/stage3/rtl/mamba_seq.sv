@@ -131,8 +131,9 @@ module mamba_seq #(
     reg  [7:0]  c_wrl_a;
     reg signed [15:0] c_wrd;
     wire signed [15:0] c_y;
-    conv_silu #(.CH(CONVD), .K(4)) u_conv (
+    conv_silu #(.CH(CONVD), .K(4), .L(L)) u_conv (
         .clk(clk), .rst(rst), .start(c_start), .done(c_done),
+        .layer(li),                      // per-layer persistent history bank
         .wr_w(c_wrw), .wr_w_addr(c_wrw_a), .wr_w_data(c_wrd),
         .wr_b(c_wrb), .wr_b_addr(c_wrb_a), .wr_b_data(c_wrd),
         .wr_x(c_wrx), .wr_x_addr(c_wrx_a), .wr_x_data(c_wrd),
