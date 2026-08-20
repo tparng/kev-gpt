@@ -213,6 +213,19 @@ class MambaSeqRef:
     def __init__(self, export="data/fabric_mamba"):
         ex = os.path.join(REPO, export) if not os.path.isabs(export) else export
         self.ex = ex
+        # config-aware sizing: d_state (NST) drives CONVD/INROWS. Read it from the
+        # export manifest so a config-B (d_state=32) export re-sizes the replica
+        # (config-A d_state=64 stays the default). Methods below read these
+        # module globals dynamically, so one MambaSeqRef == one config per process.
+        global NST, CONVD, INROWS
+        try:
+            _mf = json.load(open(f"{ex}/manifest.json"))
+            NST = int(_mf["cfg"]["d_state"])
+        except (FileNotFoundError, KeyError):
+            pass
+        CONVD = DIN + 2 * NST
+        INROWS = 2 * DIN + 2 * NST + H
+        self.NST, self.CONVD, self.INROWS = NST, CONVD, INROWS
         sj = json.load(open(f"{ex}/shifts.json"))
         self.sj = sj
 

@@ -111,7 +111,10 @@ module ssm_scan_row #(
     reg signed [41:0] injs  [0:N-1];      // S2: barrel-shifted inject
     reg signed [32:0] mul2l [0:N-1];      // S2: delayed a*h
     reg signed [15:0] hnl   [0:N-1];      // S3: saturated new state
-    reg signed [23:0] yprodl[0:N-1];      // S4: hnew * C
+    reg signed [23:0] yprodl[0:63];       // S4: hnew * C (fixed 64 lanes: the
+                                          // y adder tree below is a 64->16->4->1
+                                          // reduction, so lanes N..63 are held at
+                                          // 0 for N<64 — bit-exact, adds nothing)
 
     wire signed [16:0] a_s = {1'b0, a_q};
 
@@ -197,10 +200,13 @@ module ssm_scan_row #(
             for (k = 0; k < N; k = k + 1)
                 hnl[k] <= hnew_w[k*16 +: 16];
             if (v3) begin we <= 1'b1; waddr <= ctx_off + p3; wdata <= hnew_w; end
-            // S4 -> S5: y products
+            // S4 -> S5: y products (lanes N..63 forced 0 so the 64-wide adder
+            // tree reduces correctly for any N <= 64)
             v5 <= v4; p5 <= p4;
             for (k = 0; k < N; k = k + 1)
                 yprodl[k] <= hnl[k] * cvec[k];
+            for (k = N; k < 64; k = k + 1)
+                yprodl[k] <= 24'sd0;
 `ifdef ROW_TRACE
             if (v4 && p4 == 0)
                 $display("RT p0: hq0=%0d mull0=%0d injs0=%0d hnl0=%0d cvec0=%0d yprod0=%0d",

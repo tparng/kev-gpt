@@ -141,6 +141,16 @@ def main(argv=None):
     os.makedirs(sim, exist_ok=True)
     ex = args.export
 
+    # d_state (NST) drives the RTL geometry (CONVD/INROWS) — read it from the
+    # export manifest so a config-B (d_state=32) export builds the RTL at NST=32.
+    nst = 64
+    try:
+        _mf = json.load(open(os.path.join(REPO, ex, "manifest.json")
+                             if not os.path.isabs(ex) else f"{ex}/manifest.json"))
+        nst = int(_mf["cfg"]["d_state"])
+    except (FileNotFoundError, KeyError):
+        pass
+
     gw, out_base, head_base, lengths = build_tables(sim, ex)
 
     # ---- token streams: stream 0/1 = val.bin head; others deterministic RNG --
@@ -197,7 +207,8 @@ def main(argv=None):
         src.append(f"{REPO}/fabric/stage3/tb/tb_mamba_pipe.sv")
 
     subprocess.run([tool("iverilog"), "-g2012", f"-DNC_SIM={NC}",
-                    f"-DT_SIM={T}", "-o", "mp.vvp"] + src, cwd=sim, check=True)
+                    f"-DT_SIM={T}", f"-DNST_SIM={nst}", "-o", "mp.vvp"] + src,
+                   cwd=sim, check=True)
     out = subprocess.run([tool("vvp"), "mp.vvp"], cwd=sim, check=True,
                          capture_output=True, text=True, timeout=21600)
     tail = out.stdout[-1500:]

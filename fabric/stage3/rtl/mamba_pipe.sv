@@ -40,6 +40,10 @@ module mamba_pipe #(
     parameter int NC    = 2,                  // streams (wave width)
     parameter int TMAX  = 4,                  // max tokens/stream (dump sizing)
     parameter int T_TOKENS = 2,               // tokens each stream decodes
+    parameter int DBG   = 1,                  // 0 = tie off the sim-only debug
+                                              // readback (dump_x/dump_logit go
+                                              // write-only -> pruned); bitstream
+                                              // builds set DBG=0 for the LUT back.
     parameter int CONVD = DIN + 2*NST,        // 640
     parameter int INROWS = 2*DIN + 2*NST + H  // 1160
 ) (
@@ -121,17 +125,61 @@ module mamba_pipe #(
     reg [9:0] tok_seq [0:NC*TMAX-1];
     always @(posedge clk) if (tw_en) tok_seq[tw_addr] <= tw_data;
 
-    // ------------------------------------------ per-stream banked buffers ----
-    reg signed [31:0] xbuf  [0:NC*D-1];       // residual Q6.19
+    // --------------------------------------------- working buffers (LUTRAM) --
+    // FIT DISCIPLINE (doc 9a §6): each wave buffer here has ONE writer so it
+    // infers single-write-port distributed RAM (LUT-as-Memory) instead of the
+    // FF+address-mux tree (LUT-as-Logic) the flat multi-port form demoted to.
+    //  - The 4-lane-written buffers (zxbuf, q8buf) are packed into WIDE-WORD
+    //    rows (4 elements per row) so the P=4 parallel write is ONE row write,
+    //    not four write ports. Element reads slice the row (a cheap 4:1 mux);
+    //    async reads are unchanged, so the FSM schedule/cycle-count is identical.
+    //  - xnbuf/ybuf are 1-lane single-writer already: only a ram_style hint.
+    //  - q8buf: NORM's two write sites (pre/gate P=4 + final P=1) are funnelled
+    //    into ONE wide-word port (see q8w_* below) so it too infers DRAM.
+    //  - xbuf (residual) has TWO writers (EMB init + GEMV out_proj RMW) that can
+    //    fire on DIFFERENT streams the same cycle, so it is split into NC
+    //    per-stream single-write-port wide-word banks (the `xbk` generate below).
+    localparam int ZXW = INROWS/4;            // zxbuf wide-word rows per stream
+    localparam int Q8W = DIN/4;               // q8buf wide-word rows per stream
+    (* ram_style = "distributed" *)
     reg signed [15:0] xnbuf [0:NC*CONVD-1];   // conv out Q4.11
-    reg signed [15:0] zxbuf [0:NC*INROWS-1];  // in_proj dequant Q6.9
+    (* ram_style = "distributed" *)
+    reg        [63:0] zxbuf_w [0:NC*ZXW-1];   // in_proj dequant Q6.9, 4x16b/row
+    (* ram_style = "distributed" *)
     reg signed [15:0] ybuf  [0:NC*DIN-1];     // scan out Q4.11
-    reg signed [7:0]  q8buf [0:NC*DIN-1];     // quantized activations
+    (* ram_style = "distributed" *)
+    reg        [31:0] q8buf_w [0:NC*Q8W-1];   // quantized activations, 4x8b/row
     reg signed [15:0] logit [0:NC*V-1];
 
-    // dumps: per (stream,token) snapshot for the gate
+    // dumps: per (stream,token) snapshot for the gate (DBG=1 only — big, and
+    // pruned in the bitstream build). dump_tok is the COMPACT per-(stream,token)
+    // argmax token — always present (the board's record protocol reads it, and
+    // it anchors the whole compute chain so DBG=0 can't optimise the datapath
+    // away). dump_logit/dump_x are the wide bit-exact-gate readbacks.
+    reg        [9:0]  dump_tok   [0:NC*TMAX-1];
     reg signed [15:0] dump_logit [0:NC*TMAX*V-1];
     reg signed [31:0] dump_x     [0:NC*TMAX*D-1];
+
+    // wide-word zxbuf element read: flat index idx = stream*INROWS + offset.
+    // INROWS is a multiple of 4, so row = idx>>2, element = idx[1:0] (a plain-reg
+    // part-select — the only variable +: form iverilog/Vivado handle safely).
+    function automatic signed [15:0] zx_rd(input [15:0] idx);
+        reg [63:0] row;
+        begin
+            row   = zxbuf_w[idx[15:2]];
+            zx_rd = row[idx[1:0]*16 +: 16];
+        end
+    endfunction
+
+    // wide-word q8buf element read: flat index idx = stream*DIN + offset (DIN is
+    // a multiple of 4). row = idx>>2, byte = idx[1:0].
+    function automatic signed [7:0] q8_rd(input [15:0] idx);
+        reg [31:0] row;
+        begin
+            row   = q8buf_w[idx[15:2]];
+            q8_rd = row[idx[1:0]*8 +: 8];
+        end
+    endfunction
 
     // ------------------------------------------------------- scale helpers --
     function automatic signed [47:0] mul_m11(input signed [31:0] a,
@@ -337,7 +385,57 @@ module mamba_pipe #(
     wire [3:0] s_bB = consts[s_li*16 + 4][3:0];
     wire [3:0] s_bC = consts[s_li*16 + 4][7:4];
     wire [3:0] s_bX = consts[s_li*16 + 4][11:8];
-    wire signed [15:0] s_dtraw = zxbuf[s_st_s*INROWS + 2*DIN + 2*NST + s_hi[2:0]];
+    // dt_raw for the scan — read from the wide-word zxbuf inside the clocked
+    // block (a continuous assign calling zx_rd would not re-trigger on zxbuf_w
+    // writes, since the function's only sensitivity is its argument).
+    reg  signed [15:0] s_dtraw;
+
+    // ============================================ xbuf residual banks =========
+    // Residual Q6.19, split into NC per-stream single-write-port wide-word banks
+    // (4x32b rows). Two writers — EMB init (staged 4 elems -> 1 row) and GEMV
+    // out_proj RMW (read old row, add 4 lanes, write) — can target DIFFERENT
+    // streams the same cycle, so each bank has its OWN write port muxed between
+    // the two (mutually exclusive: a stream is held by exactly one worker). The
+    // per-bank write commits one cycle after the intent — safe, since out_proj
+    // touches strictly increasing rows (no back-to-back same-row) and EMB writes
+    // every row exactly once at token start. Reads stay async (no schedule change).
+    localparam int XW = D/4;                   // 64 rows/stream
+    localparam int XRW = (XW <= 1) ? 1 : $clog2(XW);
+    reg              xw_emb_we; reg [SW-1:0] xw_emb_s; reg [XRW-1:0] xw_emb_r; reg [127:0] xw_emb_d;
+    reg              xw_gem_we; reg [SW-1:0] xw_gem_s; reg [XRW-1:0] xw_gem_r; reg [127:0] xw_gem_d;
+    reg [127:0]      emb_stage;                // EMB row accumulator (lanes 0..2)
+    reg signed [31:0] e_val;                   // EMB per-element value (blocking)
+    reg signed [31:0] n_xv;                    // NORM xbuf read (blocking)
+    reg signed [31:0] g_xo0, g_xo1, g_xo2, g_xo3; // GEMV RMW old residual lanes
+    wire [XRW-1:0]   xr_norm_r = n_i[XRW+1:2]; // NORM element row  (n_i>>2)
+    wire [XRW-1:0]   xr_gem_r  = g_i[XRW+1:2]; // GEMV element row  (g_i>>2)
+    wire [127:0]     xrow_norm [0:NC-1];
+    wire [127:0]     xrow_gem  [0:NC-1];
+    genvar xbi;
+    generate for (xbi = 0; xbi < NC; xbi = xbi + 1) begin : xbk
+        (* ram_style = "distributed" *)
+        reg [127:0] mem [0:XW-1];
+        always @(posedge clk) begin
+            if      (xw_emb_we && xw_emb_s == xbi[SW-1:0]) mem[xw_emb_r] <= xw_emb_d;
+            else if (xw_gem_we && xw_gem_s == xbi[SW-1:0]) mem[xw_gem_r] <= xw_gem_d;
+        end
+        assign xrow_norm[xbi] = mem[xr_norm_r];
+        assign xrow_gem [xbi] = mem[xr_gem_r];
+    end endgenerate
+    // element reads: pick the holding stream's bank row, slice the element (a
+    // plain-reg part-select — the safe variable +: form).
+    function automatic signed [31:0] xrd_norm(input [7:0] e);
+        reg [127:0] row; begin row = xrow_norm[n_st_s]; xrd_norm = row[e[1:0]*32 +: 32]; end
+    endfunction
+    function automatic signed [31:0] xrd_gem(input [7:0] e);
+        reg [127:0] row; begin row = xrow_gem[g_st_s]; xrd_gem = row[e[1:0]*32 +: 32]; end
+    endfunction
+
+    // q8buf funnelled write (one wide-word port, muxed between NORM's two sites)
+    reg          q8w_we; reg [15:0] q8w_row; reg [31:0] q8w_word;
+    reg [31:0]   q8_stage;                     // final-path byte accumulator
+    reg signed [7:0] q8_byte;                  // final-path per-byte (blocking)
+    always @(posedge clk) if (q8w_we) q8buf_w[q8w_row] <= q8w_word;
 
     // ---- per-stream token boundary + dispatch helpers -----------------------
     // (computed in the clocked block below)
@@ -349,6 +447,7 @@ module mamba_pipe #(
         g_wrx <= 0; c_wrw <= 0; c_wrb <= 0; c_wrx <= 0; c_wrl <= 0;
         s_wrdtx <= 0; s_wrb <= 0; s_wrc <= 0;
         n_wry <= 0; n_wrz <= 0; n_wrg <= 0; n_wrl <= 0;
+        xw_emb_we <= 0; xw_gem_we <= 0; q8w_we <= 0;
 
         if (rst) begin
             ist <= 0; i_i <= 0; started <= 0; all_done <= 0; cyc_count <= 0;
@@ -494,8 +593,16 @@ module mamba_pipe #(
                        e_sub <= 2;
                   end
                   2: begin
-                       xbuf[e_st_s*D + e_i[7:0]] <= sat32f(rshr(mul_m11(e_acc, e_fp),
+                       // stage 4 elements into one wide row; write it every 4th
+                       // (D is a multiple of 4, so e_i==D-1 lands on lane 3).
+                       e_val = sat32f(rshr(mul_m11(e_acc, e_fp),
                                       8'sd6 - $signed({3'b0, e_fp[14:10]})));
+                       if (e_i[1:0] == 2'd3) begin
+                           xw_emb_we <= 1; xw_emb_s <= e_st_s;
+                           xw_emb_r  <= e_i[XRW+1:2];
+                           xw_emb_d  <= {e_val, emb_stage[95:0]};
+                       end else
+                           emb_stage[e_i[1:0]*32 +: 32] <= e_val;
                        e_sub <= 0;
                        if (e_i == D-1) begin
                            est <= E_IDLE;
@@ -516,7 +623,7 @@ module mamba_pipe #(
                     0: begin n_wry <= 1; n_wry_a <= n_i[9:0];
                          n_wrd <= ybuf[n_st_s*DIN + n_i[8:0]]; n_sub <= 1; end
                     1: begin n_wrz <= 1; n_wrz_a <= n_i[9:0];
-                         n_wrd <= zxbuf[n_st_s*INROWS + n_i[8:0]]; n_sub <= 2; end
+                         n_wrd <= zx_rd(n_st_s*INROWS + n_i[8:0]); n_sub <= 2; end
                     2: begin n_wrg <= 1; n_wrg_a <= n_i[9:0];
                          n_wrd <= nrmg[n_li*DIN + n_i[8:0]]; n_sub <= 0;
                          if (n_i == DIN-1) begin n_i <= 0; nst <= N_RUN; n_start <= 1; end
@@ -526,12 +633,11 @@ module mamba_pipe #(
                 end else begin                // pre / final (256), ungated
                   case (n_sub)
                     0: begin n_wry <= 1; n_wry_a <= n_i[9:0];
-                         n_wrd <= sat16f(rshr($signed({{16{xbuf[n_st_s*D+n_i[7:0]][31]}},
-                                          xbuf[n_st_s*D+n_i[7:0]]}), 8'sd10));
+                         n_xv = xrd_norm(n_i[7:0]);
+                         n_wrd <= sat16f(rshr($signed({{16{n_xv[31]}}, n_xv}), 8'sd10));
                          // final-norm: snapshot residual (l6.x_out) into the dump
                          if (n_op == 2'd2)
-                             dump_x[(n_st_s*TMAX + n_tok)*D + n_i[7:0]]
-                                 <= xbuf[n_st_s*D + n_i[7:0]];
+                             dump_x[(n_st_s*TMAX + n_tok)*D + n_i[7:0]] <= n_xv;
                          n_sub <= 1; end
                     1: begin n_wrg <= 1; n_wrg_a <= n_i[9:0];
                          n_wrd <= (n_op==2'd2) ? nfg[n_i[7:0]] : lng[n_li*D + n_i[7:0]];
@@ -553,9 +659,15 @@ module mamba_pipe #(
                          n_sub <= 2;
                     end
                     2: begin
-                         q8buf[n_st_s*DIN + n_i[8:0]] <=
-                             (n_t14[0] > 48'sd127) ? 8'sd127 :
-                             (n_t14[0] < -48'sd128) ? -8'sd128 : n_t14[0][7:0];
+                         // final: P=1 -> stage into a wide-word row, one row write
+                         // per 4 bytes (D%4==0, so n_i==D-1 lands on byte 3).
+                         q8_byte = (n_t14[0] > 48'sd127) ? 8'sd127 :
+                                   (n_t14[0] < -48'sd128) ? -8'sd128 : n_t14[0][7:0];
+                         if (n_i[1:0] == 2'd3) begin
+                             q8w_we <= 1; q8w_row <= (n_st_s*DIN + n_i[8:0]) >> 2;
+                             q8w_word <= {q8_byte, q8_stage[23:0]};
+                         end else
+                             q8_stage[n_i[1:0]*8 +: 8] <= q8_byte;
                          n_sub <= 0;
                          if (n_i == D-1) begin
                              nst <= N_IDLE; op_pc[n_st_s] <= op_pc[n_st_s] + 1;
@@ -574,10 +686,13 @@ module mamba_pipe #(
                          n_sub <= 2;
                     end
                     2: begin
-                         q8buf[n_st_s*DIN + n_i[8:0]]     <= (n_t14[0] > 48'sd127) ? 8'sd127 : (n_t14[0] < -48'sd128) ? -8'sd128 : n_t14[0][7:0];
-                         q8buf[n_st_s*DIN + n_i[8:0] + 1] <= (n_t14[1] > 48'sd127) ? 8'sd127 : (n_t14[1] < -48'sd128) ? -8'sd128 : n_t14[1][7:0];
-                         q8buf[n_st_s*DIN + n_i[8:0] + 2] <= (n_t14[2] > 48'sd127) ? 8'sd127 : (n_t14[2] < -48'sd128) ? -8'sd128 : n_t14[2][7:0];
-                         q8buf[n_st_s*DIN + n_i[8:0] + 3] <= (n_t14[3] > 48'sd127) ? 8'sd127 : (n_t14[3] < -48'sd128) ? -8'sd128 : n_t14[3][7:0];
+                         // pre/gate: P=4 -> one wide-word row write (n_i mult of 4)
+                         q8w_we <= 1; q8w_row <= (n_st_s*DIN + n_i[8:0]) >> 2;
+                         q8w_word <= {
+                             ((n_t14[3] > 48'sd127) ? 8'sd127 : (n_t14[3] < -48'sd128) ? -8'sd128 : n_t14[3][7:0]),
+                             ((n_t14[2] > 48'sd127) ? 8'sd127 : (n_t14[2] < -48'sd128) ? -8'sd128 : n_t14[2][7:0]),
+                             ((n_t14[1] > 48'sd127) ? 8'sd127 : (n_t14[1] < -48'sd128) ? -8'sd128 : n_t14[1][7:0]),
+                             ((n_t14[0] > 48'sd127) ? 8'sd127 : (n_t14[0] < -48'sd128) ? -8'sd128 : n_t14[0][7:0])};
                          n_sub <= 0;
                          if (n_i >= (n_op==2'd1 ? DIN-4 : D-4)) begin
                              nst <= N_IDLE; op_pc[n_st_s] <= op_pc[n_st_s] + 1;
@@ -594,7 +709,7 @@ module mamba_pipe #(
             case (gst)
               G_LD: begin
                 g_wrx <= 1; g_wrx_a <= g_i[8:0];
-                g_wrx_d <= q8buf[g_st_s*DIN + g_i[8:0]];
+                g_wrx_d <= q8_rd(g_st_s*DIN + g_i[8:0]);
                 if (g_i == DIN-1) begin
                     g_i <= 0; gst <= G_RUN; g_start <= 1;
                     if (g_op == 2'd0) begin
@@ -636,10 +751,13 @@ module mamba_pipe #(
                          g_sub <= 3;
                     end
                     3: begin
-                         zxbuf[g_st_s*INROWS + g_i[10:0]]     <= sat16f(rshr(g_t14[0] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9));
-                         zxbuf[g_st_s*INROWS + g_i[10:0] + 1] <= sat16f(rshr(g_t14[1] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9));
-                         zxbuf[g_st_s*INROWS + g_i[10:0] + 2] <= sat16f(rshr(g_t14[2] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9));
-                         zxbuf[g_st_s*INROWS + g_i[10:0] + 3] <= sat16f(rshr(g_t14[3] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                         // wide-word: pack the 4 dequant lanes into one row write
+                         // (g_i is a multiple of 4, so this covers g_i..g_i+3).
+                         zxbuf_w[(g_st_s*INROWS + g_i[10:0]) >> 2] <= {
+                             sat16f(rshr(g_t14[3] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9)),
+                             sat16f(rshr(g_t14[2] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9)),
+                             sat16f(rshr(g_t14[1] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9)),
+                             sat16f(rshr(g_t14[0] * $signed({1'b0, g_c_ins[15:0]}), $signed({1'b0, g_c_ins[23:16]}) + 8'sd15 - 8'sd9))};
                          g_sub <= 0;
                          if (g_i >= INROWS-4) begin
                              gst <= G_IDLE; op_pc[g_st_s] <= op_pc[g_st_s] + 1;
@@ -669,10 +787,18 @@ module mamba_pipe #(
                          g_sub <= 3;
                     end
                     3: begin
-                         xbuf[g_st_s*D + g_i[7:0]]     <= sat32f($signed({{16{xbuf[g_st_s*D+g_i[7:0]][31]}},     xbuf[g_st_s*D+g_i[7:0]]})     + rshr(g_t14[0] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19));
-                         xbuf[g_st_s*D + g_i[7:0] + 1] <= sat32f($signed({{16{xbuf[g_st_s*D+g_i[7:0]+1][31]}}, xbuf[g_st_s*D+g_i[7:0]+1]}) + rshr(g_t14[1] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19));
-                         xbuf[g_st_s*D + g_i[7:0] + 2] <= sat32f($signed({{16{xbuf[g_st_s*D+g_i[7:0]+2][31]}}, xbuf[g_st_s*D+g_i[7:0]+2]}) + rshr(g_t14[2] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19));
-                         xbuf[g_st_s*D + g_i[7:0] + 3] <= sat32f($signed({{16{xbuf[g_st_s*D+g_i[7:0]+3][31]}}, xbuf[g_st_s*D+g_i[7:0]+3]}) + rshr(g_t14[3] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                         // wide-word RMW: read the old residual row (async), add
+                         // the 4 out_proj lanes, write the row back to the bank.
+                         g_xo0 = xrd_gem(g_i[7:0]);
+                         g_xo1 = xrd_gem(g_i[7:0] + 1);
+                         g_xo2 = xrd_gem(g_i[7:0] + 2);
+                         g_xo3 = xrd_gem(g_i[7:0] + 3);
+                         xw_gem_we <= 1; xw_gem_s <= g_st_s; xw_gem_r <= g_i[XRW+1:2];
+                         xw_gem_d  <= {
+                             sat32f($signed({{16{g_xo3[31]}}, g_xo3}) + rshr(g_t14[3] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19)),
+                             sat32f($signed({{16{g_xo2[31]}}, g_xo2}) + rshr(g_t14[2] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19)),
+                             sat32f($signed({{16{g_xo1[31]}}, g_xo1}) + rshr(g_t14[1] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19)),
+                             sat32f($signed({{16{g_xo0[31]}}, g_xo0}) + rshr(g_t14[0] * $signed({1'b0, g_c_outs[15:0]}), $signed({1'b0, g_c_outs[23:16]}) + 8'sd15 - 8'sd19))};
                          g_sub <= 0;
                          if (g_i >= D-4) begin
                              gst <= G_IDLE; op_pc[g_st_s] <= op_pc[g_st_s] + 1;
@@ -724,6 +850,8 @@ module mamba_pipe #(
                          if (g_i >= V-4) begin
                              gst <= G_IDLE; op_pc[g_st_s] <= NPC;  // token complete
                              busy[g_st_s] <= 0;
+                             // latch the final argmax token (compact, always kept)
+                             dump_tok[g_st_s*TMAX + g_tok] <= g_ni;
                          end else g_i <= g_i + 4;
                     end
                   endcase
@@ -746,7 +874,7 @@ module mamba_pipe #(
                   0: begin c_wrb <= 1; c_wrb_a <= c_i[9:0];
                        c_wrd <= convb[c_li*CONVD + c_i[9:0]]; c_sub <= 1; end
                   1: begin c_wrx <= 1; c_wrx_a <= c_i[9:0];
-                       c_wrd <= zxbuf[c_st_s*INROWS + DIN + c_i[9:0]]; c_sub <= 0;
+                       c_wrd <= zx_rd(c_st_s*INROWS + DIN + c_i[9:0]); c_sub <= 0;
                        if (c_i == CONVD-1) begin c_i <= 0; cst <= C_RUN; c_start <= 1; end
                        else c_i <= c_i + 1;
                   end
@@ -798,6 +926,7 @@ module mamba_pipe #(
               SC_H: begin
                 case (sc_sub)
                   0: begin
+                       s_dtraw = zx_rd(s_st_s*INROWS + 2*DIN + 2*NST + s_hi[2:0]);
                        sc_dtq3 = sat16f($signed({{32{s_dtraw[15]}}, s_dtraw}) <<< 3);
                        sc_fp <= {8'b0, ~sc_dtq3[15], sc_dtq3[14:8]};
                        sc_sub <= 1;
@@ -879,14 +1008,34 @@ module mamba_pipe #(
                 end
             end
         end
-
-        // ---------------------------------------------------- dump read mux ---
-        case (dbg_sel)
-            4'd0: dbg_data <= dump_x[dbg_addr];
-            4'd1: dbg_data <= {{16{dump_logit[dbg_addr][15]}}, dump_logit[dbg_addr]};
-            default: dbg_data <= 32'sd0;
-        endcase
     end
+
+    // ---------------------------------------------------- dump read mux -------
+    // DBG=1 (all sim gates): the per-(stream,token) readback the run_mamba_pipe
+    // harness compares against MambaSeqRef — the bit-honest path.
+    // DBG=0 (bitstream builds): the readback is tied off, so dump_x/dump_logit
+    // become write-only and the whole readback-mux tree + dump arrays are pruned
+    // (the record protocol reads only tok/cyc, never dbg_data); compute is
+    // identical either way.
+    // sel 2 = compact argmax token — ALWAYS present (board record protocol +
+    // datapath anchor). sel 0/1 = wide x/logit dumps — DBG=1 only.
+    generate if (DBG) begin : g_dbg
+        always @(posedge clk) begin
+            case (dbg_sel)
+                4'd0: dbg_data <= dump_x[dbg_addr];
+                4'd1: dbg_data <= {{16{dump_logit[dbg_addr][15]}}, dump_logit[dbg_addr]};
+                4'd2: dbg_data <= {22'b0, dump_tok[dbg_addr]};
+                default: dbg_data <= 32'sd0;
+            endcase
+        end
+    end else begin : g_nodbg
+        always @(posedge clk) begin
+            case (dbg_sel)
+                4'd2: dbg_data <= {22'b0, dump_tok[dbg_addr]};
+                default: dbg_data <= 32'sd0;
+            endcase
+        end
+    end endgenerate
 
 endmodule
 

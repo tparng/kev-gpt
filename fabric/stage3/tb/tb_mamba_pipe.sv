@@ -5,10 +5,14 @@
 // reshape(NC,T,*) order) and prints the MEASURED cycle count (TOTCYC).
 `timescale 1ns/1ps
 
+`ifndef NST_SIM
+`define NST_SIM 64
+`endif
 module tb_mamba_pipe;
     localparam int D = 256, DIN = 512, V = 1024;
-    localparam int NC = `NC_SIM;
-    localparam int T  = `T_SIM;
+    localparam int NC  = `NC_SIM;
+    localparam int T   = `T_SIM;
+    localparam int NST = `NST_SIM;    // d_state: 64 (config-A) / 32 (config-B)
 
     reg clk = 0, rst = 1, start = 0;
     wire ready, done;
@@ -24,7 +28,7 @@ module tb_mamba_pipe;
     reg  [17:0] dbg_addr = 0;
     wire signed [31:0] dbg_data;
 
-    mamba_pipe #(.NC(NC), .TMAX(T), .T_TOKENS(T)) dut (
+    mamba_pipe #(.NC(NC), .NST(NST), .TMAX(T), .T_TOKENS(T)) dut (
         .clk(clk), .rst(rst), .ready(ready), .start(start), .done(done),
         .cyc_count(cyc_count),
         .wr_en(wr_en), .wr_sel(wr_sel), .wr_addr(wr_addr), .wr_data(wr_data),
