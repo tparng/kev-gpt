@@ -32,8 +32,9 @@
 `default_nettype none
 
 module rmsnorm_gated #(
-    parameter integer D  = 512,      // vector length (power of 2)
-    parameter integer QF = 12        // Q3.12 activations
+    parameter integer D   = 512,     // vector length (power of 2)
+    parameter integer QF  = 12,      // Q3.12 activations
+    parameter integer RDP = 4        // output read lanes/cycle
 ) (
     input  wire                    clk,
     input  wire                    rst,
@@ -63,7 +64,12 @@ module rmsnorm_gated #(
     input  wire signed [15:0]      wr_lut_data,
 
     input  wire [$clog2(D)-1:0]    rd_o_addr,
-    output wire signed [15:0]      rd_o_data
+    output wire signed [15:0]      rd_o_data,
+
+    // WIDE read: RDP consecutive outputs from `rd_ow_base` in one cycle, so the
+    // sequencer quant streams (S_QIN/S_QOUT) can consume RDP/cycle. Combinational.
+    input  wire [$clog2(D)-1:0]    rd_ow_base,
+    output wire [RDP*16-1:0]       rd_ow_data
 );
     localparam integer LOG2D  = $clog2(D);
     localparam integer A_FRAC = 26;
@@ -86,6 +92,13 @@ module rmsnorm_gated #(
     reg signed [15:0] obuf [0:D-1];
 
     assign rd_o_data = obuf[rd_o_addr];
+
+    // RDP-wide combinational read (whole-element indexed, iverilog-safe). base+g
+    // stays in-bounds: S_QIN reads 256, S_QOUT 512 — both RDP-multiples.
+    genvar gr;
+    generate for (gr = 0; gr < RDP; gr = gr + 1) begin : g_ordw
+        assign rd_ow_data[gr*16 +: 16] = obuf[rd_ow_base + gr[$clog2(D)-1:0]];
+    end endgenerate
 
     always @(posedge clk) begin
         if (wr_y)   yin [wr_y_addr]   <= wr_y_data;

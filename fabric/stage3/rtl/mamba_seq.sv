@@ -123,15 +123,17 @@ module mamba_seq #(
     reg  [18:0] g_base;   reg [10:0] g_rows;  reg [6:0] g_wpr;
     reg         g_wrx;    reg [8:0] g_wrx_a;  reg signed [7:0] g_wrx_d;
     reg  [10:0] g_rda;    wire signed [31:0] g_acc;
+    reg  [10:0] g_rdaw;   wire [4*32-1:0] g_accw;   // P=4 wide accumulator read
     // WMEM sized to the packed weight image (7*37120 in + 7*16384 out + 32768
     // head = 407296 words) rounded up to an even 409600 -> 204800 x 64b rows =
     // exactly 50 URAM, leaving URAM headroom for the emb table.
-    gemv_i4i8 #(.PE(16), .ROWS(INROWS), .D_IN(DIN), .WMEM(409600)) u_gemv (
+    gemv_i4i8 #(.PE(16), .ROWS(INROWS), .D_IN(DIN), .WMEM(409600), .RDP(4)) u_gemv (
         .clk(clk), .rst(rst), .start(g_start), .done(g_done),
         .base(g_base), .rows(g_rows), .wpr(g_wpr),
         .wr_w(wr_en && wr_sel == WSEL_GW), .wr_w_addr(wr_addr), .wr_w_data(wr_data),
         .wr_x(g_wrx), .wr_x_addr(g_wrx_a), .wr_x_data(g_wrx_d),
-        .rd_acc_addr(g_rda), .rd_acc_data(g_acc));
+        .rd_acc_addr(g_rda), .rd_acc_data(g_acc),
+        .rd_accw_base(g_rdaw), .rd_accw_data(g_accw));
 
     // conv+silu
     reg         c_start;  wire c_done;
@@ -175,14 +177,16 @@ module mamba_seq #(
     reg  [7:0]  n_wrl_a;
     reg signed [15:0] n_wrd;
     wire signed [15:0] n_out;
-    rmsnorm_gated #(.D(DIN)) u_norm (
+    reg  [8:0]  n_rdaw;   wire [4*16-1:0] n_ow;   // P=4 wide output read
+    rmsnorm_gated #(.D(DIN), .RDP(4)) u_norm (
         .clk(clk), .rst(rst), .start(n_start), .done(n_done), .gated(n_gated),
         .short_len(n_short),
         .wr_y(n_wry), .wr_y_addr(n_wry_a), .wr_y_data(n_wrd),
         .wr_z(n_wrz), .wr_z_addr(n_wrz_a), .wr_z_data(n_wrd),
         .wr_g(n_wrg), .wr_g_addr(n_wrg_a), .wr_g_data(n_wrd),
         .wr_lut(n_wrl), .wr_lut_addr(n_wrl_a), .wr_lut_data(n_wrd),
-        .rd_o_addr(n_rda), .rd_o_data(n_out));
+        .rd_o_addr(n_rda), .rd_o_data(n_out),
+        .rd_ow_base(n_rdaw), .rd_ow_data(n_ow));
 
     // ------------------------------------------------------- scale helpers --
     // fp16 decode: value = {1,frac} * 2^(exp-25); dequant of INT32 acc to
@@ -274,6 +278,12 @@ module mamba_seq #(
     reg signed [31:0] acc_t;
     reg signed [47:0] t1;
     reg [15:0] fp_t;
+    // P=4 dequant lanes (S_GIN_RD / S_GOUT_RD / S_GHD_RD process 4 rows/pass)
+    reg signed [31:0] acc4 [0:3];
+    reg        [15:0] fp4  [0:3];
+    reg signed [47:0] t14  [0:3];
+    reg signed [15:0] lv0, lv1, lv2, lv3;    // S_GHD_RD 4-lane logits
+    reg signed [15:0] nb;   reg [9:0] ni;     // running argmax fold
     reg signed [15:0] dtq3_t;   // dtraw shifted Q6.9 -> Q3.12 for the dt-LUT index
     integer kk;
 
@@ -362,28 +372,26 @@ module mamba_seq #(
           end
 
           // ---- quantize xn -> INT8 via in-recip ----------------------------
+          // P=4 quant xn -> INT8: 4 norm outputs/cycle (wide norm port), 4 lanes.
+          // D=256 mult of 4. Bit-exact (per-element independent requant).
           S_QIN: begin
               case (sub)
-                0: begin n_rda <= i[9:0]; sub <= 1; end
+                0: begin n_rdaw <= i[8:0]; sub <= 1; end
                 1: begin
-                     t1 <= rshr($signed(n_out) * $signed({1'b0, c_inr[15:0]}),
-                                $signed({1'b0, c_inr[23:16]}) + 8'sd12);
-`ifdef MSEQ_TRACE
-                     if (li == 0 && (i < 2 || i == 100))
-                         $display("TR QIN i=%0d n_out=%0d", i, $signed(n_out));
-`endif
+                     t14[0] <= rshr($signed(n_ow[15:0])  * $signed({1'b0, c_inr[15:0]}), $signed({1'b0, c_inr[23:16]}) + 8'sd12);
+                     t14[1] <= rshr($signed(n_ow[31:16]) * $signed({1'b0, c_inr[15:0]}), $signed({1'b0, c_inr[23:16]}) + 8'sd12);
+                     t14[2] <= rshr($signed(n_ow[47:32]) * $signed({1'b0, c_inr[15:0]}), $signed({1'b0, c_inr[23:16]}) + 8'sd12);
+                     t14[3] <= rshr($signed(n_ow[63:48]) * $signed({1'b0, c_inr[15:0]}), $signed({1'b0, c_inr[23:16]}) + 8'sd12);
                      sub <= 2;
                 end
                 2: begin
-                     q8buf[i[8:0]] <= (t1 > 48'sd127) ? 8'sd127 :
-                                      (t1 < -48'sd128) ? -8'sd128 : t1[7:0];
-`ifdef MSEQ_TRACE
-                     if (li == 0 && (i < 2 || i == 100))
-                         $display("TR Q8 i=%0d t1=%0d", i, t1);
-`endif
+                     q8buf[i[8:0]]     <= (t14[0] > 48'sd127) ? 8'sd127 : (t14[0] < -48'sd128) ? -8'sd128 : t14[0][7:0];
+                     q8buf[i[8:0] + 1] <= (t14[1] > 48'sd127) ? 8'sd127 : (t14[1] < -48'sd128) ? -8'sd128 : t14[1][7:0];
+                     q8buf[i[8:0] + 2] <= (t14[2] > 48'sd127) ? 8'sd127 : (t14[2] < -48'sd128) ? -8'sd128 : t14[2][7:0];
+                     q8buf[i[8:0] + 3] <= (t14[3] > 48'sd127) ? 8'sd127 : (t14[3] < -48'sd128) ? -8'sd128 : t14[3][7:0];
                      sub <= 0;
-                     if (i == D-1) begin i <= 0; st <= S_GIN_LD; end
-                     else i <= i + 1;
+                     if (i >= D-4) begin i <= 0; st <= S_GIN_LD; end
+                     else i <= i + 4;
                 end
               endcase
           end
@@ -399,37 +407,45 @@ module mamba_seq #(
               end else i <= i + 1;
           end
           S_GIN: if (g_done) begin st <= S_GIN_RD; i <= 0; sub <= 0; end
+          // P=4 in_proj dequant: read 4 accumulators/cycle (wide gemv port),
+          // 4 parallel two-stage dequant lanes -> 4 zxbuf/pass. Bit-exact to the
+          // 1-lane version: each row's dequant is independent. INROWS=1160 is a
+          // multiple of 4, so no ragged tail.
           S_GIN_RD: begin
               case (sub)
-                0: begin g_rda <= i[10:0]; sub <= 1; end
+                0: begin g_rdaw <= i[10:0]; sub <= 1; end
                 1: begin
-                     fp_t <= rsin[li*INROWS + i[10:0]];
-                     acc_t <= g_acc; sub <= 2;
+                     acc4[0] <= $signed(g_accw[ 31:  0]);
+                     acc4[1] <= $signed(g_accw[ 63: 32]);
+                     acc4[2] <= $signed(g_accw[ 95: 64]);
+                     acc4[3] <= $signed(g_accw[127: 96]);
+                     fp4[0]  <= rsin[li*INROWS + i[10:0]];
+                     fp4[1]  <= rsin[li*INROWS + i[10:0] + 1];
+                     fp4[2]  <= rsin[li*INROWS + i[10:0] + 2];
+                     fp4[3]  <= rsin[li*INROWS + i[10:0] + 3];
+                     sub <= 2;
                 end
-                2: begin  // stage 1: acc * row-scale mantissa, shift by exp
-                     t1 <= rshr(mul_m11(acc_t, fp_t),
-                                8'sd10 - $signed({3'b0, fp_t[14:10]}));
-`ifdef MSEQ_TRACE
-                     if (li == 0 && (i < 2 || i == 512 || i == 1152))
-                         $display("TR GACC i=%0d acc=%0d fp=%04x", i,
-                                  acc_t, fp_t);
-`endif
+                2: begin  // stage 1: acc * row-scale mantissa, shift by exp (x4)
+                     t14[0] <= rshr(mul_m11(acc4[0], fp4[0]), 8'sd10 - $signed({3'b0, fp4[0][14:10]}));
+                     t14[1] <= rshr(mul_m11(acc4[1], fp4[1]), 8'sd10 - $signed({3'b0, fp4[1][14:10]}));
+                     t14[2] <= rshr(mul_m11(acc4[2], fp4[2]), 8'sd10 - $signed({3'b0, fp4[2][14:10]}));
+                     t14[3] <= rshr(mul_m11(acc4[3], fp4[3]), 8'sd10 - $signed({3'b0, fp4[3][14:10]}));
                      sub <= 3;
                 end
-                3: begin  // stage 2: * act scale (m,e) -> Q6.9 (was Q3.12; 3 more
-                          // integer bits so gate z / conv xBC don't saturate)
-                     zxbuf[i[10:0]] <= sat16f(rshr(
-                         t1 * $signed({1'b0, c_ins[15:0]}),
-                         $signed({1'b0, c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                3: begin  // stage 2: * act scale (m,e) -> Q6.9 (x4)
+                     zxbuf[i[10:0]]     <= sat16f(rshr(t14[0] * $signed({1'b0, c_ins[15:0]}), $signed({1'b0, c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                     zxbuf[i[10:0] + 1] <= sat16f(rshr(t14[1] * $signed({1'b0, c_ins[15:0]}), $signed({1'b0, c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                     zxbuf[i[10:0] + 2] <= sat16f(rshr(t14[2] * $signed({1'b0, c_ins[15:0]}), $signed({1'b0, c_ins[23:16]}) + 8'sd15 - 8'sd9));
+                     zxbuf[i[10:0] + 3] <= sat16f(rshr(t14[3] * $signed({1'b0, c_ins[15:0]}), $signed({1'b0, c_ins[23:16]}) + 8'sd15 - 8'sd9));
                      sub <= 0;
-                     if (i == INROWS-1) begin i <= 0; st <= S_CONV_LDW;
+                     if (i >= INROWS-4) begin i <= 0; st <= S_CONV_LDW;
 `ifdef MSEQ_TRACE
                          $display("TR GIN l=%0d zx0=%0d zx512=%0d dtraw0=%0d",
                                   li, $signed(zxbuf[0]), $signed(zxbuf[512]),
                                   $signed(zxbuf[1152]));
 `endif
                      end
-                     else i <= i + 1;
+                     else i <= i + 4;
                 end
               endcase
           end
@@ -610,20 +626,25 @@ module mamba_seq #(
           S_NG: if (n_done) begin st <= S_QOUT; i <= 0; sub <= 0; end
 
           // ---- quantize yn, out GEMV, residual add ---------------------------
+          // P=4 quant yn -> INT8: 4 norm outputs/cycle, 4 lanes. DIN=512 mult of 4.
           S_QOUT: begin
               case (sub)
-                0: begin n_rda <= i[9:0]; sub <= 1; end
+                0: begin n_rdaw <= i[8:0]; sub <= 1; end
                 1: begin
-                     t1 <= rshr($signed(n_out) * $signed({1'b0, c_outr[15:0]}),
-                                $signed({1'b0, c_outr[23:16]}) + 8'sd12);
+                     t14[0] <= rshr($signed(n_ow[15:0])  * $signed({1'b0, c_outr[15:0]}), $signed({1'b0, c_outr[23:16]}) + 8'sd12);
+                     t14[1] <= rshr($signed(n_ow[31:16]) * $signed({1'b0, c_outr[15:0]}), $signed({1'b0, c_outr[23:16]}) + 8'sd12);
+                     t14[2] <= rshr($signed(n_ow[47:32]) * $signed({1'b0, c_outr[15:0]}), $signed({1'b0, c_outr[23:16]}) + 8'sd12);
+                     t14[3] <= rshr($signed(n_ow[63:48]) * $signed({1'b0, c_outr[15:0]}), $signed({1'b0, c_outr[23:16]}) + 8'sd12);
                      sub <= 2;
                 end
                 2: begin
-                     q8buf[i[8:0]] <= (t1 > 48'sd127) ? 8'sd127 :
-                                      (t1 < -48'sd128) ? -8'sd128 : t1[7:0];
+                     q8buf[i[8:0]]     <= (t14[0] > 48'sd127) ? 8'sd127 : (t14[0] < -48'sd128) ? -8'sd128 : t14[0][7:0];
+                     q8buf[i[8:0] + 1] <= (t14[1] > 48'sd127) ? 8'sd127 : (t14[1] < -48'sd128) ? -8'sd128 : t14[1][7:0];
+                     q8buf[i[8:0] + 2] <= (t14[2] > 48'sd127) ? 8'sd127 : (t14[2] < -48'sd128) ? -8'sd128 : t14[2][7:0];
+                     q8buf[i[8:0] + 3] <= (t14[3] > 48'sd127) ? 8'sd127 : (t14[3] < -48'sd128) ? -8'sd128 : t14[3][7:0];
                      sub <= 0;
-                     if (i == DIN-1) begin i <= 0; st <= S_GOUT_LD; end
-                     else i <= i + 1;
+                     if (i >= DIN-4) begin i <= 0; st <= S_GOUT_LD; end
+                     else i <= i + 4;
                 end
               endcase
           end
@@ -637,22 +658,36 @@ module mamba_seq #(
               end else i <= i + 1;
           end
           S_GOUT: if (g_done) begin st <= S_GOUT_RD; i <= 0; sub <= 0; end
+          // P=4 out_proj dequant + residual add: 4 accs/cycle, 4 lanes.
+          // D=256 is a multiple of 4. Bit-exact (per-channel independent).
           S_GOUT_RD: begin
               case (sub)
-                0: begin g_rda <= i[10:0]; sub <= 1; end
-                1: begin fp_t <= rsout[li*D + i[7:0]]; acc_t <= g_acc; sub <= 2; end
+                0: begin g_rdaw <= i[10:0]; sub <= 1; end
+                1: begin
+                     acc4[0] <= $signed(g_accw[ 31:  0]);
+                     acc4[1] <= $signed(g_accw[ 63: 32]);
+                     acc4[2] <= $signed(g_accw[ 95: 64]);
+                     acc4[3] <= $signed(g_accw[127: 96]);
+                     fp4[0]  <= rsout[li*D + i[7:0]];
+                     fp4[1]  <= rsout[li*D + i[7:0] + 1];
+                     fp4[2]  <= rsout[li*D + i[7:0] + 2];
+                     fp4[3]  <= rsout[li*D + i[7:0] + 3];
+                     sub <= 2;
+                end
                 2: begin
-                     t1 <= rshr(mul_m11(acc_t, fp_t),
-                                8'sd10 - $signed({3'b0, fp_t[14:10]}));
+                     t14[0] <= rshr(mul_m11(acc4[0], fp4[0]), 8'sd10 - $signed({3'b0, fp4[0][14:10]}));
+                     t14[1] <= rshr(mul_m11(acc4[1], fp4[1]), 8'sd10 - $signed({3'b0, fp4[1][14:10]}));
+                     t14[2] <= rshr(mul_m11(acc4[2], fp4[2]), 8'sd10 - $signed({3'b0, fp4[2][14:10]}));
+                     t14[3] <= rshr(mul_m11(acc4[3], fp4[3]), 8'sd10 - $signed({3'b0, fp4[3][14:10]}));
                      sub <= 3;
                 end
                 3: begin
-                     xbuf[i[7:0]] <= sat32f(
-                         $signed({{16{xbuf[i[7:0]][31]}}, xbuf[i[7:0]]}) +
-                         rshr(t1 * $signed({1'b0, c_outs[15:0]}),
-                              $signed({1'b0, c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                     xbuf[i[7:0]]     <= sat32f($signed({{16{xbuf[i[7:0]][31]}},     xbuf[i[7:0]]})     + rshr(t14[0] * $signed({1'b0, c_outs[15:0]}), $signed({1'b0, c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                     xbuf[i[7:0] + 1] <= sat32f($signed({{16{xbuf[i[7:0]+1][31]}}, xbuf[i[7:0]+1]}) + rshr(t14[1] * $signed({1'b0, c_outs[15:0]}), $signed({1'b0, c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                     xbuf[i[7:0] + 2] <= sat32f($signed({{16{xbuf[i[7:0]+2][31]}}, xbuf[i[7:0]+2]}) + rshr(t14[2] * $signed({1'b0, c_outs[15:0]}), $signed({1'b0, c_outs[23:16]}) + 8'sd15 - 8'sd19));
+                     xbuf[i[7:0] + 3] <= sat32f($signed({{16{xbuf[i[7:0]+3][31]}}, xbuf[i[7:0]+3]}) + rshr(t14[3] * $signed({1'b0, c_outs[15:0]}), $signed({1'b0, c_outs[23:16]}) + 8'sd15 - 8'sd19));
                      sub <= 0;
-                     if (i == D-1) begin
+                     if (i >= D-4) begin
                          i <= 0;
 `ifdef MSEQ_TRACE
                          $display("TR XOUT l=%0d x0=%0d x1=%0d x100=%0d",
@@ -661,7 +696,7 @@ module mamba_seq #(
 `endif
                          if (li == L-1) begin li <= 0; st <= S_NF_LD; end
                          else begin li <= li + 1; st <= S_NIN_LD; end
-                     end else i <= i + 1;
+                     end else i <= i + 4;
                 end
               endcase
           end
@@ -714,28 +749,48 @@ module mamba_seq #(
           end
           S_GHD: if (g_done) begin st <= S_GHD_RD; i <= 0; sub <= 0;
                   best <= -16'sd32768; besti <= 0; end
+          // P=4 head dequant + argmax: 4 accs/cycle, 4 logit lanes, then a
+          // running argmax fold in index order (strict >, so a tie keeps the
+          // lowest index — identical to the 1-lane sequential scan). V=1024 mult of 4.
           S_GHD_RD: begin
               case (sub)
-                0: begin g_rda <= i[10:0]; sub <= 1; end
-                1: begin fp_t <= rshd[i[9:0]]; acc_t <= g_acc; sub <= 2; end
+                0: begin g_rdaw <= i[10:0]; sub <= 1; end
+                1: begin
+                     acc4[0] <= $signed(g_accw[ 31:  0]);
+                     acc4[1] <= $signed(g_accw[ 63: 32]);
+                     acc4[2] <= $signed(g_accw[ 95: 64]);
+                     acc4[3] <= $signed(g_accw[127: 96]);
+                     fp4[0]  <= rshd[i[9:0]];
+                     fp4[1]  <= rshd[i[9:0] + 1];
+                     fp4[2]  <= rshd[i[9:0] + 2];
+                     fp4[3]  <= rshd[i[9:0] + 3];
+                     sub <= 2;
+                end
                 2: begin
-                     t1 <= rshr(mul_m11(acc_t, fp_t),
-                                8'sd10 - $signed({3'b0, fp_t[14:10]}));
+                     t14[0] <= rshr(mul_m11(acc4[0], fp4[0]), 8'sd10 - $signed({3'b0, fp4[0][14:10]}));
+                     t14[1] <= rshr(mul_m11(acc4[1], fp4[1]), 8'sd10 - $signed({3'b0, fp4[1][14:10]}));
+                     t14[2] <= rshr(mul_m11(acc4[2], fp4[2]), 8'sd10 - $signed({3'b0, fp4[2][14:10]}));
+                     t14[3] <= rshr(mul_m11(acc4[3], fp4[3]), 8'sd10 - $signed({3'b0, fp4[3][14:10]}));
                      sub <= 3;
                 end
                 3: begin
-                     logit[i[9:0]] <= sat16f(rshr(
-                         t1 * $signed({1'b0, c_hds[15:0]}),
-                         $signed({1'b0, c_hds[23:16]}) + 8'sd15 - 8'sd12));
-                     if (sat16f(rshr(t1 * $signed({1'b0, c_hds[15:0]}),
-                         $signed({1'b0, c_hds[23:16]}) + 8'sd15 - 8'sd12)) > best) begin
-                         best <= sat16f(rshr(t1 * $signed({1'b0, c_hds[15:0]}),
-                             $signed({1'b0, c_hds[23:16]}) + 8'sd15 - 8'sd12));
-                         besti <= i[9:0];
-                     end
+                     lv0 = sat16f(rshr(t14[0] * $signed({1'b0, c_hds[15:0]}), $signed({1'b0, c_hds[23:16]}) + 8'sd15 - 8'sd12));
+                     lv1 = sat16f(rshr(t14[1] * $signed({1'b0, c_hds[15:0]}), $signed({1'b0, c_hds[23:16]}) + 8'sd15 - 8'sd12));
+                     lv2 = sat16f(rshr(t14[2] * $signed({1'b0, c_hds[15:0]}), $signed({1'b0, c_hds[23:16]}) + 8'sd15 - 8'sd12));
+                     lv3 = sat16f(rshr(t14[3] * $signed({1'b0, c_hds[15:0]}), $signed({1'b0, c_hds[23:16]}) + 8'sd15 - 8'sd12));
+                     logit[i[9:0]]     <= lv0;
+                     logit[i[9:0] + 1] <= lv1;
+                     logit[i[9:0] + 2] <= lv2;
+                     logit[i[9:0] + 3] <= lv3;
+                     nb = best; ni = besti;
+                     if (lv0 > nb) begin nb = lv0; ni = i[9:0];     end
+                     if (lv1 > nb) begin nb = lv1; ni = i[9:0] + 1; end
+                     if (lv2 > nb) begin nb = lv2; ni = i[9:0] + 2; end
+                     if (lv3 > nb) begin nb = lv3; ni = i[9:0] + 3; end
+                     best <= nb; besti <= ni;
                      sub <= 0;
-                     if (i == V-1) begin st <= S_DONE; end
-                     else i <= i + 1;
+                     if (i >= V-4) begin st <= S_DONE; end
+                     else i <= i + 4;
                 end
               endcase
           end

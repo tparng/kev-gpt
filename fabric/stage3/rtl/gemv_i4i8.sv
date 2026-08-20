@@ -25,7 +25,8 @@ module gemv_i4i8 #(
     parameter int ROWS  = 1160,             // MAX geometry (buffer sizing)
     parameter int D_IN  = 512,
     parameter int WPR   = D_IN / 8,
-    parameter int WMEM  = 262144            // weight words (URAM budget)
+    parameter int WMEM  = 262144,           // weight words (URAM budget)
+    parameter int RDP   = 4                 // accumulator read lanes/cycle
 ) (
     input  wire                     clk,
     input  wire                     rst,
@@ -47,7 +48,13 @@ module gemv_i4i8 #(
     input  wire signed [7:0]        wr_x_data,
 
     input  wire [$clog2(ROWS)-1:0]  rd_acc_addr,
-    output wire signed [31:0]       rd_acc_data
+    output wire signed [31:0]       rd_acc_data,
+
+    // WIDE read: RDP consecutive accumulators from `rd_accw_base` in one cycle
+    // (the sequencer dequant streams read accs 0..rows-1 in order, so a P-lane
+    // dequant consumes RDP/cycle). Combinational, like the single-lane port.
+    input  wire [$clog2(ROWS)-1:0]  rd_accw_base,
+    output wire [RDP*32-1:0]        rd_accw_data
 );
     localparam int LP    = $clog2(PE);          // log2 words/cycle
     localparam int WBITS = PE * 32;             // wide weight word width
@@ -90,6 +97,14 @@ module gemv_i4i8 #(
 
     reg signed [31:0] accs [0:ROWS-1];
     assign rd_acc_data = accs[rd_acc_addr];
+
+    // RDP-wide read: whole-element indexed reads (iverilog-safe, like the
+    // single-lane assign above). base+g stays in-bounds for every sequencer
+    // call (in_proj 1160, out_proj 256, head 1024 are all RDP-multiples).
+    genvar gr;
+    generate for (gr = 0; gr < RDP; gr = gr + 1) begin : g_rdw
+        assign rd_accw_data[gr*32 +: 32] = accs[rd_accw_base + gr[$clog2(ROWS)-1:0]];
+    end endgenerate
 
     // -------- FSM: iterate rows x wide-steps, PE words per cycle --------------
     localparam [1:0] IDLE = 2'd0, RUN = 2'd1, DRAIN = 2'd2;
