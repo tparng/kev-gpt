@@ -5,11 +5,13 @@
 // mode: one new sample per channel per token).
 //
 // Formats (contract = mamba2_fixed at LUT resolution):
-//   x in       : INT16 Q3.12 (the dequantized in_proj output slice)
+//   x in       : INT16 Q6.9  (the dequantized in_proj xBC slice reaches ~33,
+//                which Q3.12 (+-8) clipped — the full-engine saturation bug)
 //   w, bias    : INT16 Q1.14 (conv weights are small; exported per channel)
-//   MAC        : INT32, product Q4.26 -> rnd >> 14 -> Q3.12
-//   SiLU       : 256-entry LUT over [-4,4) Q3.12 input (top 8 bits + sat),
-//                INT16 Q3.12 out; |x|>=4 tails: y=x (pos) / 0 (neg)
+//   MAC        : product Q6.9 x Q1.14 = frac 23 -> rnd >> 12 -> Q4.11
+//   SiLU       : 256-entry LUT over [-4,4) Q4.11 input (top 8 bits + sat),
+//                INT16 Q4.11 out (silu out reaches ~10, Q3.12 clipped it);
+//                |x|>=4 tails: y=x (pos) / 0 (neg). LUT rows are Q3.12 -> >>1.
 //
 // Sequential: one channel per cycle (CONV_DIM cycles/token) — conv is ~2% of
 // the token budget; wide comes later if ever needed.
@@ -85,18 +87,19 @@ module conv_silu #(
     reg signed [35:0] acc2;
 
     integer j;
-    // S2 comb: round >> (14) to Q3.12, sat, LUT index
-    wire signed [21:0] pre  = (acc2 + $signed(36'sd1 <<< 13)) >>> 14;
+    // S2 comb: round >> 12 (frac 23 -> Q4.11), sat, LUT index
+    wire signed [21:0] pre  = (acc2 + $signed(36'sd1 <<< 11)) >>> 12;
     wire signed [15:0] prs  = (pre > $signed(22'sd32767))  ? 16'sd32767 :
                               (pre < -$signed(22'sd32768)) ? -16'sd32768 :
                               pre[15:0];
-    // LUT domain [-4,4) in Q3.12: index = top 8 bits of prs+16384 clamped
-    wire signed [16:0] biased = prs + $signed(17'sd16384);
+    // LUT domain [-4,4) in Q4.11: 4.0 = 8192; index = top 8 bits of prs+8192.
+    wire signed [16:0] biased = prs + $signed(17'sd8192);
     wire [7:0] idx = (biased < 0) ? 8'd0 :
-                     (biased > $signed(17'sd32767)) ? 8'd255 : biased[14:7];
-    wire signed [15:0] ylut = (prs >= $signed(16'sd16384)) ? prs :
-                              (prs < -$signed(16'sd16384)) ? 16'sd0 :
-                              lut[idx];
+                     (biased > $signed(17'sd16383)) ? 8'd255 : biased[13:6];
+    // LUT rows are Q3.12 silu values -> >>1 (rnd) to Q4.11; tails carry Q4.11 prs
+    wire signed [15:0] ylut = (prs >= $signed(16'sd8192)) ? prs :
+                              (prs < -$signed(16'sd8192)) ? 16'sd0 :
+                              ($signed(lut[idx]) + 16'sd1) >>> 1;
 
     always @(posedge clk) begin
         done <= 1'b0;
@@ -130,7 +133,7 @@ module conv_silu #(
                   + $signed(h1[31:16]) * w1[1]
                   + $signed(h1[47:32]) * w1[2]
                   + x1 * w1[3]
-                  + (b1 <<< 12);       // bias Q1.14 -> frac 26 (products Q3.12 x Q1.14)
+                  + (b1 <<< 9);        // bias Q1.14 -> frac 23 (products Q6.9 x Q1.14)
 
             // S2: LUT + write
             if (v2) yout[c2] <= ylut;

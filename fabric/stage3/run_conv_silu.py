@@ -37,16 +37,18 @@ def silu_table():
 
 
 def ref_step(hist, x_q, w_q, b_q, lut):
-    """Bit-true integer replica of the RTL datapath."""
+    """Bit-true integer replica of the RTL datapath. x in Q6.9, y out Q4.11
+    (widened from Q3.12: the dequantized xBC slice reaches ~33 and the silu
+    output ~10, both of which Q3.12 clipped in the full engine)."""
     buf = np.concatenate([hist, x_q[:, None]], axis=1)          # (CH, K)
     hist[:] = buf[:, 1:]
-    acc = (buf * w_q).sum(1) + (b_q.astype(np.int64) << 12)     # frac 26
-    pre = (acc + (1 << 13)) >> 14                                # Q3.12
+    acc = (buf * w_q).sum(1) + (b_q.astype(np.int64) << 9)      # frac 23
+    pre = (acc + (1 << 11)) >> 12                                # Q4.11
     pre = np.clip(pre, -32768, 32767)
-    idx = np.clip((pre + 16384) >> 7, 0, 255)
-    y = lut[idx]
-    y = np.where(pre >= 16384, pre, y)
-    y = np.where(pre < -16384, 0, y)
+    idx = np.clip((pre + 8192) >> 6, 0, 255)
+    y = (lut[idx] + 1) >> 1                                      # Q3.12 -> Q4.11
+    y = np.where(pre >= 8192, pre, y)                            # 4.0 = 8192 Q4.11
+    y = np.where(pre < -8192, 0, y)
     return y
 
 
@@ -64,7 +66,9 @@ def main(argv=None):
 
     w_q = np.clip(np.round(rng.normal(0, 0.25, (CH, K)) * 16384), -32768, 32767).astype(np.int64)
     b_q = np.clip(np.round(rng.normal(0, 0.1, CH) * 16384), -32768, 32767).astype(np.int64)
-    xs = np.clip(np.round(rng.normal(0, 0.8, (T, CH)) * 4096), -32768, 32767).astype(np.int64)
+    # x in Q6.9 (*512); wide sigma so the conv output exercises the >4 / >8
+    # (>Q3.12) range the widening was for, plus the identity SiLU tail
+    xs = np.clip(np.round(rng.normal(0, 6.0, (T, CH)) * 512), -32768, 32767).astype(np.int64)
     lut = silu_table()
 
     def hexdump(path, vals):

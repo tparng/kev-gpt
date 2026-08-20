@@ -1,0 +1,9 @@
+1 c=0 s=1 n=0
+BEAT 7: st=14 li=3 hi=3 i=22 sub=2 g=0 c=0 s=1 n=0
+BEAT 8: st=6 li=6 hi=0 i=0 sub=0 g=1 c=0 s=1 n=0
+TOK 176 -> 556
+TB_MS_DONE T=2
+/home/mikeayles/Desktop/Projects/kev-gpt/.claude/worktrees/agent-af7034e48fe4b461f/fabric/stage3/tb/tb_mamba_seq.sv:111: $finish called at 6773422000 (1ps)
+tok#0 (12): logits cos 0.99886  x cos 0.83154  argmax DIFF (ref 177 rtl 176)
+tok#1 (176): logits cos 0.99073  x cos 0.53698  argmax DIFF (ref 133 rtl 556)
+MAMBA_SEQ_VERDICT: FAIL (2 tokens; bar logits cos>0.999 + argmax match)  [/tmp/kevbuild/stage3_mamba_seq]

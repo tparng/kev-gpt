@@ -101,9 +101,13 @@ module mamba_seq #(
 
     // ------------------------------------------------------------ buffers ---
     reg signed [31:0] xbuf  [0:D-1];          // residual, INT32 Q6.19
-    reg signed [15:0] xnbuf [0:CONVD-1];      // conv output (640 ch: x|B|C)
-    reg signed [15:0] zxbuf [0:INROWS-1];     // dequantized in_proj out Q3.12
-    reg signed [15:0] ybuf  [0:DIN-1];        // scan out + D-skip, Q3.12
+    reg signed [15:0] xnbuf [0:CONVD-1];      // conv output (640 ch: x|B|C) Q4.11
+                                              // (silu out reaches ~10, Q3.12 clips)
+    reg signed [15:0] zxbuf [0:INROWS-1];     // dequantized in_proj out Q6.9
+                                              // (gate z ~28 + conv xBC ~33 clip
+                                              //  Q3.12; dt shifted <<3 to Q3.12
+                                              //  at its LUT-index read)
+    reg signed [15:0] ybuf  [0:DIN-1];        // scan out + D-skip, Q4.11 (|y|~10)
     reg signed [7:0]  q8buf [0:DIN-1];        // quantized activations
     reg signed [15:0] logit [0:V-1];
 
@@ -234,6 +238,11 @@ module mamba_seq #(
     reg [15:0] dtq_h;
     reg [4:0]  eh_h;
 
+    // dtraw element (Q6.9) for the current head — read once, then part-selected
+    // safely off a plain wire (variable part-select on an unpacked-array element
+    // reads X in iverilog)
+    wire signed [15:0] dt_raw_el = zxbuf[2*DIN + 2*NST + hi[2:0]];
+
     // dt bit-length (priority encoder over 15 bits)
     function automatic [4:0] bitlen15(input [14:0] v);
         integer b;
@@ -251,6 +260,7 @@ module mamba_seq #(
     reg signed [31:0] acc_t;
     reg signed [47:0] t1;
     reg [15:0] fp_t;
+    reg signed [15:0] dtq3_t;   // dtraw shifted Q6.9 -> Q3.12 for the dt-LUT index
     integer kk;
 
     always @(posedge clk) begin
@@ -391,10 +401,11 @@ module mamba_seq #(
 `endif
                      sub <= 3;
                 end
-                3: begin  // stage 2: * act scale (m,e) -> Q3.12
+                3: begin  // stage 2: * act scale (m,e) -> Q6.9 (was Q3.12; 3 more
+                          // integer bits so gate z / conv xBC don't saturate)
                      zxbuf[i[10:0]] <= sat16f(rshr(
                          t1 * $signed({1'b0, c_ins[15:0]}),
-                         $signed({1'b0, c_ins[23:16]}) + 8'sd15 - 8'sd12));
+                         $signed({1'b0, c_ins[23:16]}) + 8'sd15 - 8'sd9));
                      sub <= 0;
                      if (i == INROWS-1) begin i <= 0; st <= S_CONV_LDW;
 `ifdef MSEQ_TRACE
@@ -447,8 +458,8 @@ module mamba_seq #(
           S_SCAN_PREP: begin
               case (sub)
                 0: begin
-                     t1 <= rshr($signed(xnbuf[DIN + i[6:0]]),
-                                $signed(8'sd12) - $signed({4'b0, bB}));
+                     t1 <= rshr($signed(xnbuf[DIN + i[6:0]]),   // xnbuf Q4.11
+                                $signed(8'sd11) - $signed({4'b0, bB}));
                      sub <= 1;
                 end
                 1: begin
@@ -462,8 +473,8 @@ module mamba_seq #(
                      sub <= 2;
                 end
                 2: begin
-                     t1 <= rshr($signed(xnbuf[DIN + NST + i[6:0]]),
-                                $signed(8'sd12) - $signed({4'b0, bC}));
+                     t1 <= rshr($signed(xnbuf[DIN + NST + i[6:0]]),  // Q4.11
+                                $signed(8'sd11) - $signed({4'b0, bC}));
                      sub <= 3;
                 end
                 3: begin
@@ -480,11 +491,11 @@ module mamba_seq #(
           // ---- per-head: dt/a lookup, dtx write, scan run --------------------
           S_SCAN_H: begin
               case (sub)
-                0: begin  // LUT index from dtraw (Q3.12): offset-binary top 8
-                     // bits ({~sign, v[14:8]}). (The first draft wrote
-                     // +16'sd32768 which overflows 16-bit signed to -32768.)
-                     fp_t <= {8'b0, ~zxbuf[2*DIN + 2*NST + hi[2:0]][15],
-                              zxbuf[2*DIN + 2*NST + hi[2:0]][14:8]};
+                0: begin  // dtraw is Q6.9 in zxbuf now; shift <<3 into the Q3.12
+                     // domain the dt-LUT is built for (|dt|<8 -> no saturation),
+                     // then take the offset-binary top 8 bits ({~sign, v[14:8]}).
+                     dtq3_t = sat16f($signed({{32{dt_raw_el[15]}}, dt_raw_el}) <<< 3);
+                     fp_t <= {8'b0, ~dtq3_t[15], dtq3_t[14:8]};
                      sub <= 1;
                 end
                 1: begin
@@ -498,10 +509,10 @@ module mamba_seq #(
                              5'd21 - bitlen15(dtq_h[14:0]);
                      sub <= 3;
                 end
-                3: begin  // per-channel dtx: x8 = rnd(xv>>(12-bX)) sat8,
+                3: begin  // per-channel dtx: x8 = rnd(xv>>(11-bX)) sat8, xnbuf Q4.11
                           // dtx = rnd((dt_q*x8)>>(14-eh))
                      t1 <= rshr($signed(xnbuf[hi[2:0]*64 + i[5:0]]),
-                                $signed(8'sd12) - $signed({4'b0, bX}));
+                                $signed(8'sd11) - $signed({4'b0, bX}));
                      sub <= 1 + 3;  // -> 4
                 end
                 4: begin
@@ -536,7 +547,9 @@ module mamba_seq #(
                 end
               endcase
           end
-          S_SCAN_RD: begin  // y = rnd(yq>>1) + rnd(D_q*xv>>13), Q3.12
+          S_SCAN_RD: begin  // y = rnd(yq>>2) + rnd(D_q*xv>>13), Q4.11 (was Q3.12;
+                            // scan yq is Q?.13 -> >>2 lands Q4.11, and D_q Q2.13 *
+                            // xnbuf Q4.11 >>13 is already Q4.11)
               case (sub)
                 0: begin s_rda <= i[5:0]; sub <= 1; end
                 1: begin
@@ -546,7 +559,7 @@ module mamba_seq #(
                 end
                 2: begin
                      ybuf[hi[2:0]*64 + i[5:0]] <= sat16f(
-                        rshr({{32{acc_t[15]}}, acc_t[15:0]}, 8'sd1)
+                        rshr({{32{acc_t[15]}}, acc_t[15:0]}, 8'sd2)
                       + rshr($signed(t1[15:0]) * $signed(xnbuf[hi[2:0]*64 + i[5:0]]),
                              8'sd13));
                      sub <= 0;

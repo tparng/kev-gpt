@@ -6,7 +6,10 @@
 //   out[i]   = sat16( rnd( g[i] * rsqrt(mean(g^2)+eps) * gamma[i] >>> 40 ) )
 //
 // Formats (contract):
-//   y, z        INT16 Q3.12       gamma  INT16 Q1.14
+//   gated=1:  y INT16 Q4.11 (scan out ~10), z INT16 Q6.9 (gate ~28) — both
+//             widened from Q3.12 which saturated in the full engine. RMSNorm
+//             is scale-invariant, so gate_sh/A/out_sh carry the format below.
+//   gamma       INT16 Q1.14
 //   short_len=1: y is INT16 Q6.9 (the engine's Q6.19-residual norm view),
 //                256 elements; eps and the output shift are rescaled so the
 //                output is still Q3.12 with true eps=1e-5 (see S_A / out_sh_n)
@@ -18,9 +21,10 @@
 //               WITHOUT the mean subtraction (RMS, not variance)
 //   out         INT16 Q3.12: (g*Yr*gamma + 2^39) >>> 40, saturated
 //
-// SiLU: 256-entry LUT over [-4,4) Q3.12 input — the EXACT conv_silu.sv
-// indexing contract: idx = top 8 bits of (z+16384) clamped to [0,32767]
-// (i.e. floor), tails y=x for z>=4, 0 for z<-4. LUT loaded via write port.
+// SiLU: 256-entry LUT over [-4,4) Q6.9 input — the conv_silu.sv indexing
+// contract at Q6.9: idx = top 8 bits of (z+2048), floor; tails y=x for z>=4,
+// 0 for z<-4. silw is Q6.9 (identity tail carries z up to ~28; LUT rows are
+// Q3.12 -> >>3). LUT loaded via write port.
 //
 // Scalar sequential (one lane): ~D cycles gate pass + rsqrt + ~D cycles
 // output pass. Simplicity over speed — norm is a tiny slice of the token.
@@ -109,25 +113,33 @@ module rmsnorm_gated #(
     reg signed [15:0] y1, z1;
     reg signed [31:0] prod2;               // y*silu Q6.24
 
-    // silu comb off z1 (conv_silu.sv lines 93-99 contract, verbatim)
-    wire signed [16:0] zb   = z1 + $signed(17'sd16384);
+    // silu comb off z1 — z is INT16 Q6.9 in the engine (gate z reaches ~28,
+    // which the old Q3.12 z clipped to +-8: the full-engine gate bug). LUT
+    // domain [-4,4): 4.0 = 2048 in Q6.9, index = top 8 bits of (z+2048)>>4.
+    // silw is Q6.9: identity tail returns z1 (Q6.9) up to ~28; LUT rows are
+    // Q3.12 silu values -> >>3 (rnd) to Q6.9.
+    wire signed [16:0] zb   = z1 + $signed(17'sd2048);
     wire        [7:0]  sidx = (zb < 0) ? 8'd0 :
-                              (zb > $signed(17'sd32767)) ? 8'd255 : zb[14:7];
-    wire signed [15:0] silw = (z1 >= $signed(16'sd16384)) ? z1 :
-                              (z1 < -$signed(16'sd16384)) ? 16'sd0 : lut[sidx];
+                              (zb > $signed(17'sd4095)) ? 8'd255 : zb[11:4];
+    wire signed [15:0] silw = (z1 >= $signed(16'sd2048)) ? z1 :
+                              (z1 < -$signed(16'sd2048)) ? 16'sd0 :
+                              ($signed(lut[sidx]) + 16'sd4) >>> 3;
     // ungated bypass: operand 1.0 (Q3.12) -> (y<<QF + 2^(QF-1))>>>QF == y exact
     wire signed [15:0] silsel = g_mode ? silw : 16'sd4096;
 
-    // GATED-PRODUCT HEADROOM (GSH): g = y*silu(z) reaches |g|~150 (real) on the
+    // GATED-PRODUCT HEADROOM (GSH): g = y*silu(z) reaches |g|~270 (real) on the
     // per-layer gated norm — the gate values are large (z>=4 -> silu(z)=z up to
-    // ~8, y up to ~10). Q3.12 saturates at +-8, and just 2-3 saturating channels
-    // (g^2 ~ 150^2) collapse mean(g^2) ~10x, inflating rsqrt ~3.2x (the gate6-8
-    // FAIL). RMSNorm is SCALE-INVARIANT in g, so storing g>>GSH (Q(3+GSH).12,
-    // real range +-8*2^GSH = +-512) cancels out of out = g*rsqrt(mean g^2)*gamma
-    // exactly, with the A and output shifts compensated below. Only gated mode
-    // shifts (ungated short/final norms have bounded inputs, no saturation).
+    // ~28, y up to ~10). g stored as g_true*2^(12-GSH) so a few big channels
+    // don't collapse mean(g^2)/inflate rsqrt. RMSNorm is SCALE-INVARIANT in g,
+    // so storing g>>GSH (real range +-8*2^GSH = +-512) cancels out of
+    // out = g*rsqrt(mean g^2)*gamma exactly, with the A and output shifts
+    // compensated below. Only gated mode shifts (ungated short/final norms
+    // have bounded inputs, no saturation).
     localparam integer GSH = 6;
-    wire [5:0] gate_sh = g_mode ? (QF + GSH) : QF;   // 18 gated / 12 ungated
+    // gated: prod2 = yin(Q4.11) * silsel(Q6.9) has frac 20; store g at frac
+    // (12-GSH)=6 -> shift 14. ungated (short pre/final norm): yin(Q6.9) * 1.0
+    // (Q3.12=4096) frac 21 >> QF=12 -> g = yin (Q6.9) exact.
+    wire [5:0] gate_sh = g_mode ? 6'd14 : 6'd12;     // 14 gated / 12 ungated
 
     // stage-2 comb: round >>> gate_sh, saturate, square
     wire signed [31:0] grnd = $signed(32'sd1) <<< (gate_sh - 1);

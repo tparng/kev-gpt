@@ -9,9 +9,9 @@ conv_silu-style floor-indexed SiLU + the layernorm.sv rsqrt minus the mean).
 Two contract adaptations to the float reference (documented, both are the
 fixed-point contract, not RTL slack):
   * silu_lut is evaluated at the floor-quantized LUT grid point the RTL
-    actually indexes ((z+16384)>>7, the pinned conv_silu contract) —
-    silu_lut itself rounds to the grid, a half-bin contract mismatch that
-    otherwise caps per-token cosine at ~0.9998 for off-grid z.
+    actually indexes (gated z is Q6.9 now: (z+2048)>>4; silu_lut floors to the
+    same grid) — a half-bin contract mismatch that otherwise caps per-token
+    cosine at ~0.9998 for off-grid z.
   * the gated product and the output are clipped to the INT16 Q3.12
     saturating range (+-8), which the RTL contract pins.
 
@@ -84,11 +84,14 @@ A_SH = LOG2D + 2 * QF - 26                               # 7
 def ref_int(yq, zq, gq, lut, mode):
     """Bit-true integer replica of the RTL datapath (one token). Gated mode
     right-shifts the product by GSH (RMS scale-invariant) so |g| up to ~512
-    real does not saturate Q3.12; A left-shifts and OUT_SH-=GSH to compensate."""
+    real does not saturate Q3.12; A left-shifts and OUT_SH-=GSH to compensate.
+    Gated inputs are y Q4.11 (scan out ~10) and z Q6.9 (gate ~28), silsel Q6.9
+    -> gate_sh 14; ungated y Q3.12, silsel 1.0 -> gate_sh 12."""
     if mode:
-        idx = np.clip((zq + 16384) >> 7, 0, 255)
-        sil = np.where(zq >= 16384, zq, np.where(zq < -16384, 0, lut[idx]))
-        gsh, out_sh = QF + GSH, OUT_SH - GSH
+        idx = np.clip((zq + 2048) >> 4, 0, 255)                # Q6.9, 4.0 = 2048
+        sil = np.where(zq >= 2048, zq,
+                       np.where(zq < -2048, 0, (lut[idx] + 4) >> 3))  # Q3.12->Q6.9
+        gsh, out_sh = 14, OUT_SH - GSH
     else:
         sil = np.full(D, 4096, dtype=np.int64)         # 1.0 Q3.12 -> g = y exact
         gsh, out_sh = QF, OUT_SH
@@ -106,11 +109,13 @@ def ref_int(yq, zq, gq, lut, mode):
 
 def ref_float(yq, zq, gq, mode):
     """Float-path reference (rmsnorm_fixed recipe at contract resolution)."""
-    yf, gf = yq / 4096.0, gq / 16384.0
+    gf = gq / 16384.0
     if mode:
-        z_grid = np.floor(zq / 128.0) / 32.0            # the indexed LUT grid point
-        g = yf * silu_lut(z_grid)
+        yf = yq / 2048.0                                # gated y Q4.11
+        zf = zq / 512.0                                 # gated z Q6.9; silu_lut
+        g = yf * silu_lut(zf)                           # floors to the same grid
     else:
+        yf = yq / 4096.0                                # ungated y Q3.12
         g = yf.copy()
     # gated g now has GSH headroom (real range +-8*2^GSH); only the OUTPUT is
     # Q3.12-saturated. Clipping g at +-8 here was the scale-blind bug's twin.
@@ -134,17 +139,21 @@ def main(argv=None):
     T = 3 * TPM
     modes = np.array([1] * TPM + [0] * TPM + [2] * TPM)   # 2 = short (Q6.9)
 
-    ys = np.clip(np.round(rng.normal(0, 1.2, (T, D)) * 4096), -32768, 32767).astype(np.int64)
-    zs = np.clip(np.round(rng.normal(0, 1.2, (T, D)) * 4096), -32768, 32767).astype(np.int64)
-    # SATURATING-GATE rows (gated mode): a few channels with large product
-    # y*silu(z) (real |g| ~ 40-150) — the engine's actual regime, which Q3.12
-    # clipped and no cosine gate could see. These exercise the GSH headroom.
+    ys = np.zeros((T, D), dtype=np.int64)
+    zs = np.zeros((T, D), dtype=np.int64)
+    # gated block [0,TPM): y Q4.11 (scan out ~10), z Q6.9 (gate ~28)
+    ys[:TPM] = np.clip(np.round(rng.normal(0, 1.5, (TPM, D)) * 2048), -32768, 32767)
+    zs[:TPM] = np.clip(np.round(rng.normal(0, 2.0, (TPM, D)) * 512), -32768, 32767)
+    # ungated block [TPM,2TPM): y Q3.12 (g = y exact)
+    ys[TPM:2 * TPM] = np.clip(np.round(rng.normal(0, 1.2, (TPM, D)) * 4096), -32768, 32767)
+    # SATURATING-GATE rows (gated mode): a few channels with a large product
+    # y*silu(z) (real |g| ~ 60-280, z>=4 -> silu(z)=z up to ~28) — the engine's
+    # actual regime, which Q3.12 clipped and no cosine gate could see. These
+    # exercise the GSH headroom and the Q6.9 z / Q4.11 y widening.
     for t in range(min(3, TPM)):
         big = rng.choice(D, 5, replace=False)
-        # y, silu(z) each up to ~8 (Q3.12 INT16 ceiling) -> product g up to ~64,
-        # which Q3.12 saturates at 8 and GSH must carry. Clip to INT16.
-        ys[t, big] = rng.choice([-1, 1], 5) * np.minimum(rng.integers(6, 8, 5) * 4096, 32767)
-        zs[t, big] = np.minimum(rng.integers(5, 8, 5) * 4096, 32767)  # z>=4 -> silu=z
+        ys[t, big] = rng.choice([-1, 1], 5) * rng.integers(6, 10, 5) * 2048  # |y|~6-10
+        zs[t, big] = rng.integers(8, 28, 5) * 512                           # z>=4 -> silu=z
     # short-mode rows: Q6.9 residual-view values. Cover the eps-sensitive
     # small-magnitude case (layer-0 emb ~ +-0.02 -> ~10 counts) and the wide
     # late-layer case (up to ~+-30).
