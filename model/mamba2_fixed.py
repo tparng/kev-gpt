@@ -106,15 +106,21 @@ def silu_lut(x: np.ndarray):
 
 
 def rmsnorm_fixed(x: np.ndarray, gamma: np.ndarray, gate: np.ndarray | None,
-                  eps=1e-5, nr_iters=2):
+                  eps=1e-5, nr_iters=6):
     """RMSNorm with Newton-Raphson rsqrt from a coarse seed (the LN datapath
-    minus the mean). Gate (mamba: silu(z)) multiplies pre-gamma."""
+    minus the mean). Gate (mamba: silu(z)) multiplies pre-gamma.
+
+    nr_iters=6: the fabric's rsqrt uses a 64-entry seed ROM + 2 Newton steps
+    and CONVERGES to true rsqrt across the ms range (verified: rsqrt_int hits
+    23.39073 == 1/sqrt(ms) for ms=1.8e-3). The old 2-iter-from-power-of-2 seed
+    here UNDER-converged for small ms (~1e-3, the small-residual pre-norms):
+    21.7 vs 23.39, a uniform 7.3% output shrink invisible to the cosine gate
+    but fatal to the fixed-scale INT8 quant that follows. 6 float iters from
+    the power-of-2 seed converge for ms in [1e-4, 1e2], matching the fabric."""
     if gate is not None:
         x = x * silu_lut(gate)      # gate BEFORE the rms (matches the float
                                     # model: rms is taken over the gated value)
     ms = float((x * x).mean()) + eps
-    # NR rsqrt: seed from exponent halving, 2 iterations (matches the fabric's
-    # 4-stage pipeline at fp-precision level; the RTL gate compares exactly)
     y = 2.0 ** (-np.floor(np.log2(ms)) / 2.0)
     for _ in range(nr_iters):
         y = y * (1.5 - 0.5 * ms * y * y)
