@@ -40,6 +40,20 @@ module tb_mamba_seq;
         end
     endtask
 
+    // watchdog + progress beacon: the engine FSM state every 200k cycles
+    integer wd;
+    initial begin
+        wd = 0;
+        forever begin
+            repeat (200000) @(posedge clk);
+            wd = wd + 1;
+            $display("BEAT %0d: st=%0d li=%0d hi=%0d i=%0d sub=%0d g=%0d c=%0d s=%0d n=%0d",
+                     wd, dut.st, dut.li, dut.hi, dut.i, dut.sub,
+                     dut.u_gemv.st, dut.u_conv.st, dut.u_scan.st, 0);
+            if (wd > 40) begin $display("TB_MS_HUNG"); $finish; end
+        end
+    end
+
     initial begin
         $readmemh("ms_cfg.mem", cfg);
         T = cfg[0];
@@ -47,11 +61,16 @@ module tb_mamba_seq;
         fd  = $fopen("ms_logit.out", "w");
         fdx = $fopen("ms_x.out", "w");
 
+        $display("T0 %0t", $time);
         repeat (4) @(posedge clk);
         rst <= 0;
         wait (ready);
+        $display("READY %0t", $time);
 
+        load_sel(1,  cfg[1],  "ms_t1.mem");
+        $display("T1LOADED %0t", $time);
         load_sel(0,  cfg[15], "ms_t0.mem");   // gemv weights (count in cfg[15])
+        $display("GWLOADED %0t", $time);
         load_sel(1,  cfg[1],  "ms_t1.mem");
         load_sel(2,  cfg[2],  "ms_t2.mem");
         load_sel(3,  cfg[3],  "ms_t3.mem");
@@ -80,11 +99,11 @@ module tb_mamba_seq;
                 @(posedge clk); @(posedge clk);
                 $fdisplay(fd, "%04x", dbg_data[15:0]);
             end
-            dbg_sel <= 0;                       // final residual
+            dbg_sel <= 0;                       // final residual (32-bit)
             for (i = 0; i < D; i = i + 1) begin
                 dbg_addr <= i[10:0];
                 @(posedge clk); @(posedge clk);
-                $fdisplay(fdx, "%04x", dbg_data[15:0]);
+                $fdisplay(fdx, "%08x", dbg_data);
             end
         end
         $fclose(fd); $fclose(fdx);

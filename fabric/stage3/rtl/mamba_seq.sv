@@ -100,7 +100,7 @@ module mamba_seq #(
     end
 
     // ------------------------------------------------------------ buffers ---
-    reg signed [15:0] xbuf  [0:D-1];          // residual, Q3.12
+    reg signed [31:0] xbuf  [0:D-1];          // residual, INT32 Q6.19
     reg signed [15:0] xnbuf [0:CONVD-1];      // conv output (640 ch: x|B|C)
     reg signed [15:0] zxbuf [0:INROWS-1];     // dequantized in_proj out Q3.12
     reg signed [15:0] ybuf  [0:DIN-1];        // scan out + D-skip, Q3.12
@@ -187,6 +187,11 @@ module mamba_seq #(
     function automatic signed [15:0] sat16f(input signed [47:0] v);
         sat16f = (v > 48'sd32767) ? 16'sd32767 :
                  (v < -48'sd32768) ? -16'sd32768 : v[15:0];
+    endfunction
+
+    function automatic signed [31:0] sat32f(input signed [47:0] v);
+        sat32f = (v > 48'sd2147483647) ? 32'sd2147483647 :
+                 (v < -48'sd2147483648) ? -32'sd2147483648 : v[31:0];
     endfunction
 
     // rounded arithmetic shift right (n >= 1)
@@ -291,8 +296,8 @@ module mamba_seq #(
                 end
                 2: begin
                      // x = nib * fp16 -> Q3.12: shift = 13 - exp (see notes)
-                     xbuf[i[7:0]] <= sat16f(rshr(mul_m11(acc_t, fp_t),
-                                    8'sd13 - $signed({3'b0, fp_t[14:10]})));
+                     xbuf[i[7:0]] <= sat32f(rshr(mul_m11(acc_t, fp_t),
+                                    8'sd6 - $signed({3'b0, fp_t[14:10]})));
                      sub <= 0;
                      if (i == D-1) begin i <= 0; st <= S_NIN_LD;
 `ifdef MSEQ_TRACE
@@ -309,7 +314,9 @@ module mamba_seq #(
           S_NIN_LD: begin
               n_gated <= 0; n_short <= 1;      // pre-norm is 256-wide
               case (sub)
-                0: begin n_wry <= 1; n_wry_a <= i[9:0]; n_wrd <= xbuf[i[7:0]];
+                0: begin n_wry <= 1; n_wry_a <= i[9:0];
+                     n_wrd <= sat16f(rshr($signed({{16{xbuf[i[7:0]][31]}},
+                                                  xbuf[i[7:0]]}), 8'sd10));
                      sub <= 1; end
                 1: begin n_wrg <= 1; n_wrg_a <= i[9:0];
                      n_wrd <= lng[li*D + i[7:0]];
@@ -595,13 +602,18 @@ module mamba_seq #(
                      sub <= 3;
                 end
                 3: begin
-                     xbuf[i[7:0]] <= sat16f(
-                         $signed({{32{xbuf[i[7:0]][15]}}, xbuf[i[7:0]]}) +
+                     xbuf[i[7:0]] <= sat32f(
+                         $signed({{16{xbuf[i[7:0]][31]}}, xbuf[i[7:0]]}) +
                          rshr(t1 * $signed({1'b0, c_outs[15:0]}),
-                              $signed({1'b0, c_outs[23:16]}) + 8'sd15 - 8'sd12));
+                              $signed({1'b0, c_outs[23:16]}) + 8'sd15 - 8'sd19));
                      sub <= 0;
                      if (i == D-1) begin
                          i <= 0;
+`ifdef MSEQ_TRACE
+                         $display("TR XOUT l=%0d x0=%0d x1=%0d x100=%0d",
+                                  li, $signed(xbuf[0]), $signed(xbuf[1]),
+                                  $signed(xbuf[100]));
+`endif
                          if (li == L-1) begin li <= 0; st <= S_NF_LD; end
                          else begin li <= li + 1; st <= S_NIN_LD; end
                      end else i <= i + 1;
@@ -615,7 +627,9 @@ module mamba_seq #(
           S_NF_LD: begin
               n_gated <= 0; n_short <= 1;      // final norm is 256-wide
               case (sub)
-                0: begin n_wry <= 1; n_wry_a <= i[9:0]; n_wrd <= xbuf[i[7:0]];
+                0: begin n_wry <= 1; n_wry_a <= i[9:0];
+                     n_wrd <= sat16f(rshr($signed({{16{xbuf[i[7:0]][31]}},
+                                                  xbuf[i[7:0]]}), 8'sd10));
                      sub <= 1; end
                 1: begin n_wrg <= 1; n_wrg_a <= i[9:0]; n_wrd <= nfg[i[7:0]];
                      sub <= 0;

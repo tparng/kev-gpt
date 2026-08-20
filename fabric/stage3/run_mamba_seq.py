@@ -136,7 +136,8 @@ def main(argv=None):
         c = {}
         lg = fx.step(int(t), st, collect=c)
         ref_logits.append(np.clip(np.round(lg * 4096), -32768, 32767))
-        ref_x.append(np.clip(np.round(c[f"l{L-1}.x_out"] * 4096), -32768, 32767))
+        ref_x.append(np.clip(np.round(c[f"l{L-1}.x_out"] * (1 << 19)),
+                             -(1 << 31), (1 << 31) - 1))
 
     # ---- simulate -------------------------------------------------------------
     src = [f"{REPO}/fabric/stage3/rtl/{m}.sv" for m in
@@ -158,7 +159,7 @@ def main(argv=None):
     got_l = rd16(f"{sim}/ms_logit.out")
     got_l = np.where(got_l >= 1 << 15, got_l - (1 << 16), got_l).reshape(-1, V)
     got_x = rd16(f"{sim}/ms_x.out")
-    got_x = np.where(got_x >= 1 << 15, got_x - (1 << 16), got_x).reshape(-1, D)
+    got_x = np.where(got_x >= 1 << 31, got_x - (1 << 32), got_x).reshape(-1, D)
 
     ok = True
     for t in range(args.tokens):

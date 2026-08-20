@@ -32,7 +32,10 @@ from .mamba2_fixed_scan import (Q_A, Q_ACT, Q_STATE, a_from_dtA, quant, rsh,
                                 sat16, scan_step_fixed, scan_step_fixed2)
 
 QW = 4                     # weight bits
-Q_RES = 12                 # residual stream Q3.12
+Q_RES = 19                 # residual stream INT32 Q6.19 (+-64, ~float-grade:
+                           # Q3.12 saturated by layer 2, Q5.10 cost +3.3% NLL;
+                           # 256x32b costs nothing in fabric). Norm cores see
+                           # a Q6.9 INT16 view (RMSNorm is scale-invariant).
 
 
 # ---------------------------------------------------------------- weights ----
@@ -173,13 +176,16 @@ class FixedMamba2:
 
     def step(self, tok: int, state, collect=None):
         """One decode step. collect: optional dict capturing per-phase signals."""
-        x = self.emb[tok].copy()                                # float residual
+        x = self.emb[tok].copy()
+        # residual is INT32 Q6.19 in the fabric — mirror it exactly
+        x = np.clip(np.round(x * (1 << Q_RES)), -(1 << 31), (1 << 31) - 1) / (1 << Q_RES)
         rng_ = getattr(self, "_ranges", None)
         for l, lay in enumerate(self.layers):
             # pre-norm residual block: x + mixer(RMSNorm(x)) — the first
             # reference draft fed x straight into in_proj (phases all gated
             # clean individually; the walk-through found the missing norm)
-            xn_in = rmsnorm_fixed(x, lay["ln_g"], gate=None)
+            x_nview = np.clip(np.round(x * 512), -32768, 32767) / 512  # Q6.9
+            xn_in = rmsnorm_fixed(x_nview, lay["ln_g"], gate=None)
             wq, ws = lay["in_q"]
             xs = self.xs[("in", l)]
             if rng_ is not None:
@@ -268,11 +274,13 @@ class FixedMamba2:
             y_i8 = quant_act(yn, os_)
             wq2, ws2 = lay["out_q"]
             _, dx = gemv_i4i8(wq2, ws2, y_i8, os_)
-            x = x + dx
+            x = np.clip(np.round((x + dx) * (1 << Q_RES)),
+                        -(1 << 31), (1 << 31) - 1) / (1 << Q_RES)
             if collect is not None:
                 collect[f"l{l}.x_out"] = x
 
-        xn = rmsnorm_fixed(x, self.normf_g, gate=None)
+        x_nview = np.clip(np.round(x * 512), -32768, 32767) / 512
+        xn = rmsnorm_fixed(x_nview, self.normf_g, gate=None)
         if rng_ is not None:
             rng_["head"] = max(rng_["head"], float(np.abs(xn).max()))
         h_i8 = quant_act(xn, self.xs["head"])
@@ -293,50 +301,6 @@ class FixedMamba2:
             for k, v in self._ranges.items():
                 self.xs[k] = v / 127.0
         self._ranges = None
-
-    def _old_calibrate(self, toks):
-        """One pass tracking absmax at each quant boundary; sets scales."""
-        maxes = {}
-        orig_quant = globals()["quant_act"]
-
-        def spy(x, s):
-            return orig_quant(x, s)
-        st = self.alloc_state()
-        for l in range(self.L):
-            self.xs[("in", l)] = 1.0
-            self.xs[("out", l)] = 1.0
-        self.xs["head"] = 1.0
-        # crude two-pass: run once with loose scales tracking float ranges
-        for t in toks:
-            c = {}
-            self.step(int(t), st, collect=c)
-        # second pass proper calibration by direct range probing
-        st = self.alloc_state()
-        ranges = {k: 1e-6 for k in self.xs}
-        x_probe = {}
-        for t in toks:
-            x = self.emb[int(t)].copy()
-            for l, lay in enumerate(self.layers):
-                ranges[("in", l)] = max(ranges[("in", l)], np.abs(x).max())
-                wq, ws = lay["in_q"]
-                zx = (wq * ws) @ x
-                d_in, N, H = self.d_in, self.N, self.H
-                z, xBC, dt_raw = zx[:d_in], zx[d_in:2 * d_in + 2 * N], zx[-H:]
-                cbuf = np.concatenate([st["conv"][l], xBC[:, None]], axis=1)
-                st["conv"][l] = cbuf[:, 1:]
-                xBC = silu_lut((cbuf * lay["conv_w"]).sum(1) + lay["conv_b"])
-                xv = xBC[:d_in]
-                y = xv * np.repeat(lay["Dh"], self.P)            # rough proxy
-                yn = rmsnorm_fixed(y, lay["norm_g"], gate=z)
-                ranges[("out", l)] = max(ranges[("out", l)], np.abs(yn).max())
-                wq2, ws2 = lay["out_q"]
-                x = x + (wq2 * ws2) @ np.clip(yn, -4, 4)
-                x_probe[l] = x
-            xn = rmsnorm_fixed(x, self.normf_g, gate=None)
-            ranges["head"] = max(ranges["head"], np.abs(xn).max())
-        for k, v in ranges.items():
-            self.xs[k] = float(v) / 127.0
-
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="model.mamba2_fixed")
