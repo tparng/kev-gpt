@@ -62,7 +62,11 @@ module conv_silu #(
     // history: one wide word per channel (K-1 samples of 16b), doc-6 layout.
     // PER-LAYER banks: row = layer*CH + ch, so the variable row is a memory
     // ADDRESS (not a per-lane mux). Cleared once at rst (all L banks), then each
-    // layer reads/updates ONLY its own bank, carried across tokens.
+    // layer reads/updates ONLY its own bank, carried across tokens. ram_style
+    // "block" + the deferred writeback below (write the shifted history one
+    // cycle later, off the S0-registered copies) keeps read and write on
+    // distinct addresses so this infers a simple-dual-port BRAM, not FFs.
+    (* ram_style = "block" *)
     reg [(K-1)*16-1:0] hist [0:LCH-1];
     reg signed [15:0]  xin  [0:CH-1];
     reg signed [15:0]  wrom [0:CH*K-1];
@@ -88,6 +92,12 @@ module conv_silu #(
 
     // history row address for the current channel in the current layer's bank
     wire [AW-1:0] haddr = layer*CH + ci;
+
+    // hist is SDP BRAM: ONE read port (haddr) + ONE write port. The clear
+    // sweep and the deferred per-channel shift share that single write port via
+    // a mux (they never fire the same cycle: v1 requires st==RUN, which only
+    // follows clearing) — otherwise two write addresses + the read = 3 ports,
+    // which a BRAM can't provide and synthesis refuses to infer.
 
     // S0: read channel operands -> regs
     reg               v1;
@@ -116,16 +126,23 @@ module conv_silu #(
                               (prs < -$signed(16'sd8192)) ? 16'sd0 :
                               ($signed(lut[idx]) + 16'sd1) >>> 1;
 
+    // single write port for hist (clear sweep OR deferred shift, never both)
+    wire                hist_we    = clearing | v1;
+    wire [AW-1:0]       hist_waddr = clearing ? clr : (layer*CH + c1);
+    wire [(K-1)*16-1:0] hist_wdata = clearing ? {(K-1)*16{1'b0}}
+                                              : {x1, h1[(K-1)*16-1:16]};
+
     always @(posedge clk) begin
         done <= 1'b0;
         if (rst) begin
             st <= IDLE; v1 <= 0; v2 <= 0; clearing <= 1'b1; clr <= '0;
         end else begin
             if (clearing) begin
-                hist[clr] <= '0;
                 if (clr == LCH-1) clearing <= 1'b0;
                 clr <= clr + 1'b1;
             end
+            // hist SDP write port (muxed clear-sweep / deferred-shift)
+            if (hist_we) hist[hist_waddr] <= hist_wdata;
             case (st)
               IDLE: if (start && !clearing) begin st <= RUN; ci <= '0; end
               RUN:  begin
@@ -139,8 +156,9 @@ module conv_silu #(
             v1 <= issue; c1 <= ci;
             h1 <= hist[haddr]; x1 <= xin[ci]; b1 <= brom[ci];
             for (j = 0; j < K; j = j + 1) w1[j] <= wrom[ci*K + j];
-            if (issue)   // shift this layer's history: drop oldest, append current
-                hist[haddr] <= {xin[ci], hist[haddr][(K-1)*16-1:16]};
+            // (the deferred history shift is applied through the single hist
+            // write port above: bit-identical, the row is not re-read until the
+            // next token so a 1-cycle-late writeback is invisible.)
 
             // S1 -> S2: K-tap MAC (K=4: 3 taps from history + current)
             v2 <= v1; c2 <= c1;

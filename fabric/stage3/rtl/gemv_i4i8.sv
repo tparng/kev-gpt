@@ -41,17 +41,38 @@ module gemv_i4i8 #(
 );
     localparam int RW = $clog2(ROWS);
     localparam int WW = $clog2(WPR);
+    localparam int AWM   = $clog2(WMEM);
+    localparam int WROWS = WMEM/2;          // 2 words packed per 64-bit URAM row
 
+    // wrom: SDP URAM. Two 32b weight words per 64b row (low=even word address,
+    // high=odd). Write is the one-time init pair-staging path (even word staged
+    // in wlo, committed with the odd word); read is 1-cycle, the low/high word
+    // chosen combinationally by the pointer LSB. The external WORD-address
+    // interface (base / wr_w_addr are word addresses) is unchanged.
     (* ram_style = "ultra" *)
-    reg [31:0] wrom [0:WMEM-1];
-    reg [$clog2(WMEM)-1:0] wptr;            // running word pointer
+    reg [63:0] wrom [0:WROWS-1];
+    reg [31:0] wlo;                         // even-word staging
+    reg [63:0] wq;                          // registered row read
+    reg        wsel1;                       // registered pointer LSB
+    wire [31:0] w1 = wsel1 ? wq[63:32] : wq[31:0];
+
+    reg [AWM-1:0] wptr;                     // running word pointer
     reg [63:0] xin  [0:WPR-1];              // x packed 8 lanes/word (INT8)
     reg signed [31:0] accs [0:ROWS-1];
 
     assign rd_acc_data = accs[rd_acc_addr];
 
+    // SDP wrom: write (init) + 1-cycle read in ONE always block (URAM inference)
     always @(posedge clk) begin
-        if (wr_w) wrom[wr_w_addr] <= wr_w_data;
+        if (wr_w) begin
+            if (~wr_w_addr[0]) wlo <= wr_w_data;
+            else wrom[wr_w_addr[AWM-1:1]] <= {wr_w_data, wlo};
+        end
+        wq    <= wrom[wptr[AWM-1:1]];
+        wsel1 <= wptr[0];
+    end
+
+    always @(posedge clk) begin
         if (wr_x) xin[wr_x_addr[$clog2(D_IN)-1:3]][(wr_x_addr[2:0])*8 +: 8]
                       <= wr_x_data;
     end
@@ -65,7 +86,6 @@ module gemv_i4i8 #(
     // S0: read weight word + x word
     reg          v1, last1;
     reg [RW-1:0] r1;
-    reg [31:0]   w1;
     reg [63:0]   x1;
     reg [$clog2(ROWS*WPR)-1:0] waddr_r;
 
@@ -102,9 +122,9 @@ module gemv_i4i8 #(
               DRAIN: if (!v1 && !v2) begin st <= IDLE; done <= 1'b1; end
             endcase
 
-            // S0 -> S1
+            // S0 -> S1 (w1 is the combinational half-select of the wrom row,
+            // registered in the dedicated wrom always block -> same S1 timing)
             v1 <= issue; r1 <= ri; last1 <= (wi == wpr-1);
-            w1 <= wrom[wptr];
             x1 <= xin[wi];
 
             // S1 -> S2: 8 nibble products

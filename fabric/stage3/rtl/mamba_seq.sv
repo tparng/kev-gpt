@@ -55,7 +55,12 @@ module mamba_seq #(
                      DBG_Y = 4, DBG_YN = 5, DBG_LOGIT = 6, DBG_X8 = 7;
 
     // ------------------------------------------------------------ tables ----
-    (* ram_style = "ultra" *) reg [31:0] emb  [0:V*D/8-1];      // INT4 rows
+    // emb: INT4 rows, 2 x 32b words packed per 64b URAM row (low=even word
+    // address, high=odd) so a 32Kx32 table pins into URAM instead of demoting
+    // to BRAM. Write is pair-staged; read is 1-cycle with a half-select.
+    (* ram_style = "ultra", cascade_height = 4 *)
+    reg [63:0] emb  [0:V*D/8/2-1];
+    reg [31:0] emb_wlo;                        // even-word staging
     reg [15:0] esc   [0:V-1];                 // emb per-row fp16 scale
     reg [15:0] convw [0:L*CONVD*4-1];         // Q1.14
     reg [15:0] convb [0:L*CONVD-1];
@@ -81,7 +86,8 @@ module mamba_seq #(
     always @(posedge clk) if (wr_en) begin
         case (wr_sel)
             WSEL_GW:    ;                     // handled inside gemv (below)
-            WSEL_EMB:   emb  [wr_addr[14:0]] <= wr_data;
+            WSEL_EMB:   if (~wr_addr[0]) emb_wlo <= wr_data;
+                        else emb[wr_addr[14:1]] <= {wr_data, emb_wlo};
             WSEL_ESC:   esc  [wr_addr[9:0]]  <= wr_data[15:0];
             WSEL_CW:    convw[wr_addr[14:0]] <= wr_data[15:0];
             WSEL_CB:    convb[wr_addr[12:0]] <= wr_data[15:0];
@@ -117,7 +123,10 @@ module mamba_seq #(
     reg  [18:0] g_base;   reg [10:0] g_rows;  reg [6:0] g_wpr;
     reg         g_wrx;    reg [8:0] g_wrx_a;  reg signed [7:0] g_wrx_d;
     reg  [10:0] g_rda;    wire signed [31:0] g_acc;
-    gemv_i4i8 #(.ROWS(INROWS), .D_IN(DIN), .WMEM(524288)) u_gemv (
+    // WMEM sized to the packed weight image (7*37120 in + 7*16384 out + 32768
+    // head = 407296 words) rounded up to an even 409600 -> 204800 x 64b rows =
+    // exactly 50 URAM, leaving URAM headroom for the emb table.
+    gemv_i4i8 #(.ROWS(INROWS), .D_IN(DIN), .WMEM(409600)) u_gemv (
         .clk(clk), .rst(rst), .start(g_start), .done(g_done),
         .base(g_base), .rows(g_rows), .wpr(g_wpr),
         .wr_w(wr_en && wr_sel == WSEL_GW), .wr_w_addr(wr_addr), .wr_w_data(wr_data),
@@ -255,9 +264,13 @@ module mamba_seq #(
     endfunction
 
     // temp regs used across cycles inside states
-    reg [31:0] word_t;      // plain-reg staging (variable part-selects on
-                            // unpacked-array ELEMENTS read X in iverilog —
-                            // the documented repo gotcha; stage via this reg)
+    // emb packed read: register the 64b row + the low/high select, then word_t
+    // is the combinational half — a plain net, so the variable part-select in
+    // S_EMB is iverilog-safe (the gotcha is unpacked-array ELEMENTS, not nets).
+    reg [63:0] emb_q;                        // registered emb row
+    reg        emb_sel;                      // registered word-address LSB
+    wire [31:0] word_t = emb_sel ? emb_q[63:32] : emb_q[31:0];
+    wire [14:0] emb_wa = tok_in*(D/8) + i[11:3];   // linear word address
     reg signed [31:0] acc_t;
     reg signed [47:0] t1;
     reg [15:0] fp_t;
@@ -295,7 +308,8 @@ module mamba_seq #(
               case (sub)
                 0: begin acc_t <= 32'sd0; sub <= 1;
                      fp_t <= esc[tok_in];
-                     word_t <= emb[tok_in*(D/8) + i[11:3]];  // stage the word
+                     emb_q   <= emb[emb_wa[14:1]];  // stage the packed 64b row
+                     emb_sel <= emb_wa[0];          // pick low/high 32b word
                      t1 <= 0;
                 end
                 1: begin

@@ -52,19 +52,31 @@ module ssm_scan_row #(
     localparam int AW = (CTX > 1) ? $clog2(CTX*P) : PW;
 
     // state: one wide word per channel (lane n in bits [n*16 +: 16]);
-    // CTX contexts stacked (URAM when CTX*P*N*16 is large)
-    (* ram_style = "ultra" *)
-    reg [N*16-1:0] h [0:CTX*P-1];
+    // CTX contexts stacked. Vivado won't shard a single 1024-bit RTL object
+    // across parallel URAMs (it demotes the whole thing to LUTRAM + a giant
+    // read mux), so the flat word is genvar-banked into NB x 64-bit block-RAM
+    // slices — same raddr/waddr/we/wdata drivers, hq reassembled from banks.
+    // Read latency stays 1 cycle; rows are strictly increasing so the write-
+    // lags-read window never collides. Constant genvar part-selects are
+    // iverilog-safe. N*16 must be a multiple of 64 (N=64 -> 16 banks of 64b).
+    localparam int NB = (N*16)/64;
     reg [AW-1:0]   raddr;
-    reg [N*16-1:0] hq;
+    wire [N*16-1:0] hq;
     reg            we;
     reg [AW-1:0]   waddr;
     reg [N*16-1:0] wdata;
 
-    always @(posedge clk) begin
-        hq <= h[raddr];
-        if (we) h[waddr] <= wdata;
-    end
+    genvar hbi;
+    generate for (hbi = 0; hbi < NB; hbi = hbi + 1) begin : hbank
+        (* ram_style = "block" *)
+        reg [63:0] mem [0:CTX*P-1];
+        reg [63:0] q;
+        always @(posedge clk) begin
+            q <= mem[raddr];
+            if (we) mem[waddr] <= wdata[hbi*64 +: 64];
+        end
+        assign hq[hbi*64 +: 64] = q;
+    end endgenerate
 
     reg signed [15:0] dtx [0:P-1];
     reg signed [7:0]  bvec[0:N-1];
