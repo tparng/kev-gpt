@@ -7,6 +7,9 @@
 //
 // Formats (contract):
 //   y, z        INT16 Q3.12       gamma  INT16 Q1.14
+//   short_len=1: y is INT16 Q6.9 (the engine's Q6.19-residual norm view),
+//                256 elements; eps and the output shift are rescaled so the
+//                output is still Q3.12 with true eps=1e-5 (see S_A / out_sh_n)
 //   g           INT16 Q3.12 (rounded, saturated gated product)
 //   sum(g^2)    Q6.24 accumulate (48-bit)
 //   A = mean+eps Q.26  =  (sum >>> (log2(D)-2)) + round(1e-5*2^26)
@@ -151,8 +154,12 @@ module rmsnorm_gated #(
     reg signed [15:0] go1, gm1, gm2;
     reg signed [95:0]  prod_gy;            // g*Yr        Q.(QF+26)
     reg signed [111:0] prod_gyg;           // g*Yr*gamma  Q.(QF+40)
-    localparam signed [111:0] ORND = 112'sd1 <<< (OUT_SH - 1);
-    wire signed [112:0] osh  = (prod_gyg + ORND) >>> OUT_SH;
+    // short mode: g is Q6.9 and Yr is true-scale (8x smaller than the Q3.12
+    // path), so shift 3 less to land the output back in Q3.12 exactly:
+    // y*2^9 * Yr*2^26 * gamma*2^14 >>> 37 = y*gamma*rsqrt * 2^12.
+    wire [5:0] out_sh_n = short_len ? OUT_SH - 3 : OUT_SH;
+    wire signed [111:0] ornd = 112'sd1 <<< (out_sh_n - 1);
+    wire signed [112:0] osh  = (prod_gyg + ornd) >>> out_sh_n;
     wire signed [15:0]  osat = (osh > $signed(113'sd32767))  ? 16'sd32767 :
                                (osh < -$signed(113'sd32768)) ? -16'sd32768 :
                                osh[15:0];
@@ -175,8 +182,14 @@ module rmsnorm_gated #(
                 end
                 S_GDRAIN: if (!v1 && !v2) state <= S_A;
                 // ---- A = mean(g^2) + eps  (Q.26): the LN core minus mean --
+                // short mode inputs are Q6.9 (engine pre/final norms feed the
+                // Q6.19 residual view): sum of 256 Q6.9 squares IS mean*2^26
+                // (2^18*256), so eps lands at true scale with NO shift. The
+                // old A_SH-1 shift left eps effectively 64x too large — a
+                // -5..8% norm shrink on small-residual layers (gate6 FAIL).
                 S_A: begin
-                    A <= ($signed(sumsq) >>> (short_len ? A_SH-1 : A_SH))
+                    A <= (short_len ? $signed(sumsq)
+                                    : ($signed(sumsq) >>> A_SH))
                          + $signed(EPS_A);
                     state <= S_MSB;
                 end

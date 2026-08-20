@@ -298,6 +298,10 @@ module mamba_seq #(
                      // x = nib * fp16 -> Q3.12: shift = 13 - exp (see notes)
                      xbuf[i[7:0]] <= sat32f(rshr(mul_m11(acc_t, fp_t),
                                     8'sd6 - $signed({3'b0, fp_t[14:10]})));
+`ifdef MSEQ_TRACE
+                     if (i < 2) $display("TR EMBQ i=%0d nib=%0d fp=%04x",
+                                         i, acc_t, fp_t);
+`endif
                      sub <= 0;
                      if (i == D-1) begin i <= 0; st <= S_NIN_LD;
 `ifdef MSEQ_TRACE
@@ -339,11 +343,19 @@ module mamba_seq #(
                 1: begin
                      t1 <= rshr($signed(n_out) * $signed({1'b0, c_inr[15:0]}),
                                 $signed({1'b0, c_inr[23:16]}) + 8'sd12);
+`ifdef MSEQ_TRACE
+                     if (li == 0 && (i < 2 || i == 100))
+                         $display("TR QIN i=%0d n_out=%0d", i, $signed(n_out));
+`endif
                      sub <= 2;
                 end
                 2: begin
                      q8buf[i[8:0]] <= (t1 > 48'sd127) ? 8'sd127 :
                                       (t1 < -48'sd128) ? -8'sd128 : t1[7:0];
+`ifdef MSEQ_TRACE
+                     if (li == 0 && (i < 2 || i == 100))
+                         $display("TR Q8 i=%0d t1=%0d", i, t1);
+`endif
                      sub <= 0;
                      if (i == D-1) begin i <= 0; st <= S_GIN_LD; end
                      else i <= i + 1;
@@ -372,6 +384,11 @@ module mamba_seq #(
                 2: begin  // stage 1: acc * row-scale mantissa, shift by exp
                      t1 <= rshr(mul_m11(acc_t, fp_t),
                                 8'sd10 - $signed({3'b0, fp_t[14:10]}));
+`ifdef MSEQ_TRACE
+                     if (li == 0 && (i < 2 || i == 512 || i == 1152))
+                         $display("TR GACC i=%0d acc=%0d fp=%04x", i,
+                                  acc_t, fp_t);
+`endif
                      sub <= 3;
                 end
                 3: begin  // stage 2: * act scale (m,e) -> Q3.12

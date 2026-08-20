@@ -15,7 +15,7 @@ module tb_rmsnorm_gated;
     reg signed [15:0] wr_y_data, wr_z_data, wr_g_data, wr_lut_data;
     wire signed [15:0] rd_o_data;
 
-    wire short_len = 1'b0;
+    reg short_len = 1'b0;      // mode bit1 (rg_mode: bit0 gated, bit1 short)
     rmsnorm_gated #(.D(D)) dut (
         .short_len(short_len),
         .clk(clk), .rst(rst), .start(start), .gated(gated), .done(done),
@@ -64,7 +64,7 @@ module tb_rmsnorm_gated;
                 wr_z <= 1; wr_z_addr <= i; wr_z_data <= zmem[t*D + i];
             end
             @(posedge clk); wr_y <= 0; wr_z <= 0;
-            gated <= mmem[t][0];
+            gated <= mmem[t][0]; short_len <= mmem[t][1];
             @(posedge clk); start <= 1;
             @(posedge clk); start <= 0;
             wait (done);

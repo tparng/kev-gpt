@@ -57,6 +57,26 @@ def silu_table():
     return np.round(grid / (1.0 + np.exp(-grid)) * 4096).astype(np.int64)
 
 
+def ref_int_short(yq, gq):
+    """Bit-true replica of the SHORT mode: 256 x Q6.9 in, ungated, Q3.12 out.
+    A = sum(g^2) + eps (sum of 256 Q6.9 squares IS mean*2^26); out >>> 37."""
+    g = yq[: D // 2].astype(np.int64)
+    A = int((g * g).sum()) + EPS_A
+    Yr = rsqrt_int(A)
+    out = np.empty(D // 2, dtype=np.int64)
+    rnd = 1 << (OUT_SH - 3 - 1)
+    for i in range(D // 2):
+        t = int(g[i]) * Yr * int(gq[i])
+        out[i] = min(32767, max(-32768, (t + rnd) >> (OUT_SH - 3)))
+    return out
+
+
+def ref_float_short(yq, gq):
+    yf, gf = yq[: D // 2] / 512.0, gq[: D // 2] / 16384.0
+    rms = 1.0 / np.sqrt((yf * yf).mean() + 1e-5)
+    return np.clip(yf * rms * gf, SAT_LO, SAT_HI)
+
+
 def ref_int(yq, zq, gq, lut, mode):
     """Bit-true integer replica of the RTL datapath (one token)."""
     if mode:
@@ -99,11 +119,18 @@ def main(argv=None):
     os.makedirs(sim, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     TPM = args.tokens_per_mode
-    T = 2 * TPM
-    modes = np.array([1] * TPM + [0] * TPM)
+    T = 3 * TPM
+    modes = np.array([1] * TPM + [0] * TPM + [2] * TPM)   # 2 = short (Q6.9)
 
     ys = np.clip(np.round(rng.normal(0, 1.2, (T, D)) * 4096), -32768, 32767).astype(np.int64)
     zs = np.clip(np.round(rng.normal(0, 1.2, (T, D)) * 4096), -32768, 32767).astype(np.int64)
+    # short-mode rows: Q6.9 residual-view values. Cover the eps-sensitive
+    # small-magnitude case (layer-0 emb ~ +-0.02 -> ~10 counts) and the wide
+    # late-layer case (up to ~+-30).
+    ys[2 * TPM] = np.clip(np.round(rng.normal(0, 0.02, D) * 512), -32768, 32767)
+    for t in range(2 * TPM + 1, T):
+        s = rng.uniform(0.05, 12.0)
+        ys[t] = np.clip(np.round(rng.normal(0, s, D) * 512), -32768, 32767)
     gq = np.clip(np.round(rng.normal(1, 0.2, D) * 16384), -32768, 32767).astype(np.int64)
     lut = silu_table()
 
@@ -134,28 +161,34 @@ def main(argv=None):
     got = np.where(got >= 1 << 15, got - (1 << 16), got).reshape(T, D)
 
     mism = 0
-    min_cos = {1: 1.0, 0: 1.0}
+    min_cos = {1: 1.0, 0: 1.0, 2: 1.0}
     max_rel = 0.0
     max_abs = 0.0
     for t in range(T):
         m = int(modes[t])
-        mism += int((got[t] != ref_int(ys[t], zs[t], gq, lut, m)).sum())
-        ref = ref_float(ys[t], zs[t], gq, m)
-        gf = got[t] / 4096.0
+        if m == 2:
+            mism += int((got[t][: D // 2] != ref_int_short(ys[t], gq)).sum())
+            ref = ref_float_short(ys[t], gq)
+            gf = got[t][: D // 2] / 4096.0
+        else:
+            mism += int((got[t] != ref_int(ys[t], zs[t], gq, lut, m)).sum())
+            ref = ref_float(ys[t], zs[t], gq, m)
+            gf = got[t] / 4096.0
         cos = float(gf @ ref / ((np.linalg.norm(gf) * np.linalg.norm(ref)) or 1.0))
         min_cos[m] = min(min_cos[m], cos)
         err = np.abs(gf - ref)
         max_abs = max(max_abs, float(err.max()))
         max_rel = max(max_rel, float((err / np.maximum(np.abs(ref), 1e-2)).max()))
 
-    ok = min_cos[1] > 0.9999 and min_cos[0] > 0.9999 and mism == 0
+    ok = min_cos[1] > 0.9999 and min_cos[0] > 0.9999 and min_cos[2] > 0.9999 \
+        and mism == 0
     print(f"RMSNORM_GATED_INFO: max_abs_err {max_abs:.6f}  "
           f"max_rel_err {max_rel:.6f} (den floor 1e-2)  "
           f"int_replica_mismatches {mism}")
     print(f"RMSNORM_GATED_VERDICT: {'PASS' if ok else 'FAIL'} "
           f"gated_min_cos={min_cos[1]:.8f} ungated_min_cos={min_cos[0]:.8f} "
-          f"max_rel_err={max_rel:.6f} "
-          f"({TPM}+{TPM} tokens x {D}, bar cos>0.9999 both modes + bit-exact "
+          f"short_min_cos={min_cos[2]:.8f} max_rel_err={max_rel:.6f} "
+          f"({TPM}x3 tokens, bar cos>0.9999 all modes + bit-exact "
           f"vs int replica)  [{sim}]")
     return 0 if ok else 1
 
