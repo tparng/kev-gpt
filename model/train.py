@@ -134,6 +134,12 @@ def main(argv=None):
     p.add_argument("--qat-w4", action="store_true",
                    help="mamba2: straight-through INT4 weight fake-quant "
                         "(fine-tune from --init-from for the fabric contract)")
+    p.add_argument("--fabric-qat", action="store_true",
+                   help="mamba2: fabric-AWARE QAT. Train through a differentiable "
+                        "STE mirror of the fabric fixed-point datapath (INT8 acts, "
+                        "SiLU/dt/a LUTs, Q6.9/Q6.19 requant) so the model matches "
+                        "the float ideal THROUGH the fabric (model.mamba2_fabqat). "
+                        "Needs --init-from (calibrates scales) + --qat-w4.")
     p.add_argument("--d-state", type=int, default=64,
                    help="mamba2 state dim N per head-channel (config-B gate "
                         "runs 32 — halves state memory, questions the copy "
@@ -195,7 +201,11 @@ def main(argv=None):
             z_loss=args.z_loss,
             loss_clamp=args.loss_clamp,
         )
-        model = Mamba2(cfg).to(device)
+        if args.fabric_qat:
+            from .mamba2_fabqat import FabricMamba2
+            model = FabricMamba2(cfg).to(device)
+        else:
+            model = Mamba2(cfg).to(device)
         print(f"params={model.num_params() / 1e6:.2f}M  "
               f"(mamba2: state/stream {model.state_bytes(1)/1024:.0f} KB int8, constant in T)")
         if args.init_from:
@@ -222,6 +232,15 @@ def main(argv=None):
                     parametrize.register_parametrization(mod, "weight", W4STE())
                     nq += 1
             print(f"qat-w4: STE fake-quant on {nq} Linear weights")
+        if args.fabric_qat:
+            if not args.init_from:
+                raise SystemExit("--fabric-qat needs --init-from (to calibrate scales)")
+            vb = os.path.join(args.data_dir, "val.bin")
+            vt = np.fromfile(vb, dtype=np.uint16)[:64]
+            model.calibrate_from_fixed(args.init_from, vt)
+            print(f"fabric-qat: calibrated STE scales from {args.init_from} "
+                  f"(in={[round(s,4) for s in model.fab_in_scale[:3]]}..., "
+                  f"bX={model.fab_bX})")
     elif args.qat:
         from .qgpt import QGPT, load_fp_into_qat
         cfg = GPTConfig(
