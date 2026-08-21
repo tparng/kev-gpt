@@ -25,11 +25,14 @@ module gemv_banked_resident_vec #(
     parameter integer KMAX   = 1024,      // max reduction length of any single layer
     parameter integer WWORDS = 25600,     // resident capacity in wide words
     parameter integer RLAT   = 2,         // read->mac pipeline depth (cycles)
-    parameter integer K2     = 0          // doc-7 R3: 2 K-steps/cycle via the URAM's
+    parameter integer K2     = 0,         // doc-7 R3: 2 K-steps/cycle via the URAM's
                                           // SECOND read port (free at N=1; the TDP claim
                                           // is silicon-proven by split-brain). Integer
                                           // associativity keeps the accumulate BIT-EXACT
                                           // (lane sums peak ~2^20, no mid-sum saturation).
+    // Passed straight through to weight_bank_tdp -- see that module for why
+    // "block" (Genesys2, no URAM on that part) is not a capability downgrade.
+    parameter               MEM_PRIMITIVE = "ultra"
 ) (
     input  wire                          clk,
     input  wire                          rst,
@@ -107,7 +110,8 @@ module gemv_banked_resident_vec #(
     // (rword_b) and kc+1 (rword1_b); grp_base and k_count are always even here.
     wire [$clog2(WWORDS)-1:0] waddr;
     wire [WBITS-1:0] wword_rd, wword2_rd;
-    weight_bank_tdp #(.LANES(LANES), .WWORDS(WWORDS), .DP((K2 != 0) ? 1 : 0)) u_wb (
+    weight_bank_tdp #(.LANES(LANES), .WWORDS(WWORDS), .DP((K2 != 0) ? 1 : 0),
+                       .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_wb (
         .clk(clk), .clk2x(clk),
         .ld_rst(ld_rst), .w_we(w_we), .w_data(w_data),
         .raddr_b(waddr), .rword_b(wword_rd), .rword1_b(wword2_rd),

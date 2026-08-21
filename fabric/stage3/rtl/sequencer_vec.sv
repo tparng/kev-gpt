@@ -40,7 +40,12 @@ module sequencer_vec #(
     parameter integer LN_OUT_FRAC = 22,
     parameter integer VFRAC       = 16,
     parameter integer GELU_FRAC   = 12,
-    parameter integer ISH         = 40
+    parameter integer ISH         = 40,
+    // Genesys2 (Kintex-7) port: no URAM primitive exists on that part, so the
+    // resident weight image and KV-cache code bank must fall back to ordinary
+    // BRAM TDP. Passed straight through to gemv_banked_resident_vec/kv_bank;
+    // default "ultra" leaves the KV260 build/gates untouched.
+    parameter               MEM_PRIMITIVE = "ultra"
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -122,7 +127,7 @@ module sequencer_vec #(
       S_MPSET=17, S_RES2=20, S_FIN=21,              // mlp_proj setup (GELU folded into G_RB)
       S_HEADSET=22, S_ARGMAX=23,                    // final LN_f -> head -> argmax
       S_KVW_S=24, S_KVW_F=25, S_KVW_W=26,           // KV quant-write (doc-7 R1)
-      S_CDR=27;                                     // ctx drain from the pair catchers
+      S_CDR=27;                                     // ctx drain from the head catcher
     reg [4:0] st;
     reg [3:0] blk;                           // transformer block 0..NLAYER-1
     reg [10:0] ci;
@@ -206,7 +211,7 @@ module sequencer_vec #(
     reg  [P*32-1:0]    ln_x, ln_g;
     wire               ln_yv, ln_done;
     wire [P*64-1:0]    ln_y;
-    layernorm_vec #(.P(P)) u_ln (
+    layernorm_vec #(.P(P), .D(D)) u_ln (
         .clk(clk), .rst(rst), .start(ln_start), .valid_in(ln_vin),
         .x_in(ln_x), .gamma_in(ln_g), .y_valid(ln_yv), .y_out(ln_y), .done(ln_done));
 
@@ -223,7 +228,7 @@ module sequencer_vec #(
     wire [P*32-1:0]    gv_yout;
     wire [LANES*8-1:0] emb_pair;            // pair-read data (RPP embed rows)
     gemv_banked_resident_vec #(.LANES(LANES), .P(P), .MMAX(1024), .KMAX(1024), .RLAT(2),
-                  .WWORDS(WWORDS), .K2(1)) u_gemv (
+                  .WWORDS(WWORDS), .K2(1), .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_gemv (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
         .x_we(gv_xwe), .x_data(gv_xdata),
@@ -253,78 +258,87 @@ module sequencer_vec #(
         .clk(clk), .in_valid(gl_vin), .x(gl_x),
         .out_valid(gl_vout), .y(gl_y));
 
-    // ---- TWIN vec_attn_w engines (doc-7 R4e): heads ping-pong A/B by parity,
-    // each on its OWN kv_bank read stream (the URAM/BRAM second port), so a head
-    // PAIR runs fully concurrently — the attention slope halves again.
-    reg               at_startA, at_startB, at_ldvA, at_ldvB;
+    // ---- SINGLE vec_attn_w engine (Genesys2 port): was twin engines (A+B)
+    // running a head PAIR concurrently on kv_bank's two read ports -- found to
+    // cost 247 DSP48E1 + ~44K LUTs PER ENGINE at synth (494 DSPs = 61% of the
+    // xc7k325t's 840, LUTs alone put the whole design at 123.75% before even
+    // reaching place&route), independent of LANES (which only sizes the GEMV
+    // weight bank, 0 DSPs). Collapsed to one engine processing all NHEAD heads
+    // serially -- a real throughput cost (no more pair-concurrency) in exchange
+    // for roughly halving attention's DSP/LUT footprint. kv_bank's second read
+    // port is tied permanently idle at the instantiation below (kv_bank.sv
+    // itself is UNCHANGED -- shared with the KV260 gate). See PORT-NOTES.md.
+    reg               at_startA, at_ldvA;
     reg [8:0]         at_tcount;
     wire              at_kdoneA, at_ctxvA, at_doneA;
-    wire              at_kdoneB, at_ctxvB, at_doneB;
-    wire [6:0]        at_ctxidxA, at_ctxidxB;
-    wire [P*32-1:0]   at_ctxdataA, at_ctxdataB;
-    reg [1:0]  hh;                          // legacy name: head A of the current pair
-    reg [1:0]  hB;                          // head B of the current pair
-    reg        pair;                        // pair index (NHEAD/2 = 2 pairs)
-    reg        adone_s, bdone_s;            // sticky engine-done flags per pair
+    wire [6:0]        at_ctxidxA;
+    wire [P*32-1:0]   at_ctxdataA;
+    reg [1:0]  hh;                          // the single engine's current head, 0..NHEAD-1
+    reg        adone_s;                     // sticky engine-done flag for the current head
     reg [8:0]  wi;                          // load-address counter (runs ahead)
     reg [8:0]  wic;                         // accepted-word counter (consume stage)
     reg        wiv;                         // (legacy)
     localparam integer HR = HEAD_DIM / P;
-    reg        qsel;                        // whose q is streaming (0=A, 1=B)
-    wire [10:0] aw_src = (qsel ? hB : hh)*HR + wi;
-    reg  [P*32-1:0] q_data_q;                    // registered WITH at_ldv (aligned pair)
+    wire [10:0] aw_src = hh*HR + wi;
+    reg  [P*32-1:0] q_data_q;                    // registered WITH at_ldv
     reg             ldv0;                        // addr-stage valid (1 ahead of at_ldv)
-    // BOTH engines' ctx strobes land in catch buffers, drained serially in S_CDR
-    // (2*HR cycles). A direct ctxv_bank write from the catcher made the bank
+    // ctx strobes land in a catch buffer, drained into ctxv_bank in S_CDR (HR
+    // cycles/head). A direct ctxv_bank write from the catcher made the bank
     // 2W1R -> synthesis fell back to REGISTERS (take-5); the buffer keeps it 1W1R.
     reg [P*32-1:0] ctxbufA [0:HR-1];
-    reg [P*32-1:0] ctxbufB [0:HR-1];
-    reg [4:0]  cdr;                         // ctx drain counter (0..2*HR-1)
+    reg [4:0]  cdr;                         // ctx drain counter (0..HR-1)
     // KV-write FEEDER (R4f, extended to ALL writes): every (head, K/V) of the
     // new position quantises into kv_bank through this mini-FSM, STARTED AT THE
     // QKV DISPATCH so the K writes hide under the qkv GEMV+readback. Ordering
-    // (NHEAD=4, head pairs (0,1)/(2,3)): K h0,h1,h2,h3 then V h1,h0,h3,h2 —
-    // K-first so attention pairs can start on kvp_done counts (pair0 >= 2,
-    // pair1 >= 4); within each V pair, engine B's head FIRST so its commit
-    // lands in stream A's K->V gap instead of stalling behind engine A's
-    // T-beat V read (W_CWR commits only while read-stream A is idle).
+    // (general NHEAD -- Genesys2 port, single engine): K h0..h(NHEAD-1) then
+    // V h0..h(NHEAD-1), plain ascending — K-first so attention can start on
+    // kvp_done counts (head h needs kvp_done >= h+1, S_AST). The original
+    // NHEAD=4 twin-engine build wrote V in a hand-tuned shuffled order
+    // (V1,V0,V3,V2) so each engine's V-write landed in a gap in the OTHER
+    // engine's read schedule; with a single engine that micro-optimization
+    // has no target to hide under anyway, so ascending order is simply
+    // correct — see PORT-NOTES.md.
     // Data-ready gate: row fr of the current vector may be consumed only once
     // the qkv readback has written it (kvw_src < qkv_wrow). The qkv_bank read
-    // port is arbitrated: S_ALD's q streams win; the feeder pauses (addr
+    // port is arbitrated: S_ALD's q stream wins; the feeder pauses (addr
     // presented only when granted, the in-flight beat completes regardless).
     // V reads are interlocked: at_kdone latches a pending flag, kb_rstart
-    // fires once kvp_done covers that engine's V write (vneedA/vneedB).
+    // fires once kvp_done covers this head's V write (vneedA).
     localparam [1:0] KF_IDLE=2'd0, KF_S=2'd1, KF_F=2'd2, KF_W=2'd3;
     reg [1:0] kvf_st;
     reg       kvf_active;
-    reg [3:0] kvp_done;                     // completed (head,K/V) writes 0..8
+    reg [3:0] kvp_done;                     // completed (head,K/V) writes 0..2*NHEAD
     reg [10:0] qkv_wrow;                    // qkv rows committed by G_RB so far
-    reg       vpA, vpB;                     // V-read pending (kdone seen, write not)
+    reg       vpA;                          // V-read pending (kdone seen, write not)
     wire      kvf_grant = (st != S_ALD) && (st != S_KVW_F);
-    wire [3:0] vneedA = {2'b0, hh} + 4'd6;  // V write index for engine A's head
-    wire [3:0] vneedB = {2'b0, hB} + 4'd4;  // V write index for engine B's head
+    // kvp_done value once V for the current head has committed: V for head h
+    // is the (NHEAD+h+1)th write in the ascending K-then-V order above.
+    wire [3:0] vneedA = NHEAD[3:0] + {2'b0, hh} + 4'd1;
 
     // ---- kv_bank: the on-chip K8/V8 cache making decode faithful ---------------
-    reg         kb_wstart, kb_wvalid, kb_rstart, kb_rkv, kb2_rstart, kb2_rkv;
+    reg         kb_wstart, kb_wvalid, kb_rstart, kb_rkv;
     reg  [P*32-1:0] kb_wdata_q;                  // registered with kb_wvalid (L_FEED idiom)
     reg  [1:0]  kvw_h;                           // KV-write head loop
     reg         kvw_kv;                          // 0 = K, 1 = V
-    wire        kb_wdone, kb_rvalid, kb_rdone, kb2_rvalid, kb2_rdone;
-    wire [HEAD_DIM*32-1:0] kb_rdata, kb2_rdata;  // one dequantised position per beat
-    reg  [1:0]  alds;                            // S_ALD phase: 0 qA, 1 qB
+    wire        kb_wdone, kb_rvalid, kb_rdone;
+    wire [HEAD_DIM*32-1:0] kb_rdata;             // one dequantised position per beat
+    reg  [1:0]  alds;                            // (legacy, unused post single-engine collapse)
     wire [10:0] kvw_src = (kvw_kv ? 2*D/P : D/P) + kvw_h*HR
                           + {{(11-$clog2(ROWSM+1)){1'b0}}, fr};
+    // kv_bank's second read port is a fixed interface (shared, unmodified file
+    // -- see below) permanently idled here: rd2_start tied low so Vivado can
+    // constant-propagate/eliminate the second port's logic during synthesis.
     kv_bank #(.P(P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(NLAYER),
-              .TMAX(TMAX), .KBITS(8)) u_kvb (
+              .TMAX(TMAX), .KBITS(8), .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_kvb (
         .clk(clk), .rst(rst),
         .wq_start(kb_wstart), .wq_layer(blk), .wq_kv(kvw_kv), .wq_head(kvw_h),
         .wq_pos(pos), .wq_valid(kb_wvalid), .wq_data(kb_wdata_q), .wq_done(kb_wdone),
         .rd_start(kb_rstart), .rd_layer(blk), .rd_kv(kb_rkv), .rd_head(hh),
         .rd_tcount(pos + 9'd1),
         .rd_valid(kb_rvalid), .rd_data(kb_rdata), .rd_done(kb_rdone),
-        .rd2_start(kb2_rstart), .rd2_layer(blk), .rd2_kv(kb2_rkv), .rd2_head(hB),
-        .rd2_tcount(pos + 9'd1),
-        .rd2_valid(kb2_rvalid), .rd2_data(kb2_rdata), .rd2_done(kb2_rdone));
+        .rd2_start(1'b0), .rd2_layer(4'd0), .rd2_kv(1'b0), .rd2_head(2'd0),
+        .rd2_tcount(9'd0),
+        .rd2_valid(), .rd2_data(), .rd2_done());
 
     vec_attn_w #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attnA (
         .clk(clk), .rst(rst), .start(at_startA), .tcount(at_tcount),
@@ -333,14 +347,6 @@ module sequencer_vec #(
         .k_done(at_kdoneA),
         .ctx_valid(at_ctxvA), .ctx_idx(at_ctxidxA), .ctx_data(at_ctxdataA),
         .done(at_doneA));
-
-    vec_attn_w #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attnB (
-        .clk(clk), .rst(rst), .start(at_startB), .tcount(at_tcount),
-        .q_valid(at_ldvB), .q_data(q_data_q),
-        .kv_valid(kb2_rvalid), .kv_data(kb2_rdata),
-        .k_done(at_kdoneB),
-        .ctx_valid(at_ctxvB), .ctx_idx(at_ctxidxB), .ctx_data(at_ctxdataB),
-        .done(at_doneB));
 
     // ---- callable GEMV / LN parameter registers --------------------------------
     reg [19:0] g_wbase;            // weight base
@@ -466,14 +472,14 @@ module sequencer_vec #(
     always @(posedge clk) begin
         ln_start<=1'b0; ln_vin<=1'b0; gv_ldrst<=1'b0; gv_xwe<=1'b0; gv_start<=1'b0;
         dq_vin<=1'b0; gl_vin<=1'b0; done<=1'b0;
-        at_startA<=1'b0; at_startB<=1'b0; at_ldvA<=1'b0; at_ldvB<=1'b0;
-        kb_wstart<=1'b0; kb_wvalid<=1'b0; kb_rstart<=1'b0; kb2_rstart<=1'b0;
+        at_startA<=1'b0; at_ldvA<=1'b0;
+        kb_wstart<=1'b0; kb_wvalid<=1'b0; kb_rstart<=1'b0;
         if (rst) begin
             st<=S_IDLE; ci<=0; fr<=0; orow<=0; dor<=0; gor<=0;
             rv0<=0; rv1<=0; rv2<=0;
             civ<=0; frv<=0; arv<=0; wiv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0;
             kvf_st<=KF_IDLE; kvf_active<=1'b0;
-            kvp_done<=4'd0; qkv_wrow<=11'd0; vpA<=1'b0; vpB<=1'b0;
+            kvp_done<=4'd0; qkv_wrow<=11'd0; vpA<=1'b0;
             rng_state<=32'd0; smp_en<=1'b0;
             gpre_active<=1'b0; gpre_done<=1'b0; gj<=9'd0; gj_dv<=1'b0;
         end else begin
@@ -554,10 +560,10 @@ module sequencer_vec #(
                     g_wbase<=blk*GW_BLK + WB_QKV; g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
                     g_asel<=blk*4 + 6'd0; g_frac<=7'd16; g_dqrow<=blk*DQB_P + DR_QKV; g_dst<=3'd0;
                     g_ret<=S_AST; ci<=0; civ<=0;
-                    hh<=2'd0; hB<=2'd1; pair<=1'b0;
+                    hh<=2'd0;
                     kvw_h<=2'd0; kvw_kv<=1'b0;
                     kvf_active<=1'b1; kvf_st<=KF_S; kvp_done<=4'd0; qkv_wrow<=11'd0;
-                    vpA<=1'b0; vpB<=1'b0;
+                    vpA<=1'b0;
                     gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // ============ KV quant-write: k then v, per head ==============
@@ -578,7 +584,7 @@ module sequencer_vec #(
                     else if (kvw_h == 2'd0) begin kvw_h<=2'd1; kvw_kv<=1'b0; st<=S_KVW_S; end
                     else begin
                         kvw_h<=2'd2; kvw_kv<=1'b0; kvf_active<=1'b1; kvf_st<=KF_S;
-                        hh<=2'd0; hB<=2'd1; pair<=1'b0; st<=S_AST;
+                        hh<=2'd0; st<=S_AST;
                     end
                 end
                 // ================= callable GEMV ==============================
@@ -716,53 +722,46 @@ module sequencer_vec #(
                         else gor<=gor+1'b1;
                     end
                 end
-                // ============ attention (R4e: twin engines, head pairs) ========
-                // a pair starts once ITS K writes have committed (pair0 needs
-                // K h0,h1 = writes 1..2; pair1 needs K h2,h3 = writes 3..4);
-                // the V writes are covered by the per-engine read interlocks.
-                S_AST: if (kvp_done >= (pair ? 4'd4 : 4'd2)) begin
+                // ============ attention (Genesys2 port: single engine, ========
+                // ============ heads processed serially 0..NHEAD-1) =============
+                // head hh starts once ITS K write has committed (write hh+1);
+                // the V write is covered by the read interlock (vneedA) below.
+                S_AST: if (kvp_done >= {2'b0, hh} + 4'd1) begin
                     at_startA<=1'b1; at_tcount<=pos + 9'd1;
-                    wi<=9'd0; wic<=9'd0; wiv<=1'b0; ldv0<=1'b0; qsel<=1'b0;
-                    adone_s<=1'b0; bdone_s<=1'b0; st<=S_ALD;
+                    wi<=9'd0; wic<=9'd0; wiv<=1'b0; ldv0<=1'b0;
+                    adone_s<=1'b0; st<=S_ALD;
                 end
                 S_ALD: begin
-                    // stream q to A (qsel=0) then to B (qsel=1); each engine's K
-                    // stream starts the moment its q is in (its OWN kv_bank port).
-                    // V-starts and ctx collection are the catchers below the case.
+                    // stream q to the engine; its K stream starts the moment its
+                    // q is in. V-start and ctx collection are the catchers below.
                     ldv0     <= (wi != HR[8:0]);
                     q_data_q <= qkv_r;
-                    if (!qsel) at_ldvA <= ldv0; else at_ldvB <= ldv0;
+                    at_ldvA  <= ldv0;
                     if (wi != HR[8:0]) wi <= wi + 1'b1;
-                    if (qsel ? at_ldvB : at_ldvA) begin
+                    if (at_ldvA) begin
                         if (wic == HR-1) begin
-                            if (!qsel) begin
-                                kb_rstart <= 1'b1; kb_rkv <= 1'b0;   // K for A (head hh)
-                                at_startB <= 1'b1;
-                                wi<=9'd0; wic<=9'd0; ldv0<=1'b0; qsel<=1'b1;
-                            end else begin
-                                kb2_rstart <= 1'b1; kb2_rkv <= 1'b0; // K for B (head hB)
-                                st <= S_ACL;
-                            end
+                            kb_rstart <= 1'b1; kb_rkv <= 1'b0;   // K for head hh
+                            st <= S_ACL;
                         end else wic <= wic + 1'b1;
                     end
                 end
-                S_ACL: if (adone_s && bdone_s) begin
+                S_ACL: if (adone_s) begin
                     cdr <= 5'd0; st <= S_CDR;
                 end
-                // drain both ctx catchers into ctxv_bank (the bank's ONLY writer)
+                // drain the ctx catcher into ctxv_bank (the bank's ONLY writer)
                 S_CDR: begin
-                    if (cdr < HR[4:0])
-                        ctxv_bank[hh*HR + {6'b0, cdr[2:0]}] <= ctxbufA[cdr[2:0]];
-                    else
-                        ctxv_bank[hB*HR + {6'b0, cdr[2:0]}] <= ctxbufB[cdr[2:0]];
-                    if (cdr == 2*HR-1) begin
-                        if (pair) begin                           // -> proj GEMV
+                    ctxv_bank[hh*HR + {6'b0, cdr[2:0]}] <= ctxbufA[cdr[2:0]];
+                    // Genesys2 port: was pair-indexed (2 heads/iteration via twin
+                    // engines); single engine now loops one head at a time,
+                    // hh 0..NHEAD-1, HR drain cycles/head instead of 2*HR/pair.
+                    if (cdr == HR[4:0]-1'b1) begin
+                        if (hh == NHEAD[1:0]-2'd1) begin           // -> proj GEMV
                             g_wbase<=blk*GW_BLK + WB_PROJ; g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
                             g_asel<=blk*4 + 6'd1; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_PROJ; g_dst<=3'd1;
                             l_gbase<=blk*2 + 4'd1; l_dst<=1'b1; l_ret<=S_FCRET;  // LN2 (fed in S_RES1)
                             g_ret<=S_RES1; ci<=0; civ<=0; gv_ldrst<=1'b1; st<=G_AQ;
                         end else begin
-                            pair<=1'b1; hh<=2'd2; hB<=2'd3; st<=S_AST;
+                            hh<=hh+2'd1; st<=S_AST;
                         end
                     end else cdr <= cdr + 5'd1;
                 end
@@ -889,26 +888,29 @@ module sequencer_vec #(
                 S_FIN: begin done<=1'b1; st<=S_IDLE; end
                 default: st<=S_IDLE;
             endcase
-            // ---- R4e catchers: fire regardless of FSM state -------------------
-            // V streams start when the engine's probs are ready AND that head's
+            // ---- R4e catcher: fires regardless of FSM state --------------------
+            // V stream starts when the engine's probs are ready AND this head's
             // V write has committed (kvp_done >= vneed); a not-yet-ready kdone
             // latches a pending flag and fires on the write's completion.
             if (at_kdoneA) vpA <= 1'b1;
-            if (at_kdoneB) vpB <= 1'b1;
             if ((at_kdoneA || vpA) && (kvp_done >= vneedA)) begin
                 kb_rstart  <= 1'b1; kb_rkv  <= 1'b1; vpA <= 1'b0;
             end
-            if ((at_kdoneB || vpB) && (kvp_done >= vneedB)) begin
-                kb2_rstart <= 1'b1; kb2_rkv <= 1'b1; vpB <= 1'b0;
-            end
             if (at_ctxvA) ctxbufA[at_ctxidxA[2:0]] <= at_ctxdataA;
-            if (at_ctxvB) ctxbufB[at_ctxidxB[2:0]] <= at_ctxdataB;
             if (at_doneA) adone_s <= 1'b1;
-            if (at_doneB) bdone_s <= 1'b1;
             // ---- KV feeder: ALL (head,K/V) writes, armed at the qkv dispatch --
-            // K h0..h3 ride the qkv readback (data-ready gated row by row),
-            // then V h1,h0,h3,h2 hide under the attention pairs (B-head first,
-            // see the declaration comment). Hardcodes NHEAD=4 head pairs.
+            // K h0..h(NHEAD-1) ride the qkv readback (data-ready gated row by
+            // row), then V h0..h(NHEAD-1) (plain ascending -- Genesys2 port).
+            // Originally (KV260 / twin-engine builds) V was written in a
+            // hand-shuffled order so each of the two concurrent engines' V
+            // writes landed in a gap in the OTHER engine's read schedule -- a
+            // latency-hiding micro-optimization with no meaning once there is
+            // only one engine processing one head at a time (see the
+            // single-engine collapse above, PORT-NOTES.md): plain ascending
+            // order is simply correct here, not a fallback. vneedA (declared
+            // above) tracks this order; S_AST's per-head gate
+            // (`kvp_done >= hh+1`) needs no further conditioning since
+            // K-writes are already ascending.
             case (kvf_st)
                 KF_S: if (kvf_active) begin
                     kb_wstart<=1'b1; fr<=0; frv<=0; kvf_st<=KF_F;
@@ -925,16 +927,12 @@ module sequencer_vec #(
                 end
                 KF_W: if (kb_wdone) begin
                     kvp_done <= kvp_done + 4'd1;
-                    if (!kvw_kv) begin                       // K phase: h0->h1->h2->h3
-                        if (kvw_h != 2'd3) begin kvw_h<=kvw_h+2'd1; kvf_st<=KF_S; end
-                        else begin kvw_kv<=1'b1; kvw_h<=2'd1; kvf_st<=KF_S; end
-                    end else begin                           // V phase: h1->h0->h3->h2
-                        case (kvw_h)
-                            2'd1: begin kvw_h<=2'd0; kvf_st<=KF_S; end
-                            2'd0: begin kvw_h<=2'd3; kvf_st<=KF_S; end
-                            2'd3: begin kvw_h<=2'd2; kvf_st<=KF_S; end
-                            default: begin kvf_active<=1'b0; kvf_st<=KF_IDLE; end
-                        endcase
+                    if (!kvw_kv) begin                       // K phase: h0->h1->...->h(NHEAD-1)
+                        if (kvw_h != NHEAD[1:0]-2'd1) begin kvw_h<=kvw_h+2'd1; kvf_st<=KF_S; end
+                        else begin kvw_kv<=1'b1; kvw_h<=2'd0; kvf_st<=KF_S; end  // -> V phase, start h0
+                    end else begin                           // V phase: h0->h1->...->h(NHEAD-1)
+                        if (kvw_h != NHEAD[1:0]-2'd1) begin kvw_h<=kvw_h+2'd1; kvf_st<=KF_S; end
+                        else begin kvf_active<=1'b0; kvf_st<=KF_IDLE; end
                     end
                 end
                 default: ;

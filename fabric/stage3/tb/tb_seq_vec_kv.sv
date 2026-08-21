@@ -26,10 +26,32 @@
 `ifndef SEEDVAL
  `define SEEDVAL 0
 `endif
+// Genesys2 port: sequencer_vec's D/NLAYER/NHEAD/VOCAB were real module
+// parameters but this testbench never threaded them (only P/LANES/TMAX),
+// so it had in practice only ever exercised the deployed KV260 defaults
+// (256/4/4/193) -- see fabric/genesys2/PORT-NOTES.md. Defaults here match
+// those exactly, so this is additive: nothing changes unless run_vec_kv.py
+// passes a different value.
+`ifndef DVAL
+ `define DVAL 256
+`endif
+`ifndef NLAYERVAL
+ `define NLAYERVAL 4
+`endif
+`ifndef NHEADVAL
+ `define NHEADVAL 4
+`endif
+`ifndef VOCABVAL
+ `define VOCABVAL 193
+`endif
 module tb;
     localparam integer P     = `PVAL;
     localparam integer LANES = `LVAL;
     localparam integer TMAXP = `TMAXVAL;
+    localparam integer DP      = `DVAL;
+    localparam integer NLAYERP = `NLAYERVAL;
+    localparam integer NHEADP  = `NHEADVAL;
+    localparam integer VOCABP  = `VOCABVAL;
     localparam integer WBITS = LANES * 4;
     localparam integer SUBW  = WBITS / 32;
     localparam integer PLEN  = `PLEN;
@@ -51,7 +73,12 @@ module tb;
  `define KVSTOP 0
 `endif
     reg [1:0] dbgstop_r = 2'b0;
-    sequencer_vec #(.P(P), .LANES(LANES), .TMAX(TMAXP)) dut (
+    // D3/D_MLP follow this codebase's fixed 3x/4x-of-D convention (qkv width,
+    // mlp_ratio=4) rather than adding two more `defines -- HEAD_DIM is left at
+    // sequencer_vec's own default (64): this port varies NHEAD, not HEAD_DIM
+    // (see PORT-NOTES.md).
+    sequencer_vec #(.P(P), .LANES(LANES), .TMAX(TMAXP), .D(DP), .D3(3*DP),
+                     .D_MLP(4*DP), .NLAYER(NLAYERP), .NHEAD(NHEADP), .VOCAB(VOCABP)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_id(tok), .pos(pos), .done(done),
         .tok_out(tok_out), .rd_sel(rsel), .rd_addr(raddr), .rd_data(rdata),
         .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data), .dbg_stop(dbgstop_r),

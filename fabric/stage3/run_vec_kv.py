@@ -82,8 +82,17 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
     else:
         gold = _sample_stream(gold_seq, list(prompt_ids), ngen, seed)
 
+    # Derived from the actual checkpoint (was hardcoded to the deployed
+    # KV260 shape: nlayer=4, d=256, nhead=4, vocab=193) -- see
+    # fabric/genesys2/PORT-NOTES.md. HEAD_DIM is not derived; this port's
+    # sizing decision keeps it fixed at sequencer_vec's own default (64).
+    d_model = p["tok_emb"].shape[1]
+    nlayer = len(p["blocks"])
+    nhead = int(p["n_head"])
+    vocab = p["tok_emb"].shape[0]
+
     iseq = seq_ref.IntSequencer(p, cfg)
-    write_mems_wideword(sim_dir, iseq, lanes, 4, P)
+    write_mems_wideword(sim_dir, iseq, lanes, nlayer, P)
     # gelu_lut2 (the paired-lane core vec_gelu now uses) reads the even/odd split
     with open(os.path.join(sim_dir, "gelu_lut.mem")) as fh:
         lut = [ln.strip() for ln in fh if ln.strip()]
@@ -115,7 +124,9 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
     vvp = os.path.join(sim_dir, "sim.vvp")
     defs = [f"-DPVAL={P}", f"-DLVAL={lanes}", f"-DWROMN={wrom_n}",
             f"-DTMAXVAL={tmax}", f"-DPLEN={plen}", f"-DNGEN={ngen}",
-            f"-DSEEDVAL={seed & 0xFFFFFFFF}"]
+            f"-DSEEDVAL={seed & 0xFFFFFFFF}",
+            f"-DDVAL={d_model}", f"-DNLAYERVAL={nlayer}",
+            f"-DNHEADVAL={nhead}", f"-DVOCABVAL={vocab}"]
     if os.environ.get("KVDBG"):
         defs.append("-DKVDBG")
     if os.environ.get("KVSTOP"):
