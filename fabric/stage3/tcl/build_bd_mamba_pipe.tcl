@@ -1,18 +1,21 @@
 # Mamba-2 WAVE engine bitstream — PS+PL block design around mamba_pipe_axi (the
 # pipelined NC-stream engine, config-B NST=32, DBG=0). Build-only; run
 # impl_mamba_pipe.tcl afterwards for synth/impl/bitstream.
-#   vivado -mode batch -source build_bd_mamba_pipe.tcl -tclargs <FREQMHZ> <BDIR> <NC> <NST> <TMAX>
-# Requires seed.mem in the mem search path (rmsnorm rsqrt seed ROM).
+#   vivado -mode batch -source build_bd_mamba_pipe.tcl -tclargs <FREQMHZ> <BDIR> <NC> <NST> <TMAX> <QH>
+# seed.mem is only the sim/fallback init — the real rsqrt seed loads over AXI
+# (WSEL_SEED=15), so the bitstream does NOT depend on it baking.
 set freq [lindex $argv 0]
 set bdir [lindex $argv 1]
 set nc   [lindex $argv 2]
 set nst  [lindex $argv 3]
 set tmax [lindex $argv 4]
+set qh   [lindex $argv 5]
 if {$freq eq ""} { set freq 100 }
 if {$bdir eq ""} { set bdir "/tmp/kevbuild/mamba_pipe_bit" }
 if {$nc   eq ""} { set nc 2 }
 if {$nst  eq ""} { set nst 32 }
 if {$tmax eq ""} { set tmax 2 }
+if {$qh   eq ""} { set qh 16 }
 
 set part  "xck26-sfvc784-2LV-c"
 set board "xilinx.com:kv260_som:part0:1.4"
@@ -43,7 +46,8 @@ set_property -dict [list \
 
 set g [create_bd_cell -type module -reference mamba_pipe_axi eng]
 set_property -dict [list CONFIG.C_S_AXI_ADDR_WIDTH {8} \
-    CONFIG.NC $nc CONFIG.NST $nst CONFIG.TMAX $tmax CONFIG.T_TOKENS $tmax] [get_bd_cells eng]
+    CONFIG.NC $nc CONFIG.NST $nst CONFIG.QH $qh \
+    CONFIG.TMAX $tmax CONFIG.T_TOKENS $tmax] [get_bd_cells eng]
 
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list \
     Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
@@ -58,4 +62,4 @@ validate_bd_design
 make_wrapper -files [get_files design_1.bd] -top -import
 set_property top design_1_wrapper [current_fileset]
 generate_target all [get_files design_1.bd]
-puts "BD_BUILD_MAMBA_PIPE_OK freq=$freq nc=$nc nst=$nst tmax=$tmax"
+puts "BD_BUILD_MAMBA_PIPE_OK freq=$freq nc=$nc nst=$nst tmax=$tmax qh=$qh"

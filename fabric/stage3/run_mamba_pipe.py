@@ -86,6 +86,13 @@ def build_tables(sim, ex):
     for s, v in tables.items():
         w32(f"{sim}/ms_t{s}.mem", v)
 
+    # table 15 = rsqrt seed (WSEL_SEED), 64 x 20-bit — loaded over the write port
+    # so nothing depends on the $readmemh init baking into a bitstream. Count
+    # goes in cfg[17] (cfg[15] = gemv-weight count, cfg[16] = NC).
+    from fabric.stage3.run_layernorm import seed_table
+    seedv = np.asarray(list(seed_table()), dtype=np.int64)
+    w32(f"{sim}/ms_t15.mem", seedv)
+
     consts = np.zeros(128, dtype=np.uint64)
     for l in range(L):
         lj = sj["layers"][l] if "layers" in sj else sj[str(l)]
@@ -108,6 +115,7 @@ def build_tables(sim, ex):
     lengths = {s: len(v) for s, v in tables.items()}
     lengths[15] = len(gw)
     lengths[14] = 128
+    lengths[17] = len(seedv)   # seed count -> cfg[17]
     return gw, out_base, head_base, lengths
 
 
@@ -138,6 +146,10 @@ def main(argv=None):
     ap.add_argument("--tokens", type=int, default=2)
     ap.add_argument("--export", default="data/fabric_mamba")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--zero-seed-init", action="store_true",
+                    help="write seed.mem as all-zero (kills the $readmemh baked "
+                         "init) while still loading the real seed via the write "
+                         "port — proves the AXI seed-load path")
     ap.add_argument("--dir", default=None)
     args = ap.parse_args(argv)
 
@@ -185,24 +197,37 @@ def main(argv=None):
     # truth used to MEASURE the INT12 fidelity hit (argmax agreement).
     gold = reference(seqs, ex, qh=QH)
 
+    # board reference pack: pl_mamba_pipe replays these exact tokens on silicon
+    # and compares the engine's per-(stream,token) argmax (dump_tok readback).
+    np.savez(f"{sim}/mp_ref.npz",
+             toks=np.asarray(seqs, dtype=np.int64),
+             ref_argmax=np.asarray([[g[0] for g in row] for row in gold],
+                                   dtype=np.int64),
+             ref_logits=np.asarray([[g[1] for g in row] for row in gold],
+                                   dtype=np.int64))
+
     # ---- simulate -----------------------------------------------------------
+    # seed.mem feeds only the rmsnorm_gated $readmemh sim/fallback init; the
+    # real seed loads over the write port (table 15). --zero-seed-init writes
+    # zeros here to prove the loaded path (silicon behaves like zeros).
     from fabric.stage3.run_layernorm import seed_table
     with open(f"{sim}/seed.mem", "w") as f:
         for v in seed_table():
-            f.write(f"{int(v):05x}\n")
+            f.write(f"{0 if args.zero_seed_init else int(v):05x}\n")
 
     if args.engine == "seq":
         src = [f"{REPO}/fabric/stage3/rtl/{m}.sv" for m in
                ("mamba_seq", "gemv_i4i8", "conv_silu", "ssm_scan_row",
                 "rmsnorm_gated")]
         src.append(f"{REPO}/fabric/stage3/tb/tb_mamba_seq.sv")
-        cfg2 = np.zeros(16, dtype=np.int64)
+        cfg2 = np.zeros(17, dtype=np.int64)
         cfg2[0] = T
         for s, ln in lengths.items():
             if s < 16:
                 cfg2[s] = ln
         cfg2[14] = 128
         cfg2[15] = len(gw)
+        cfg2[16] = lengths[17]   # seq cfg word16 = seed count (WSEL_SEED)
         w32(f"{sim}/ms_cfg.mem", cfg2)
         with open(f"{sim}/ms_tok.mem", "w") as f:
             for t in range(T):

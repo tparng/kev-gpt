@@ -100,6 +100,7 @@ module tb_mamba_pipe;
         load_sel(12, cfg[12], "ms_t12.mem");
         load_sel(13, cfg[13], "ms_t13.mem");
         load_sel(14, cfg[14], "ms_t14.mem");
+        load_sel(15, cfg[17], "ms_t15.mem");   // rsqrt seed (WSEL_SEED), cnt cfg[17]
         $display("TABLES_LOADED %0t", $time);
 
         // load per-(stream,token) input tokens (stream-major)

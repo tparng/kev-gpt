@@ -82,7 +82,7 @@ module mamba_pipe #(
                      WSEL_CB = 4, WSEL_SLUT = 5, WSEL_ALUT = 6, WSEL_DLUT = 7,
                      WSEL_LNG = 8, WSEL_NRMG = 9, WSEL_NFG = 10,
                      WSEL_RSIN = 11, WSEL_RSOUT = 12, WSEL_RSHD = 13,
-                     WSEL_CONST = 14;
+                     WSEL_CONST = 14, WSEL_SEED = 15;
 
     // ------------------------------------------------------------ tables ----
     (* ram_style = "ultra", cascade_height = 4 *)
@@ -315,6 +315,8 @@ module mamba_pipe #(
         .wr_z(n_wrz), .wr_z_addr(n_wrz_a), .wr_z_data(n_wrz_d),
         .wr_g(n_wrg), .wr_g_addr(n_wrg_a), .wr_g_data(n_wrg_d),
         .wr_lut(n_wrl), .wr_lut_addr(n_wrl_a), .wr_lut_data(n_wrd),
+        .wr_seed(wr_en && wr_sel == WSEL_SEED),
+        .wr_seed_addr(wr_addr[5:0]), .wr_seed_data(wr_data[19:0]),
         .rd_o_addr(n_rda), .rd_o_data(n_out),
         .rd_ow_base(n_rdaw), .rd_ow_data(n_ow));
 

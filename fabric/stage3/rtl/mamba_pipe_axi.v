@@ -23,6 +23,7 @@ module mamba_pipe_axi #(
     parameter integer C_S_AXI_ADDR_WIDTH = 8,
     parameter integer NC   = 2,
     parameter integer NST  = 32,
+    parameter integer QH   = 16,
     parameter integer TMAX = 2,
     parameter integer T_TOKENS = 2
 ) (
@@ -145,7 +146,8 @@ module mamba_pipe_axi #(
         end
     end
 
-    mamba_pipe #(.NC(NC), .NST(NST), .TMAX(TMAX), .T_TOKENS(T_TOKENS), .DBG(0))
+    mamba_pipe #(.NC(NC), .NST(NST), .QH(QH), .TMAX(TMAX), .T_TOKENS(T_TOKENS),
+                 .DBG(0))
     u_pipe (
         .clk(clk), .rst(~aresetn | soft_reset), .ready(ready),
         .start(go_pulse), .done(done), .cyc_count(cyc_count),
