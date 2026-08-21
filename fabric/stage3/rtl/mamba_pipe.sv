@@ -325,23 +325,37 @@ module mamba_pipe #(
     localparam [3:0] OP_EMB=0, OP_NPRE=1, OP_GIN=2, OP_CONV=3, OP_SCAN=4,
                      OP_NGATE=5, OP_GOUT=6, OP_NFIN=7, OP_GHD=8, OP_DONE=9;
 
+    // op_of / layer_of are on the wave dispatch critical path (re-evaluated per
+    // stream inside each worker's dispatch loop). The original `% 6` / `/ 6`
+    // synthesise to CARRY8 divider chains and — fanned across the chip to the
+    // worker layer regs (g_li/c_li/s_li) — were the MEASURED routed critical path
+    // (op_pc -> /6 -> worker layer reg, route-dominated). Grouped-case lookups
+    // (identical truth table) map to a shallow LUT mux instead, taking the divider
+    // off that path. Values identical => bit-exact, same schedule / cycle count.
     function automatic [3:0] op_of(input [7:0] pc);
-        reg [7:0] k; reg [2:0] ph;
-        begin
-            if (pc == 0)       op_of = OP_EMB;
-            else if (pc <= 42) begin
-                k = pc - 8'd1; ph = k % 6;
-                op_of = (ph==0)?OP_NPRE:(ph==1)?OP_GIN:(ph==2)?OP_CONV:
-                        (ph==3)?OP_SCAN:(ph==4)?OP_NGATE:OP_GOUT;
-            end
-            else if (pc == 43) op_of = OP_NFIN;
-            else if (pc == 44) op_of = OP_GHD;
-            else               op_of = OP_DONE;
-        end
+        case (pc)
+            8'd0:                                             op_of = OP_EMB;
+            8'd1, 8'd7, 8'd13, 8'd19, 8'd25, 8'd31, 8'd37:    op_of = OP_NPRE;
+            8'd2, 8'd8, 8'd14, 8'd20, 8'd26, 8'd32, 8'd38:    op_of = OP_GIN;
+            8'd3, 8'd9, 8'd15, 8'd21, 8'd27, 8'd33, 8'd39:    op_of = OP_CONV;
+            8'd4, 8'd10, 8'd16, 8'd22, 8'd28, 8'd34, 8'd40:   op_of = OP_SCAN;
+            8'd5, 8'd11, 8'd17, 8'd23, 8'd29, 8'd35, 8'd41:   op_of = OP_NGATE;
+            8'd6, 8'd12, 8'd18, 8'd24, 8'd30, 8'd36, 8'd42:   op_of = OP_GOUT;
+            8'd43:                                            op_of = OP_NFIN;
+            8'd44:                                            op_of = OP_GHD;
+            default:                                          op_of = OP_DONE;
+        endcase
     endfunction
     function automatic [3:0] layer_of(input [7:0] pc);
-        if (pc >= 1 && pc <= 42) layer_of = (pc - 8'd1) / 6;
-        else                     layer_of = 0;
+        case (pc)
+            8'd7,  8'd8,  8'd9,  8'd10, 8'd11, 8'd12: layer_of = 4'd1;
+            8'd13, 8'd14, 8'd15, 8'd16, 8'd17, 8'd18: layer_of = 4'd2;
+            8'd19, 8'd20, 8'd21, 8'd22, 8'd23, 8'd24: layer_of = 4'd3;
+            8'd25, 8'd26, 8'd27, 8'd28, 8'd29, 8'd30: layer_of = 4'd4;
+            8'd31, 8'd32, 8'd33, 8'd34, 8'd35, 8'd36: layer_of = 4'd5;
+            8'd37, 8'd38, 8'd39, 8'd40, 8'd41, 8'd42: layer_of = 4'd6;
+            default:                                  layer_of = 4'd0;
+        endcase
     endfunction
     // 0 none,1 emb,2 norm,3 gemv,4 conv,5 scan
     function automatic [2:0] wrk_of(input [3:0] op);
@@ -536,7 +550,7 @@ module mamba_pipe #(
                 if (est == E_IDLE) begin
                     found = 0; pick = 0;
                     for (kk = 0; kk < NC; kk = kk + 1) begin
-                        ss = (rr[1] + 1 + kk) % NC;
+                        ss = rr[1] + 1 + kk; if (ss >= NC) ss = ss - NC;  // %NC, divider-free (rr+1+kk < 2NC)
                         if (!found && active[ss] && !busy[ss]
                             && wrk_of(op_of(op_pc[ss])) == 3'd1) begin
                             found = 1; pick = ss[SW-1:0];
@@ -552,7 +566,7 @@ module mamba_pipe #(
                 if (nst == N_IDLE) begin
                     found = 0; pick = 0;
                     for (kk = 0; kk < NC; kk = kk + 1) begin
-                        ss = (rr[2] + 1 + kk) % NC;
+                        ss = rr[2] + 1 + kk; if (ss >= NC) ss = ss - NC;  // %NC, divider-free
                         if (!found && active[ss] && !busy[ss]
                             && wrk_of(op_of(op_pc[ss])) == 3'd2) begin
                             found = 1; pick = ss[SW-1:0];
@@ -573,7 +587,7 @@ module mamba_pipe #(
                 if (gst == G_IDLE) begin
                     found = 0; pick = 0;
                     for (kk = 0; kk < NC; kk = kk + 1) begin
-                        ss = (rr[3] + 1 + kk) % NC;
+                        ss = rr[3] + 1 + kk; if (ss >= NC) ss = ss - NC;  // %NC, divider-free
                         if (!found && active[ss] && !busy[ss]
                             && wrk_of(op_of(op_pc[ss])) == 3'd3) begin
                             found = 1; pick = ss[SW-1:0];
@@ -592,7 +606,7 @@ module mamba_pipe #(
                 if (cst == C_IDLE) begin
                     found = 0; pick = 0;
                     for (kk = 0; kk < NC; kk = kk + 1) begin
-                        ss = (rr[4] + 1 + kk) % NC;
+                        ss = rr[4] + 1 + kk; if (ss >= NC) ss = ss - NC;  // %NC, divider-free
                         if (!found && active[ss] && !busy[ss]
                             && wrk_of(op_of(op_pc[ss])) == 3'd4) begin
                             found = 1; pick = ss[SW-1:0];
@@ -614,7 +628,7 @@ module mamba_pipe #(
                 if (sst == SC_IDLE) begin
                     found = 0; pick = 0;
                     for (kk = 0; kk < NC; kk = kk + 1) begin
-                        ss = (rr[5] + 1 + kk) % NC;
+                        ss = rr[5] + 1 + kk; if (ss >= NC) ss = ss - NC;  // %NC, divider-free
                         if (!found && active[ss] && !busy[ss]
                             && wrk_of(op_of(op_pc[ss])) == 3'd5) begin
                             found = 1; pick = ss[SW-1:0];
