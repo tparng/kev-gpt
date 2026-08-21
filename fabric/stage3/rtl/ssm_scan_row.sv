@@ -26,7 +26,8 @@ module ssm_scan_row #(
                                          // INT12 (keep range, drop low 4 bits) to
                                          // shrink the scan-h BRAM ~25% for high NC.
                                          // N*QH must be a multiple of 64 (QH even).
-    parameter int CTX = 1                // state contexts (layers*heads)
+    parameter int CTX = 1,               // state contexts (layers*heads)
+    parameter int RDP = 4                // wide-read lanes/cycle (SCAN_RD widen)
 ) (
     // which context this call updates: state rows [pbase*P .. +P)
     input  wire [$clog2(CTX)-1:0]  pbase,
@@ -51,7 +52,13 @@ module ssm_scan_row #(
     input  wire signed [7:0]    wr_c_data,
 
     input  wire [$clog2(P)-1:0] rd_y_addr,
-    output wire signed [15:0]   rd_y_data
+    output wire signed [15:0]   rd_y_data,
+
+    // WIDE read: RDP consecutive y outputs from rd_yw_base in one cycle, so the
+    // engine's SCAN_RD (y-readback + D-skip) can consume RDP/cycle. yout is a FF
+    // array -> free combinational fan-out (same values as rd_y). Combinational.
+    input  wire [$clog2(P)-1:0] rd_yw_base,
+    output wire [RDP*16-1:0]    rd_yw_data
 );
     localparam int PW = $clog2(P);
     localparam int AW = (CTX > 1) ? $clog2(CTX*P) : PW;
@@ -94,6 +101,12 @@ module ssm_scan_row #(
     reg signed [7:0]  cvec[0:N-1];
     reg signed [15:0] yout[0:P-1];
     assign rd_y_data = yout[rd_y_addr];
+
+    // RDP-wide combinational read. SCAN_RD reads P (=64), an RDP-multiple.
+    genvar gyr;
+    generate for (gyr = 0; gyr < RDP; gyr = gyr + 1) begin : g_yrdw
+        assign rd_yw_data[gyr*16 +: 16] = yout[rd_yw_base + gyr[PW-1:0]];
+    end endgenerate
 
     always @(posedge clk) begin
         if (wr_dtx) dtx [wr_dtx_addr] <= wr_dtx_data;

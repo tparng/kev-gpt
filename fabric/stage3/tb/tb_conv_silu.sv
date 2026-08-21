@@ -15,6 +15,9 @@ module tb_conv_silu;
     reg [7:0]              wr_lut_addr;
     reg signed [15:0] wr_w_data, wr_b_data, wr_x_data, wr_lut_data;
     wire signed [15:0] rd_y_data;
+    wire ready;
+    reg  [$clog2(CH)-1:0] rd_yw_base = 0;        // wide-read port (unused here)
+    wire [4*16-1:0]       rd_yw_data;
 
     conv_silu #(.CH(CH), .K(K), .L(L)) dut (.*);
     always #2 clk = ~clk;

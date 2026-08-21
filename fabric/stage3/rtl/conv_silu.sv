@@ -22,7 +22,8 @@ module conv_silu #(
     parameter int CH = 640,          // d_inner + 2*d_state
     parameter int K  = 4,
     parameter int L  = 7,            // layers: one persistent history bank each
-    parameter int QF = 12            // Q3.12 activations
+    parameter int QF = 12,           // Q3.12 activations
+    parameter int RDP = 4            // wide-read lanes/cycle (CONV_RD widen)
 ) (
     input  wire                  clk,
     input  wire                  rst,       // clears the shift history
@@ -54,7 +55,13 @@ module conv_silu #(
     input  wire signed [15:0]    wr_lut_data,
 
     input  wire [$clog2(CH)-1:0] rd_y_addr,
-    output wire signed [15:0]    rd_y_data
+    output wire signed [15:0]    rd_y_data,
+
+    // WIDE read: RDP consecutive outputs from rd_yw_base in one cycle, so the
+    // engine's CONV_RD stream can consume RDP/cycle (yout is a FF array, so this
+    // is a free combinational fan-out — same values as rd_y). Combinational.
+    input  wire [$clog2(CH)-1:0] rd_yw_base,
+    output wire [RDP*16-1:0]     rd_yw_data
 );
     localparam int CW  = $clog2(CH);
     localparam int LCH = L*CH;               // total history rows across banks
@@ -76,6 +83,13 @@ module conv_silu #(
     reg signed [15:0]  yout [0:CH-1];
 
     assign rd_y_data = yout[rd_y_addr];
+
+    // RDP-wide combinational read (whole-element indexed, iverilog-safe). base+g
+    // stays in-bounds: CONV_RD reads CH, an RDP-multiple.
+    genvar gr;
+    generate for (gr = 0; gr < RDP; gr = gr + 1) begin : g_yrdw
+        assign rd_yw_data[gr*16 +: 16] = yout[rd_yw_base + gr[$clog2(CH)-1:0]];
+    end endgenerate
 
     always @(posedge clk) begin
         if (wr_w)   wrom[wr_w_addr] <= wr_w_data;

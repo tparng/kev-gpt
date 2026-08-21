@@ -144,12 +144,18 @@ module mamba_pipe #(
     //    per-stream single-write-port wide-word banks (the `xbk` generate below).
     localparam int ZXW = INROWS/4;            // zxbuf wide-word rows per stream
     localparam int Q8W = DIN/4;               // q8buf wide-word rows per stream
+    localparam int XNW = CONVD/4;             // xnbuf wide-word rows per stream
+    localparam int YBW = DIN/4;               // ybuf  wide-word rows per stream
+    // xnbuf/ybuf are wide-word (4x16b/row) so the P=4 CONV_RD / SCAN_RD writes are
+    // ONE row write (single write port -> DRAM), not four ports. Element reads
+    // slice the row (xn_rd/yb_rd), matching the zxbuf pattern. Each has ONE writer
+    // (C_RD / SC_RD), so single-write-port distributed RAM infers cleanly.
     (* ram_style = "distributed" *)
-    reg signed [15:0] xnbuf [0:NC*CONVD-1];   // conv out Q4.11
+    reg        [63:0] xnbuf_w [0:NC*XNW-1];   // conv out Q4.11, 4x16b/row
     (* ram_style = "distributed" *)
     reg        [63:0] zxbuf_w [0:NC*ZXW-1];   // in_proj dequant Q6.9, 4x16b/row
     (* ram_style = "distributed" *)
-    reg signed [15:0] ybuf  [0:NC*DIN-1];     // scan out Q4.11
+    reg        [63:0] ybuf_w  [0:NC*YBW-1];   // scan out Q4.11, 4x16b/row
     (* ram_style = "distributed" *)
     reg        [31:0] q8buf_w [0:NC*Q8W-1];   // quantized activations, 4x8b/row
     reg signed [15:0] logit [0:NC*V-1];
@@ -181,6 +187,24 @@ module mamba_pipe #(
         begin
             row   = q8buf_w[idx[15:2]];
             q8_rd = row[idx[1:0]*8 +: 8];
+        end
+    endfunction
+
+    // wide-word xnbuf element read: idx = stream*CONVD + offset (CONVD mult of 4).
+    function automatic signed [15:0] xn_rd(input [15:0] idx);
+        reg [63:0] row;
+        begin
+            row   = xnbuf_w[idx[15:2]];
+            xn_rd = row[idx[1:0]*16 +: 16];
+        end
+    endfunction
+
+    // wide-word ybuf element read: idx = stream*DIN + offset (DIN mult of 4).
+    function automatic signed [15:0] yb_rd(input [15:0] idx);
+        reg [63:0] row;
+        begin
+            row   = ybuf_w[idx[15:2]];
+            yb_rd = row[idx[1:0]*16 +: 16];
         end
     endfunction
 
@@ -233,16 +257,21 @@ module mamba_pipe #(
     reg         c_wrw, c_wrb, c_wrx, c_wrl;
     reg  [11:0] c_wrw_a;  reg [9:0] c_wrb_a, c_wrx_a, c_rda;
     reg  [7:0]  c_wrl_a;
-    reg signed [15:0] c_wrd;
+    reg signed [15:0] c_wrd;                     // weight/LUT load data (shared)
+    // CONV_LDX collapse: bias + x are independent ports -> written the same cycle
+    // (own data reg each). CONV_LDX 1280->640.
+    reg signed [15:0] c_wrb_d, c_wrx_d;
     wire signed [15:0] c_y;
-    conv_silu #(.CH(CONVD), .K(4), .L(SL)) u_conv (
+    reg  [9:0]  c_rdaw;   wire [4*16-1:0] c_yw;   // CONV_RD wide read (P=4)
+    conv_silu #(.CH(CONVD), .K(4), .L(SL), .RDP(4)) u_conv (
         .clk(clk), .rst(rst), .start(c_start), .done(c_done), .ready(c_ready),
         .layer(c_layer),
         .wr_w(c_wrw), .wr_w_addr(c_wrw_a), .wr_w_data(c_wrd),
-        .wr_b(c_wrb), .wr_b_addr(c_wrb_a), .wr_b_data(c_wrd),
-        .wr_x(c_wrx), .wr_x_addr(c_wrx_a), .wr_x_data(c_wrd),
+        .wr_b(c_wrb), .wr_b_addr(c_wrb_a), .wr_b_data(c_wrb_d),
+        .wr_x(c_wrx), .wr_x_addr(c_wrx_a), .wr_x_data(c_wrx_d),
         .wr_lut(c_wrl), .wr_lut_addr(c_wrl_a), .wr_lut_data(c_wrd),
-        .rd_y_addr(c_rda), .rd_y_data(c_y));
+        .rd_y_addr(c_rda), .rd_y_data(c_y),
+        .rd_yw_base(c_rdaw), .rd_yw_data(c_yw));
 
     // scan row (driven only by the SCAN worker); NC*LR*H state contexts
     reg         s_start;  wire s_done, s_ready;
@@ -251,15 +280,19 @@ module mamba_pipe #(
     reg         s_wrdtx, s_wrb, s_wrc;
     reg  [5:0]  s_wrdtx_a, s_wrb_a, s_wrc_a, s_rda;
     reg signed [15:0] s_dtx_d;
-    reg signed [7:0]  s_bc_d;
+    // SC_PREP collapse: B and C are independent ports -> written the same cycle
+    // (own data reg each). SC_PREP 4*NST -> NST cycles.
+    reg signed [7:0]  s_b_d, s_c_d;
     wire signed [15:0] s_y;
-    ssm_scan_row #(.P(64), .N(NST), .QH(QH), .CTX(SCTX)) u_scan (
+    reg  [5:0]  s_rdaw;   wire [4*16-1:0] s_yw;   // SCAN_RD wide read (P=4)
+    ssm_scan_row #(.P(64), .N(NST), .QH(QH), .CTX(SCTX), .RDP(4)) u_scan (
         .clk(clk), .rst(rst), .ready(s_ready), .start(s_start), .done(s_done),
         .pbase(s_pbase), .a_q(s_aq), .sh_i(s_shi), .sh_y(s_shy),
         .wr_dtx(s_wrdtx), .wr_dtx_addr(s_wrdtx_a), .wr_dtx_data(s_dtx_d),
-        .wr_b(s_wrb), .wr_b_addr(s_wrb_a), .wr_b_data(s_bc_d),
-        .wr_c(s_wrc), .wr_c_addr(s_wrc_a), .wr_c_data(s_bc_d),
-        .rd_y_addr(s_rda), .rd_y_data(s_y));
+        .wr_b(s_wrb), .wr_b_addr(s_wrb_a), .wr_b_data(s_b_d),
+        .wr_c(s_wrc), .wr_c_addr(s_wrc_a), .wr_c_data(s_c_d),
+        .rd_y_addr(s_rda), .rd_y_data(s_y),
+        .rd_yw_base(s_rdaw), .rd_yw_data(s_yw));
     assign ready = s_ready & c_ready;
 
     // gated rmsnorm (driven only by the NORM worker)
@@ -268,15 +301,19 @@ module mamba_pipe #(
     reg         n_wry, n_wrz, n_wrg, n_wrl;
     reg  [8:0]  n_wry_a, n_wrz_a, n_wrg_a, n_rda;
     reg  [7:0]  n_wrl_a;
-    reg signed [15:0] n_wrd;
+    reg signed [15:0] n_wrd;                     // LUT-load data (shared)
+    // NORM feed collapse: y/z/g are three INDEPENDENT write ports on rmsnorm, so
+    // the stream-in drives all three in ONE cycle (own data reg each) instead of
+    // 3 (gated) / 2 (pre/final) serial sub-steps. NG_LD 1536->512, NIN/NF 512->256.
+    reg signed [15:0] n_wry_d, n_wrz_d, n_wrg_d;
     wire signed [15:0] n_out;
     reg  [8:0]  n_rdaw;   wire [4*16-1:0] n_ow;
     rmsnorm_gated #(.D(DIN), .RDP(4)) u_norm (
         .clk(clk), .rst(rst), .start(n_start), .done(n_done), .gated(n_gated),
         .short_len(n_short),
-        .wr_y(n_wry), .wr_y_addr(n_wry_a), .wr_y_data(n_wrd),
-        .wr_z(n_wrz), .wr_z_addr(n_wrz_a), .wr_z_data(n_wrd),
-        .wr_g(n_wrg), .wr_g_addr(n_wrg_a), .wr_g_data(n_wrd),
+        .wr_y(n_wry), .wr_y_addr(n_wry_a), .wr_y_data(n_wry_d),
+        .wr_z(n_wrz), .wr_z_addr(n_wrz_a), .wr_z_data(n_wrz_d),
+        .wr_g(n_wrg), .wr_g_addr(n_wrg_a), .wr_g_data(n_wrg_d),
         .wr_lut(n_wrl), .wr_lut_addr(n_wrl_a), .wr_lut_data(n_wrd),
         .rd_o_addr(n_rda), .rd_o_data(n_out),
         .rd_ow_base(n_rdaw), .rd_ow_data(n_ow));
@@ -334,6 +371,7 @@ module mamba_pipe #(
     // ---------------------------------------------------------- workers ------
     integer kk, ss;
     reg found; reg [SW-1:0] pick;
+    reg [3:0] clv;                            // CONV dispatch: chosen layer (skip test)
 
     // EMB worker
     localparam [1:0] E_IDLE=0, E_RUN=1;
@@ -377,6 +415,12 @@ module mamba_pipe #(
     localparam [2:0] C_IDLE=0, C_LDW=1, C_LDX=2, C_RUN=3, C_RD=4;
     reg [2:0]  cst; reg [SW-1:0] c_st_s; reg [3:0] c_li;
     reg [11:0] c_i; reg [2:0] c_sub; reg signed [47:0] c_t1;
+    // CONV_LDW skip: conv_silu.wrom holds ONE layer's weights (shared across all
+    // NC streams — weights are stream-independent) and PERSISTS across runs, so
+    // re-stream it only when the loaded layer changes. cw_valid/cw_layer track
+    // what is currently resident; a same-layer dispatch skips the 2560-cyc reload
+    // (amortising the conv-weight load ~/NC as the wave clusters same-layer convs).
+    reg [3:0]  cw_layer; reg cw_valid;
 
     // SCAN worker
     localparam [3:0] SC_IDLE=0, SC_PREP=1, SC_H=2, SC_HWAIT=3, SC_RD=4;
@@ -385,6 +429,10 @@ module mamba_pipe #(
     reg [15:0] sc_dtq; reg [4:0] sc_eh;
     reg signed [31:0] sc_acc; reg signed [47:0] sc_t1; reg [15:0] sc_fp;
     reg signed [15:0] sc_dtq3;
+    reg signed [47:0] sc_b1, sc_c1;              // SC_PREP: B/C shift temps
+    reg signed [31:0] sc_yacc [0:3];             // SC_RD P4: 4 scan-y lanes
+    reg signed [15:0] sc_dsk;                    // SC_RD P4: per-head D-skip const
+    reg        [63:0] sc_xrow;                   // SC_RD P4: xnbuf row (4 lanes)
     wire [3:0] s_bB = consts[s_li*16 + 4][3:0];
     wire [3:0] s_bC = consts[s_li*16 + 4][7:4];
     wire [3:0] s_bX = consts[s_li*16 + 4][11:8];
@@ -455,7 +503,7 @@ module mamba_pipe #(
         if (rst) begin
             ist <= 0; i_i <= 0; started <= 0; all_done <= 0; cyc_count <= 0;
             est <= E_IDLE; nst <= N_IDLE; gst <= G_IDLE; cst <= C_IDLE;
-            sst <= SC_IDLE;
+            sst <= SC_IDLE; cw_valid <= 1'b0;
             for (w = 0; w < NC; w = w + 1) begin
                 op_pc[w] <= 0; tokcnt[w] <= 0; active[w] <= 0; busy[w] <= 0;
             end
@@ -552,8 +600,14 @@ module mamba_pipe #(
                     end
                     if (found) begin
                         busy[pick] <= 1; rr[4] <= pick; started <= 1;
-                        c_st_s <= pick; c_li <= layer_of(op_pc[pick]);
-                        c_i <= 0; c_sub <= 0; cst <= C_LDW;
+                        clv = layer_of(op_pc[pick]);
+                        c_st_s <= pick; c_li <= clv;
+                        c_layer <= pick*LR + clv;    // history bank (set here so a
+                                                     // C_LDW skip still selects it)
+                        c_i <= 0; c_sub <= 0;
+                        // skip the weight re-stream iff this layer's weights are
+                        // already resident in conv_silu.wrom.
+                        cst <= (cw_valid && cw_layer == clv) ? C_LDX : C_LDW;
                     end
                 end
                 // ---- SCAN worker ----
@@ -621,34 +675,28 @@ module mamba_pipe #(
             // ===================================================== NORM =======
             case (nst)
               N_LD: begin
-                if (n_op == 2'd1) begin       // gated (512)
-                  case (n_sub)
-                    0: begin n_wry <= 1; n_wry_a <= n_i[9:0];
-                         n_wrd <= ybuf[n_st_s*DIN + n_i[8:0]]; n_sub <= 1; end
-                    1: begin n_wrz <= 1; n_wrz_a <= n_i[9:0];
-                         n_wrd <= zx_rd(n_st_s*INROWS + n_i[8:0]); n_sub <= 2; end
-                    2: begin n_wrg <= 1; n_wrg_a <= n_i[9:0];
-                         n_wrd <= nrmg[n_li*DIN + n_i[8:0]]; n_sub <= 0;
-                         if (n_i == DIN-1) begin n_i <= 0; nst <= N_RUN; n_start <= 1; end
-                         else n_i <= n_i + 1;
-                    end
-                  endcase
-                end else begin                // pre / final (256), ungated
-                  case (n_sub)
-                    0: begin n_wry <= 1; n_wry_a <= n_i[9:0];
-                         n_xv = xrd_norm(n_i[7:0]);
-                         n_wrd <= sat16f(rshr($signed({{16{n_xv[31]}}, n_xv}), 8'sd10));
-                         // final-norm: snapshot residual (l6.x_out) into the dump
-                         if (n_op == 2'd2)
-                             dump_x[(n_st_s*TMAX + n_tok)*D + n_i[7:0]] <= n_xv;
-                         n_sub <= 1; end
-                    1: begin n_wrg <= 1; n_wrg_a <= n_i[9:0];
-                         n_wrd <= (n_op==2'd2) ? nfg[n_i[7:0]] : lng[n_li*D + n_i[7:0]];
-                         n_sub <= 0;
-                         if (n_i == D-1) begin n_i <= 0; nst <= N_RUN; n_start <= 1; end
-                         else n_i <= n_i + 1;
-                    end
-                  endcase
+                // COLLAPSED feed: all writes for element n_i in ONE cycle (the
+                // y/z/g ports are independent), n_i advances every cycle.
+                if (n_op == 2'd1) begin       // gated (512): y + z + g
+                  n_wry <= 1; n_wry_a <= n_i[9:0];
+                  n_wry_d <= yb_rd(n_st_s*DIN + n_i[8:0]);
+                  n_wrz <= 1; n_wrz_a <= n_i[9:0];
+                  n_wrz_d <= zx_rd(n_st_s*INROWS + n_i[8:0]);
+                  n_wrg <= 1; n_wrg_a <= n_i[9:0];
+                  n_wrg_d <= nrmg[n_li*DIN + n_i[8:0]];
+                  if (n_i == DIN-1) begin n_i <= 0; nst <= N_RUN; n_start <= 1; end
+                  else n_i <= n_i + 1;
+                end else begin                // pre / final (256), ungated: y + g
+                  n_xv = xrd_norm(n_i[7:0]);
+                  n_wry <= 1; n_wry_a <= n_i[9:0];
+                  n_wry_d <= sat16f(rshr($signed({{16{n_xv[31]}}, n_xv}), 8'sd10));
+                  // final-norm: snapshot residual (l6.x_out) into the dump
+                  if (n_op == 2'd2)
+                      dump_x[(n_st_s*TMAX + n_tok)*D + n_i[7:0]] <= n_xv;
+                  n_wrg <= 1; n_wrg_a <= n_i[9:0];
+                  n_wrg_d <= (n_op==2'd2) ? nfg[n_i[7:0]] : lng[n_li*D + n_i[7:0]];
+                  if (n_i == D-1) begin n_i <= 0; nst <= N_RUN; n_start <= 1; end
+                  else n_i <= n_i + 1;
                 end
               end
               N_RUN: if (n_done) begin nst <= N_QUANT; n_i <= 0; n_sub <= 0; end
@@ -865,33 +913,33 @@ module mamba_pipe #(
 
             // ===================================================== CONV =======
             case (cst)
-              C_LDW: begin
+              C_LDW: begin                       // re-stream this layer's weights
                 c_wrw <= 1; c_wrw_a <= c_i[11:0];
                 c_wrd <= convw[c_li*CONVD*4 + c_i[11:0]];
-                c_layer <= c_st_s*LR + c_li;
-                if (c_i == CONVD*4-1) begin c_i <= 0; cst <= C_LDX; c_sub <= 0; end
+                if (c_i == CONVD*4-1) begin
+                    c_i <= 0; cst <= C_LDX; c_sub <= 0;
+                    cw_valid <= 1'b1; cw_layer <= c_li;   // now resident
+                end else c_i <= c_i + 1;
+              end
+              C_LDX: begin                       // COLLAPSED: bias + x in one cycle
+                c_wrb <= 1; c_wrb_a <= c_i[9:0];
+                c_wrb_d <= convb[c_li*CONVD + c_i[9:0]];
+                c_wrx <= 1; c_wrx_a <= c_i[9:0];
+                c_wrx_d <= zx_rd(c_st_s*INROWS + DIN + c_i[9:0]);
+                if (c_i == CONVD-1) begin c_i <= 0; cst <= C_RUN; c_start <= 1; end
                 else c_i <= c_i + 1;
               end
-              C_LDX: begin
-                case (c_sub)
-                  0: begin c_wrb <= 1; c_wrb_a <= c_i[9:0];
-                       c_wrd <= convb[c_li*CONVD + c_i[9:0]]; c_sub <= 1; end
-                  1: begin c_wrx <= 1; c_wrx_a <= c_i[9:0];
-                       c_wrd <= zx_rd(c_st_s*INROWS + DIN + c_i[9:0]); c_sub <= 0;
-                       if (c_i == CONVD-1) begin c_i <= 0; cst <= C_RUN; c_start <= 1; end
-                       else c_i <= c_i + 1;
-                  end
-                endcase
-              end
               C_RUN: if (c_done) begin cst <= C_RD; c_i <= 0; c_sub <= 0; end
-              C_RD: begin
+              C_RD: begin                        // P=4 wide read -> one xnbuf row/cyc
                 case (c_sub)
-                  0: begin c_rda <= c_i[9:0]; c_sub <= 1; end
-                  1: begin xnbuf[c_st_s*CONVD + c_i[9:0]] <= c_y; c_sub <= 0;
-                       if (c_i == CONVD-1) begin
+                  0: begin c_rdaw <= c_i[9:0]; c_sub <= 1; end
+                  1: begin
+                       xnbuf_w[(c_st_s*CONVD + c_i[9:0]) >> 2] <= c_yw;
+                       c_sub <= 0;
+                       if (c_i >= CONVD-4) begin
                            cst <= C_IDLE; op_pc[c_st_s] <= op_pc[c_st_s] + 1;
                            busy[c_st_s] <= 0;
-                       end else c_i <= c_i + 1;
+                       end else c_i <= c_i + 4;
                   end
                 endcase
               end
@@ -901,30 +949,20 @@ module mamba_pipe #(
             // ===================================================== SCAN =======
             case (sst)
               SC_PREP: begin
-                case (sc_sub)
-                  0: begin
-                       sc_t1 <= rshr($signed(xnbuf[s_st_s*CONVD + DIN + sc_i[6:0]]),
-                                  $signed(8'sd11) - $signed({4'b0, s_bB}));
-                       sc_sub <= 1;
-                  end
-                  1: begin s_wrb <= 1; s_wrb_a <= sc_i[5:0];
-                       s_bc_d <= (sc_t1 > 48'sd127) ? 8'sd127 :
-                                 (sc_t1 < -48'sd128) ? -8'sd128 : sc_t1[7:0];
-                       sc_sub <= 2;
-                  end
-                  2: begin
-                       sc_t1 <= rshr($signed(xnbuf[s_st_s*CONVD + DIN + NST + sc_i[6:0]]),
-                                  $signed(8'sd11) - $signed({4'b0, s_bC}));
-                       sc_sub <= 3;
-                  end
-                  3: begin s_wrc <= 1; s_wrc_a <= sc_i[5:0];
-                       s_bc_d <= (sc_t1 > 48'sd127) ? 8'sd127 :
-                                 (sc_t1 < -48'sd128) ? -8'sd128 : sc_t1[7:0];
-                       sc_sub <= 0;
-                       if (sc_i == NST-1) begin sc_i <= 0; s_hi <= 0; sst <= SC_H; sc_sub <= 0; end
-                       else sc_i <= sc_i + 1;
-                  end
-                endcase
+                // COLLAPSED: B and C prep in ONE cycle (independent ports, both
+                // reads + shifts combinational). NST cycles instead of 4*NST.
+                sc_b1 = rshr($signed(xn_rd(s_st_s*CONVD + DIN + sc_i[6:0])),
+                             $signed(8'sd11) - $signed({4'b0, s_bB}));
+                sc_c1 = rshr($signed(xn_rd(s_st_s*CONVD + DIN + NST + sc_i[6:0])),
+                             $signed(8'sd11) - $signed({4'b0, s_bC}));
+                s_wrb <= 1; s_wrb_a <= sc_i[5:0];
+                s_b_d <= (sc_b1 > 48'sd127) ? 8'sd127 :
+                         (sc_b1 < -48'sd128) ? -8'sd128 : sc_b1[7:0];
+                s_wrc <= 1; s_wrc_a <= sc_i[5:0];
+                s_c_d <= (sc_c1 > 48'sd127) ? 8'sd127 :
+                         (sc_c1 < -48'sd128) ? -8'sd128 : sc_c1[7:0];
+                if (sc_i == NST-1) begin sc_i <= 0; s_hi <= 0; sst <= SC_H; sc_sub <= 0; end
+                else sc_i <= sc_i + 1;
               end
               SC_H: begin
                 case (sc_sub)
@@ -946,7 +984,7 @@ module mamba_pipe #(
                        sc_sub <= 3;
                   end
                   3: begin
-                       sc_t1 <= rshr($signed(xnbuf[s_st_s*CONVD + s_hi[2:0]*64 + sc_i[5:0]]),
+                       sc_t1 <= rshr($signed(xn_rd(s_st_s*CONVD + s_hi[2:0]*64 + sc_i[5:0])),
                                   $signed(8'sd11) - $signed({4'b0, s_bX}));
                        sc_sub <= 4;
                   end
@@ -972,27 +1010,43 @@ module mamba_pipe #(
                 endcase
               end
               SC_HWAIT: if (s_done) begin sst <= SC_RD; sc_i <= 0; sc_sub <= 0; end
-              SC_RD: begin
+              SC_RD: begin                       // P=4 wide: y-readback + D-skip
                 case (sc_sub)
-                  0: begin s_rda <= sc_i[5:0]; sc_sub <= 1; end
-                  1: begin
-                       sc_acc <= s_y; sc_sub <= 2;
-                       sc_t1 <= $signed(consts[s_li*16 + 5 + {2'b0, s_hi[2:1]}]
-                                >> (s_hi[0] ? 16 : 0)) & 32'shFFFF;
+                  0: begin s_rdaw <= sc_i[5:0];
+                       // per-head D-skip const (Q value; same for all 64 channels):
+                       // even head -> low 16b, odd -> high 16b of the packed word.
+                       sc_dsk <= s_hi[0]
+                           ? consts[s_li*16 + 5 + {2'b0, s_hi[2:1]}][31:16]
+                           : consts[s_li*16 + 5 + {2'b0, s_hi[2:1]}][15:0];
+                       sc_sub <= 1;
                   end
-                  2: begin
-                       ybuf[s_st_s*DIN + s_hi[2:0]*64 + sc_i[5:0]] <= sat16f(
-                          rshr({{32{sc_acc[15]}}, sc_acc[15:0]}, 8'sd2)
-                        + rshr($signed(sc_t1[15:0]) * $signed(xnbuf[s_st_s*CONVD + s_hi[2:0]*64 + sc_i[5:0]]),
-                               8'sd13));
+                  1: begin                         // latch the 4 scan-y lanes
+                       sc_yacc[0] <= $signed(s_yw[15:0]);
+                       sc_yacc[1] <= $signed(s_yw[31:16]);
+                       sc_yacc[2] <= $signed(s_yw[47:32]);
+                       sc_yacc[3] <= $signed(s_yw[63:48]);
+                       sc_sub <= 2;
+                  end
+                  2: begin                         // 4 ybuf lanes -> one row write
+                       // the 4 D-skip xnbuf channels are one aligned row: read once.
+                       sc_xrow = xnbuf_w[(s_st_s*CONVD + s_hi[2:0]*64 + sc_i[5:0]) >> 2];
+                       ybuf_w[(s_st_s*DIN + s_hi[2:0]*64 + sc_i[5:0]) >> 2] <= {
+                         sat16f(rshr({{32{sc_yacc[3][15]}}, sc_yacc[3][15:0]}, 8'sd2)
+                          + rshr($signed(sc_dsk) * $signed(sc_xrow[48 +: 16]), 8'sd13)),
+                         sat16f(rshr({{32{sc_yacc[2][15]}}, sc_yacc[2][15:0]}, 8'sd2)
+                          + rshr($signed(sc_dsk) * $signed(sc_xrow[32 +: 16]), 8'sd13)),
+                         sat16f(rshr({{32{sc_yacc[1][15]}}, sc_yacc[1][15:0]}, 8'sd2)
+                          + rshr($signed(sc_dsk) * $signed(sc_xrow[16 +: 16]), 8'sd13)),
+                         sat16f(rshr({{32{sc_yacc[0][15]}}, sc_yacc[0][15:0]}, 8'sd2)
+                          + rshr($signed(sc_dsk) * $signed(sc_xrow[0 +: 16]), 8'sd13))};
                        sc_sub <= 0;
-                       if (sc_i == 63) begin
+                       if (sc_i >= 60) begin       // 64 channels, P=4 -> last at 60
                            sc_i <= 0;
                            if (s_hi == H-1) begin
                                sst <= SC_IDLE; op_pc[s_st_s] <= op_pc[s_st_s] + 1;
                                busy[s_st_s] <= 0;
                            end else begin s_hi <= s_hi + 1; sst <= SC_H; sc_sub <= 0; end
-                       end else sc_i <= sc_i + 1;
+                       end else sc_i <= sc_i + 4;
                   end
                 endcase
               end

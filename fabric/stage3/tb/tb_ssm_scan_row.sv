@@ -23,6 +23,8 @@ module tb_ssm_scan_row;
     reg  signed [7:0]  wr_b_data, wr_c_data;
     reg  [5:0]  rd_y_addr;
     wire signed [15:0] rd_y_data;
+    reg  [5:0]  rd_yw_base = 0;                  // wide-read port (unused here)
+    wire [4*16-1:0] rd_yw_data;
 
     reg [1:0] pbase = 0;
     ssm_scan_row #(.P(P), .N(N), .CTX(4)) dut (.*);
