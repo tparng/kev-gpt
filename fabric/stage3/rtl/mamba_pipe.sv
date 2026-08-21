@@ -63,9 +63,13 @@ module mamba_pipe #(
     input  wire [18:0] wr_addr,
     input  wire [31:0] wr_data,
 
-    // per-(stream,token) input token load
+    // per-(stream,token) input token load. Width expression is inline, NOT the
+    // body localparam TW: a forward reference from the port list is a hard
+    // error in xsim and only a WARNING in Vivado synth, which then elaborates
+    // a mis-sized port — the first-silicon garbage-output bug (all-railed
+    // logits from corrupted token/stream addressing).
     input  wire        tw_en,
-    input  wire [TW-1:0] tw_addr,
+    input  wire [((NC*TMAX <= 1) ? 1 : $clog2(NC*TMAX))-1:0] tw_addr,
     input  wire [9:0]  tw_data,
 
     // dump reads (combinational): sel 0 = dump_x (32b), 1 = dump_logit (16b)
