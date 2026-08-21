@@ -210,9 +210,11 @@ def bitlen15(v):
 class MambaSeqRef:
     """Integer decode-step replica of mamba_seq.sv, loaded from the export dir."""
 
-    def __init__(self, export="data/fabric_mamba"):
+    def __init__(self, export="data/fabric_mamba", qh=16):
         ex = os.path.join(REPO, export) if not os.path.isabs(export) else export
         self.ex = ex
+        self.qh = qh                 # scan-h stored bits (mirrors ssm_scan_row.QH:
+                                     # 16 = INT16 exact, 12 = INT12 state-quant)
         # config-aware sizing: d_state (NST) drives CONVD/INROWS. Read it from the
         # export manifest so a config-B (d_state=32) export re-sizes the replica
         # (config-A d_state=64 stays the default). Methods below read these
@@ -419,7 +421,7 @@ class MambaSeqRef:
                 sh_i = 16 + 13 - bX - eh - bB
                 sh_y = bC
                 yq = scan_step_fixed2(state["h"][li * H + hi], dtx, B8, C8,
-                                      int(a_q), sh_i, sh_y)
+                                      int(a_q), sh_i, sh_y, qh=self.qh)
                 scan_yraw.append([int(v) for v in yq])
                 # ---- S_SCAN_RD: y = rnd(yq>>1) + rnd(Dq*xv>>13), Q4.11 -------
                 Dword = int(consts[li * 16 + 5 + (hi >> 1)])

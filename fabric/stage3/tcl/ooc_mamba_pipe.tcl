@@ -3,7 +3,7 @@
 # budget with per-stream scan h banked x NC) and at what Fmax? Reports the
 # post-synth primitive estimate (URAM/BRAM/DSP/LUT), then attempts place+route
 # for the routed WNS. Run FROM a dir that has seed.mem (rmsnorm rsqrt seed ROM).
-#   vivado -mode batch -source ooc_mamba_pipe.tcl -tclargs <PERIOD_NS> <NC> <NST> <DBG>
+#   vivado -mode batch -source ooc_mamba_pipe.tcl -tclargs <PERIOD_NS> <NC> <NST> <DBG> <QH>
 set period [lindex $argv 0]
 if {$period eq ""} { set period 8.0 }
 set nc [lindex $argv 1]
@@ -12,6 +12,8 @@ set nst [lindex $argv 2]
 if {$nst eq ""} { set nst 64 }
 set dbg [lindex $argv 3]
 if {$dbg eq ""} { set dbg 0 }
+set qh [lindex $argv 4]
+if {$qh eq ""} { set qh 16 }
 set part "xck26-sfvc784-2LV-c"
 set root [file normalize [file dirname [info script]]/../../..]
 set rtl  "$root/fabric/stage3/rtl"
@@ -23,7 +25,7 @@ read_verilog -sv "$rtl/ssm_scan_row.sv"
 read_verilog -sv "$rtl/rmsnorm_gated.sv"
 
 synth_design -top mamba_pipe -part $part -mode out_of_context \
-    -generic NC=$nc -generic NST=$nst -generic DBG=$dbg \
+    -generic NC=$nc -generic NST=$nst -generic DBG=$dbg -generic QH=$qh \
     -generic TMAX=2 -generic T_TOKENS=2
 create_clock -name clk -period $period [get_ports clk]
 
@@ -34,7 +36,7 @@ set s_ramb36 [llength [get_cells -hier -filter {REF_NAME =~ RAMB36*}]]
 set s_ramb18 [llength [get_cells -hier -filter {REF_NAME =~ RAMB18*}]]
 set s_dsp    [llength [get_cells -hier -filter {PRIMITIVE_TYPE =~ ARITHMETIC.*}]]
 set s_lutl   [llength [get_cells -hier -filter {REF_NAME =~ LUT* && SOFT_HLUTNM == ""}]]
-puts "MAMBA_PIPE_SYNTH nc=$nc nst=$nst dbg=$dbg uram=$s_uram ramb36=$s_ramb36 ramb18=$s_ramb18 dsp=$s_dsp"
+puts "MAMBA_PIPE_SYNTH nc=$nc nst=$nst qh=$qh dbg=$dbg uram=$s_uram ramb36=$s_ramb36 ramb18=$s_ramb18 dsp=$s_dsp"
 puts "KV260_AVAIL uram=64 ramb36=144 dsp=1248 lut=117120"
 
 # ---- attempt place + route for routed WNS (guarded) ----

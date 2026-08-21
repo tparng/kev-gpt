@@ -38,6 +38,9 @@ module mamba_pipe #(
     parameter int LR    = 7,                  // real layers
     parameter int V     = 1024,
     parameter int NC    = 2,                  // streams (wave width)
+    parameter int QH    = 16,                 // scan-h STORED bits/lane (state-quant
+                                              // lever: 16=INT16 bit-exact, 12=INT12
+                                              // to shrink the NC-scaling scan-h BRAM)
     parameter int TMAX  = 4,                  // max tokens/stream (dump sizing)
     parameter int T_TOKENS = 2,               // tokens each stream decodes
     parameter int DBG   = 1,                  // 0 = tie off the sim-only debug
@@ -250,7 +253,7 @@ module mamba_pipe #(
     reg signed [15:0] s_dtx_d;
     reg signed [7:0]  s_bc_d;
     wire signed [15:0] s_y;
-    ssm_scan_row #(.P(64), .N(NST), .CTX(SCTX)) u_scan (
+    ssm_scan_row #(.P(64), .N(NST), .QH(QH), .CTX(SCTX)) u_scan (
         .clk(clk), .rst(rst), .ready(s_ready), .start(s_start), .done(s_done),
         .pbase(s_pbase), .a_q(s_aq), .sh_i(s_shi), .sh_y(s_shy),
         .wr_dtx(s_wrdtx), .wr_dtx_addr(s_wrdtx_a), .wr_dtx_data(s_dtx_d),

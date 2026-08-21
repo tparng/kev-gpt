@@ -111,9 +111,12 @@ def build_tables(sim, ex):
     return gw, out_base, head_base, lengths
 
 
-def reference(seqs, ex):
-    """N independent single-stream MambaSeqRef runs (the bit-exact oracle)."""
-    eng = MambaSeqRef(ex)
+def reference(seqs, ex, qh=16):
+    """N independent single-stream MambaSeqRef runs (the bit-exact oracle).
+
+    qh<16 quantises the carried scan state to `qh` bits (the INT12 state-quant
+    lever) — the oracle the qh-matched RTL is bit-exact to."""
+    eng = MambaSeqRef(ex, qh=qh)
     gold = []  # gold[s][t] = (argmax, logits(list V), x_out(list D))
     for seq in seqs:
         st = eng.alloc_state()
@@ -130,14 +133,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="fabric.stage3.run_mamba_pipe")
     ap.add_argument("--engine", choices=["seq", "pipe"], default="pipe")
     ap.add_argument("--nc", type=int, default=2)
+    ap.add_argument("--scan-qh", type=int, default=16,
+                    help="scan-h stored bits (16=INT16 bit-exact, 12=INT12 state-quant)")
     ap.add_argument("--tokens", type=int, default=2)
     ap.add_argument("--export", default="data/fabric_mamba")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dir", default=None)
     args = ap.parse_args(argv)
 
-    NC, T = args.nc, args.tokens
-    sim = args.dir or kevbuild(f"stage3_mamba_pipe_nc{NC}")
+    NC, T, QH = args.nc, args.tokens, args.scan_qh
+    sim = args.dir or kevbuild(f"stage3_mamba_pipe_nc{NC}_qh{QH}")
     os.makedirs(sim, exist_ok=True)
     ex = args.export
 
@@ -176,7 +181,9 @@ def main(argv=None):
     w32(f"{sim}/ms_cfg.mem", cfg)
 
     # ---- reference ----------------------------------------------------------
-    gold = reference(seqs, ex)
+    # gold is qh-matched (the RTL must be BIT-EXACT to it). gold16 is the INT16
+    # truth used to MEASURE the INT12 fidelity hit (argmax agreement).
+    gold = reference(seqs, ex, qh=QH)
 
     # ---- simulate -----------------------------------------------------------
     from fabric.stage3.run_layernorm import seed_table
@@ -207,7 +214,8 @@ def main(argv=None):
         src.append(f"{REPO}/fabric/stage3/tb/tb_mamba_pipe.sv")
 
     subprocess.run([tool("iverilog"), "-g2012", f"-DNC_SIM={NC}",
-                    f"-DT_SIM={T}", f"-DNST_SIM={nst}", "-o", "mp.vvp"] + src,
+                    f"-DT_SIM={T}", f"-DNST_SIM={nst}", f"-DQH_SIM={QH}",
+                    "-o", "mp.vvp"] + src,
                    cwd=sim, check=True)
     out = subprocess.run([tool("vvp"), "mp.vvp"], cwd=sim, check=True,
                          capture_output=True, text=True, timeout=21600)
@@ -254,7 +262,23 @@ def main(argv=None):
 
     verdict = "PASS" if bad == 0 else "FAIL"
     print(f"\nMAMBA_PIPE_VERDICT: {verdict} (NC={ncc}, T={T}; bit-exact vs "
-          f"MambaSeqRef)  [{sim}]")
+          f"MambaSeqRef qh={QH})  [{sim}]")
+
+    # ---- INT12 fidelity: argmax + logit drift vs the INT16 truth ------------
+    if QH < 16:
+        gold16 = reference(seqs, ex, qh=16)
+        tot_pred = 0; am_agree = 0; l1sum = 0.0; ltot = 0
+        for s in range(ncc):
+            for t in range(T):
+                a12, l12, _ = gold[s][t]        # == RTL (bit-exact to qh gold)
+                a16, l16, _ = gold16[s][t]
+                tot_pred += 1
+                am_agree += int(a12 == a16)
+                d = np.abs(np.asarray(l12) - np.asarray(l16))
+                l1sum += float(d.sum()); ltot += d.size
+        hit = 100.0 * (tot_pred - am_agree) / tot_pred
+        print(f"MAMBA_PIPE_FIDELITY qh={QH}: argmax agree {am_agree}/{tot_pred} "
+              f"vs INT16 truth  (argmax hit {hit:.2f}%)  mean|logitΔ|={l1sum/ltot:.2f}")
     if mcyc:
         tot = int(mcyc.group(1))
         per = tot / (ncc * T)

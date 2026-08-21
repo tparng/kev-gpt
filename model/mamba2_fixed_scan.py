@@ -173,7 +173,7 @@ if __name__ == "__main__":
     main()
 
 
-def scan_step_fixed2(h, dtx_q, B8, C8, a_q, sh_i, sh_y):
+def scan_step_fixed2(h, dtx_q, B8, C8, a_q, sh_i, sh_y, qh=16):
     """Generalized integer scan step (the shift-algebra contract).
 
     Real-value mapping (all scales powers of two, calibrated per layer):
@@ -184,6 +184,11 @@ def scan_step_fixed2(h, dtx_q, B8, C8, a_q, sh_i, sh_y):
     Update: h' = rnd((a*h + (dtx*B) <<sh_i>>) >> 16), y = rnd((h'@C8) >> sh_y)
     Same fused-single-rounding datapath as the silicon-proven core; the two
     shifts become ports.
+
+    State-quant lever (`qh`, the doc-9 INT12 path, mirrors ssm_scan_row.QH):
+    the y output uses the FULL INT16 state, but the CARRIED state is quantised to
+    `qh` bits — round to the nearest 2^(16-qh) grid, saturate to qh bits, then
+    reconstruct (<<16-qh). qh=16 is the exact INT16 core (no quantisation).
     """
     inj = dtx_q[:, None] * B8[None, :]
     if sh_i > 0:
@@ -191,10 +196,16 @@ def scan_step_fixed2(h, dtx_q, B8, C8, a_q, sh_i, sh_y):
     elif sh_i < 0:
         inj = rsh(inj, -sh_i)
     acc = a_q * h + inj
-    h[:] = sat16(rsh(acc, Q_A))
-    yacc = h @ C8
+    h_full = sat16(rsh(acc, Q_A))
+    yacc = h_full @ C8                       # y uses the FULL-precision state
     if sh_y > 0:
         yacc = rsh(yacc, sh_y)
     elif sh_y < 0:
         yacc = yacc << -sh_y
+    if qh < 16:                              # quantise the carried state
+        shw = 16 - qh
+        lo, hi = -(1 << (qh - 1)), (1 << (qh - 1)) - 1
+        h[:] = (np.clip(rsh(h_full, shw), lo, hi) << shw).astype(np.int64)
+    else:
+        h[:] = h_full
     return sat16(yacc)

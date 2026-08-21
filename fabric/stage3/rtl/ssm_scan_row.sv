@@ -21,6 +21,11 @@ module ssm_scan_row #(
     parameter int P  = 64,               // rows per CALL (one head-slice)
     parameter int N  = 64,
     parameter int QA = 16,
+    parameter int QH = 16,               // STORED state bits/lane (the doc-9 state-
+                                         // quant lever). 16 = bit-exact INT16; 12 =
+                                         // INT12 (keep range, drop low 4 bits) to
+                                         // shrink the scan-h BRAM ~25% for high NC.
+                                         // N*QH must be a multiple of 64 (QH even).
     parameter int CTX = 1                // state contexts (layers*heads)
 ) (
     // which context this call updates: state rows [pbase*P .. +P)
@@ -59,12 +64,18 @@ module ssm_scan_row #(
     // Read latency stays 1 cycle; rows are strictly increasing so the write-
     // lags-read window never collides. Constant genvar part-selects are
     // iverilog-safe. N*16 must be a multiple of 64 (N=64 -> 16 banks of 64b).
-    localparam int NB = (N*16)/64;
+    // STORED state is QH bits/lane (QH<=16 = the state-quant lever). The a*h
+    // multiply reconstructs a 16-bit value (stored << SHW), so the recurrence
+    // arithmetic is unchanged INT16; only the CARRIED state loses its low SHW
+    // bits (range preserved) — the quantize-the-carry contract of probe_state_
+    // quant. QH=16 => SHW=0 => bit-identical to the INT16 core.
+    localparam int SHW = 16 - QH;
+    localparam int NB = (N*QH)/64;
     reg [AW-1:0]   raddr;
-    wire [N*16-1:0] hq;
+    wire [N*QH-1:0] hq;
     reg            we;
     reg [AW-1:0]   waddr;
-    reg [N*16-1:0] wdata;
+    reg [N*QH-1:0] wdata;
 
     genvar hbi;
     generate for (hbi = 0; hbi < NB; hbi = hbi + 1) begin : hbank
@@ -118,8 +129,14 @@ module ssm_scan_row #(
 
     wire signed [16:0] a_s = {1'b0, a_q};
 
-    // S3 combinational per lane: fused single rounding + sat
-    wire [N*16-1:0] hnew_w;
+    // S3 combinational per lane: fused single rounding + sat. hnew_w is the full
+    // INT16 new state (feeds y, unquantised — y uses full precision). hstore_w is
+    // the QH-bit CARRIED state (round hn to a 2^SHW grid, sat to QH bits) that gets
+    // written back and reconstructed (<<SHW) on the next step's a*h read.
+    localparam signed [16:0] QHMAX = (17'sd1 <<< (QH-1)) - 17'sd1;
+    localparam signed [16:0] QHMIN = -(17'sd1 <<< (QH-1));
+    wire [N*16-1:0]  hnew_w;
+    wire [N*QH-1:0]  hstore_w;
     genvar g;
     generate for (g = 0; g < N; g = g + 1) begin : lane
         wire signed [42:0] acc  = mul2l[g] + injs[g];
@@ -129,6 +146,21 @@ module ssm_scan_row #(
                                 (shft < -$signed(27'sd32768)) ? -16'sd32768 :
                                 shft[15:0];
         assign hnew_w[g*16 +: 16] = hn;
+        // round-to-nearest into the QH grid, then saturate to QH bits
+        wire signed [16:0] hn_r = (SHW > 0)
+            ? ($signed({hn[15], hn}) + ($signed(17'sd1) <<< (SHW-1))) >>> SHW
+            : $signed({hn[15], hn});
+        wire signed [QH-1:0] hn_q = (hn_r > QHMAX) ? QHMAX[QH-1:0] :
+                                    (hn_r < QHMIN) ? QHMIN[QH-1:0] : hn_r[QH-1:0];
+        assign hstore_w[g*QH +: QH] = hn_q;
+    end endgenerate
+
+    // read reconstruction: stored QH-bit value sign-extended to 16b then <<SHW,
+    // so the a*h multiply sees the same INT16-grid value the reference carries.
+    wire [N*16-1:0] hrec_w;
+    generate for (g = 0; g < N; g = g + 1) begin : lrec
+        assign hrec_w[g*16 +: 16] =
+            {{(16-QH){hq[g*QH + QH - 1]}}, hq[g*QH +: QH]} << SHW;
     end endgenerate
     wire [N*16-1:0] hnl_w;
     generate for (g = 0; g < N; g = g + 1) begin : lanew
@@ -183,7 +215,7 @@ module ssm_scan_row #(
             // S1 -> S2: products
             v2 <= v1; p2 <= p1;
             for (k = 0; k < N; k = k + 1) begin
-                mull[k] <= a_s * $signed(hq[k*16 +: 16]);
+                mull[k] <= a_s * $signed(hrec_w[k*16 +: 16]);
                 injl[k] <= dtx1 * bvec[k];
             end
             // S2 -> S3: barrel shift only
@@ -199,7 +231,7 @@ module ssm_scan_row #(
             v4 <= v3; p4 <= p3;
             for (k = 0; k < N; k = k + 1)
                 hnl[k] <= hnew_w[k*16 +: 16];
-            if (v3) begin we <= 1'b1; waddr <= ctx_off + p3; wdata <= hnew_w; end
+            if (v3) begin we <= 1'b1; waddr <= ctx_off + p3; wdata <= hstore_w; end
             // S4 -> S5: y products (lanes N..63 forced 0 so the 64-wide adder
             // tree reduces correctly for any N <= 64)
             v5 <= v4; p5 <= p4;
