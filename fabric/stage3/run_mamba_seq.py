@@ -23,6 +23,7 @@ import sys
 import numpy as np
 
 from fabric.stage3._simdir import kevbuild
+from fabric.stage3.run_layernorm import seed_table
 from model.mamba2_fixed import FixedMamba2, scale_me
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,6 +60,10 @@ def main(argv=None):
     ap.add_argument("--ckpt", default="data/ckpt.mamba2.chat6q.baked.pt")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dir", default=None)
+    ap.add_argument("--zero-seed-init", action="store_true",
+                    help="write seed.mem as all-zero (kills the $readmemh baked "
+                         "init) while still loading the real seed via AXI table "
+                         "15 — proves the fix no longer depends on baked ROM.")
     args = ap.parse_args(argv)
 
     sim = args.dir or kevbuild("stage3_mamba_seq")
@@ -89,6 +94,9 @@ def main(argv=None):
         10: rd16(f"{ex}/normf_g.mem"),
         11: cat("in_proj_scale"), 12: cat("out_proj_scale"),
         13: rd16(f"{ex}/head_scale.mem"),
+        # table 15 = rsqrt seed table (WSEL_SEED), 64 x 20-bit — the values the
+        # rmsnorm_gated seed_rom used to bake from seed.mem, now loaded over AXI.
+        15: np.asarray(list(seed_table()), dtype=np.int64),
     }
     for s, v in tables.items():
         w32(f"{sim}/ms_t{s}.mem", v)
@@ -119,10 +127,12 @@ def main(argv=None):
     with open(f"{sim}/ms_tok.mem", "w") as f:
         for t in toks:
             f.write(f"{int(t):04x}\n")
-    cfg = np.zeros(16, dtype=np.int64)
+    # cfg[0]=T, cfg[1..13] = table 1..13 counts, cfg[14]=const count,
+    # cfg[15]=gemv-weight count (WSEL_GW), cfg[16]=seed count (WSEL_SEED=15).
+    cfg = np.zeros(17, dtype=np.int64)
     cfg[0] = args.tokens
     for s, v in tables.items():
-        cfg[s] = len(v)
+        cfg[16 if s == 15 else s] = len(v)   # seed count -> cfg[16]
     cfg[14] = 128
     cfg[15] = len(gw)
     w32(f"{sim}/ms_cfg.mem", cfg)
@@ -143,11 +153,13 @@ def main(argv=None):
     src = [f"{REPO}/fabric/stage3/rtl/{m}.sv" for m in
            ("mamba_seq", "gemv_i4i8", "conv_silu", "ssm_scan_row", "rmsnorm_gated")]
     src.append(f"{REPO}/fabric/stage3/tb/tb_mamba_seq.sv")
-    # rmsnorm needs seed.mem in cwd
-    from fabric.stage3.run_layernorm import seed_table
+    # seed.mem feeds only the rmsnorm_gated $readmemh sim/fallback init. The
+    # real seed now loads over AXI (table 15). --zero-seed-init writes zeros
+    # here so the baked init is dead — if the sim still PASSES, the fix proves
+    # it no longer depends on the ROM baking (the silicon failure mode).
     with open(f"{sim}/seed.mem", "w") as f:
         for v in seed_table():
-            f.write(f"{int(v):05x}\n")
+            f.write(f"{0 if args.zero_seed_init else int(v):05x}\n")
     subprocess.run([tool("iverilog"), "-g2012", "-o", "ms.vvp"] + src,
                    cwd=sim, check=True)
     out = subprocess.run([tool("vvp"), "ms.vvp"], cwd=sim, check=True,

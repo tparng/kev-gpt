@@ -63,6 +63,15 @@ module rmsnorm_gated #(
     input  wire [7:0]              wr_lut_addr,
     input  wire signed [15:0]      wr_lut_data,
 
+    // rsqrt seed ROM init (once), 20-bit Q1.16 seed values — loaded over AXI so
+    // the seed table does NOT depend on $readmemh baking into the bitstream
+    // (on silicon the baked init read back as 0 -> rsqrt diverged -> norm
+    // exploded). AXI-written after reset, before the first token; wins over the
+    // sim-only initial below.
+    input  wire                    wr_seed,
+    input  wire [5:0]              wr_seed_addr,
+    input  wire [19:0]             wr_seed_data,
+
     input  wire [$clog2(D)-1:0]    rd_o_addr,
     output wire signed [15:0]      rd_o_data,
 
@@ -100,16 +109,22 @@ module rmsnorm_gated #(
         assign rd_ow_data[gr*16 +: 16] = obuf[rd_ow_base + gr[$clog2(D)-1:0]];
     end endgenerate
 
-    always @(posedge clk) begin
-        if (wr_y)   yin [wr_y_addr]   <= wr_y_data;
-        if (wr_z)   zin [wr_z_addr]   <= wr_z_data;
-        if (wr_g)   grom[wr_g_addr]   <= wr_g_data;
-        if (wr_lut) lut [wr_lut_addr] <= wr_lut_data;
-    end
-
-    // ---- seed ROM (64 x Q1.16) — same file/format as layernorm.sv -------
-    (* rom_style = "block" *) reg [19:0] seed_rom [0:63];
+    // ---- seed ROM (64 x Q1.16) — same values as layernorm.sv -------------
+    // Runtime-loadable RAM (was a rom_style="block" ROM): written via wr_seed
+    // over AXI. The baked $readmemh init did not survive into the bitstream on
+    // silicon (the .mem was off the synth run-dir path -> seed_rom read 0 ->
+    // Newton rsqrt diverged -> norm railed). The AXI load is now the source of
+    // truth; the initial is a sim convenience / harmless fallback only.
+    (* ram_style = "distributed" *) reg [19:0] seed_rom [0:63];
     initial $readmemh("seed.mem", seed_rom);
+
+    always @(posedge clk) begin
+        if (wr_y)    yin [wr_y_addr]    <= wr_y_data;
+        if (wr_z)    zin [wr_z_addr]    <= wr_z_data;
+        if (wr_g)    grom[wr_g_addr]    <= wr_g_data;
+        if (wr_lut)  lut [wr_lut_addr]  <= wr_lut_data;
+        if (wr_seed) seed_rom[wr_seed_addr] <= wr_seed_data;
+    end
 
     // ---- FSM -------------------------------------------------------------
     localparam [4:0]

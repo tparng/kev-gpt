@@ -126,13 +126,15 @@ def main(argv=None):
     cfg = rd16(f"{args.dir}/ms_cfg.mem")
     if not args.skip_load:
         t0 = time.time()
-        # identical order to tb_mamba_seq: t1, t0(gw), t1 again, t2..t14
+        # identical order to tb_mamba_seq: t1, t0(gw), t1 again, t2..t14, t15(seed)
         d.load_table(1, rd16(f"{args.dir}/ms_t1.mem"))
         d.load_table(0, rd16(f"{args.dir}/ms_t0.mem"))
         for s in range(1, 15):
             d.load_table(s, rd16(f"{args.dir}/ms_t{s}.mem"))
+        # WSEL_SEED=15: the rsqrt seed table, loaded over AXI (no baked ROM).
+        d.load_table(15, rd16(f"{args.dir}/ms_t15.mem"))
         print(f"tables loaded ({time.time()-t0:.1f}s, "
-              f"{cfg[15] + sum(cfg[1:15])} words)")
+              f"{cfg[15] + sum(cfg[1:15]) + cfg[16]} words)")
 
     # ---- gate replay: logits cosine vs the laptop reference ----------------
     ref_path = f"{args.dir}/ms_ref.npz"

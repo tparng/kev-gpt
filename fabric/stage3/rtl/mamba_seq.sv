@@ -49,7 +49,7 @@ module mamba_seq #(
                      WSEL_CB = 4, WSEL_SLUT = 5, WSEL_ALUT = 6, WSEL_DLUT = 7,
                      WSEL_LNG = 8, WSEL_NRMG = 9, WSEL_NFG = 10,
                      WSEL_RSIN = 11, WSEL_RSOUT = 12, WSEL_RSHD = 13,
-                     WSEL_CONST = 14;
+                     WSEL_CONST = 14, WSEL_SEED = 15;
     // debug selectors
     localparam [3:0] DBG_X = 0, DBG_XN = 1, DBG_ZX = 2, DBG_XBC = 3,
                      DBG_Y = 4, DBG_YN = 5, DBG_LOGIT = 6, DBG_X8 = 7;
@@ -185,6 +185,10 @@ module mamba_seq #(
         .wr_z(n_wrz), .wr_z_addr(n_wrz_a), .wr_z_data(n_wrd),
         .wr_g(n_wrg), .wr_g_addr(n_wrg_a), .wr_g_data(n_wrd),
         .wr_lut(n_wrl), .wr_lut_addr(n_wrl_a), .wr_lut_data(n_wrd),
+        // rsqrt seed table: streamed straight off the AXI table-write bus (like
+        // WSEL_GW), 64 x 20-bit, loaded once before the first token.
+        .wr_seed(wr_en && wr_sel == WSEL_SEED),
+        .wr_seed_addr(wr_addr[5:0]), .wr_seed_data(wr_data[19:0]),
         .rd_o_addr(n_rda), .rd_o_data(n_out),
         .rd_ow_base(n_rdaw), .rd_ow_data(n_ow));
 

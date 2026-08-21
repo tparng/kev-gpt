@@ -1,7 +1,8 @@
 // tb_mamba_seq — drives the full mamba engine: loads every table from .mem
 // files (ms_t<sel>.mem, sizes from ms_cfg.mem), then for each token in
 // ms_tok.mem runs a step and dumps logits + final residual to ms_out.
-// ms_cfg.mem: word0=T, word1..15 = element count for wsel 1..15.
+// ms_cfg.mem: word0=T, word1..14 = element count for wsel 1..14, word15 =
+// gemv-weight count (wsel 0), word16 = rsqrt-seed count (wsel 15).
 `timescale 1ns/1ps
 
 module tb_mamba_seq;
@@ -24,7 +25,7 @@ module tb_mamba_seq;
 
     // one big stimulus memory per selector, loaded lazily
     reg [31:0] tbl [0:524287];
-    reg [31:0] cfg [0:15];
+    reg [31:0] cfg [0:16];
     reg [15:0] toks [0:255];
     integer T, t, i, s, n, fd, fdx;
     integer cyc = 0, c0 = 0;
@@ -87,6 +88,8 @@ module tb_mamba_seq;
         load_sel(12, cfg[12], "ms_t12.mem");
         load_sel(13, cfg[13], "ms_t13.mem");
         load_sel(14, cfg[14], "ms_t14.mem");
+        load_sel(15, cfg[16], "ms_t15.mem");   // rsqrt seed (WSEL_SEED), cnt cfg[16]
+        $display("SEEDLOADED %0t", $time);
 
         for (t = 0; t < T; t = t + 1) begin
             @(posedge clk); tok_in <= toks[t][9:0];
