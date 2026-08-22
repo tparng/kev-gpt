@@ -2094,3 +2094,133 @@ this whole Phase 4 investigation set out to determine.
    other piece of this port's own "bit-honest before fast" discipline --
    not done, since this session's two checks were synth-only sizing
    exploration, not a deployment candidate build.
+
+## Phase 4 continued -- training the candidate, and two real NLAYER bugs found
+
+Trained a real checkpoint at the Phase 4 candidate shape and immediately
+hit the "bit-honest before fast" gate doing exactly its job -- twice.
+
+**Attempt 1: D=192/NHEAD=3/NLAYER=4 (the original recommendation) -- INVALID
+shape, caught before any board/Vivado time was spent on it.** Trained
+cleanly (best val 1.009 FP, 1.041 QAT, `data/char_optionA`'s existing
+57-char corpus, `--n-embd 192 --n-head 3 --n-layer 4 --block-size 128`,
+CUDA, ~5 min total). Exporting and gating it (`fabric.stage3.run_vec_kv
+--lanes 64 --npz fabric/export_optionB/goformer.npz`) crashed immediately:
+`fabric/stage3/run_layernorm.py`'s `_ln_int_quantized` asserts `d_model &
+(d_model-1) == 0` -- **`layernorm_vec.sv`'s mean/variance divide is
+shift-based (`sum >>> D_SH`), only exact when D is a power of 2. D=192
+(=3*64) is not.** This is a real, structural constraint of the design
+(not a bug to patch), missed entirely by the earlier synth-only sizing
+exploration -- that check only exercised RESOURCE FOOTPRINT (LUT/FF/BRAM/
+DSP counts), never the actual LayerNorm MATH, so it had no way to catch
+this. **Corrected candidate: D=128 (Option A's own value, a valid power of
+2), NHEAD=2 (unchanged), NLAYER=9** (real weight need ~30,740 wide words,
+still fits the 256-RAMB36 bucket) -- chosen to keep every already-validated
+width parameter and only grow depth.
+
+**Attempt 2: D=128/NHEAD=2/NLAYER=9 -- hit a real capacity limit (`DQ_N`),
+caught before wasting the trained checkpoint.** Retrained (~3 min FP + ~11
+min QAT). Gating failed again, this time with NO crash but `hw gen=[None,
+...]` (X output) at a normal, non-hung cycle count -- a DIFFERENT failure
+mode than the LN assertion. Root cause: `sequencer_vec.sv`'s `DQ_N`
+parameter (capacity of the `dqm_w`/`dqe_w` per-channel dequant-scale ROMs)
+was **hardcoded to `9409`** -- exactly `NLAYER*(D3+D+D_MLP+D)+VOCAB` at the
+ORIGINAL KV260 shape (`4*(768+256+1024+256)+193`), never re-derived for any
+other shape, and never exposed as an overridable parameter anywhere in the
+`xheep_kevgpt_peripheral.sv`/wrapper instantiation chain. NLAYER=9/D=128's
+real need (10,425 entries) exceeds it; NLAYER=8's (9,273) does not --
+**retrained one layer shallower, NLAYER=8**, to sidestep this specific
+limit without touching RTL yet.
+
+**Attempt 3: D=128/NHEAD=2/NLAYER=8 -- STILL X output, a real, distinct RTL
+bug, not resolved by picking a smaller NLAYER.** Sanity-checked the test
+methodology itself first (re-ran Option A's already-proven checkpoint
+through the identical `--lanes 64` pathway -- still `match=True`, ruling
+out an environment/tooling regression). Bisected empirically by training
+throwaway checkpoints at NLAYER=4 (PASS), 6 (FAIL), 5 (FAIL) -- exact
+boundary: NLAYER<=4 works, NLAYER>=5 fails, unrelated to `DQ_N` (NLAYER=5's
+real dequant-channel need is comfortably under even the OLD hardcoded 9409
+limit). **Root cause: `GAMMA_N` (the `gamma_w` LayerNorm-scale ROM's
+capacity) was ALSO hardcoded, to `9` -- exactly `2*NLAYER+1` at
+NLAYER=4 (2 LayerNorms per block + 1 final LN_f)**, same unparameterized-
+constant class of bug as `DQ_N`, coincidentally exact-fitting at NLAYER=4
+and silently truncating `gamma_w.mem` at load time for anything deeper.
+
+**Fixed both `GAMMA_N` and `DQ_N` properly**: converted from hardcoded
+`parameter` defaults to parameters DERIVED from the actual shape
+(`GAMMA_N = 2*NLAYER+1`, `DQ_N = NLAYER*(D3+D+D_MLP+D)+VOCAB`), requiring
+reordering `sequencer_vec.sv`'s own parameter list so `NLAYER`/`D`/`D3`/
+`D_MLP`/`VOCAB` are declared before them (safe -- every instantiation site
+in the whole project uses named `#(.PARAM(value))` connections, confirmed
+before reordering, never positional). Both formulas reproduce the OLD
+hardcoded defaults bit-for-bit at NLAYER=4 (`2*4+1=9`,
+`4*(768+256+1024+256)+193=9409` exactly) -- a pure generalization, not a
+behavior change for any existing NLAYER=4 build. Regression-checked
+D=256/NLAYER=4 (this session's own earlier-gated checkpoint) still
+`match=True` after the change.
+
+**Re-gated NLAYER=8 -- STILL X.** The `GAMMA_N`/`DQ_N` fix alone wasn't
+enough; a THIRD bug remained. Bisected properly this time using the RTL
+itself rather than more retraining: patched a scratch copy of
+`sequencer_vec.sv`'s existing `dbg_stop==2'd3 && blk==4'd0` "stop after
+block 0" debug hook to stop after a CHOSEN block instead (`blk==4'd7`, then
+`4'd3`, `4'd5`, `4'd4` -- binary search), each time comparing the dumped
+`xres_bank` residual against `IntKVQSequencer.block0_phase_signals(tok)`'s
+`x_out_q25` (note: `block0_phase_signals` is defined on the base
+`IntSequencer` class but must be called on an `IntKVQSequencer` INSTANCE --
+calling it on a raw `IntSequencer` hits an unrelated `v_cache` bug in that
+base class's own `_attn_step`, a dead end that cost real debugging time
+before finding `IntKVQSequencer`'s override resolves it correctly). Also
+had to restrict the comparison to the first `D/P` dump entries -- the dump
+task always emits 256 lines regardless of shape, so entries beyond the
+real `xres_bank` extent (128 of 256, at D=128) are ALWAYS X regardless of
+correctness, an easy false positive to avoid. **Result: blocks 0-3 bit-
+exact, blocks 4-7 entirely X** -- pinpointing the failure to exactly
+`blk==4`.
+
+**Root cause 3: `NSACT` (capacity of the `inv_sact` scale-select ROM),
+hardcoded to `17`.** `g_asel` (the `inv_sact[g_asel]` index) is set to
+`blk*4 + {0,1,2,3}` for the four per-block dequant ops (qkv/proj/mlp_fc/
+mlp_proj) plus `4*NLAYER` for the head -- ranging `0..4*NLAYER` inclusive,
+needing `4*NLAYER+1` entries. At NLAYER=4 (the original default), that's
+exactly `17` -- matching the hardcoded constant bit-for-bit, same
+coincidental-exact-fit pattern as `GAMMA_N`. At NLAYER=8, block 4's FIRST
+access (`g_asel=16`, its qkv dequant) is still the array's last valid
+index, but blocks 4's remaining three accesses (`g_asel=17,18,19`, for
+proj/mlp_fc/mlp_proj) read past the end -- exactly matching the empirical
+"blocks 0-3 fine, block 4 corrupted" boundary. Same fix pattern: `NSACT`
+converted from a hardcoded `17` to a derived `4*NLAYER+1`.
+
+**All three (`GAMMA_N`, `DQ_N`, `NSACT`) are now derived from the actual
+shape parameters instead of guessed constants -- the same fix philosophy
+as this session's earlier `gdone` width fix**, and for the same underlying
+reason: every one of them happened to be sized EXACTLY right for
+NLAYER=4/D=256 (the original KV260 shape this whole codebase was first
+built against), so nothing before this session ever had a reason to
+suspect they weren't properly parameterized -- Option A (NLAYER=2, well
+under every one of these limits) never exercised the boundary either.
+
+**Regression-checked after the `NSACT` fix**: D=256/NLAYER=4 still
+`match=True` (byte-for-byte identical cycle-count and token stream to
+before). **Re-gated D=128/NHEAD=2/NLAYER=8**: **`VEC_KV_VERDICT
+match=True`** -- `gen=[1, 41, 30, 34, 26, 1, 41, 29]`, exact match, real
+trained-and-QAT-fine-tuned checkpoint (`data/ckpt_optionB.qat.pt`, best QAT
+val loss 1.031), `fabric/export_optionB/goformer.npz`. Synced the fixed
+`sequencer_vec.sv` into the fork repo's vendored copy.
+
+**Final candidate actually trained and gated: D=128/D3=384/D_MLP=512/
+NHEAD=2/NLAYER=8/VOCAB=57** (4x Option A's depth, same width) rather than
+the originally-recommended D=192/NHEAD=3/NLAYER=4 -- a deeper-not-wider
+tradeoff forced by the power-of-2-D constraint, landing on a shape this
+session's real BRAM-bucket analysis already showed fits comfortably (27668
+real wide-words at this exact NLAYER, well under the 32768-word/256-RAMB36
+bucket boundary established earlier in this Phase 4 section). Not yet
+synth-checked at THIS exact NLAYER=8 shape specifically (the earlier synth
+checks used D=192/NLAYER=4 and D=256/NLAYER=4, not D=128/NLAYER=8) -- worth
+a real synth-only checkpoint before committing to P&R, same discipline as
+everywhere else in this file.
+
+**Not yet done**: synth-only Vivado checkpoint for the ACTUAL D=128/
+NLAYER=8 shape (the earlier synth checks used different shapes for the
+DSP/BRAM feasibility argument, not this exact final candidate); full P&R/
+bitstream/real-hardware bring-up.

@@ -29,11 +29,38 @@ module sequencer_vec #(
     parameter integer LANES = 16,
     parameter integer VOCAB = 193,
     parameter integer TMAX  = 256,
-    parameter integer GAMMA_N = 9,
-    parameter integer DQ_N  = 9409,
-    parameter integer NSACT = 17,
     parameter integer WWORDS = 262144,
     parameter integer NLAYER = 4,
+    // gamma_w capacity: 2 LayerNorms (ln1+ln2) per block + 1 final LN_f.
+    // dqm_w/dqe_w capacity: one dequant channel per GEMV output row across
+    // every block's qkv/proj/mlp_fc/mlp_proj, plus the head. Both were
+    // HARDCODED (9 / 9409, sized for NLAYER=4/D=256/D3=768/D_MLP=1024/
+    // VOCAB=193's original KV260 shape) until this fix -- silently
+    // truncating gamma_w.mem/dqm_w.mem/dqe_w.mem at $readmemh load time for
+    // ANY caller with a different real need, with NO error or warning
+    // beyond an easily-missed "not enough words" message, corrupting
+    // LayerNorm/dequant for the truncated tail (in practice: the last
+    // block(s)) and propagating as X/garbage through everything
+    // downstream. Found via a real NLAYER=5 hang-free-but-X-output bug
+    // (GAMMA_N=9=2*4+1 fit NLAYER<=4 exactly, silently broke at NLAYER=5)
+    // -- see fabric/genesys2/PORT-NOTES.md. Now derived from the actual
+    // shape parameters instead of a guessed constant, matching gdone's own
+    // earlier width fix -- bit-identical to the old hardcoded defaults for
+    // every existing NLAYER=4 config (2*4+1=9, exactly), so no existing
+    // build's behavior changes.
+    parameter integer GAMMA_N = 2*NLAYER + 1,
+    parameter integer DQ_N    = NLAYER*(D3+D+D_MLP+D) + VOCAB,
+    // inv_sact capacity: g_asel = blk*4 + {0,1,2,3} (qkv/proj/mlp_fc/mlp_proj
+    // dequant-frac select per block) ranges 0..4*(NLAYER-1)+3, PLUS the
+    // final g_asel=4*NLAYER for the head -- 4*NLAYER+1 entries total. Same
+    // hardcoded-for-NLAYER=4 bug as GAMMA_N/DQ_N above (17=4*4+1 exactly):
+    // found via bisecting the SAME NLAYER=8 X-output symptom down to an
+    // exact blk==4 boundary (blocks 0-3 fine, 4-7 corrupted) AFTER the
+    // GAMMA_N/DQ_N fix alone didn't resolve it -- g_asel=4*4=16 (block 4's
+    // qkv access) was still the last VALID index into the old 17-deep
+    // array, but block 4's proj/mlp_fc/mlp_proj accesses (g_asel=17,18,19)
+    // read past the end. See fabric/genesys2/PORT-NOTES.md.
+    parameter integer NSACT   = 4*NLAYER + 1,
     parameter integer NHEAD = 4,
     parameter integer HEAD_DIM = 64,
     parameter integer RESID_FRAC  = 25,
