@@ -1724,3 +1724,83 @@ half's full real-hardware treatment from the earlier section) -- next
 step. The `gdone` width fix should be synth-neutral (pure bookkeeping
 register, no MAC-path timing impact) but that claim itself needs the same
 "prove it before trusting it" treatment as everything else in this repo.
+
+### Synth-only Vivado checkpoint for WEIGHT_DDR_BACKED=1 (DONE, clean)
+
+Regenerated the `genesys2_kevgpt` FuseSoC project (`make vivado-fpga-nobuild
+FPGA_BOARD=genesys2_kevgpt`, X-HEEP's own `.venv` sourced for FuseSoC's
+`mako`-dependent codegen step) and ran `make synth` **from inside the
+generated project directory** (`build/openhwgroup.org_systems_core-v-mini-
+mcu_1.0.5/genesys2_kevgpt-vivado/`, not the top-level `esl_epfl_x_heep`
+Makefile -- `synth` is a target of the generated project's own Makefile,
+confirmed by grepping it after the top-level invocation failed with "No
+rule to make target 'synth'"). Regenerating wipes the project's ROM `.mem`
+files (same gotcha earlier sessions hit) -- re-placed a fresh set generated
+via `write_mems_wideword` at `P=8, LANES=64` (the deployed value, and the
+only one proven valid by today's `LANES>=8*P` finding) against the current
+checkpoint (`D=256/NLAYER=4/VOCAB=57` -- note this does NOT match the
+wrapper's own hardcoded Option A parameters, `D=128/NLAYER=2`; for a
+synth-only check this is fine, since the RTL's actual memory/logic
+footprint is fixed by the wrapper's own instantiation parameters, not by
+`.mem` file content -- Vivado just pads/truncates `$readmemh` against the
+RTL's declared array size and warns, it doesn't resynthesize the array
+itself. A future run should regenerate matching Option-A-shaped `.mem`
+files, or a real checkpoint retrained at that shape, before any bitstream
+meant to actually run correctly -- this checkpoint just proves synthesis
+elaborates cleanly).
+
+**Result: clean.** Zero `ERROR` lines in the full synthesis log; both
+`.v`/`.edn` netlist outputs and the `synth_1` `.dcp` checkpoint written
+successfully. All `CRITICAL WARNING`s are the same pre-existing, benign
+CDC-constraint pattern-match misses (DMI JTAG debug subsystem, SPI-slave
+CDC FIFOs, `sync.xdc`) already accepted in the earlier KV-cache-only synth
+checkpoint -- none touch this session's new RTL.
+
+Real hierarchical utilization (`report_utilization -hierarchical
+-hierarchical_depth 4`, opened directly against the `synth_1` `.dcp`):
+
+```
+xilinx_core_v_mini_mcu_wrapper_kevgpt (top): 99567 LUT (48.86%), 55608 FF (13.64%),
+                                              248 RAMB36+10 RAMB18 (56.85% RAMB36-equiv), 803 DSP (95.60%)
+  u_kevgpt (xheep_kevgpt_peripheral):        58851 LUT,          26583 FF, 240 RAMB36+10 RAMB18, 798 DSP
+    (u_seq) own logic:                        8869 LUT,           4067 FF,  60 RAMB36+ 4 RAMB18, 104 DSP
+    g_kvb_ddr.u_kvb (kv_bank_ddr):           14819 LUT,           3656 FF,   9 RAMB36+ 1 RAMB18,  30 DSP
+    g_wld.u_wld (weight_loader_ddr, NEW):       155 LUT,            418 FF,   0 RAMB36+ 0 RAMB18,   0 DSP
+    u_attnA (vec_attn_w):                    14708 LUT,           9336 FF,   5 RAMB36+ 3 RAMB18, 384 DSP
+    u_gemv (gemv_banked_resident_vec):        8634 LUT,           3784 FF, 158 RAMB36+ 1 RAMB18,   0 DSP
+      u_wb (weight_bank_tdp):                  422 LUT,            277 FF, 128 RAMB36,              0 DSP
+  u_kevgpt_ddr_bundle (CDC+mux2+engines+arb):  3235 LUT,           8799 FF,   0 RAMB36,               0 DSP
+  u_mig_dual_arb:                               145 LUT,            101 FF,   0 RAMB36,               0 DSP
+  u_cpu_ddr_bridge (unmodified):              1399 LUT,           1557 FF,   0 RAMB36,               0 DSP
+  x_heep_system_i (cv32e40px SoC):          (unchanged from earlier checkpoint)
+```
+
+**The key confirmation**: `g_wld.u_wld` (`weight_loader_ddr`, wired in for
+the first time this checkpoint) costs **155 LUT, 418 FF, ZERO BRAM, ZERO
+DSP** -- exactly matching its design intent as a thin control FSM +
+sequential-issue counter feeding an existing memory port, not a new
+compute or storage block. `u_kevgpt_ddr_bundle` grew from the earlier
+KV-only checkpoint's 2921 LUT/8693 FF to 3235 LUT/8799 FF (**+314 LUT/+106
+FF**, still **zero BRAM, zero DSP**) -- consistent with exactly the two new
+`async_fifo_gray` CDC instances (`u_wl_rd_req_cdc`: 40 LUT/25 FF,
+`u_wl_rd_ret_cdc`: 192 LUT/25 FF) plus `mig_read_mux2` now actually
+arbitrating two real requesters instead of one idle input. **DSP total
+(803/840, 95.60%) is byte-for-byte UNCHANGED from the KV-cache-only
+checkpoint** -- confirms neither the `gdone` width fix nor any of today's
+new wiring touches the tight DSP budget at all. Total BRAM (253 RAMB36-
+equivalent / 445, 56.85%) has headroom; the `(u_seq) own logic` row shows a
++10 RAMB36 shift vs. the earlier session's own quoted number (50->60) that
+wasn't chased down further -- most likely attributable to comparing against
+a different `.mem`/checkpoint content and/or hierarchical-depth reporting
+granularity between the two runs, not a new BRAM consumer (every NEW
+module this session -- `weight_loader_ddr`, the two new CDC FIFOs -- is
+independently confirmed zero-BRAM above); worth a clean side-by-side re-run
+if it matters before committing to a final BRAM budget.
+
+This is a synth-only checkpoint (no place & route, no timing closure, no
+bitstream) -- confirms the design elaborates/synthesizes cleanly with real
+resource numbers, but does NOT yet confirm the new CDC pair's timing
+closes under real constraints or that a bitstream programs and runs
+correctly on the physical board. Full P&R/bitstream/real-hardware bring-up
+for `WEIGHT_DDR_BACKED=1` remains the next step, mirroring the KV-cache
+half's earlier treatment.
