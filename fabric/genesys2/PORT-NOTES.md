@@ -1854,3 +1854,98 @@ already at the synth-only checkpoint above) -- a real board run to confirm
 bit-exact generation would need either regenerating this bitstream against
 Option-A-shaped `.mem` content, or a checkpoint retrained at that exact
 shape, same caveat as before.
+
+### Real hardware: found the real Option A checkpoint, rebuilt, and real board bring-up (DONE, PASS)
+
+**The `.mem` shape caveat above resolved itself cleanly**: `fabric/genesys2/
+gen_chat_fw.py` (the script that already produces `kevgpt_chat`'s deployed
+`kevgpt_weights.h`) defaults to `fabric/export_optionA/goformer.npz`, NOT
+the `fabric/export/goformer.npz` this whole session's gates used. That file
+is genuinely `D=128/NLAYER=2/VOCAB=57/NHEAD=2` -- Option A's real shape,
+matching the wrapper's own hardcoded RTL parameters exactly. Regenerated
+every ROM `.mem` file against it (same `write_mems_wideword` call, `P=8,
+LANES=64`, now `nlayer=2`), replaced the mismatched-shape files in the
+project directory, and force-rebuilt (removed the stale `synth_1`/`impl_1`
+run directories so Vivado couldn't silently reuse cached results against
+the wrong ROM content -- `.mem` files aren't tracked as Makefile
+prerequisites, so this step doesn't happen automatically).
+
+**Result: clean rebuild, better timing margin.** `0 Errors` throughout;
+`Bitgen Completed Successfully`. Timing: `WNS=2.135ns` (0/2124 failing),
+`WHS=0.108ns` (0/1980 failing), `WPWS=4.600ns` (0/1111 failing) -- all
+positive, all comfortably better than the mismatched-ROM build's own
+numbers (2.135 vs. 1.672ns WNS) -- consistent with genuinely-sized memory
+content packing more cleanly, though that wasn't the point of the rebuild.
+
+**New firmware**: `sw/applications/kevgpt_wld_bringup/` (own `kevgpt.h`/
+`kevgpt_regs.h`/`kevgpt.c` copies, same per-app-directory convention
+`kevgpt_chat`/`kevgpt_bringup` already use -- plus two new register
+offsets, `KEVGPT_REG_WLD_ADDR`/`WLD_WORDS`/`WLD_CTRL`, and a
+`kevgpt_wld_load()` helper mirroring `kevgpt_step()`'s own write-then-poll
+pattern). Deliberately does NOT call `kevgpt_weight_load_reset()`/
+`kevgpt_weight_load_word()` (the firmware `wl_we` boot-stream) AT ALL --
+the resident weight image reaches `weight_bank_tdp` ONLY through
+`weight_loader_ddr`'s DMA port, so a passing result is proof of the DMA
+path specifically, not a coincidence of some other load mechanism still
+running underneath it. Sequence: (1) write `kevgpt_weight_words[]`
+(reused verbatim from `kevgpt_chat`, same array Phase 3's
+`kevgpt_ddr_stage` already proved round-trips through `cpu_ddr_bridge`
+bit-exact) to a DDR3 offset of `0x20000` (128KiB) via `EXT_SLAVE_START_
+ADDRESS`: (2) `kevgpt_wld_load()` -- write `WLD_ADDR`/`WLD_WORDS`, pulse
+`WLD_CTRL`, poll `STATUS.wld_done`; (3) run the SAME prompt/gen loop
+`kevgpt_chat` uses (`kevgpt_prompt_ids`/`kevgpt_expected_gen`, also from
+the shared `kevgpt_weights.h`); (4) compare. The `0x20000` offset is
+deliberately placed past `kv_bank_ddr`'s own KV-cache DDR footprint at
+this shape (`NLAYER=2*2*NHEAD=2*TMAX=128` rows `* ROW_BEATS=3 * 32B/beat` =
+98,304B `< 0x20000`) so the staged weight image and the KV cache's DDR
+region can never alias, even though today's own sequencing (stage -> load
+-> first `go`) would be safe regardless of overlap.
+
+Cleared a stale `openocd`/JTAG-holding `cat /dev/ttyUSB0` pair left running
+from an earlier session before starting (same `LIBUSB_ERROR_BUSY` class of
+issue this port has hit before) -- confirmed killed via `ps -p` before
+reprogramming.
+
+**Result: real UART trace, bit-exact.**
+```
+KEVGPT_WLD_PHASE,control_plane
+KEVGPT_WLD_ID,0x53515256
+KEVGPT_WLD_PHASE,stage_ddr
+KEVGPT_WLD_STAGED_WORDS,73856
+KEVGPT_WLD_PHASE,dma_load
+KEVGPT_WLD_DMA_DONE
+KEVGPT_WLD_STATUS_PRE,0x00000004
+KEVGPT_WLD_PHASE,generate
+... (per-pass cycle counts, KEVGPT_WLD_GEN lines) ...
+KEVGPT_WLD_CYCLES,58252
+KEVGPT_WLD_CMP,i=0,got=1,want=1
+KEVGPT_WLD_CMP,i=1,got=29,want=29
+KEVGPT_WLD_CMP,i=2,got=30,want=30
+KEVGPT_WLD_CMP,i=3,got=34,want=34
+KEVGPT_WLD_CMP,i=4,got=1,want=1
+KEVGPT_WLD_CMP,i=5,got=40,want=40
+KEVGPT_WLD_PASS,generate
+```
+
+All 6 generated tokens `[1, 29, 30, 34, 1, 40]` bit-exact against the same
+golden `kevgpt_chat` already checks against -- generated ENTIRELY from a
+weight image that reached `weight_bank_tdp` through `weight_loader_ddr`'s
+hardware DMA engine, never through firmware's `wl_we` register stream.
+`STATUS_PRE=0x00000004` confirms `wld_done` (bit 2) latches correctly and
+the busy/done bits stay clear once the load completes, matching the
+register design. Total cycle count (58,252) matches the earlier KV-cache-
+only real-hardware bring-up's own number (58,251, off-by-one is measurement
+rounding) almost exactly -- expected, since the one-time DMA weight load
+happens BEFORE the per-pass cycle counter starts and isn't part of that
+total; the actual per-token compute cost is unchanged by where the weights
+came from.
+
+**This closes the exact scope gap Phase 3 flagged**: *"this proves the
+CPU's own write+read path into DDR3 is correct byte for byte. It does NOT
+yet prove `weight_loader_ddr`'s hardware DMA path reads this same staged
+image correctly on real hardware."* It now does, on real silicon, with the
+real deployed model shape, matching the KV-cache half's own real-hardware
+rigor exactly. Both halves of Phase 2 (`KV_DDR_BACKED`, `WEIGHT_DDR_BACKED`)
+are now gated in isolation, gated at full-sequencer scale, gated through
+the arbiter stack with genuine dual-clock CDC, synthesized, placed & routed
+with positive margin, and proven bit-exact on real hardware.
