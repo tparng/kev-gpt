@@ -1530,7 +1530,64 @@ completely: gated in isolation (`tb_kv_bank_ddr.sv`), gated at full-sequencer
 scale in simulation (`tb_seq_vec_kv_ddr.sv`), gated through the complete
 arbiter stack including genuine dual-clock CDC (`tb_kevgpt_ddr_bundle.sv`),
 synthesized clean, placed and routed with positive timing margin, and now
-proven bit-exact on the real board. Next: Phase 3 (weight staging into
-DDR3) and Phase 4 (model-size selection) as above -- the weight-window half
-of Phase 2 has NOT yet had this same real-hardware treatment (it isn't wired
-into the top level yet, only gated in simulation).
+proven bit-exact on the real board.
+
+## Phase 3 -- firmware-driven weight staging into DDR3 (DONE, bit-exact on real hardware)
+
+New app: `sw/applications/kevgpt_ddr_stage/main.c`. Reuses
+`kevgpt_weight_words[]`/`KEVGPT_WEIGHT_WORDS_COUNT` verbatim from
+`kevgpt_chat/kevgpt_weights.h` (`#include`d via a relative path, no
+duplication of the ~287KB generated array) -- the exact same packed word
+stream `kevgpt_chat` already streams into the on-chip `weight_bank_tdp` via
+`wl_we`, just written to DDR3 byte addresses (`EXT_SLAVE_START_ADDRESS`,
+from the mcu-gen-generated `core_v_mini_mcu.h`) instead of a register.
+Matches the plan's own framing exactly: "reuse its packing logic, change
+only the destination" -- no new packing logic needed. Write-then-readback-
+verify, bit-exact, over the SAME `cpu_ddr_bridge` path
+`kevgpt_ddr_bench.c` (Phase 0) already proved readable/writable with
+synthetic data -- this is the first time it's carried the REAL, full-size
+weight image.
+
+**Build gotcha**: `make app PROJECT=kevgpt_ddr_stage` failed initially --
+X-HEEP's `sw/CMakeLists.txt` resolves app sources relative to `SOURCE`
+(default `.`, meaning X-HEEP's own `sw/` when the sub-make `-C sw`'s into
+that directory), and this project's own `kevgpt_*` apps live in the
+TOP-LEVEL repo's `sw/applications/`, three directories above X-HEEP's own
+root -- but the sub-make's OWN working directory is one level deeper
+(`sw/`) than where that "three directories up" figure was measured from, so
+the correct value is **`SOURCE=../../../../sw/` (four `..`, not three)** --
+confirmed via `os.path.relpath` rather than guessed. This is likely the
+same class of off-by-one-directory mistake as the earlier documented
+`SOURCE=../../../sw/` `make vivado-fpga` bug (a different depth, for a
+different target, easy to conflate) -- worth remembering as its own, separate
+gotcha specifically for `make app` on a repo-external application directory.
+
+**Result** (JTAG-loaded via the already-programmed DDR-backed-KV-cache
+bitstream from the P&R/bring-up step above, no reprogramming needed --
+FPGA configuration persists across firmware reloads): full UART trace:
+```
+KEVGPT_DDR_STAGE_PHASE,write
+KEVGPT_DDR_STAGE_WORDS,73856
+KEVGPT_DDR_STAGE_PHASE,verify
+KEVGPT_DDR_STAGE_ERRORS,0
+KEVGPT_DDR_STAGE_PASS,stage_verify
+```
+All 73,856 words (Option A's full weight image) written to DDR3 and read
+back bit-exact, zero mismatches, on real silicon.
+
+**Scope note**: this proves the CPU's OWN write+read path into DDR3 is
+correct byte for byte. It does NOT yet prove `weight_loader_ddr`'s hardware
+DMA path reads this SAME staged image correctly on real hardware (that
+module is gated against a synthetic image in
+`fabric/genesys2/tb/tb_weight_loader_ddr.sv`, and isn't wired into the real
+top level yet -- the weight-window control-flow integration into
+`sequencer_vec.sv`'s own layer loop, and giving `weight_loader_ddr` its own
+CDC once it is wired in, remain the real next steps before Phase 2's
+weight-window half gets the same real-hardware treatment the KV-cache half
+just did).
+
+Next: Phase 4 (final model-size selection), now with real BRAM, rate, AND
+DDR3-staging numbers to anchor it instead of estimates -- and, before that,
+finishing Phase 2's weight-window half (top-level wiring + CDC + real
+hardware bring-up) to match the KV-cache half's now-complete verification
+depth.
