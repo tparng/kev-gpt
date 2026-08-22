@@ -12,12 +12,11 @@
 // the write side, req_*/ret_* for both read sides) as pass-through ports and
 // produces the merged bundle:
 //
-//   kv_bank_ddr(write) --pkt/ack--CDC--> mig_write_engine --cmd--\
-//                                                                  mig_rw_arbiter -> app_*
-//   kv_bank_ddr(read)  --req/ret--CDC--\                         /
-//                                        mig_read_mux2 -> mig_read_engine --cmd--/
-//   weight_loader_ddr  --req/ret------- /  (not yet wired at the top level;
-//                                           needs its own CDC too once it is)
+//   kv_bank_ddr(write)     --pkt/ack--CDC--> mig_write_engine --cmd--\
+//                                                                      mig_rw_arbiter -> app_*
+//   kv_bank_ddr(read)      --req/ret--CDC--\                         /
+//                                            mig_read_mux2 -> mig_read_engine --cmd--/
+//   weight_loader_ddr(read)--req/ret--CDC--/
 //
 // TWO CLOCK DOMAINS, not one: kv_bank_ddr/weight_loader_ddr live inside
 // sequencer_vec.sv's own hierarchy, clocked on kevgpt's compute clock
@@ -70,12 +69,9 @@ module kevgpt_ddr_bundle #(
     input  wire                 kv_rd_ret_ready,
     output wire [DATA_W-1:0]    kv_rd_ret_data,
 
-    // ---- weight_loader_ddr's read port (req_*/ret_*) -- ui_clk domain as
-    // declared; NOT yet wired to a real instance at the top level (tied to
-    // constant idle values there, which need no synchronizer). When it IS
-    // wired to a real gen_clk-domain weight_loader_ddr instance, this port
-    // needs the SAME req/ret CDC treatment kv_bank_ddr's read port gets
-    // below -- not done yet, flagged rather than silently assumed away. ----
+    // ---- weight_loader_ddr's read port (req_*/ret_*), gen_clk domain --
+    // now the SAME req/ret CDC treatment kv_bank_ddr's read port gets below
+    // (async_fifo_gray, same 2-FIFO shape) is applied to this port too. ----
     input  wire                 wl_rd_req_valid,
     output wire                 wl_rd_req_ready,
     input  wire [ADDR_W-1:0]    wl_rd_req_addr,
@@ -155,8 +151,36 @@ module kevgpt_ddr_bundle #(
         .rd_empty_o(), .rd_almost_empty_o()
     );
 
-    // ---- read side (ui_clk domain throughout): merge kv_bank_ddr (post-CDC)
-    // + weight_loader_ddr (no CDC yet -- see port comment) onto one engine ---
+    // ---- CDC: weight_loader_ddr's read request (gen_clk -> ui_clk) ---------
+    wire wl_rd_req_valid_ui, wl_rd_req_ready_ui;
+    wire [ADDR_W-1:0] wl_rd_req_addr_ui;
+    async_fifo_gray #(.DATA_W(ADDR_W), .DEPTH(CDC_FIFO_DEPTH)) u_wl_rd_req_cdc (
+        .wr_clk_i(gen_clk), .wr_rst_ni(!gen_rst),
+        .wr_valid_i(wl_rd_req_valid), .wr_ready_o(wl_rd_req_ready),
+        .wr_data_i(wl_rd_req_addr),
+        .wr_full_o(), .wr_almost_full_o(),
+        .rd_clk_i(ui_clk), .rd_rst_ni(!ui_rst),
+        .rd_valid_o(wl_rd_req_valid_ui), .rd_ready_i(wl_rd_req_ready_ui),
+        .rd_data_o(wl_rd_req_addr_ui),
+        .rd_empty_o(), .rd_almost_empty_o()
+    );
+
+    // ---- CDC: weight_loader_ddr's read return (ui_clk -> gen_clk) ----------
+    wire wl_rd_ret_valid_ui, wl_rd_ret_ready_ui;
+    wire [DATA_W-1:0] wl_rd_ret_data_ui;
+    async_fifo_gray #(.DATA_W(DATA_W), .DEPTH(CDC_FIFO_DEPTH)) u_wl_rd_ret_cdc (
+        .wr_clk_i(ui_clk), .wr_rst_ni(!ui_rst),
+        .wr_valid_i(wl_rd_ret_valid_ui), .wr_ready_o(wl_rd_ret_ready_ui),
+        .wr_data_i(wl_rd_ret_data_ui),
+        .wr_full_o(), .wr_almost_full_o(),
+        .rd_clk_i(gen_clk), .rd_rst_ni(!gen_rst),
+        .rd_valid_o(wl_rd_ret_valid), .rd_ready_i(wl_rd_ret_ready),
+        .rd_data_o(wl_rd_ret_data),
+        .rd_empty_o(), .rd_almost_empty_o()
+    );
+
+    // ---- read side (ui_clk domain throughout): merge kv_bank_ddr and
+    // weight_loader_ddr (both post-CDC) onto one shared mig_read_engine ------
     wire                 rdm_req_valid, rdm_req_ready;
     wire [ADDR_W-1:0]    rdm_req_addr;
     wire                 rdm_ret_valid, rdm_ret_ready;
@@ -166,8 +190,8 @@ module kevgpt_ddr_bundle #(
         .clk(ui_clk), .rst(ui_rst),
         .a_req_valid(kv_rd_req_valid_ui), .a_req_ready(kv_rd_req_ready_ui), .a_req_addr(kv_rd_req_addr_ui),
         .a_ret_valid(kv_rd_ret_valid_ui), .a_ret_ready(kv_rd_ret_ready_ui), .a_ret_data(kv_rd_ret_data_ui),
-        .b_req_valid(wl_rd_req_valid), .b_req_ready(wl_rd_req_ready), .b_req_addr(wl_rd_req_addr),
-        .b_ret_valid(wl_rd_ret_valid), .b_ret_ready(wl_rd_ret_ready), .b_ret_data(wl_rd_ret_data),
+        .b_req_valid(wl_rd_req_valid_ui), .b_req_ready(wl_rd_req_ready_ui), .b_req_addr(wl_rd_req_addr_ui),
+        .b_ret_valid(wl_rd_ret_valid_ui), .b_ret_ready(wl_rd_ret_ready_ui), .b_ret_data(wl_rd_ret_data_ui),
         .req_valid(rdm_req_valid), .req_ready(rdm_req_ready), .req_addr(rdm_req_addr),
         .ret_valid(rdm_ret_valid), .ret_ready(rdm_ret_ready), .ret_data(rdm_ret_data)
     );

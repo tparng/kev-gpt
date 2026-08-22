@@ -1591,3 +1591,136 @@ DDR3-staging numbers to anchor it instead of estimates -- and, before that,
 finishing Phase 2's weight-window half (top-level wiring + CDC + real
 hardware bring-up) to match the KV-cache half's now-complete verification
 depth.
+
+### weight_loader_ddr wired into the top level (firmware-triggerable, additive)
+
+Closed the exact gap the previous section flagged: `weight_loader_ddr` is
+now instantiated in the real hierarchy, not just gated in isolation.
+
+`sequencer_vec.sv` got a new `WEIGHT_DDR_BACKED` parameter (default 0,
+every existing build untouched) -- unlike `KV_DDR_BACKED`'s generate-
+selected REPLACEMENT of `kv_bank`/`kv_bank_ddr`, this one is ADDITIVE:
+`weight_loader_ddr`'s `wb_ld_rst`/`wb_w_we`/`wb_w_data` OR onto
+`gemv_banked_resident_vec`'s existing boot-load port alongside firmware's
+own `wl_rst`/`wl_we`/`wl_data` (`w_data` muxed `wl_we ? wl_data :
+wld_ldb_data` so the two sources never collide -- a firmware-sequencing
+invariant, not hardware-enforced). New ports (`wld_ld_start/ld_ddr_addr/
+ld_words/ld_done`, `wl_rd_req_*/wl_rd_ret_*`) threaded through
+`xheep_kevgpt_peripheral.sv` as three new write-only registers beyond the
+AXI-shell-parity map (`0x34 WLD_ADDR`, `0x38 WLD_WORDS`, `0x3C WLD_CTRL`)
+plus a new `STATUS` bit (b2, `wld_done` latched) -- added as NEW registers
+rather than reusing CTRL bits specifically so the documented "0x00-0x30
+matches gemv_axi_seq_vec.v exactly" KV260-parity statement stays true.
+`kevgpt_ddr_bundle.sv` got the SAME CDC treatment its own header flagged as
+outstanding: two more `async_fifo_gray` instances (`u_wl_rd_req_cdc`,
+`u_wl_rd_ret_cdc`) bridging `weight_loader_ddr`'s req/ret port from
+`gen_clk` into `ui_clk`, mirroring `kv_bank_ddr`'s existing four exactly.
+`xilinx_core_v_mini_mcu_wrapper_kevgpt.sv` now wires the real `wl_rd_*`
+signals end to end (previously tied to constant idle values) and flips
+`WEIGHT_DDR_BACKED(1)` alongside the existing `KV_DDR_BACKED(1)`.
+
+### Two real, pre-existing RTL bugs found while gating this (neither caused by today's wiring)
+
+Built `fabric/genesys2/tb/tb_seq_vec_kv_wld.sv` (byte-for-byte copy of
+`tb_seq_vec_kv_ddr.sv`'s stimulus shape: stage the full weight image into a
+behavioral DDR model, this time triggering ONE `wld_ld_start` pulse instead
+of streaming `wl_we`, then run the same prompt/gen loop) to prove
+`WEIGHT_DDR_BACKED=1` end to end. First attempts -- and, damningly, a
+re-run of the EXISTING default-path regression (`fabric.stage3.run_vec_kv`,
+`KV_DDR_BACKED=0`/`WEIGHT_DDR_BACKED=0`, unmodified `sequencer_vec.sv` from
+`HEAD`) -- hung: stuck forever in `G_RB` (state 8), `ci` frozen at 0, 40M
+simulated cycles, no progress. Confirmed via a controlled isolation (same
+call against the untouched pre-session file) that this predates today's
+work entirely -- not a regression from this session's wiring.
+
+**Bug 1 -- `gdone` 4-bit wraparound (`gemv_banked_resident_vec.sv`).**
+`gdone` (the GEMV's committed-group counter, gating `sequencer_vec.sv`'s
+`G_RB` row-issue: `ci>>GRPSH < gv_gdone`) was hardcoded `reg [3:0]` (max
+15), but `GROUPS = ceil(MMAX/LANES)` with `MMAX=1024` fixed can need MORE
+than 16 groups for a single GEMV call (e.g. `D_MLP=1024` at `LANES=64`
+needs EXACTLY 16). `gdone` silently wraps 15->0 right as `ci`'s group index
+reaches the same boundary, and the plain `<` comparison (no modular
+unwrap) deadlocks permanently at that exact point -- explaining the
+identical `st=8,blk=0` hang signature on every affected run. Never
+triggered by the KV260 deployment (`LANES=128`, <=8 groups) or Genesys2
+Option A's real shape (`D_MLP=512`, <=8 groups at `LANES=64`) -- only
+surfaced testing a bigger candidate checkpoint (`D=256/NLAYER=4/D_MLP=1024`)
+at `LANES=64`, exactly Phase 4's own "compute candidate shapes" territory.
+**Fix**: `gdone`'s width is now a derived parameter, `GDONE_W =
+$clog2((MMAX+LANES-1)/LANES + 1)`, scaling automatically with whatever
+`MMAX`/`LANES` a caller instantiates -- not a hardcoded guess. `gdone` is
+pure bookkeeping (a counter, never part of the MAC accumulate datapath), so
+widening it touches no timing-critical logic. `sequencer_vec.sv`'s
+`gv_gdone` wire widened to match (same formula, so the port connection
+doesn't silently truncate).
+
+**Bug 2 -- embed lookup requires `LANES >= 8*P` (`sequencer_vec.sv`,
+inherent to the design, not a bug to fix, but a silently-violated
+precondition in the standard gate scripts' own defaults).** `S_EMB`'s embed
+fetch ONLY reads through the GEMV weight bank's spare-depth port-B path
+(`emb_sel_w`/`emb_addr_w`, "log §36 fit-plan 2") -- `sequencer_vec.sv` has
+NO fallback to the older dedicated `tok_emb_w.mem`/`pos_emb_w.mem` ROMs
+(those files are still emitted by `write_mems_wideword` "for other
+harnesses" per its own comment, but never `$readmemh`'d by `sequencer_vec`
+at all). That embed-table append into `wrom.mem` only happens when
+`wrom_embed_words()`'s own `EPW = (LANES*4)//(P*32) >= 1`, i.e.
+`LANES >= 8*P`. `fabric.stage3.run_vec_kv`'s own CLI/function default is
+`P=8, lanes=16` -- `EPW=0` at that combination, so the embed table is
+NEVER written, and `S_EMB` reads uninitialized (X) weight-bank rows
+UNCONDITIONALLY, for ANY checkpoint, independent of the `gdone` bug above.
+Traced via a scaled-down manual repro: `run_sequencer.py`'s OLDER, non-P-
+wide `sequencer.sv` gate (`--nlayer 1`) confirmed block-0's actual MATH is
+bit-exact for this checkpoint (`SEQ_VERDICT block0_bitexact=True`) --
+proving the corruption is specific to `sequencer_vec`'s P-wide embed path,
+not the model/checkpoint. Progressively narrowed with `dbg_stop`
+(1=after embed, 3=after block0) against `seq_ref.block0_phase_signals`:
+even the RAW EMBED OUTPUT (`x_in_q25`) was already 100% X before block0
+even started, at `LANES=16`. This was masked until today because the
+`gdone` bug (above) always hung the FIRST real GEMV before any test could
+observe the (still garbage) final output. **Not fixed in RTL** -- this is
+an inherent tradeoff of the spare-weight-depth embed design (documented
+already in `sequencer_vec.sv`'s own header comment: "smaller LANES no
+longer carry embeds in the wrom image"), not something to patch around.
+The actionable finding: `LANES=16` (the gate scripts' historical/CLI
+default) is a STRUCTURALLY INVALID configuration for `sequencer_vec.sv` --
+always was, for any checkpoint -- and must never be used for a full-
+sequencer gate. `LANES=64` (this port's actual deployed value,
+`EPW=(64*4)/(8*32)=1`) is the smallest valid choice and was already in use
+by every one of today's new DDR gates, which is exactly why they surfaced
+this precondition instead of silently inheriting it.
+
+**Re-verified everything at `LANES=64` with both fixes in place, bit-exact
+against the Python golden reference `gen=[30, 26, 1, 29, 30, 34]`** (this
+session's checkpoint, `D=256/NLAYER=4/VOCAB=57`, prompt `[3,10,25,40]`):
+  - Default path (`KV_DDR_BACKED=0`/`WEIGHT_DDR_BACKED=0`, on-chip
+    `kv_bank` + firmware `wl_we` stream): `VEC_KV_VERDICT match=True`,
+    ~27,940 cyc/pass avg -- confirms the fix didn't disturb the existing
+    resident path at all.
+  - `KV_DDR_BACKED=1` (`tb_seq_vec_kv_ddr.sv`, DDR-streamed KV cache):
+    `gen=[30, 26, 1, 29, 30, 34]`, exact match.
+  - `WEIGHT_DDR_BACKED=1` (new `tb_seq_vec_kv_wld.sv`, weight image loaded
+    ENTIRELY through `weight_loader_ddr`'s DMA path instead of `wl_we`):
+    `gen=[30, 26, 1, 29, 30, 34]`, exact match -- proves today's top-level
+    wiring (the OR-mux onto the boot-load port, the register interface,
+    the new CDC pair) end to end, under realistic multi-token/multi-layer
+    traffic, not just `tb_weight_loader_ddr.sv`'s isolated synthetic-image
+    gate.
+  - As a fast-failure sanity check, re-ran the OLD `LANES=16` default
+    afterward: no more 40M-cycle hang (confirms `gdone` alone was the hang
+    cause), but still `match=False` with all-X output (confirms `LANES=16`
+    remains structurally invalid, as expected -- a clean fast failure now
+    instead of a silent infinite one, which is itself the improvement
+    "bit-honest before fast" asks for).
+
+Synced the fixed `gemv_banked_resident_vec.sv`/`sequencer_vec.sv` plus the
+new `xheep_kevgpt_peripheral.sv`/`kevgpt_ddr_bundle.sv`/
+`xilinx_core_v_mini_mcu_wrapper_kevgpt.sv` into the fork repo's vendored
+`hw/ip/kevgpt_seq/rtl/` copies (the file FuseSoC's build actually consumes
+-- confirmed via diff before copying, not assumed in sync).
+
+**Not yet done**: synth-only Vivado checkpoint, full P&R/bitstream, and
+real-hardware bring-up for `WEIGHT_DDR_BACKED=1` (mirroring the KV-cache
+half's full real-hardware treatment from the earlier section) -- next
+step. The `gdone` width fix should be synth-neutral (pure bookkeeping
+register, no MAC-path timing impact) but that claim itself needs the same
+"prove it before trusting it" treatment as everything else in this repo.

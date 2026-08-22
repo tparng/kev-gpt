@@ -55,7 +55,20 @@ module sequencer_vec #(
     // the kv_wr_*/kv_rd_* DMA ports below instead of on-chip BRAM. The two
     // are mutually exclusive at elaboration time (generate), not a runtime
     // mux -- KV260's build never even sees kv_bank_ddr's logic.
-    parameter               KV_DDR_BACKED = 0
+    parameter               KV_DDR_BACKED = 0,
+    // DDR3-backed weight-window loader (PORT-NOTES.md "weight_loader_ddr
+    // wired to top level"): 0 (default) leaves every existing build
+    // byte-for-byte untouched -- wld_* outputs tied idle, gemv_banked_
+    // resident_vec's boot-load port driven ONLY by the existing firmware
+    // wl_rst/wl_we/wl_data path, exactly as today. 1 additionally
+    // instantiates weight_loader_ddr.sv, ORing its wb_ld_rst/wb_w_we/
+    // wb_w_data into that SAME boot-load port alongside wl_rst/wl_we/
+    // wl_data -- additive, not a generate-selected replacement like
+    // KV_DDR_BACKED, since firmware's boot-time stream and the DMA
+    // reloader are both valid sources of the same port at different
+    // times (never driven together; that's a firmware-sequencing
+    // invariant, not enforced in hardware here).
+    parameter               WEIGHT_DDR_BACKED = 0
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -100,7 +113,24 @@ module sequencer_vec #(
     output wire [28:0]          kv_rd_req_addr,
     input  wire                 kv_rd_ret_valid,
     output wire                 kv_rd_ret_ready,
-    input  wire [255:0]         kv_rd_ret_data
+    input  wire [255:0]         kv_rd_ret_data,
+
+    // ---- DDR-backed weight-window loader control + DMA ports
+    // (WEIGHT_DDR_BACKED=1 only; idle-tied when 0). Control ports mirror
+    // weight_loader_ddr.sv's own ld_start/ld_ddr_addr/ld_words/ld_done
+    // (firmware-triggered, one window per pulse); DMA ports are named to
+    // match fabric/genesys2/rtl/kevgpt_ddr_bundle.sv's existing wl_rd_*
+    // pass-through ports for direct top-level wiring. -----------------------
+    input  wire                 wld_ld_start,
+    input  wire [28:0]          wld_ld_ddr_addr,
+    input  wire [31:0]          wld_ld_words,
+    output wire                 wld_ld_done,
+    output wire                 wl_rd_req_valid,
+    input  wire                 wl_rd_req_ready,
+    output wire [28:0]          wl_rd_req_addr,
+    input  wire                 wl_rd_ret_valid,
+    output wire                 wl_rd_ret_ready,
+    input  wire [255:0]         wl_rd_ret_data
 );
     localparam integer ROWS  = D    / P;
     localparam integer ROWS3 = D3   / P;
@@ -251,14 +281,54 @@ module sequencer_vec #(
     reg [10:0]         gv_m, gv_k;
     reg [$clog2(WWORDS)-1:0] gv_wbase;
     wire               gv_done;
-    wire [3:0]         gv_gdone;           // committed-group count (RB overlap)
+    // committed-group count (RB overlap) -- width MUST match gemv_banked_
+    // resident_vec's own derived GDONE_W (ceil(MMAX/LANES) groups, MMAX=1024
+    // fixed at the u_gemv instantiation below) or the port connection
+    // silently truncates. A hardcoded [3:0] here deadlocked G_RB for any
+    // GEMV needing >=16 groups (D_MLP=1024 at LANES=64 needs exactly 16) --
+    // see gdone's own comment in gemv_banked_resident_vec.sv.
+    localparam integer GEMV_MMAX    = 1024;
+    localparam integer GEMV_GROUPS  = (GEMV_MMAX + LANES - 1) / LANES;
+    localparam integer GDONE_W      = $clog2(GEMV_GROUPS + 1);
+    wire [GDONE_W-1:0] gv_gdone;
     reg [10:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
     wire [LANES*8-1:0] emb_pair;            // pair-read data (RPP embed rows)
+    // ---- optional DDR-backed weight-window loader (WEIGHT_DDR_BACKED=1
+    // only) -- see the parameter's own comment above. Additive: ORs onto
+    // the SAME boot-load port firmware's wl_rst/wl_we/wl_data already
+    // drives, never a generate-selected replacement (unlike kv_bank vs.
+    // kv_bank_ddr), since both are valid sources at different times.
+    wire        wld_ldb_rst, wld_ldb_we;
+    wire [31:0] wld_ldb_data;
+    generate
+    if (WEIGHT_DDR_BACKED) begin : g_wld
+        weight_loader_ddr #(.ADDR_W(29), .DATA_W(256)) u_wld (
+            .clk(clk), .rst(rst),
+            .ld_start(wld_ld_start), .ld_ddr_addr(wld_ld_ddr_addr),
+            .ld_words(wld_ld_words), .ld_done(wld_ld_done),
+            .wb_ld_rst(wld_ldb_rst), .wb_w_we(wld_ldb_we), .wb_w_data(wld_ldb_data),
+            .rd_req_valid(wl_rd_req_valid), .rd_req_ready(wl_rd_req_ready),
+            .rd_req_addr(wl_rd_req_addr),
+            .rd_ret_valid(wl_rd_ret_valid), .rd_ret_ready(wl_rd_ret_ready),
+            .rd_ret_data(wl_rd_ret_data));
+    end else begin : g_wld_off
+        assign wld_ldb_rst     = 1'b0;
+        assign wld_ldb_we      = 1'b0;
+        assign wld_ldb_data    = 32'd0;
+        assign wld_ld_done     = 1'b0;
+        assign wl_rd_req_valid = 1'b0;
+        assign wl_rd_req_addr  = 29'd0;
+        assign wl_rd_ret_ready = 1'b1;
+    end
+    endgenerate
+
     gemv_banked_resident_vec #(.LANES(LANES), .P(P), .MMAX(1024), .KMAX(1024), .RLAT(2),
                   .WWORDS(WWORDS), .K2(1), .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_gemv (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
-        .ld_rst(gv_ldrst | wl_rst), .w_we(wl_we), .w_data(wl_data),
+        .ld_rst(gv_ldrst | wl_rst | wld_ldb_rst),
+        .w_we(wl_we | wld_ldb_we),
+        .w_data(wl_we ? wl_data : wld_ldb_data),
         .x_we(gv_xwe), .x_data(gv_xdata),
         .start(gv_start), .done(gv_done), .gdone(gv_gdone),
         .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),

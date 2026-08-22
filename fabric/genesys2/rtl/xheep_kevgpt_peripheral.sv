@@ -15,12 +15,27 @@
 //
 // Register map (addr[7:2], the same 6-bit word index the AXI shell used):
 //  0x00 CTRL (b0 go, b1 wl_rst, b2 soft_reset, b4:3 dbg_stop)
-//  0x04 STATUS (b0 done, b1 busy)
+//  0x04 STATUS (b0 done, b1 busy, b2 wld_done -- see below)
 //  0x08 TOK_ID   0x0C POS    0x10 W_DATA (wl_we) 0x14 RD_SEL  0x18 RD_ADDR
 //  0x1C RD_DATA_LO   0x20 RD_DATA_HI   0x24 TOK_OUT   0x28 CYCLES   0x2C IDCODE
 //  0x30 SEED (write-only): nonzero => load xorshift state + enable on-chip
 //       Gumbel-max sampling (persists across GOs); 0/never-written => greedy
 //       argmax (bit-exact) -- identical semantics to the AXI shell.
+//
+// 0x00-0x30 above match gemv_axi_seq_vec.v's own map exactly (KV260 parity,
+// unmodified). Registers below 0x34 are Genesys2/DDR-only (WEIGHT_DDR_BACKED,
+// no KV260 equivalent), added rather than reusing CTRL bits so that parity
+// statement stays true:
+//  0x34 WLD_ADDR  (write-only): wld_ld_ddr_addr[28:0], DDR3 byte address
+//       (beat-aligned) of the weight window to stream, sampled on the SAME
+//       write that would follow -- write this and WLD_WORDS before WLD_CTRL.
+//  0x38 WLD_WORDS (write-only): wld_ld_words[31:0], 32-bit chunks to stream
+//       (must be a multiple of 8 -- weight_loader_ddr.sv's own DATA_W/32).
+//  0x3C WLD_CTRL  (write-only, b0 wld_ld_start): pulses weight_loader_ddr's
+//       ld_start, same one-cycle-pulse semantics as CTRL's go/wl_rst above.
+//       STATUS.b2 (wld_done) latches high when the load completes, clearing
+//       on the next WLD_CTRL write (mirrors STATUS.b0's done_latched vs.
+//       go_pulse clearing behaviour) or on soft_reset/rst_ni.
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
@@ -77,6 +92,12 @@ module xheep_kevgpt_peripheral #(
     // through to sequencer_vec's own KV_DDR_BACKED=1 path; see that
     // parameter's comment in sequencer_vec.sv for the full picture.
     parameter               KV_DDR_BACKED = 0,
+    // DDR3-backed weight-window loader (PORT-NOTES.md "weight_loader_ddr
+    // wired to top level") -- 0 (default) leaves this peripheral's existing
+    // build untouched (WLD_* registers still exist but drive an idle
+    // sequencer_vec.wld_* port set). 1 threads them through to sequencer_vec's
+    // own WEIGHT_DDR_BACKED=1 path; see that parameter's comment.
+    parameter               WEIGHT_DDR_BACKED = 0,
     parameter type reg_req_t = reg_pkg::reg_req_t,
     parameter type reg_rsp_t = reg_pkg::reg_rsp_t
 ) (
@@ -101,7 +122,19 @@ module xheep_kevgpt_peripheral #(
     output logic [28:0]          kv_rd_req_addr,
     input  logic                 kv_rd_ret_valid,
     output logic                 kv_rd_ret_ready,
-    input  logic [255:0]         kv_rd_ret_data
+    input  logic [255:0]         kv_rd_ret_data,
+
+    // ---- DDR-backed weight-window loader DMA ports (WEIGHT_DDR_BACKED=1
+    // only; idle-tied by sequencer_vec itself when 0) -- wire straight to a
+    // kevgpt_ddr_bundle.sv instance's wl_rd_req_*/wl_rd_ret_* ports at the
+    // top level (its CDC-facing side, once that port grows real CDC -- see
+    // kevgpt_ddr_bundle.sv's own header note). ------------------------------
+    output logic                 wl_rd_req_valid,
+    input  logic                 wl_rd_req_ready,
+    output logic [28:0]          wl_rd_req_addr,
+    input  logic                 wl_rd_ret_valid,
+    output logic                 wl_rd_ret_ready,
+    input  logic [255:0]         wl_rd_ret_data
 );
     wire clk = clk_i;
     wire [5:0] windex = reg_req_i.addr[7:2];
@@ -114,6 +147,9 @@ module xheep_kevgpt_peripheral #(
     reg [10:0]   rd_addr;
     reg [31:0]   seed;
     reg          seed_we;
+    reg          wld_ld_start_r;
+    reg [28:0]   wld_ld_ddr_addr_r;
+    reg [31:0]   wld_ld_words_r;
 
     // ---- write side: one register-file update per accepted write request ----
     // (matches the AXI shell's pulse semantics for go/wl_we/seed_we -- each is
@@ -124,8 +160,9 @@ module xheep_kevgpt_peripheral #(
             go_pulse<=0; wl_rst<=0; soft_reset<=0; wl_we<=0; wl_data<=0;
             tok_id<=0; pos<=0; rd_sel<=0; rd_addr<=0; dbg_stop<=0;
             seed<=0; seed_we<=0;
+            wld_ld_start_r<=0; wld_ld_ddr_addr_r<=0; wld_ld_words_r<=0;
         end else if (reg_req_i.valid && reg_req_i.write) begin
-            go_pulse<=0; wl_rst<=0; wl_we<=0; seed_we<=0;   // 1-cycle pulses default low
+            go_pulse<=0; wl_rst<=0; wl_we<=0; seed_we<=0; wld_ld_start_r<=0;   // 1-cycle pulses default low
             case (windex)
                 6'h0: begin go_pulse<=reg_req_i.wdata[0]; wl_rst<=reg_req_i.wdata[1];
                             soft_reset<=reg_req_i.wdata[2]; dbg_stop<=reg_req_i.wdata[4:3]; end
@@ -135,18 +172,30 @@ module xheep_kevgpt_peripheral #(
                 6'h5: rd_sel  <= reg_req_i.wdata[3:0];
                 6'h6: rd_addr <= reg_req_i.wdata[10:0];
                 6'hC: begin seed <= reg_req_i.wdata; seed_we <= 1'b1; end   // 0x30 SEED
+                6'hD: wld_ld_ddr_addr_r <= reg_req_i.wdata[28:0];          // 0x34 WLD_ADDR
+                6'hE: wld_ld_words_r    <= reg_req_i.wdata;                // 0x38 WLD_WORDS
+                6'hF: wld_ld_start_r    <= reg_req_i.wdata[0];             // 0x3C WLD_CTRL
                 default: ;
             endcase
         end else begin
-            go_pulse<=0; wl_rst<=0; wl_we<=0; seed_we<=0;
+            go_pulse<=0; wl_rst<=0; wl_we<=0; seed_we<=0; wld_ld_start_r<=0;
         end
+    end
+
+    // wld_done latches on weight_loader_ddr's ld_done pulse, clears on the
+    // NEXT WLD_CTRL write (mirrors done_latched vs. go_pulse below) or reset.
+    reg wld_done_latched;
+    always @(posedge clk) begin
+        if (core_rst) wld_done_latched <= 1'b0;
+        else if (wld_ld_start_r) wld_done_latched <= 1'b0;
+        else if (core_wld_done) wld_done_latched <= 1'b1;
     end
 
     // ---- read side: combinational mux, same word map as the AXI shell ----
     reg [31:0] rdata_mux;
     always @(*) begin
         case (windex)
-            6'h1: rdata_mux = {30'b0, core_busy, done_latched};
+            6'h1: rdata_mux = {29'b0, wld_done_latched, core_busy, done_latched};
             6'h7: rdata_mux = core_rd_data[31:0];
             6'h8: rdata_mux = core_rd_data[63:32];
             6'h9: rdata_mux = {23'b0, core_tok_out};
@@ -165,6 +214,7 @@ module xheep_kevgpt_peripheral #(
     // ---- the unmodified sequencer core + its run/cycle-count bookkeeping,
     //      identical to gemv_axi_seq_vec.v ----
     wire               core_done_w;
+    wire               core_wld_done;
     wire [8:0]         core_tok_out;
     wire signed [63:0] core_rd_data;
     reg                core_busy, done_latched;
@@ -182,7 +232,8 @@ module xheep_kevgpt_peripheral #(
 
     sequencer_vec #(.P(P), .LANES(LANES), .D(D), .D3(D3), .D_MLP(D_MLP), .NHEAD(NHEAD),
                      .VOCAB(VOCAB), .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX),
-                     .MEM_PRIMITIVE(MEM_PRIMITIVE), .KV_DDR_BACKED(KV_DDR_BACKED)) u_seq (
+                     .MEM_PRIMITIVE(MEM_PRIMITIVE), .KV_DDR_BACKED(KV_DDR_BACKED),
+                     .WEIGHT_DDR_BACKED(WEIGHT_DDR_BACKED)) u_seq (
         .clk(clk), .rst(core_rst), .go(go_pulse),
         .tok_id(tok_id), .pos(pos), .done(core_done_w), .tok_out(core_tok_out),
         .rd_sel(rd_sel), .rd_addr(rd_addr), .rd_data(core_rd_data),
@@ -192,6 +243,10 @@ module xheep_kevgpt_peripheral #(
         .kv_wr_pkt_addr(kv_wr_pkt_addr), .kv_wr_pkt_data(kv_wr_pkt_data), .kv_wr_pkt_mask(kv_wr_pkt_mask),
         .kv_wr_ack_valid(kv_wr_ack_valid), .kv_wr_ack_ready(kv_wr_ack_ready),
         .kv_rd_req_valid(kv_rd_req_valid), .kv_rd_req_ready(kv_rd_req_ready), .kv_rd_req_addr(kv_rd_req_addr),
-        .kv_rd_ret_valid(kv_rd_ret_valid), .kv_rd_ret_ready(kv_rd_ret_ready), .kv_rd_ret_data(kv_rd_ret_data)
+        .kv_rd_ret_valid(kv_rd_ret_valid), .kv_rd_ret_ready(kv_rd_ret_ready), .kv_rd_ret_data(kv_rd_ret_data),
+        .wld_ld_start(wld_ld_start_r), .wld_ld_ddr_addr(wld_ld_ddr_addr_r),
+        .wld_ld_words(wld_ld_words_r), .wld_ld_done(core_wld_done),
+        .wl_rd_req_valid(wl_rd_req_valid), .wl_rd_req_ready(wl_rd_req_ready), .wl_rd_req_addr(wl_rd_req_addr),
+        .wl_rd_ret_valid(wl_rd_ret_valid), .wl_rd_ret_ready(wl_rd_ret_ready), .wl_rd_ret_data(wl_rd_ret_data)
     );
 endmodule

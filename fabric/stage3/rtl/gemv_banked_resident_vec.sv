@@ -23,6 +23,10 @@ module gemv_banked_resident_vec #(
     parameter integer P      = 8,         // boundary width (P divides LANES, KMAX, MMAX)
     parameter integer MMAX   = 1024,      // max output rows of any single layer
     parameter integer KMAX   = 1024,      // max reduction length of any single layer
+    // width of gdone (below): must hold 0..GROUPS inclusive (GROUPS=ceil(MMAX/
+    // LANES)) -- see gdone's own comment. Derived, not hardcoded, so it scales
+    // automatically with whatever MMAX/LANES a caller instantiates.
+    parameter integer GDONE_W = $clog2((MMAX + LANES - 1) / LANES + 1),
     parameter integer WWORDS = 25600,     // resident capacity in wide words
     parameter integer RLAT   = 2,         // read->mac pipeline depth (cycles)
     parameter integer K2     = 0,         // doc-7 R3: 2 K-steps/cycle via the URAM's
@@ -51,8 +55,16 @@ module gemv_banked_resident_vec #(
     output reg                           done,
     // committed-group count (groupwise RB overlap): increments the cycle group
     // g's ymem word commits, so the host may drain rows of groups < gdone while
-    // the MAC computes the next group. Reset on start.
-    output reg  [3:0]                    gdone,
+    // the MAC computes the next group. Reset on start. Width is GDONE_W (below,
+    // derived from GROUPS=ceil(MMAX/LANES)) -- a hardcoded 4 bits (max 15) here
+    // silently wrapped and deadlocked the consumer's row-issue gate (sequencer_
+    // vec.sv's G_RB, "ci>>GRPSH < gv_gdone") for any single GEMV call needing
+    // >=16 groups (e.g. D_MLP=1024 at LANES=64 needs exactly 16) -- found via a
+    // real hang while gating weight_loader_ddr against a larger candidate
+    // checkpoint; never triggered by the KV260 deployment (LANES=128, <=8
+    // groups) or Genesys2 Option A's real shape (D_MLP=512, <=8 groups at
+    // LANES=64) -- see fabric/genesys2/PORT-NOTES.md.
+    output reg  [GDONE_W-1:0]            gdone,
     // readback: P INT32 outputs per address (2-cycle latency)
     input  wire [$clog2(MMAX/P)-1:0]     rd_addr,
     output reg  [P*32-1:0]               y_out,
@@ -208,7 +220,7 @@ module gemv_banked_resident_vec #(
         end
 
         if (rst) begin
-            state <= IDLE; done <= 1'b0; gdone <= 4'd0;
+            state <= IDLE; done <= 1'b0; gdone <= {GDONE_W{1'b0}};
             g <= 0; kc <= 0; kmac <= 0; accb <= {YBITS{1'b0}}; grp_base <= 0;
             for (i = 0; i < RLAT; i = i + 1) begin v_p[i] <= 1'b0; v2_p[i] <= 1'b0; end
             add_v <= 1'b0; add_v2 <= 1'b0;
@@ -218,7 +230,7 @@ module gemv_banked_resident_vec #(
                     done <= 1'b0;
                     if (start) begin
                         g <= 0; kc <= 0; kmac <= 0; accb <= {YBITS{1'b0}};
-                        gdone <= 4'd0;
+                        gdone <= {GDONE_W{1'b0}};
                         grp_base <= w_base;
                         for (i = 0; i < RLAT; i = i + 1) begin
                             v_p[i] <= 1'b0; v2_p[i] <= 1'b0;
@@ -241,7 +253,7 @@ module gemv_banked_resident_vec #(
                     end
                     if (kmac == k_count) begin
                         ymem[g[$clog2(GROUPS)-1:0]] <= accb;
-                        gdone <= gdone + 4'd1;
+                        gdone <= gdone + 1'b1;
                         if (g == gcount - 1) state <= FIN;
                         else begin
                             g <= g + 1'b1; kc <= 0; kmac <= 0;
