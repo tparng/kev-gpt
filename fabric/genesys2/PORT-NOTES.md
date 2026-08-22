@@ -1949,3 +1949,148 @@ rigor exactly. Both halves of Phase 2 (`KV_DDR_BACKED`, `WEIGHT_DDR_BACKED`)
 are now gated in isolation, gated at full-sequencer scale, gated through
 the arbiter stack with genuine dual-clock CDC, synthesized, placed & routed
 with positive margin, and proven bit-exact on real hardware.
+
+## Phase 4 -- model-size sizing, anchored by real synth numbers
+
+Two exploratory synth-only checkpoints (NOT deployed -- the wrapper was
+restored to Option A's real, hardware-proven values,
+`D=128/D3=384/D_MLP=512/NHEAD=2/NLAYER=2/WWORDS=16384`, immediately after
+each check; confirmed via `git status` showing no diff before moving on).
+`.mem` ROM content for both checks reused this session's D=256/NLAYER=4/
+VOCAB=57 files (correct for the FIRST check's shape; mismatched, but
+harmless, for sizing-only purposes on the SECOND -- resource footprint is
+fixed by RTL parameters, not by `$readmemh` file content, confirmed by
+`DQ_N`/`DQROWS` already being checkpoint-independent throughout this whole
+port).
+
+**Key open question going in**: today's `WEIGHT_DDR_BACKED=1` synth
+checkpoint showed DSP already at 95.60% (803/840) at Option A's tiny
+current shape (`D=128/NLAYER=2`) -- if DSP scales with model width or head
+count at all, there'd be almost no room to grow before hitting a hard DSP
+ceiling, independent of anything the DDR-streaming redesign unlocks on the
+BRAM side.
+
+**Traced the RTL first, before spending synthesis time**: `vec_attn_w.sv`'s
+per-position dot-product/context-accumulate multiplier arrays are
+`HEAD_DIM`-wide (`for (l = 0; l < HEAD_DIM; l = l+1) ... $signed(q_l) *
+$signed(k_l)`) -- HEAD_DIM is pinned at sequencer_vec's own default (64)
+regardless of D/NHEAD (the single serial attention engine iterates over
+NHEAD heads in more CYCLES, not more hardware -- see the earlier
+"SINGLE vec_attn_w engine" collapse in this file). `layernorm_vec.sv`'s own
+multiplier arrays are `P`-wide (fixed P=8) or fully scalar (mean/var/rsqrt
+Newton iteration operate on a single accumulated value, not per-D). Neither
+block's DSP footprint should depend on D, NHEAD, NLAYER, VOCAB, or TMAX at
+all -- only on the pinned P=8/HEAD_DIM=64 pipeline widths. This is the
+whole point of the P-wide/serial-attention-engine architecture: bigger
+models cost more CYCLES, not more DSP hardware.
+
+**Exploratory check 1 -- D=256/D3=768/D_MLP=1024/NHEAD=4/NLAYER=4/VOCAB=57**
+(this session's own checkpoint shape, already bit-exact gated in Icarus at
+BOTH `KV_DDR_BACKED=1` and `WEIGHT_DDR_BACKED=1` separately). `WWORDS=65536`
+(real analytic need ~59,424 wide words at this shape/LANES=64/P=8).
+**Result: clean synth, 0 errors. DSP = 803/840 (95.60%) -- byte-for-byte
+IDENTICAL to Option A's tiny shape**, confirming the RTL-tracing hypothesis
+directly: DSP really is a fixed architectural cost, invariant to model
+size, at least across this 2x-D/2x-NLAYER/2x-NHEAD jump. LUT also stayed
+close (106089->99567 range across these runs). **BRAM overflowed**: 551
+RAMB36+4 RAMB18 vs. the device's 445 RAMB36 budget (124%) -- `weight_bank_
+tdp` alone (`u_wb`) took 512 RAMB36 (exactly 4x Option A's 128, matching
+the 4x `WWORDS` bump 16384->65536 linearly) -- full weight residency (the
+ONLY mode actually built today; per-layer weight-WINDOW streaming remains
+future work) is the real ceiling for this candidate, not DSP, not the
+(now BRAM-flat) KV cache.
+
+**A real build-system finding along the way**: tried `WWORDS=40960`
+(≈1.27x headroom over a smaller D=192 candidate's real ~32,284-word need)
+expecting `weight_bank_tdp`'s BRAM to shrink proportionally -- it measured
+**byte-for-byte identical** to the `WWORDS=65536` run (still 512 RAMB36),
+even after a full project regeneration (`rm -rf` the whole FuseSoC build
+dir and `make vivado-fpga-nobuild` from scratch -- ruling out a Vivado
+project-cache explanation directly, not assumed). Root cause: `weight_bank_
+tdp`'s `MEM_PRIMITIVE="block"` synthesis branch infers an `xpm_memory_
+tdpram`, and Vivado's own BRAM-cascade packer appears to round the
+DEPTH-cascade up to the next POWER-OF-2 tile-cascade bucket (`WWORDS` in
+`(16384, 32768]` and `(32768, 65536]` both land in the SAME 128-deep-tile-
+cascade bucket, hence the same 512-RAMB36 footprint) -- confirmed
+definitively by then trying `WWORDS=32768` (the exact boundary), which DID
+drop to exactly **256 RAMB36** (half), matching the "one bucket down"
+prediction precisely. **Actionable finding for any future WWORDS choice**:
+size to the boundary AT OR BELOW the real need, not just "some headroom
+over the real need" -- an oversized-but-still-under-the-next-power-of-2
+WWORDS costs nothing extra; crossing a power-of-2 boundary costs a full
+doubling for no reason.
+
+**Exploratory check 2 -- D=192/D3=576/D_MLP=768/NHEAD=3/NLAYER=4/VOCAB=57**,
+`WWORDS=32768` (real analytic need ~32,284 -- see the wide-word-count
+formula below). **Result: clean synth, 0 errors, and it FITS**:
+```
+LUT:  99825/203800 = 48.98%
+FF:   55589/407600 = 13.64%
+BRAM: 381/445 (Block RAM Tile, Vivado's own normalized count) = 85.62%
+DSP:  803/840 = 95.60%  <- byte-for-byte unchanged from Option A, again
+```
+`u_wb` (weight_bank_tdp) = 256 RAMB36 (confirms the power-of-2-bucket
+finding above); `g_kvb_ddr.u_kvb` (kv_bank_ddr) = 9 RAMB36+1 RAMB18,
+**unchanged from Option A's NLAYER=2 shape despite NLAYER doubling to 4**
+-- direct empirical confirmation that `kv_bank_ddr`'s BRAM cost really is
+flat/shape-independent (it holds only the fixed `inv_lut_lo`/`inv_lut_hi`
+scale-inverse ROMs, not per-position K/V data, which now lives in DDR3).
+Every fixed-baseline block (`(u_seq)` own scratch buffers, `u_attnA`,
+`u_gelu`, `u_gemv` own logic, `u_ln`) matched Option A's ORIGINAL numbers
+almost exactly once BRAM pressure dropped back under 100% -- the mild
+LUTRAM-vs-BRAM packing swings observed in the two OVER-budget runs (an
+earlier "+10 RAMB36 shift" noted without explanation in the synth-only-
+checkpoint section above) are best explained by Vivado's own memory-
+inference heuristic opportunistically favoring LUTRAM for small/borderline
+scratch buffers when overall BRAM pressure is already critical -- not a
+real per-block resource change, and it goes away once the design fits
+comfortably.
+
+**Word-count formula** (matching `sequencer_vec.sv`'s own `GW_QKV/GW_PROJ/
+GW_FC/GW_MP/GW_HEAD/EMB_TOK*/EMB_POS*` localparams, verified against this
+session's own empirical `wrom_n` counts within ~7%, good enough for
+first-pass sizing): per layer, `GW_BLK = ceil(D3/LANES)*D + ceil(D/LANES)*D
++ ceil(D_MLP/LANES)*D + ceil(D/LANES)*D_MLP` (D3=3D, D_MLP=4D by this
+project's convention); total `= GW_BLK*NLAYER + ceil(VOCAB/LANES)*D +
+VOCAB*(D/P) + TMAX*(D/P)` (the last two terms are the tok/pos embed tables
+appended into the same wrom image, only when `LANES>=8*P` -- see the
+`LANES>=8*P` embed finding earlier in this file).
+
+**Conclusion**: with the KV cache genuinely BRAM-flat (`kv_bank_ddr`) and
+DSP genuinely model-size-invariant (confirmed twice, empirically, not just
+by RTL inspection), the SOLE real constraint for a fully-weight-resident
+build today is `weight_bank_tdp`'s linear-in-WWORDS (power-of-2-bucketed)
+BRAM cost. **D=192/NHEAD=3/NLAYER=4/VOCAB=57 -- roughly 2x Option A's
+depth (NLAYER) and 1.5x its width (D), a substantially more capable model
+-- synthesizes cleanly with real margin on every resource** (BRAM 85.62%,
+LUT 48.98%, DSP 95.60% unchanged). Context length (TMAX) is free to grow
+independently (it costs zero BRAM now, only DDR3 footprint + per-position
+DMA latency) since it was decoupled from BRAM entirely by `kv_bank_ddr`.
+
+**Cycle budget**: not separately re-measured for this exact candidate, but
+strongly bounded by two already-real data points: (1) this session's
+D=256/NLAYER=4/NHEAD=4 shape (bigger in every dimension than this
+candidate) measured **~27,940-28,132 cycles/pass** in the Icarus gate
+(`tb_seq_vec_kv_wld.sv`/`tb_seq_vec_kv_ddr.sv`, LANES=64) -- both comfortably
+under 3% of the 1,000,000-cycle/token budget the 50 tok/s target allows;
+(2) real hardware measured Option A's own D=128/NLAYER=2 shape at
+~4,587-8,359 cycles/pass. A D=192/NLAYER=4 candidate should land well
+within these two bounds. Cycle budget is NOT the binding constraint at
+this shape -- BRAM (specifically, full weight residency) is, exactly as
+this whole Phase 4 investigation set out to determine.
+
+**Not yet done / explicit next steps, not started this session**:
+1. Train (or re-export, if a suitable checkpoint already exists) a real
+   D=192/D3=576/D_MLP=768/NHEAD=3/NLAYER=4/VOCAB=57 checkpoint -- everything
+   above used either this session's own D=256/NLAYER=4 checkpoint (for
+   functional/cycle numbers) or mismatched/synthetic `.mem` content
+   (synth-only checks 1 and 2, resource-footprint-only, not functionally
+   meaningful) -- neither is a trained model at the ACTUAL recommended
+   shape.
+2. Gate that real checkpoint bit-exact via `fabric.stage3.run_vec_kv` (at
+   `LANES=64`, never `LANES=16` -- see the earlier `LANES>=8*P` finding)
+   before spending any more Vivado time on it.
+3. Full P&R/bitstream/real-hardware bring-up at this shape, matching every
+   other piece of this port's own "bit-honest before fast" discipline --
+   not done, since this session's two checks were synth-only sizing
+   exploration, not a deployment candidate build.
