@@ -1804,3 +1804,53 @@ closes under real constraints or that a bitstream programs and runs
 correctly on the physical board. Full P&R/bitstream/real-hardware bring-up
 for `WEIGHT_DDR_BACKED=1` remains the next step, mirroring the KV-cache
 half's earlier treatment.
+
+### Full place & route, timing closure, and bitstream for WEIGHT_DDR_BACKED=1 (DONE, clean)
+
+Ran `make` (the default `all: post_build` target, full synth+impl+bitgen)
+from inside the same regenerated project directory, reusing the ROM `.mem`
+files already placed for the synth-only checkpoint above -- no project
+regeneration needed this time (project state, including the placed `.mem`
+files, survives between `make synth` and `make`). Implementation run took
+18m11s.
+
+**Result: clean, zero errors throughout.** `0 Errors` at every DRC
+checkpoint (placement DRC, route DRC, final bitstream-precondition DRC --
+`0 Errors, 1473 Warnings`, all the same class of pre-existing DSP-pipelining/
+methodology advisories already seen at the synth stage, none new). `Bitgen
+Completed Successfully`; `xilinx_core_v_mini_mcu_wrapper_kevgpt.bit`
+written (11.4MB).
+
+**Timing closes cleanly and positively across the whole design** (the
+final, signed-off `report_timing_summary` against the routed design, not
+just the router's own estimate):
+
+```
+WNS(ns)=1.672   TNS(ns)=0.000   TNS failing endpoints: 0 / 2124
+WHS(ns)=0.092   THS(ns)=0.000   THS failing endpoints: 0 / 1980
+WPWS(ns)=4.600  TPWS(ns)=0.000  TPWS failing endpoints: 0 / 1111
+"All user specified timing constraints are met."
+```
+
+Positive margin on setup (WNS), hold (WHS), AND pulse-width (WPWS) checks,
+zero failing endpoints on any of them -- this covers the new CDC paths
+(`kevgpt_ddr_bundle`'s two additional `async_fifo_gray` instances for
+`weight_loader_ddr`'s req/ret port) as part of the real, whole-design
+static timing analysis, not a partial/optimistic estimate. Margin is
+somewhat tighter than the KV-cache-only checkpoint's own bring-up
+(WNS=2.474ns/WHS=0.086ns there vs. 1.672ns/0.092ns here) but both are
+comfortably positive with zero violations -- expected, since this build
+adds real logic (the CDC pair, the new registers) without changing the
+clock structure.
+
+**Not yet done**: real-hardware bring-up -- JTAG-programming this
+bitstream and confirming `WEIGHT_DDR_BACKED=1` actually reloads a weight
+window through the DMA path correctly on physical silicon (mirroring the
+KV-cache half's own real-hardware confirmation earlier). The bitstream
+exists and is ready for that step; the `.mem` files used to build it
+reflect this session's checkpoint (`D=256/NLAYER=4/VOCAB=57`, not the
+wrapper's own hardcoded Option A parameters `D=128/NLAYER=2` -- flagged
+already at the synth-only checkpoint above) -- a real board run to confirm
+bit-exact generation would need either regenerating this bitstream against
+Option-A-shaped `.mem` content, or a checkpoint retrained at that exact
+shape, same caveat as before.
