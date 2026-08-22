@@ -1435,3 +1435,102 @@ Next: Phase 3 (firmware-driven weight staging into DDR3, so
 and Phase 4 (final model-size selection), now with a real, measured
 per-shape BRAM number for the DDR-backed KV cache to calibrate against
 instead of an estimate.
+
+## Full place & route, timing closure, bitstream, and real board bring-up (DONE, bit-exact)
+
+Went all the way: full `make` (synth+impl+bitgen, not just the synth-only
+checkpoint above), JTAG programming, and a real `kevgpt_chat` run against
+the DDR-backed KV cache on physical silicon.
+
+**Timing closure**: clean, positive margin on every path group.
+`WNS=2.474ns, TNS=0.000, 0 failing endpoints (of 2124)`;
+`WHS=0.086ns, THS=0.000, 0 failing endpoints (of 1980)`. Per-clock: `jtag_clk_pin`
+WNS=4.622ns, `spi_slave_clk_pin` WNS=2.474ns -- both positive. This is real
+static timing analysis covering the new CDC paths (`kevgpt_ddr_bundle`'s
+`async_fifo_gray` instances) along with everything else -- a clean WNS here
+is real evidence the gray-code synchronizer chains are correctly
+constrained (an existing project-wide XDC already covers `async_fifo_gray`
+generically, since `cpu_ddr_bridge.sv` already relies on the same primitive
+for its own, pre-existing CDC boundary), not just an absence of errors.
+`write_bitstream` completed successfully: 0 Errors, 356 Warnings, 0 Critical
+Warnings. The many `REQP-1839` "RAMB36 async control check" warnings are the
+expected, benign signature of async-reset gray-code CDC synchronizers
+feeding BRAM address pins -- standard, accepted CDC design, not a real
+finding (STA doesn't model async reset assertion timing by design; that's
+what the false-path/max-delay constraints on those same paths are for).
+
+**Board bring-up procedure** (same process-hygiene discipline as earlier
+sessions -- stale watcher processes from a PRIOR session were still holding
+both the JTAG cable and the UART port; had to `kill -9` an openocd PID that
+survived a first, non-forceful `pkill` before OpenOCD could open the FTDI
+device at all): programmed via `vivado -source *_pgm.tcl -tclargs
+xc7k325tffg900-2 <bitstream>.bit` (FuseSoC's own `vivado-fpga-pgm` target
+hung silently with no error output for an unknown reason -- invoking the
+generated `_pgm.tcl` directly worked cleanly and is the more debuggable
+path anyway), confirmed OpenOCD re-examines the RISC-V core cleanly on the
+freshly-programmed bitstream, started a fresh UART reader at 115200 baud
+(`UART_BAUDRATE` in `x-heep.h`), then loaded and ran the EXISTING
+`kevgpt_chat` firmware (`sw/build/main.elf`, unchanged since an earlier
+session -- the DDR-backed KV cache swap is entirely transparent to firmware,
+same register contract, so no rebuild was needed) via
+`riscv32-corev-elf-gdb ... -ex "target remote :3333" -ex "monitor reset
+halt" -ex load -ex continue -batch`.
+
+**Result: bit-exact.** Full UART trace:
+```
+KEVGPT_PHASE,control_plane
+KEVGPT_ID,0x53515256
+KEVGPT_PHASE,weight_load
+KEVGPT_WEIGHT_WORDS,73856
+KEVGPT_STATUS_PRE,0x00000000
+KEVGPT_PHASE,generate
+KEVGPT_PASS_CYCLES,pi=0,cyc=4587
+KEVGPT_PASS_CYCLES,pi=1,cyc=5050
+KEVGPT_PASS_CYCLES,pi=2,cyc=5550
+KEVGPT_PASS_CYCLES,pi=3,cyc=6011  GEN pos=3 tok=1
+KEVGPT_PASS_CYCLES,pi=4,cyc=6479  GEN pos=4 tok=29
+KEVGPT_PASS_CYCLES,pi=5,cyc=6924  GEN pos=5 tok=30
+KEVGPT_PASS_CYCLES,pi=6,cyc=7418  GEN pos=6 tok=34
+KEVGPT_PASS_CYCLES,pi=7,cyc=7873  GEN pos=7 tok=1
+KEVGPT_PASS_CYCLES,pi=8,cyc=8359  GEN pos=8 tok=40
+KEVGPT_CYCLES,58251
+KEVGPT_CMP,i=0,got=1,want=1    KEVGPT_CMP,i=1,got=29,want=29
+KEVGPT_CMP,i=2,got=30,want=30  KEVGPT_CMP,i=3,got=34,want=34
+KEVGPT_CMP,i=4,got=1,want=1    KEVGPT_CMP,i=5,got=40,want=40
+KEVGPT_PASS,generate
+```
+All 6 generated tokens exactly match `kevgpt_expected_gen` (the golden
+values `gen_chat_fw.py` baked into the firmware from the same
+`IntKVQSequencer.generate_greedy` reference this whole port has been graded
+against throughout) -- `STATUS_PRE=0x0` confirms a clean, non-stale reset
+(the freshly-programmed bitstream sidesteps `reset_config none`'s "soft
+reset doesn't clear done_latched" gotcha entirely, same fix as earlier
+sessions). This is the same discipline as the original Option A hardware
+bring-up (kv_bank.sv, resident) -- now repeated with `KV_DDR_BACKED=1`
+(kv_bank_ddr.sv, DDR3-streamed) and passing identically.
+
+**Real measured rate with the DDR-backed KV cache**: steady-state generation
+(the 6 passes producing a token) averages 7177.3 cycles/token -> at the
+confirmed 50MHz clock, **143.5us/token -> ~6,966 tok/s**. Compare to Option
+A's resident-KV-cache measurement from earlier this port (~11,930-11,985
+tok/s): DDR-backed KV costs roughly **1.7x** the resident design's per-token
+latency at this tiny scale (NLAYER=2/D=128/TMAX=128) -- a real, measured
+number, not a simulation estimate. Per-pass cycles grow with position
+(6011->8359 over positions 3->8), matching the expected shape: `rd_tcount`
+for a KV read scales with `pos+1`, so more DDR round-trips accumulate as
+context grows. At this small scale DDR latency is clearly NOT free, but it's
+also nowhere near the ~240x cycle-budget headroom the 50 tok/s target was
+built on (Phase 0) -- meaning a genuinely bigger model, where compute cost
+per layer grows much faster than KV traffic, should have this overhead
+comfortably hidden. Worth re-measuring once a larger candidate shape (Phase
+4) is actually built, not assumed to scale the same way.
+
+This closes out real-hardware verification for Phase 2's KV-cache half
+completely: gated in isolation (`tb_kv_bank_ddr.sv`), gated at full-sequencer
+scale in simulation (`tb_seq_vec_kv_ddr.sv`), gated through the complete
+arbiter stack including genuine dual-clock CDC (`tb_kevgpt_ddr_bundle.sv`),
+synthesized clean, placed and routed with positive timing margin, and now
+proven bit-exact on the real board. Next: Phase 3 (weight staging into
+DDR3) and Phase 4 (model-size selection) as above -- the weight-window half
+of Phase 2 has NOT yet had this same real-hardware treatment (it isn't wired
+into the top level yet, only gated in simulation).
