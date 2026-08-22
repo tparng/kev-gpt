@@ -71,13 +71,37 @@ module xheep_kevgpt_peripheral #(
     parameter integer TMAX   = 128,
     // Genesys2 has no URAM at all -- see weight_bank_tdp.sv/kv_bank.sv.
     parameter               MEM_PRIMITIVE = "block",
+    // DDR3-backed KV cache (fabric/genesys2/PORT-NOTES.md "Phase 2
+    // architecture") -- 0 (default) keeps this peripheral's existing,
+    // fully-resident build untouched. 1 threads kv_wr_*/kv_rd_* straight
+    // through to sequencer_vec's own KV_DDR_BACKED=1 path; see that
+    // parameter's comment in sequencer_vec.sv for the full picture.
+    parameter               KV_DDR_BACKED = 0,
     parameter type reg_req_t = reg_pkg::reg_req_t,
     parameter type reg_rsp_t = reg_pkg::reg_rsp_t
 ) (
     input  logic     clk_i,
     input  logic     rst_ni,
     input  reg_req_t reg_req_i,
-    output reg_rsp_t reg_rsp_o
+    output reg_rsp_t reg_rsp_o,
+
+    // ---- DDR-backed KV cache DMA ports (KV_DDR_BACKED=1 only; idle-tied by
+    // sequencer_vec itself when 0, see that module) -- wire straight to a
+    // fabric/genesys2/rtl/kevgpt_ddr_bundle.sv instance's kv_wr_*/kv_rd_*
+    // ports at the top level. ---------------------------------------------
+    output logic                 kv_wr_pkt_valid,
+    input  logic                 kv_wr_pkt_ready,
+    output logic [28:0]          kv_wr_pkt_addr,
+    output logic [255:0]         kv_wr_pkt_data,
+    output logic [31:0]          kv_wr_pkt_mask,
+    input  logic                 kv_wr_ack_valid,
+    output logic                 kv_wr_ack_ready,
+    output logic                 kv_rd_req_valid,
+    input  logic                 kv_rd_req_ready,
+    output logic [28:0]          kv_rd_req_addr,
+    input  logic                 kv_rd_ret_valid,
+    output logic                 kv_rd_ret_ready,
+    input  logic [255:0]         kv_rd_ret_data
 );
     wire clk = clk_i;
     wire [5:0] windex = reg_req_i.addr[7:2];
@@ -158,11 +182,16 @@ module xheep_kevgpt_peripheral #(
 
     sequencer_vec #(.P(P), .LANES(LANES), .D(D), .D3(D3), .D_MLP(D_MLP), .NHEAD(NHEAD),
                      .VOCAB(VOCAB), .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX),
-                     .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_seq (
+                     .MEM_PRIMITIVE(MEM_PRIMITIVE), .KV_DDR_BACKED(KV_DDR_BACKED)) u_seq (
         .clk(clk), .rst(core_rst), .go(go_pulse),
         .tok_id(tok_id), .pos(pos), .done(core_done_w), .tok_out(core_tok_out),
         .rd_sel(rd_sel), .rd_addr(rd_addr), .rd_data(core_rd_data),
         .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data), .dbg_stop(dbg_stop),
-        .seed(seed), .seed_we(seed_we)
+        .seed(seed), .seed_we(seed_we),
+        .kv_wr_pkt_valid(kv_wr_pkt_valid), .kv_wr_pkt_ready(kv_wr_pkt_ready),
+        .kv_wr_pkt_addr(kv_wr_pkt_addr), .kv_wr_pkt_data(kv_wr_pkt_data), .kv_wr_pkt_mask(kv_wr_pkt_mask),
+        .kv_wr_ack_valid(kv_wr_ack_valid), .kv_wr_ack_ready(kv_wr_ack_ready),
+        .kv_rd_req_valid(kv_rd_req_valid), .kv_rd_req_ready(kv_rd_req_ready), .kv_rd_req_addr(kv_rd_req_addr),
+        .kv_rd_ret_valid(kv_rd_ret_valid), .kv_rd_ret_ready(kv_rd_ret_ready), .kv_rd_ret_data(kv_rd_ret_data)
     );
 endmodule

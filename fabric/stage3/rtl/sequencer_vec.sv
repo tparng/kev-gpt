@@ -45,7 +45,17 @@ module sequencer_vec #(
     // resident weight image and KV-cache code bank must fall back to ordinary
     // BRAM TDP. Passed straight through to gemv_banked_resident_vec/kv_bank;
     // default "ultra" leaves the KV260 build/gates untouched.
-    parameter               MEM_PRIMITIVE = "ultra"
+    parameter               MEM_PRIMITIVE = "ultra",
+    // DDR3-backed KV cache (fabric/genesys2/PORT-NOTES.md "Phase 2
+    // architecture"): 0 (default) keeps every existing build -- KV260 and
+    // Genesys2 Option A alike -- byte-for-byte on the resident kv_bank.sv
+    // path, untouched. 1 selects kv_bank_ddr.sv instead (same wq_*/rd_*
+    // external contract, verified bit-exact against kv_bank.sv in
+    // fabric/genesys2/tb/tb_kv_bank_ddr.sv), routing the KV cache through
+    // the kv_wr_*/kv_rd_* DMA ports below instead of on-chip BRAM. The two
+    // are mutually exclusive at elaboration time (generate), not a runtime
+    // mux -- KV260's build never even sees kv_bank_ddr's logic.
+    parameter               KV_DDR_BACKED = 0
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -72,7 +82,25 @@ module sequencer_vec #(
     // a per-logit Gumbel noise (precomputed into gumbel_bank during the head GEMV).
     // seed == 0 (or never written) => greedy argmax, bit-exact to the old behaviour.
     input  wire [31:0] seed,
-    input  wire        seed_we
+    input  wire        seed_we,
+
+    // ---- DDR-backed KV cache DMA ports (KV_DDR_BACKED=1 only; idle-tied
+    // when 0 -- see KV_DDR_BACKED parameter comment above). Wire straight to
+    // a fabric/genesys2/rtl/kevgpt_ddr_bundle.sv instance's kv_wr_*/kv_rd_*
+    // ports at the top level. -----------------------------------------------
+    output wire                 kv_wr_pkt_valid,
+    input  wire                 kv_wr_pkt_ready,
+    output wire [28:0]          kv_wr_pkt_addr,
+    output wire [255:0]         kv_wr_pkt_data,
+    output wire [31:0]          kv_wr_pkt_mask,
+    input  wire                 kv_wr_ack_valid,
+    output wire                 kv_wr_ack_ready,
+    output wire                 kv_rd_req_valid,
+    input  wire                 kv_rd_req_ready,
+    output wire [28:0]          kv_rd_req_addr,
+    input  wire                 kv_rd_ret_valid,
+    output wire                 kv_rd_ret_ready,
+    input  wire [255:0]         kv_rd_ret_data
 );
     localparam integer ROWS  = D    / P;
     localparam integer ROWS3 = D3   / P;
@@ -328,17 +356,55 @@ module sequencer_vec #(
     // kv_bank's second read port is a fixed interface (shared, unmodified file
     // -- see below) permanently idled here: rd2_start tied low so Vivado can
     // constant-propagate/eliminate the second port's logic during synthesis.
-    kv_bank #(.P(P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(NLAYER),
-              .TMAX(TMAX), .KBITS(8), .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_kvb (
-        .clk(clk), .rst(rst),
-        .wq_start(kb_wstart), .wq_layer(blk), .wq_kv(kvw_kv), .wq_head(kvw_h),
-        .wq_pos(pos), .wq_valid(kb_wvalid), .wq_data(kb_wdata_q), .wq_done(kb_wdone),
-        .rd_start(kb_rstart), .rd_layer(blk), .rd_kv(kb_rkv), .rd_head(hh),
-        .rd_tcount(pos + 9'd1),
-        .rd_valid(kb_rvalid), .rd_data(kb_rdata), .rd_done(kb_rdone),
-        .rd2_start(1'b0), .rd2_layer(4'd0), .rd2_kv(1'b0), .rd2_head(2'd0),
-        .rd2_tcount(9'd0),
-        .rd2_valid(), .rd2_data(), .rd2_done());
+    //
+    // KV_DDR_BACKED selects kv_bank (on-chip, default) or kv_bank_ddr
+    // (DDR3-streamed) at ELABORATION time -- see the parameter's own comment.
+    // Both branches drive the SAME internal signals (kb_wstart..kb_rdone);
+    // sequencer_vec's own FSM is unmodified either way (confirmed event-
+    // driven on wq_done/rd_done throughout, not cycle-counted, before this
+    // generate was added -- see PORT-NOTES.md).
+    generate
+    if (KV_DDR_BACKED) begin : g_kvb_ddr
+        kv_bank_ddr #(.P(P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(NLAYER),
+                      .TMAX(TMAX), .KBITS(8), .ADDR_W(29), .DATA_W(256),
+                      .KV_DDR_BASE(0)) u_kvb (
+            .clk(clk), .rst(rst),
+            .wq_start(kb_wstart), .wq_layer(blk), .wq_kv(kvw_kv), .wq_head(kvw_h),
+            .wq_pos(pos), .wq_valid(kb_wvalid), .wq_data(kb_wdata_q), .wq_done(kb_wdone),
+            .wr_pkt_valid(kv_wr_pkt_valid), .wr_pkt_ready(kv_wr_pkt_ready),
+            .wr_pkt_addr(kv_wr_pkt_addr), .wr_pkt_data(kv_wr_pkt_data), .wr_pkt_mask(kv_wr_pkt_mask),
+            .wr_ack_valid(kv_wr_ack_valid), .wr_ack_ready(kv_wr_ack_ready),
+            .rd_start(kb_rstart), .rd_layer(blk), .rd_kv(kb_rkv), .rd_head(hh),
+            .rd_tcount(pos + 9'd1),
+            .rd_valid(kb_rvalid), .rd_data(kb_rdata), .rd_done(kb_rdone),
+            .rd_req_valid(kv_rd_req_valid), .rd_req_ready(kv_rd_req_ready), .rd_req_addr(kv_rd_req_addr),
+            .rd_ret_valid(kv_rd_ret_valid), .rd_ret_ready(kv_rd_ret_ready), .rd_ret_data(kv_rd_ret_data));
+    end else begin : g_kvb_resident
+        kv_bank #(.P(P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(NLAYER),
+                  .TMAX(TMAX), .KBITS(8), .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_kvb (
+            .clk(clk), .rst(rst),
+            .wq_start(kb_wstart), .wq_layer(blk), .wq_kv(kvw_kv), .wq_head(kvw_h),
+            .wq_pos(pos), .wq_valid(kb_wvalid), .wq_data(kb_wdata_q), .wq_done(kb_wdone),
+            .rd_start(kb_rstart), .rd_layer(blk), .rd_kv(kb_rkv), .rd_head(hh),
+            .rd_tcount(pos + 9'd1),
+            .rd_valid(kb_rvalid), .rd_data(kb_rdata), .rd_done(kb_rdone),
+            .rd2_start(1'b0), .rd2_layer(4'd0), .rd2_kv(1'b0), .rd2_head(2'd0),
+            .rd2_tcount(9'd0),
+            .rd2_valid(), .rd2_data(), .rd2_done());
+        // KV_DDR_BACKED=0: DMA ports are unused, tied to inert/idle values
+        // (never asserts a request, always accepts an ack/return it will
+        // never actually receive) so the module elaborates cleanly with no
+        // dangling/undriven top-level outputs.
+        assign kv_wr_pkt_valid = 1'b0;
+        assign kv_wr_pkt_addr  = 29'd0;
+        assign kv_wr_pkt_data  = 256'd0;
+        assign kv_wr_pkt_mask  = 32'hFFFFFFFF;
+        assign kv_wr_ack_ready = 1'b1;
+        assign kv_rd_req_valid = 1'b0;
+        assign kv_rd_req_addr  = 29'd0;
+        assign kv_rd_ret_ready = 1'b1;
+    end
+    endgenerate
 
     vec_attn_w #(.P(P), .HEAD_DIM(HEAD_DIM), .TMAX(TMAX)) u_attnA (
         .clk(clk), .rst(rst), .start(at_startA), .tcount(at_tcount),

@@ -799,3 +799,639 @@ from simulation alone.
 - The pre-existing, unrelated whitespace/formatting diffs in `ai_accel/` RTL and
   vendor `.core`/wrapper files in the fork (present before this port's work started)
   are still untouched -- not this port's concern, flagged in an earlier session.
+
+## DDR3-backed larger model: BRAM calibration (KV cache is the real ceiling)
+
+Follow-on to the interactive-chat retarget (plan:
+`/home/tparng/.claude/plans/steady-floating-pretzel.md`). Board spec used
+throughout: Genesys2 DDR3 at 400MHz DDR (800MT/s) x4 bytes = **3.2GB/s peak**
+(user-confirmed), giving 32-64MB/token of headroom at the 50 tok/s target even
+at pessimistic controller efficiency -- DDR3 *bandwidth* is not a binding
+constraint at this token rate; latency-hiding and correctness are the real
+design concerns, not throughput.
+
+Decomposed the real hierarchical `report_utilization` data (Option A,
+single-engine attention, LANES=64, WWORDS=16384) instead of trusting
+`sizing.py` alone (already known this session to underestimate BRAM by ~5x):
+
+```
+xilinx_core_v_mini_mcu_wrapper_kevgpt (top): 253 RAMB36, 13 RAMB18, 803 DSP
+  u_kevgpt (xheep_kevgpt_peripheral): 245 RAMB36, 13 RAMB18, 798 DSP
+    u_seq (sequencer_vec) own logic: 50 RAMB36, 5 RAMB18, 104 DSP
+    u_attnA (vec_attn_w):             5 RAMB36, 3 RAMB18, 384 DSP
+    u_dq (vec_dequant):               0 RAMB36, 0 RAMB18,  16 DSP
+    u_gelu (vec_gelu):                8 RAMB36, 0 RAMB18,   0 DSP
+    u_gemv (gemv_banked_resident_vec):158 RAMB36, 1 RAMB18,   0 DSP
+      u_wb (weight_bank_tdp):         128 RAMB36, 0 RAMB18,   0 DSP
+    u_kvb (kv_bank):                   24 RAMB36, 3 RAMB18,  30 DSP
+```
+
+Calibration points extracted:
+- **`kv_bank` real-vs-formula tax: 1.68x.** `sizing.py`'s `kv_cache_bytes()`
+  predicts 70.0KB for Option A's exact shape (NLAYER=2, D=128, TMAX=128); real
+  synth gives 24 RAMB36 + 3 RAMB18 = 117.5KB. Small-buffer BRAM-tile rounding
+  (36Kb/18Kb granularity) inflates a small KV cache more than a big one would
+  be inflated proportionally -- treat 1.68x as an upper bound, not necessarily
+  the asymptotic ratio at much bigger KV sizes.
+- **`u_wb` (weight bank) 128 RAMB36 at `WWORDS=16384`** reflects a
+  deliberately *oversized* window (this session's own earlier note: "right-
+  sized then doubled for LANES=64's halved word-width"), not the true minimal
+  per-layer footprint -- don't use this number directly as a per-layer weight
+  cost; the true minimal 2-layer window at D=128 computes to ~192KB logical
+  (12*D^2 INT4 params/layer), well under the 590KB actually provisioned here.
+- **Fixed, ~non-scaling baseline: 93 RAMB36 = 428.5KB** (`u_seq`-own 50 +
+  `u_attnA` 5 + `u_gelu` 8 + `u_gemv`-own-minus-`u_wb` 30). Conservative
+  (treats all of `u_seq`-own as fixed even though some of it -- xres/qkv
+  buffers -- likely scales mildly with D); good enough for first-order sizing,
+  should be re-checked once a candidate shape is actually synthesized.
+
+**Finding: weight streaming alone (the plan's original framing) does not
+unlock a meaningfully bigger model.** Projecting fixed-428.5KB + a *true*
+minimal weight window (x1.2 assumed packing tax) + KV cache (x1.68 tax)
+against the ~1678.5KB free BRAM pool:
+
+| config (NLAYER, D, ctx) | weight window | KV cache | total | vs free |
+|---|---|---|---|---|
+| Option A 2L/D=128/ctx=128 (sanity check) | 230K | 118K | 781K | 47% |
+| 6L/D=192/ctx=128 | 518K | 529K | 1483K | 88% |
+| 8L/D=192/ctx=128 | 518K | 706K | 1659K | **99%** |
+| 12L/D=192/ctx=128 | 518K | 1058K | 2012K | 120% -- over |
+| 16L/D=256/ctx=128 | 922K | 1882K | 3240K | 193% -- over |
+
+KV cache was already the dominant BRAM cost once NLAYER exceeds ~2-3, and it
+does NOT shrink from streaming weights -- every layer's K/V history for the
+live context must stay reachable regardless of how weights are loaded. Even
+with weights streamed to a near-zero window, KV cache alone saturates the
+board by ~7-8 layers.
+
+**Decision: stream the KV cache to DDR3 too**, not just weights (asked and
+confirmed with the user). Initially assumed this needed a new write-capable
+DMA engine from scratch (no reusable RTL) -- **wrong, corrected below.**
+
+### Phase 2 architecture (derisked): four existing modules, all reusable unmodified
+
+Read `kv_bank.sv`'s full interface end to end
+(`hw/vendor/.../ai_accel/rtl/accelerator/streamer/`... no, `fabric/stage3/rtl/
+kv_bank.sv`) and the `ai_accel` streamer stack. Two findings change Phase 2's
+risk profile a lot:
+
+1. **`kv_bank.sv`'s storage shape maps directly onto a flat DDR array.**
+   Every (layer, kv, head, pos) has a fixed-size record: HEAD_DIM*KBITS-bit
+   code row + 48-bit header (scale16+lo32), addressed by
+   `w_pbase = ((layer*2+kv)*NHEAD+head)*TMAX + pos` -- exactly a linear
+   index into `HROWS = NLAYER*2*NHEAD*TMAX` fixed-size slots. This is
+   *already* how the on-chip TDP BRAM is addressed (`kva_a`/`pos_ra`/
+   `pos_ra2` in `kv_bank.sv`), so relocating it to DDR3 is "same address
+   arithmetic, different backing store," not a new addressing scheme.
+   Write happens once per (layer,kv,head,pos) -- NLAYER*2*NHEAD times/token.
+   Read streams `rd_tcount` (~pos+1) *consecutive* rows for one
+   (layer,kv,head) -- NLAYER*2*NHEAD calls/token, each a burst of
+   consecutive addresses. That read shape is exactly what `mig_read_engine`
+   already does (issue N sequential `req_addr_i`, drain N `ret_data_o`
+   beats); the write shape (one fire-and-forget beat per call) is exactly
+   what `mig_write_engine` already does.
+2. **A full write-capable engine + a 2-master MIG arbiter already exist**,
+   hardware-tested via `ai_accel`'s own `AI_PASS,ddr_bram_prefetch` result,
+   completely unrelated to and untouched by kevgpt so far:
+   - `mig_read_engine.sv` -- streaming reads, credit-based outstanding
+     tracking (already known).
+   - `mig_write_engine.sv` -- single-beat write packets
+     (`pkt_valid_i`/`pkt_addr_i`/`pkt_data_i`/`pkt_mask_i` in,
+     `ack_valid_o` out), handles MIG's split cmd/wdf channel timing
+     internally.
+   - `mig_rw_arbiter.sv` -- merges one read-engine's command stream + one
+     write-engine's command stream onto a single MIG command channel
+     (priority-with-hysteresis, `BATCH_LIMIT`-based anti-thrash). This is
+     the piece that combines kevgpt's own read+write traffic into one
+     app-level bundle.
+   - `mig_dual_master_arbiter.sv` -- merges TWO independent, already-self-
+     consistent app-level bundles onto the *physical* MIG port, with correct
+     read-return demuxing (owner FIFO, since MIG returns reads in issue
+     order) and write-data pairing (a second owner FIFO, since `app_wdf_*`
+     is independently paced from `app_addr/cmd/en`). Built generically for
+     exactly this "two masters share one DDR3 controller" situation.
+   - `v22_streamer_top.sv` is the reference integration showing all three of
+     `mig_read_engine`+`mig_write_engine`+`mig_rw_arbiter` wired together
+     (verbatim, minus its CDC `async_fifo_gray` layers, which exist only
+     because `ai_accel`'s accelerator core runs on a separate clock domain
+     from MIG's `ui_clk`; kevgpt's `clk_gen` is *already* sourced from
+     `ui_clk` directly -- see `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv` --
+     so kevgpt's own instances need NO clock-domain-crossing FIFOs at all,
+     one less thing to get wrong).
+
+   Confirmed via `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`: today only
+   `cpu_ddr_bridge` is wired, straight to MIG's real app port (no
+   `ai_accel`, no dual-master-arbiter present in this build at all) -- so
+   the ENTIRE second slot of a `mig_dual_master_arbiter` is free.
+
+**Resulting Phase 2 shape** (all four `mig_*` modules reused verbatim, zero
+modification):
+   - Add ONE `mig_read_engine` + ONE `mig_write_engine` + ONE `mig_rw_arbiter`
+     for kevgpt's own traffic (shared by BOTH the weight-window reads and the
+     KV-cache reads/writes -- ample bandwidth headroom from Phase 0 means
+     time-multiplexing one read engine across two different DDR regions is
+     fine, no need for a second read engine).
+   - Add ONE `mig_dual_master_arbiter`: side A = kevgpt's new combined
+     bundle, side B = the *existing, unmodified* `cpu_ddr_bridge` (rewire its
+     `app_*` ports from "straight to MIG" into side B's ports instead).
+     Arbiter output drives the real MIG app port.
+   - New RTL actually needed is now scoped down to: (a) request-issuing FSMs
+     inside `kv_bank.sv` (replace the BRAM read/write always-blocks with
+     `mig_read_engine`/`mig_write_engine` request sequencing, same external
+     `wq_*`/`rd_*` register-interface contract so `sequencer_vec.sv` and the
+     gate harness don't need to change), (b) an analogous window-swap request
+     FSM inside `weight_bank_tdp.sv`/`gemv_banked_resident_vec.sv`, and (c)
+     the top-level wrapper wiring described above. No new arbitration or
+     credit-tracking logic needs inventing -- the hard, error-prone parts
+     (owner-order read demux, write-data pairing, MIG command-channel
+     protocol) are already built and already proven on this exact board.
+
+Next step: design `kv_bank.sv`'s DDR-backed read FSM in detail (replace
+`R_RUN`'s `r_rowi`-indexed BRAM address stream with a loop issuing
+`rd_tcount` sequential `mig_read_engine` requests, decode the returned
+256-bit beats back into `code`+`hdr` fields, feed the existing `deq_word`
+dequant combinational block unchanged), then the write FSM (replace `W_CWR`'s
+BRAM commit with one `mig_write_engine` packet).
+
+### MIG behavioral model + reused-engine smoke test (Icarus, no board needed)
+
+Before touching `kv_bank.sv`, built a Icarus-simulatable stand-in for
+`genesys2_mig_native_shell`'s app-level UI port: `fabric/genesys2/tb/
+mig_behav_model.sv`. Deliberately NOT a timing-accurate MIG model (no
+calibration sequence, no bank conflicts, always-ready cmd/wdf channels, a
+fixed `READ_LATENCY`-cycle pipe for reads) -- Phase 0 already showed DDR3
+bandwidth/latency headroom is ample at 50 tok/s, so the thing worth gating
+bit-exactly is address/data correctness of the new request-issuing FSMs, not
+real DDR timing (that's a Phase 6, real-hardware concern). Mask polarity
+follows Xilinx UG586's MIG7 native-UI convention (active-low: 0 = byte
+written, 1 = byte masked) -- flagged as an assumption to cross-check at
+Phase 6, not yet verified against the real generated `genesys2_mig_native_
+shell` wrapper.
+
+Smoke-tested the full reused chain -- `mig_write_engine` -> `mig_read_engine`
+-> `mig_rw_arbiter` -> `mig_behav_model`, all four wired exactly per
+`v22_streamer_top.sv`'s reference pattern -- via a scratch `iverilog -g2012`
+testbench (write a known pattern, read it back, then a SECOND write with a
+partial byte mask, read back and confirm only the unmasked lane changed).
+Two small fixes needed to get these ai_accel files through Icarus at all
+(they'd only ever been through Vivado / real hardware before -- no prior
+Icarus/Verilator testbench existed for this streamer stack, confirmed via
+repo-wide grep): `unique case` qualifiers are accepted with a benign
+"ignored" notice, and the SVA `assert property` blocks in `mig_read_engine.sv`
+/ `mig_rw_arbiter.sv` / `sync_fifo.sv` need `-DSYNTHESIS` to skip (they're the
+only content gated by that define in those three files, confirmed by grep
+before relying on it -- doesn't change any functional logic, just compiles
+out debug-only assertions Icarus's `-gno-assertions` didn't fully suppress).
+
+**Result: `MIG_SMOKE_VERDICT,PASS`** -- both the full-write/full-read and the
+partial-byte-mask cases matched exactly. This means the entire reused DMA
+stack (`mig_read_engine`+`mig_write_engine`+`mig_rw_arbiter`, unmodified) is
+now available as an ordinary Icarus gate dependency for the new `kv_bank.sv`
+redesign -- the same bit-exact-before-synthesis discipline as every other
+fabric/stage3 block, not a synthesis-only leap of faith.
+
+### kv_bank_ddr.sv -- write-side FSM (DONE, gated PASS)
+
+`fabric/genesys2/rtl/kv_bank_ddr.sv`: a new sibling module (kv_bank.sv itself
+untouched, matching this project's established "add a variant, don't break
+the existing build" pattern). Write-only for now -- the read-side streaming
+loop is the next piece. Reuses kv_bank.sv's W_IDLE..W_QNT collect/scale/
+quantise pipeline byte-for-byte verbatim (same inv_lut ROMs, same divide-free
+magic-multiply scale/inv derivation), so wstage/w_scale/w_lo are guaranteed
+identical to the already-verified reference for identical inputs. Only the
+final commit differs: instead of a same-cycle on-chip TDP BRAM write, a new
+DMA sub-FSM (states W_DMA/W_DACK) issues `ROW_BEATS` sequential write packets
+on a `mig_write_engine`-shaped `pkt_*`/`ack_*` port.
+
+DDR layout: each (layer,kv,head,pos) row is `CODE_BEATS` beats of quantised
+codes (`ceil(HEAD_DIM*KBITS/DATA_W)`, =2 at HEAD_DIM=64/KBITS=8/DATA_W=256)
+plus 1 header beat ({scale16,lo32} in the low 48 bits, byte-masked), addressed
+as `KV_DDR_BASE + w_pbase*ROW_BEATS*BEAT_BYTES + beat*BEAT_BYTES` -- a flat
+byte offset reusing kv_bank.sv's existing row-index arithmetic verbatim, just
+multiplied by the beat stride instead of used as a direct BRAM address.
+Address convention (byte address, beat-aligned, never shifted) and mask
+polarity (active-low: 0=write) both cross-checked against `cpu_ddr_bridge.sv`'s
+header before writing any of this, not assumed.
+
+**Gate**: `fabric/genesys2/tb/tb_kv_bank_ddr.sv` -- an RTL-vs-RTL crosscheck
+(not yet a Python-golden gate matching the `run_*.py` convention; flagged as
+a follow-up, not done): drives identical `wq_*` stimulus into both
+`kv_bank.sv` (already Python-gated via `fabric.stage3.run_vec_kv`) and
+`kv_bank_ddr.sv`, decodes `kv_bank_ddr`'s DDR-resident bytes by hand in the
+testbench, and compares against `kv_bank.sv`'s own dequantised `rd_data` for
+the same row. Two test vectors (small positive-offset span; wide span
+straddling zero, to exercise a negative `lo`), 64 lanes each = 128 comparison
+points. **Result: `KV_BANK_DDR_VERDICT,PASS`, 0/128 mismatches.**
+
+Three real bugs found and fixed while building this gate (not in the RTL --
+all three were testbench/verification-infrastructure bugs, but the kind that
+would have produced false confidence if shipped un-caught, so recorded in
+full):
+1. **`wait(signal)`/`@(posedge signal)` on a single-cycle pulse driven by the
+   common "default-clear, then conditionally set" NBA idiom** (`wq_done<=0`
+   unconditionally at the top of the always block, `wq_done<=1` in one
+   specific branch -- what `kv_bank.sv`'s `wq_done`/`rd_done` and
+   `kv_bank_ddr.sv`'s `wq_done` all use) **fired one full cycle early in
+   Icarus**, confirmed directly via debug `$display` comparing the "just
+   unblocked" data against the real pulse one cycle later. Root-caused (not
+   just patched around): this class of pulse, sampled by a *different*
+   process via edge-sensitivity, does not reliably behave like a true
+   registered-value 0->1 transition on Icarus. Fixed by replacing every
+   `wait`/`@(posedge ...)` on these pulses with a monotonic pulse-counter
+   incremented in its own `always @(posedge clk)` block, and waiting for the
+   counter to reach a target value instead -- sidesteps edge-detection
+   semantics entirely. Worth remembering for every future testbench in this
+   port that synchronizes on one of these single-cycle "done" pulses (the
+   read-side FSM's `rd_done`/`rd2_done`, the eventual weight-window DMA's own
+   completion pulse, etc.) -- use the counter idiom from the start, not
+   `wait()`.
+2. **`kv_bank.sv`'s read port has no direct "read position p" input** --
+   `rd_start`/`rd_tcount` streams positions `0..tcount-1` of a (layer,kv,head)
+   selector in order; there is no way to address a single arbitrary position
+   directly. To check position `p`, request `tcount=p+1` and take the *last*
+   emitted beat (`rd_done` fires on it). Mis-set to `tcount=1` initially
+   (silently read position 0, which was never written, producing X compared
+   against real DDR data by coincidence-passing/failing depending on which
+   row position 0 happened to alias with) -- worth remembering for the
+   read-side FSM's own gate, which will drive this same port directly.
+3. **`mig_behav_model`'s `MEM_WORDS` sized too small for the row indices this
+   test actually exercises** (1024, vs. `ROW_BEATS*HROWS`=3072 needed) --
+   `word_idx()`'s fixed-width address slice *silently wraps/aliases* out-of-
+   range addresses onto in-range words rather than erroring, so an
+   undersized backing store doesn't fail loudly: it corrupted exactly the
+   test case with a large row index (silently aliasing its beats onto
+   unrelated words) while the small-row-index case happened to stay within
+   bounds and passed normally -- the worst kind of test bug, since it looks
+   like a partial pass. Root-caused by adding a temporary debug print of the
+   real MIG-side `word_idx()` result next to the testbench's own (unshifted,
+   untruncated) index computation and finding they disagreed. Fixed by
+   sizing `MEM_WORDS` generously (8192) and documenting the sizing
+   requirement directly in the testbench so it isn't silently re-introduced.
+
+### kv_bank_ddr.sv -- read-side FSM (DONE, gated PASS)
+
+Added to the same `fabric/genesys2/rtl/kv_bank_ddr.sv` file (kv_bank.sv
+itself is a single module with both read and write sides; kv_bank_ddr.sv
+follows the same shape now that both halves exist). New states RR_IDLE/
+RR_REQ/RR_WAIT/RR_EMIT: matches kv_bank.sv's own read-port contract exactly
+(no direct "read position p" input -- streams positions `0..tcount-1` of a
+(layer,kv,head) selector in order, `rd_valid`/`rd_data` pulse once per
+position, `rd_done` on the last one), but internally walks each position by
+issuing `ROW_BEATS` sequential requests on a `mig_read_engine`-shaped
+`req_*`/`ret_*` port (one request in flight at a time -- simpler than
+pipelining ahead, and Phase 0 already established there's no bandwidth/
+latency pressure to justify the extra complexity yet), capturing the
+returned beats into the same code/hdr layout the write side stages them in,
+then dequantising with the exact same `x_hat = code*scale+lo` math
+`kv_bank.sv`'s own `deq_word` combinational block uses (copied verbatim, not
+re-derived). No `rd2_*` (second read port) -- the current single-engine
+`sequencer_vec.sv` ties it off permanently anyway, so this matches actual
+usage rather than kv_bank.sv's full historical interface.
+
+**Gate**: extended `fabric/genesys2/tb/tb_kv_bank_ddr.sv` to also issue a
+real `rd_start` against `kv_bank_ddr` itself (through an actual
+`mig_read_engine` + `mig_rw_arbiter` -- not a shortcut; this exercises the
+same arbiter class that will later merge kevgpt's own DDR traffic with the
+existing `cpu_ddr_bridge`, so it's useful mileage on that stack too) and
+compares the result against `kv_bank.sv`'s reference read, in addition to
+the existing hand-decoded-DDR-bytes check from the write-side gate. Both
+checks now run for both test vectors: manual decode confirms the WRITE
+path's bytes are correct, the real read-port exercise confirms the READ FSM
+itself retrieves and dequantises them correctly. **Result:
+`KV_BANK_DDR_VERDICT,PASS`, 0 mismatches across 256 comparison points** (64
+lanes x 2 checks x 2 test vectors). Compiled clean with zero warnings after
+fixing one cosmetic port-width mismatch (a debug-only `outstanding_o` wire
+sized for the wrong `MAX_OUTSTANDING`).
+
+No new bugs beyond the three already recorded above -- the write-side gate's
+fixes (monotonic-counter pulse synchronization, `tcount=pos+1`-then-take-
+the-last-beat semantics, `MEM_WORDS` sizing) carried over directly and
+avoided repeating any of them on the read side.
+
+### weight_loader_ddr.sv -- weight-window streaming (DONE, gated PASS)
+
+Redesigned the scope from the original framing (a DMA-backed replacement for
+`weight_bank_tdp.sv`'s read port) after actually tracing
+`gemv_banked_resident_vec.sv`'s MAC pipeline: its read port
+(`raddr_b`/`rword_b`) is consumed by an RLAT-deep, tightly-timed pipeline
+(addend stage registered specifically to close a 5ns cone, per this
+session's own earlier notes on tight DSP margin) that assumes weight reads
+are ALWAYS ready -- `weight_bank_tdp` is a fixed 1-cycle-latency on-chip
+memory today, it never stalls, and the MAC's `kc` walk has no backpressure
+concept at all. Making the MAC's own read port DMA-backed would mean real
+surgery on that already-verified, timing-critical pipeline.
+
+Sidestepped that entirely: `fabric/genesys2/rtl/weight_loader_ddr.sv` is a
+hardware-driven ALTERNATIVE SOURCE for `weight_bank_tdp`'s EXISTING boot-load
+port (`ld_rst`/`w_we`/`w_data`) -- the same port firmware already drives via
+the `wl_we` register to stream the whole weight image in once at boot
+(`xheep_kevgpt_peripheral.sv`'s `wl_we`/`wl_data` -> `sequencer_vec.sv`'s
+`wl_rst`/`wl_we`/`wl_data` -> `gemv_banked_resident_vec.sv`'s
+`ld_rst`/`w_we`/`w_data`). This loader plays the identical role, just sourced
+from DDR3 at runtime (once per weight-window reload) instead of from
+firmware once at boot. `weight_bank_tdp.sv` and
+`gemv_banked_resident_vec.sv`'s MAC pipeline are BOTH completely untouched --
+by the time a GEMV `start` fires, the window is already fully resident,
+satisfying the exact same "always ready" assumption the MAC pipeline already
+relies on. Tradeoff: single-buffered (compute waits for the window to finish
+loading; no double-buffered overlap yet) -- correctness first, matching
+every other DMA piece built in this port so far; double-buffering is future
+work once this baseline is proven on real hardware.
+
+Design: issues DMA read requests via a `mig_read_engine`-shaped `req_*` port
+as fast as `rd_req_ready` allows (decoupled from the drain side, unlike
+`kv_bank_ddr.sv`'s read side which issues one outstanding request at a
+time) -- weight-window reloads happen once per layer per TOKEN, so
+throughput matters here for the cycle budget in a way the low-frequency KV
+reads did not; paying DDR round-trip latency once per pipeline fill instead
+of once per beat is the difference between a reload costing thousands of
+cycles vs. tens of thousands. Each returned 256-bit beat is unpacked into
+`DATA_W/32`=8 sequential `w_we` pulses feeding `weight_bank_tdp`'s existing
+write-word assembler verbatim -- no new packing logic to get bit-exact,
+since this is a straight copy (pre-quantized weights, no quantize/dequantize
+math involved, unlike the KV cache).
+
+**Gate**: `fabric/genesys2/tb/tb_weight_loader_ddr.sv` -- streams a known
+LFSR-generated image out of `mig_behav_model` through a real
+`mig_read_engine` into an unmodified `weight_bank_tdp` instance, then reads
+the resident bank back via its existing `raddr_b`/`rword_b` port and checks
+it matches the source DDR image exactly. Two cases (zero DDR offset/16
+words; a nonzero 100-beat offset/24 words -- deliberately not repeating the
+KV-cache gate's early mistake of only testing a zero-offset case, since that
+one hid a real address-truncation bug until a nonzero-offset case exposed
+it). At LANES=64 (Option A's actual value), `weight_bank_tdp`'s own word
+width (WBITS=LANES*4=256) exactly equals the DMA beat width (DATA_W=256), so
+the readback check is a direct beat-for-word comparison with no unpacking
+arithmetic of its own to get wrong. **Result:
+`WEIGHT_LOADER_DDR_VERDICT,PASS`, 0 mismatches across 40 words checked**,
+clean compile, no new testbench-infrastructure bugs this time (the KV gate's
+earlier fixes -- monotonic-counter pulse synchronization in particular --
+were reused directly and avoided repeating that class of bug).
+
+Both DMA subsystems (KV cache read+write, weight-window load) now exist and
+are independently gated.
+
+### Top-level arbiter wiring (DONE, gated PASS)
+
+Two new modules, both pure glue (no new arbitration/credit-tracking logic of
+their own beyond one small mux):
+
+- **`fabric/genesys2/rtl/mig_read_mux2.sv`** -- merges `kv_bank_ddr`'s read
+  requests and `weight_loader_ddr`'s read requests onto ONE shared
+  `mig_read_engine` (the plan's own stated design: "ample bandwidth headroom
+  makes time-multiplexing one engine across two DDR regions fine"). Same
+  owner-FIFO IDEA `mig_dual_master_arbiter.sv` already uses for its own
+  read-return demux (push an owner tag on every accepted request, pop it in
+  the same order against real returns), applied one layer earlier in the
+  stack (upstream of the engine, merging requesters, rather than downstream,
+  demuxing an already-formed bundle).
+- **`fabric/genesys2/rtl/kevgpt_ddr_bundle.sv`** -- combines `kv_bank_ddr`'s
+  write engine + the shared read engine (via `mig_read_mux2`) through one
+  `mig_rw_arbiter` into a single self-consistent app-level bundle -- the
+  shape `mig_dual_master_arbiter`'s side A (or B) expects. Does NOT
+  instantiate `kv_bank_ddr`/`weight_loader_ddr` themselves (those belong
+  wherever `sequencer_vec.sv`'s own hierarchy eventually places them); it
+  only takes their DMA-facing ports as pass-through.
+
+**A real bug, found and fixed**: `mig_read_mux2`'s owner FIFO initially
+popped on bare `ret_valid` (copying `mig_dual_master_arbiter`'s own pattern
+verbatim) -- WRONG here. `mig_dual_master_arbiter`'s owner FIFO demuxes the
+*raw MIG native-UI return path*, which has no backpressure at all (a return
+must be consumed the instant it arrives, so valid alone means consumed).
+`mig_read_engine`'s own `ret_valid`/`ret_ready` is a REAL handshake (backed
+by its own return FIFO, data waits if the consumer isn't ready yet) -- the
+owner FIFO here needed to pop on `ret_valid && ret_ready` (the real "beat
+was actually consumed" event). Symptom with the bug present: the integration
+gate hung during the weight-loader phase (worked fine for the low-throughput,
+single-outstanding KV read path, which never let the two conditions diverge)
+-- the owner FIFO drained faster than real consumption once multiple
+requests were pipelined ahead, going empty while `mig_read_engine` still had
+buffered returns waiting, permanently deadlocking `ret_ready` at 0. Debugged
+by tracing `owner_empty`/`ret_valid`/`ret_ready`/`outstanding_o` cycle by
+cycle and finding the owner FIFO empty while the engine still claimed
+`ret_valid`. Fixed, and documented directly in `mig_read_mux2.sv`'s header
+as a reusability warning: this owner-FIFO idiom needs the handshake-aware
+pop condition against any port with a REAL valid/ready handshake, not MIG's
+raw backpressure-free return path.
+
+**Gate**: `fabric/genesys2/tb/tb_kevgpt_ddr_bundle.sv` -- the full stack
+end to end: `kv_bank_ddr` + `weight_loader_ddr` + `mig_read_mux2` +
+`kevgpt_ddr_bundle` + a real `mig_dual_master_arbiter`, side B driven by a
+synthetic app-level requester standing in for `cpu_ddr_bridge` (that module
+isn't modified by this port, so it isn't re-gated here -- this test proves
+the WIRING and genuine two-master sharing, not `cpu_ddr_bridge`'s own
+already-established correctness). Four phases: (1) `kv_bank_ddr` write+read
+through the full stack, side B idle -- crosschecked against `kv_bank.sv`;
+(2) `weight_loader_ddr` load through the full stack, side B idle --
+crosschecked against the source DDR image; (3) synthetic side B alone,
+side A idle -- proves side B's own data path isn't swapped with side A;
+(4) `kv_bank_ddr` write + a synthetic side-B write/read, launched
+concurrently (`fork`/`join`) -- real two-master sharing, not two sequential
+single-master phases. **Result: `KEVGPT_DDR_BUNDLE_VERDICT,PASS`, 0 errors
+across all four phases**, clean compile.
+
+All of Phase 2 (both DMA subsystems, plus the arbiter wiring merging them
+with room for `cpu_ddr_bridge` alongside) is now built and gated end to end
+in simulation.
+
+## Real hardware integration (RTL done + a real CDC bug found and fixed; Vivado check still pending)
+
+### sequencer_vec.sv: KV_DDR_BACKED generate-selected kv_bank_ddr
+
+Confirmed BOTH sides of `kv_bank.sv`'s external contract are event-driven
+before touching anything (`if (kb_wdone)` gates the write-side FSM
+transitions explicitly; the read side has no fixed-latency assumption
+either -- `vec_attn_w` already tolerates kv_bank.sv's own multi-cycle
+pipeline latency via `rd_valid` watching, not a cycle count) -- this is what
+makes swapping `kv_bank` for `kv_bank_ddr` (drastically different internal
+latency, same external pulses) timing-safe rather than a leap of faith.
+
+Added a `KV_DDR_BACKED` parameter (default 0) to `sequencer_vec.sv` and
+wrapped the `kv_bank` instantiation in a `generate if/else`: `KV_DDR_BACKED=0`
+(default) elaborates the untouched, already-verified `kv_bank.sv` path byte-
+for-byte as before -- KV260's build and every existing Genesys2 gate never
+even see `kv_bank_ddr`'s logic. `KV_DDR_BACKED=1` elaborates `kv_bank_ddr.sv`
+instead, with new `kv_wr_*`/`kv_rd_*` DMA ports added to `sequencer_vec.sv`'s
+own port list (tied to inert idle values in the `KV_DDR_BACKED=0` branch, so
+no dangling outputs). Threaded straight through `xheep_kevgpt_peripheral.sv`
+(new `KV_DDR_BACKED` parameter + pass-through ports, same pattern) -- this
+was tractable specifically because `xheep_kevgpt_peripheral` is a PEER to
+the X-HEEP SoC in `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`, not nested
+inside `core_v_mini_mcu`'s own vendored boundary (confirmed by reading the
+wrapper: `xheep_kevgpt_peripheral` and `x_heep_system_i` are both instantiated
+directly, side by side, connected only via the generic
+`ext_peripheral_slave_req_o`/`resp_i` register bus) -- no X-HEEP SoC-boundary
+plumbing needed at all.
+
+**Regression check (KV_DDR_BACKED=0, the default/existing path)**:
+re-ran `fabric.stage3.run_vec_kv` (had to route around a pre-existing harness
+issue -- its own hardcoded default prompt `[48,10,100,77,...]` contains
+token ids out of range for Option A's 57-vocab checkpoint, a KV260-vocab
+leftover unrelated to this change; called `run_vec_kv.run()` directly with
+an in-range prompt instead of via its CLI). **`VEC_KV_VERDICT match=True`**
+-- confirms the generate-based swap didn't disturb the existing, deployed
+behavior at all.
+
+**Full-sequencer DDR-KV verification (KV_DDR_BACKED=1, the new path)**: built
+`fabric/genesys2/tb/tb_seq_vec_kv_ddr.sv`, a byte-for-byte copy of
+`fabric/stage3/tb/tb_seq_vec_kv.sv`'s own stimulus (weight stream, prompt/gen
+GO-pulse loop, cycle counting, KVDBG hooks) with ONLY the `sequencer_vec`
+instantiation changed (`KV_DDR_BACKED(1)` + the new DMA ports wired to a real
+`mig_write_engine`+`mig_read_engine`+`mig_behav_model` stack, not a
+shortcut). This exercises `kv_bank_ddr` under REALISTIC multi-token, multi-
+layer, multi-head traffic -- not just the two isolated write+read pairs
+`tb_kv_bank_ddr.sv` already covers. **Result: identical bit-exact token
+stream to both the resident-`kv_bank` regression run above AND the Python
+golden reference** (`gen=[41, 36, 46, 1, 29, 30]` in all three), confirmed
+via a direct Python comparison against `IntKVQSequencer.generate_greedy`,
+not just eyeballing printed lines.
+
+### Top-level wrapper wiring + a real clock-domain-crossing bug
+
+Edited `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`: instantiated
+`kevgpt_ddr_bundle` (side A) + `mig_dual_master_arbiter`, rewired
+`cpu_ddr_bridge`'s `app_*` ports from "straight to MIG" into the dual-
+arbiter's side B (cpu_ddr_bridge itself untouched), wired
+`xheep_kevgpt_peripheral`'s new `kv_wr_*`/`kv_rd_*` ports into the bundle,
+and flipped `xheep_kevgpt_peripheral`'s `KV_DDR_BACKED` to 1 for THIS board
+build specifically to prove the mechanism -- Option A's own KV cache is tiny
+(~118KB) and doesn't need DDR streaming at this model size, but exercising
+it now, ahead of actually needing it, is what proves the DMA path is real
+before the Phase 4 model-size decision depends on it.
+
+**A real bug, found while wiring this (not caught by any simulation gate up
+to this point):** every Icarus gate built so far (`tb_kv_bank_ddr.sv`,
+`tb_weight_loader_ddr.sv`, `tb_kevgpt_ddr_bundle.sv`) ran `kv_bank_ddr`,
+`mig_read_engine`/`mig_write_engine`, and `mig_behav_model` all on ONE
+shared simulation clock. Real hardware has TWO clock domains here:
+`kv_bank_ddr` lives inside `sequencer_vec.sv`'s own hierarchy, clocked on
+kevgpt's compute clock (`clk_gen`, confirmed 50MHz by an earlier session's
+own clock-wizard-config check) -- but `mig_read_engine`/`mig_write_engine`/
+`mig_rw_arbiter` and the app-level bundle MUST run on MIG's own `ui_clk`
+(a hard requirement of MIG's native-UI app port, not a design choice), and
+`clk_gen` is PLL-derived FROM `ui_clk` via `xilinx_clk_wizard_wrapper` --
+genuinely different frequencies, not the same clock under two names. Wiring
+`kevgpt_ddr_bundle`'s output straight into `mig_dual_master_arbiter` (itself
+correctly on `ui_clk`) while `kv_bank_ddr` stays on `clk_gen` would have
+been an un-synchronized multi-bit bus crossing two real, differently-clocked
+domains -- a genuine metastability/data-corruption risk on real silicon,
+invisible to every simulation run so far specifically because they all used
+one shared clock.
+
+**Fixed**: `kevgpt_ddr_bundle.sv` now takes separate `gen_clk`/`gen_rst` and
+`ui_clk`/`ui_rst` inputs and does its own clock-domain crossing for
+`kv_bank_ddr`'s four DMA signals (write-packet, write-ack, read-request,
+read-return), using `async_fifo_gray` -- the exact same CDC primitive and
+4-FIFO shape `cpu_ddr_bridge.sv` already uses for its own `clk_i`/`ui_clk_i`
+boundary, reused rather than re-derived. `weight_loader_ddr`'s read port is
+NOT yet CDC'd (it isn't wired to a real instance at the top level yet --
+tied to constant idle values there, which need no synchronizer) -- flagged
+directly in the module's header as a real follow-up needed once that
+integration happens, not silently assumed away.
+
+**Re-verified the CDC fix under a GENUINE two-clock-domain simulation** (not
+just re-running the old single-clock gate and calling it done): updated
+`tb_kevgpt_ddr_bundle.sv` to drive `clk`/`ui_clk` as two independent clocks
+with a deliberately non-integer-multiple period ratio (10ns vs 7ns, to
+actually stress the crossing rather than accidentally look synchronous).
+First attempt still failed for the (deliberately still-un-CDC'd)
+`weight_loader_ddr` path -- exactly the expected failure mode, confirming
+the CDC finding empirically: `weight_loader_ddr`/`weight_bank_tdp` were
+still wired directly across the two clocks with no synchronizer in the
+testbench, producing visibly torn/shifted data. Isolated that known,
+already-documented gap by moving `weight_loader_ddr`/`weight_bank_tdp` onto
+`ui_clk` for this test only (not a real deployment shape -- noted inline)
+so the KV path's real CDC fix could be verified cleanly on its own. **Result:
+`KEVGPT_DDR_BUNDLE_VERDICT,PASS`, 0 errors across all four phases**
+(including Phase 4's genuinely concurrent two-master traffic), under real
+two-clock-domain conditions.
+
+### Fileset wiring (fork repo)
+
+Added `kv_bank_ddr.sv`/`weight_loader_ddr.sv`/`mig_read_mux2.sv`/
+`kevgpt_ddr_bundle.sv` to `kevgpt_seq.core`'s `rtl` fileset. No changes
+needed for the `mig_*`/`async_fifo_gray`/`cpu_ddr_bridge` files themselves --
+confirmed via `grep` that `x-heep:ip:ai_accel`'s own `rtl` fileset (which
+already contains all of them) is an unconditional dependency of
+`core-v-mini-mcu.core`, already pulled into every Genesys2 kevgpt build
+(this is how `genesys2_mig_native_shell.sv` already resolved for
+`xilinx_core_v_mini_mcu_wrapper_kevgpt.sv` before any of this session's
+work). All new/changed RTL files re-synced from kev-gpt's canonical copies
+into the fork's vendored `hw/ip/kevgpt_seq/rtl/` directory.
+
+### The real Vivado synth-only checkpoint (DONE, clean)
+
+Corrected after the fact: Vivado 2022.2 IS available in this environment, at
+`~/tools-2022/Xilinx/Vivado/2022.2` (`source ~/vivado2022.sh` or that
+directory's `settings64.sh` directly) -- the earlier "not installed" note
+above was simply looking in the wrong place (`/tools/Xilinx`,
+`/opt/Xilinx`). Ran the real checkpoint once this was found.
+
+**Process notes** (for next time): the project regeneration
+(`make vivado-fpga-nobuild FPGA_BOARD=genesys2_kevgpt`) needs the repo's own
+Python venv (`.venv/bin/activate`) SOURCED, not just its `fusesoc` binary on
+PATH -- FuseSoC's own code-generation step (OpenTitan's `prim` generator,
+needs the `mako` package) shells out to a bare `python3`, which resolves to
+system Python (missing `mako`) unless the venv is actually activated in the
+shell, not just referenced via absolute path. Regenerating the project wipes
+the previous stale build's ROM `.mem` files (this session's earlier full
+run of `fabric.stage3.run_vec_kv` already regenerated a correct set for
+Option A's exact shape in a scratch dir -- reused directly rather than
+regenerating a third time); they need re-placing into both the project's top
+level and its `.runs/synth_1/` subdirectory before synthesis, same gotcha as
+earlier sessions already documented. `make synth` (not the full
+`vivado-fpga`/`.bit` target) is the right target for a synth-only
+checkpoint -- it depends on `<name>.v`/`<name>.edn` (via `_synth.tcl` +
+`_netlist.tcl`), stopping well short of place & route.
+
+**Result: clean.** Zero `ERROR` lines in the full synthesis log; netlist
+(`.v`/`.edn`) written successfully. Real hierarchical utilization
+(`report_utilization -hierarchical`, opened directly against the synth_1
+`.dcp` checkpoint -- fast, no resynthesis):
+
+```
+xilinx_core_v_mini_mcu_wrapper_kevgpt (top): 98769 LUT (48.46%), 54933 FF, 238 RAMB36+11 RAMB18 (54.72%), 803 DSP (95.60%)
+  u_kevgpt (xheep_kevgpt_peripheral):        58443 LUT,          26015 FF, 230 RAMB36+11 RAMB18,            798 DSP
+    (u_seq) own logic:                        8603 LUT,           3974 FF,  50 RAMB36+ 5 RAMB18,            104 DSP
+    g_kvb_ddr.u_kvb (kv_bank_ddr):           14821 LUT,           3655 FF,   9 RAMB36+ 1 RAMB18,             30 DSP
+    u_attnA (vec_attn_w):                    14709 LUT,           9336 FF,   5 RAMB36+ 3 RAMB18,            384 DSP
+    u_gemv (gemv_banked_resident_vec):        8642 LUT,           3785 FF, 158 RAMB36+ 1 RAMB18,              0 DSP
+      u_wb (weight_bank_tdp):                  430 LUT,            279 FF, 128 RAMB36,                        0 DSP
+  u_kevgpt_ddr_bundle (new: CDC + mig_read_mux2 + engines + arbiter): 2921 LUT, 8693 FF, 0 RAMB36, 0 DSP
+  u_mig_dual_arb:                             152 LUT,            102 FF,   0 RAMB36,                         0 DSP
+  u_cpu_ddr_bridge (unmodified):             1386 LUT,           1558 FF,   0 RAMB36,                         0 DSP
+  x_heep_system_i (cv32e40px SoC):          33796 LUT,          18538 FF,   0 RAMB36,                         5 DSP
+```
+
+**The key confirmation**: `kv_bank_ddr` uses **9 RAMB36+1 RAMB18**, vs.
+resident `kv_bank`'s **24 RAMB36+3 RAMB18** at this exact same shape
+(NLAYER=2/D=128/NHEAD=2/TMAX=128 -- the number from this session's earlier
+BRAM-calibration work). A real, measured **-15 RAMB36/-2 RAMB18** reduction,
+matching (and directly explaining) `u_kevgpt`'s own top-level reduction from
+245+13 (the pre-this-session baseline) to 230+11 -- the DDR-backed KV cache
+genuinely moved the bulk of its storage off-chip, exactly as designed, not
+just in simulation. The remaining 9 RAMB36 in `kv_bank_ddr` are the
+`inv_lut_lo`/`inv_lut_hi` ROM tables (reused verbatim from `kv_bank.sv`,
+unrelated to the on-chip code/header storage that actually moved to DDR3).
+`u_kevgpt_ddr_bundle` (all the new CDC FIFOs + read/write engines + rw
+arbiter combined) costs **zero BRAM, zero DSP** -- small enough to fit
+entirely in distributed RAM/logic, matching the expectation that this is
+control/muxing/FIFO plumbing, not compute. DSP total (803/840, 95.60%) is
+UNCHANGED from the pre-DDR baseline to the exact tile -- confirms none of
+this session's new RTL touches the tight DSP budget at all, only BRAM (and
+only in the intended, favorable direction).
+
+This is a synth-only checkpoint (no place & route, no timing closure, no
+bitstream) -- it confirms the design elaborates/synthesizes cleanly and
+gives real resource numbers, but does NOT yet confirm the CDC fix's timing
+closes under real constraints (that needs a full implementation run) or
+that a bitstream programs and runs correctly on the physical board. Those
+remain real follow-ups, same as any other synth-only checkpoint in this
+project's history.
+
+Next: Phase 3 (firmware-driven weight staging into DDR3, so
+`weight_loader_ddr` has a real image to load from -- and
+`weight_loader_ddr`'s own CDC, once it's actually wired to the top level)
+and Phase 4 (final model-size selection), now with a real, measured
+per-shape BRAM number for the DDR-backed KV cache to calibrate against
+instead of an estimate.
