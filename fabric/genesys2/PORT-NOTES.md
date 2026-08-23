@@ -2263,3 +2263,97 @@ always.
 This is now the real, committed, in-progress deployment target (both
 repos), not a revert-after-measuring exploration. Next: full P&R/
 bitstream/real-hardware bring-up at this shape.
+
+### The real BRAM budget: NLAYER=8 fails place_design, corrected to NLAYER=4
+
+Ran the full build (`make`, synth+impl+bitgen) for NLAYER=8 straight after
+the clean synth-only checkpoint above. **It failed** -- not synthesis, not
+timing, but a hard resource DRC at `place_design`:
+
+```
+ERROR: [DRC UTLZ-1] Resource utilization: RAMB36/FIFO over-utilized in Top
+Level Design. This design requires 489 of such cell types but only 445
+compatible sites are available in the target device.
+```
+
+**Root cause of the discrepancy**: the synth-only checkpoint's utilization
+report (382/445 RAMB36-equivalent, "fits") was measured by `open_checkpoint`
+on the ISOLATED `synth_1` `.dcp`, opened out of its full-project context.
+Doing this treats `mig_7series_0` (the DDR3 controller), `xilinx_clk_
+wizard_clk_wiz_0_0`, and `xilinx_mem_gen_4096`/`xilinx_mem_gen_16384`
+(X-HEEP's own on-chip SRAM banks, 8+5 instances) as **unresolved black
+boxes reporting ZERO resource usage** -- confirmed by the `CRITICAL
+WARNING: Could not resolve non-primitive black box cell ...` lines that
+were present (and, in hindsight, should have been treated as a real
+caveat rather than noted and moved past) in EVERY synth-only checkpoint
+this whole session, not just this one. Their REAL combined BRAM cost is
+`489 - 382 = 107` RAMB36-equivalent tiles -- entirely missing from every
+isolated-checkpoint utilization number reported anywhere in this file
+before now. This means the true usable budget for `kevgpt`'s own logic is
+`445 - 107 = 338` tiles, not 445.
+
+**This changes the whole Phase 4 sizing conclusion.** With `kevgpt`'s
+non-weight fixed baseline + `kv_bank_ddr` at ~126 tiles (unchanged across
+every shape measured this session), the REAL budget available for
+`weight_bank_tdp` is `338 - 126 = 212` tiles -- meaning the largest usable
+power-of-2 BRAM-cascade bucket is **128 RAMB36** (`WWORDS<=16384`), not the
+256-tile bucket the NLAYER=8 candidate needed. Recomputing real wide-word
+need at D=128 (same word-count formula as before):
+
+```
+NLAYER=2: 9,236 words   (Option A's own real shape)
+NLAYER=3: 12,308 words
+NLAYER=4: 15,380 words  <- largest that still fits the 16384-word/128-RAMB36 bucket
+NLAYER=5: 18,452 words  <- needs the next bucket (256 RAMB36) -- does NOT fit
+NLAYER=6: 21,524 words
+```
+
+**Corrected candidate: D=128/D3=384/D_MLP=512/NHEAD=2/NLAYER=4/VOCAB=57**
+(2x Option A's depth, not 4x) -- the largest depth that stays within the
+SAME BRAM bucket Option A's own already-proven-working build already uses.
+Retrained (best val 1.045 FP / 1.057 QAT, same recipe as before, ~8 min
+total), exported, and gated: **`VEC_KV_VERDICT match=True`**
+(`gen=[1, 41, 30, 34, 26, 1, 41, 29]`). Updated the wrapper to
+`NLAYER(4)`/`WWORDS(16384)` (WWORDS unchanged from Option A -- real need
+15,376 fits the SAME bucket).
+
+**Full build result: clean, this time for real.** `0 Errors` throughout
+(synth, place, route, bitgen DRC). `Bitgen Completed Successfully`;
+`write_bitstream completed successfully`. Timing closes with positive
+margin and zero failing endpoints on setup, hold, and pulse-width:
+
+```
+WNS(ns)=2.627   (0/2124 failing)
+WHS(ns)=0.108   (0/1980 failing)
+WPWS(ns)=4.600  (0/1111 failing)
+```
+
+**Real, full-device utilization this time** (`report_utilization` from the
+PLACED design -- `xilinx_core_v_mini_mcu_wrapper_kevgpt_utilization_
+placed.rpt`, which correctly includes `mig_7series_0`/X-HEEP's SRAM/
+everything, not an isolated-checkpoint undercount):
+
+```
+LUT:  102751/203800 = 50.42%
+FF:    60668/407600 = 14.88%
+BRAM:    360/445     = 80.90% (355 RAMB36 + 10 RAMB18)
+DSP:     803/840     = 95.60%  <- unchanged YET AGAIN
+```
+
+Real margin this time (64 spare BRAM tiles, ~14%), confirmed against the
+device's TRUE total resource picture, not an optimistic partial one.
+`xilinx_core_v_mini_mcu_wrapper_kevgpt.bit` written (11.4MB).
+
+**Lesson for any future synth-only checkpoint in this file**: an isolated
+`open_checkpoint` report on `synth_1`'s own `.dcp` is only trustworthy for
+resources INSIDE `kevgpt`'s own hierarchy (which is genuinely elaborated
+there) -- it silently reports zero for any sibling IP core resolved as a
+black box. Trust the full-build `place_design`/`utilization_placed.rpt`
+numbers for an actual go/no-go BRAM budget call; treat a clean isolated
+synth-only checkpoint as "no errors elaborating kevgpt's own logic",
+NOT as "the whole design fits."
+
+**Not yet done**: real-hardware bring-up for this corrected D=128/NLAYER=4
+shape (JTAG-program the new bitstream, confirm bit-exact generation on
+physical silicon, mirroring the KV-cache/weight-DMA halves' own real-
+hardware treatment earlier in this file).
