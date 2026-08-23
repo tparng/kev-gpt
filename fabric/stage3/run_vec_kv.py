@@ -43,7 +43,7 @@ def _decode(meta_path, ids):
     return "".join(itos.get(int(i), "?") for i in ids)
 
 
-def _sample_stream(gold_seq, prompt_ids, ngen, seed):
+def _sample_stream(gold_seq, prompt_ids, ngen, seed, vocab):
     """The on-chip-sampling golden, mirroring the TB pass schedule EXACTLY.
 
     The TB runs NPASS = PLEN+NGEN-1 passes (pos = 0..NPASS-1) and dumps the tok_out of
@@ -55,7 +55,7 @@ def _sample_stream(gold_seq, prompt_ids, ngen, seed):
     Sampling perturbs the SAME Q6.25 head logits the fabric argmax sees (step_head_q25).
     Returns the NGEN sampled tokens."""
     gold_seq.reset()
-    rng = gumbel.GumbelRng(seed)
+    rng = gumbel.GumbelRng(seed, vocab=vocab)
     # prompt passes 0..PLEN-2: greedy, output discarded (sampling not yet enabled)
     for tok in prompt_ids[:-1]:
         gold_seq.step_head_q25(int(tok))
@@ -76,11 +76,6 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
     assert plen + ngen - 1 <= tmax, "prompt+gen must fit the KV window"
 
     p, cfg = seq_ref.build(npz)
-    gold_seq = IntKVQSequencer(p, cfg, kbits=8, vbits=8, rotate=False, divfree=True)
-    if seed == 0:
-        gold = gold_seq.generate_greedy(list(prompt_ids), ngen)[plen:]
-    else:
-        gold = _sample_stream(gold_seq, list(prompt_ids), ngen, seed)
 
     # Derived from the actual checkpoint (was hardcoded to the deployed
     # KV260 shape: nlayer=4, d=256, nhead=4, vocab=193) -- see
@@ -90,6 +85,12 @@ def run(sim_dir, prompt_ids, ngen, P=8, lanes=16, tmax=256,
     nlayer = len(p["blocks"])
     nhead = int(p["n_head"])
     vocab = p["tok_emb"].shape[0]
+
+    gold_seq = IntKVQSequencer(p, cfg, kbits=8, vbits=8, rotate=False, divfree=True)
+    if seed == 0:
+        gold = gold_seq.generate_greedy(list(prompt_ids), ngen)[plen:]
+    else:
+        gold = _sample_stream(gold_seq, list(prompt_ids), ngen, seed, vocab)
 
     iseq = seq_ref.IntSequencer(p, cfg)
     write_mems_wideword(sim_dir, iseq, lanes, nlayer, P)

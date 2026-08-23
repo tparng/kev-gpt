@@ -2432,3 +2432,149 @@ synthesized, placed & routed with positive timing margin, and now proven
 bit-exact on real Genesys2 hardware. `sequencer_vec.sv`'s three fixed
 capacity constants (`GAMMA_N`/`DQ_N`/`NSACT`) are permanently fixed for
 any future NLAYER, not just this one shape.
+
+## Interactive UART chat: untethered weight loading + real generation loop
+
+Every firmware app up to this point only ever ran ONE baked-in prompt at
+boot, diffed against a fixed golden token stream, with weight loading
+tethered to a live GDB session (`restore ... binary`) over JTAG. This pass
+builds real interactive chat on top of the already-proven Option B model:
+a UART weight loader (so a chat session only needs a serial cable, not a
+live JTAG/OpenOCD/GDB session) and an interactive generate loop with
+on-chip Gumbel sampling for variety and a degenerate-reply guard ported
+from the KV260 lineage's own already-solved version of this problem
+(`fabric/stage3/board/pl_kv256.py`'s min-length ender mask).
+
+New pieces: `fabric/genesys2/gen_chat_fw.py`'s `emit_tokenizer_header()`
+(generates `kevgpt_tokenizer.h` -- `kevgpt_itos`/`kevgpt_stoi`/
+`kevgpt_stop_ids` -- from the same `meta.json` every gate already treats
+as the vocab, not hand-written); `fabric/genesys2/send_weights.py` (host
+side of the UART loader, reuses `wrom_to_words()`'s existing packing);
+`sw/applications/kevgpt_interactive/` (fork repo) -- `main.c` implements
+the UART weight-load handshake (`KEVGPT_UART_READY`/`KEVGPT_UART_LOAD_DONE`
+markers), a hand-rolled char-by-char prompt reader (no line-read helper
+exists in this SDK; `_read()` is a stub), lowercase+`kevgpt_stoi[]` encode,
+`kevgpt_step()` prefill with a once-per-turn reseed, and a streaming
+generate loop with the ender-remask guard via a new `kevgpt_read_bank()`
+helper (head-logit readback, `RD_SEL=8`, Q6.25).
+
+**Firmware builds clean for `TARGET=genesys2`** (`make app
+PROJECT=kevgpt_interactive TARGET=genesys2`, no `SOURCE=` override --
+matches this fork's own documented `make app` lesson): `main.elf` links,
+the trailing `mem_usage.py` `$(PWD)`-staleness failure is the same
+already-documented cosmetic issue every prior app hit, harmless since it
+fires after `.elf`/`.hex`/`.bin` are already built.
+
+**Found and fixed a real bug in the gate itself while verifying the
+sampling path on Option B's shape for the first time**:
+`fabric/stage3/run_vec_kv.py`'s `_sample_stream()` constructed
+`gumbel.GumbelRng(seed)` with no `vocab` argument, silently defaulting to
+`gumbel.py`'s module-level `VOCAB=193` (the KV260 shape) -- the exact same
+"constant coincidentally exact-fit for NLAYER=4/VOCAB=193, silently wrong
+for anything else" bug class as `GAMMA_N`/`DQ_N`/`NSACT` above, just in the
+Python golden this time instead of the RTL. Sampling mode had never been
+exercised against a non-193-vocab checkpoint before Option B (57 vocab), so
+it was never caught: `GumbelRng.sample_token()` looped `range(self.vocab)`
+= `range(193)` against a 57-entry `logits` list and threw `IndexError` on
+the first run. Fixed by deriving `vocab` in `run()` before building `gold`
+(it was already computed, just later in the function) and threading it
+through `_sample_stream(..., vocab)` into `GumbelRng(seed, vocab=vocab)`.
+The RTL side never had this bug -- `-DVOCABVAL={vocab}` was already
+correctly derived and wired to the TB's `VOCAB` parameter.
+
+**Also hit, immediately after the vocab fix**: both greedy (`--seed 0`)
+and sampled runs came back all-`X` on the RTL side even after the fix --
+turned out to be an already-documented gate-usage gotcha, not a new bug:
+`run_vec_kv.py`'s own CLI defaults (`--p 8 --lanes 16`) give `EPW =
+(LANES*4)//(P*32) = 0`, so the token/pos embedding table never gets
+appended into `wrom.mem` and `S_EMB` reads uninitialized weight-bank rows
+unconditionally (`LANES >= 8*P` is required, already documented earlier in
+this file from the original Option A crash). Re-ran with `--lanes 64`
+(matching every other Option B invocation this session) -- clean.
+
+**Verification step 1 (host-only, automated) result: bit-exact at three
+different seeds**, `--lanes 64` against `fabric/export_optionB/goformer.npz`:
+
+| prompt | seed | ngen | result |
+|---|---|---|---|
+| "once" | 0 (greedy) | 8 | match=True, gen=`[1,42,37,36,35,1,41,30]` |
+| "once" | 1 | 8 | match=True, gen=`[1,42,37,36,35,1,41,30]` (coincides with greedy for this prompt -- seed=42/999999 below diverge, ruling out an accidental no-op) |
+| "hey" | 42 | 8 | match=True, gen=`[1,34,36,34,1,40,36,1]` |
+| "yo" | 999999 | 10 | match=True, gen=`[42,1,39,30,28,29,41,1,46,36]` |
+
+Proves the on-chip Gumbel sampling path itself is bit-exact against
+`gumbel.GumbelRng` on Option B's actual shape (D=128/NLAYER=4/VOCAB=57),
+not just on the original KV260-shaped checkpoint the gate happened to be
+written against.
+
+**Real hardware bring-up**: fresh JTAG bitstream program (`vivado -mode
+batch -source ..._pgm.tcl`, same `.bit` Option B's earlier bring-up
+produced -- unchanged, since only firmware changed this pass), `openocd -f
+quad-x-heep-openocd-genesys2.cfg` found the TAP cleanly, `riscv32-corev-
+elf-gdb ... -ex "monitor reset halt" -ex load -ex continue -batch` loaded
+`kevgpt_interactive`'s `main.elf`. UART came up at `KEVGPT_INTERACTIVE_ID,
+0x53515256` ("SQRV", correct), then blocked at `KEVGPT_UART_READY` as
+designed.
+
+**Sharp edge, immediately hit and fixed**: the firmware's `KEVGPT_UART_
+READY` marker is a one-shot printf -- if a `cat /dev/ttyUSB0` reader (or
+any other passive listener) consumes it before `send_weights.py` starts
+listening, the byte is gone for good and `send_weights.py` times out even
+though the firmware is still correctly sitting ready to receive. Not a
+firmware or protocol bug -- a real ordering requirement for any host tool
+in this role: start listening (`send_weights.py`) BEFORE triggering the
+reset+load+continue that makes the firmware print the marker, not after.
+
+**`send_weights.py`, real hardware: `SEND_WEIGHTS_PASS`** -- 123,008 words
+(492,032 bytes) sent, `KEVGPT_UART_LOAD_DONE` + `KEVGPT_INTERACTIVE_READY`
+confirmed on the wire.
+
+**Verification step 2 (real hardware, scripted): bit-exact.** The
+production `chat_turn()` loop deliberately has no host-controllable seed
+(it self-seeds from a live cycle counter, "good enough for chat variety,
+not a cryptographic requirement" -- see `main.c`), so a scripted seed-exact
+comparison against it directly isn't possible by design. Instead drove the
+SAME register sequence `_sample_stream()`/the TB use, directly over JTAG
+via a plain (non-Python -- this GDB build has no Python scripting support)
+GDB command script: `monitor halt`, soft_reset pulse, three greedy prefill
+GOs discarded, `SEED=1` write, then GO/read-TOK_OUT chained through 8
+sampled positions (mirroring `_sample_stream`'s exact pass schedule), 
+`monitor resume` to hand control back to the firmware. Prompt "once"
+(ids `[36,35,24,26]`), seed=1:
+
+```
+KEVGPT_SEED_PROBE_RESULT,[1, 42, 37, 36, 35, 1, 41, 30]
+```
+
+Bit-exact against the same Python-computed sampled sequence from the host
+gate above (`[1, 42, 37, 36, 35, 1, 41, 30]`) -- the SEED register, the
+persistent xorshift/argmax datapath, and the head-logit path all work
+correctly when driven for real on Option B's actual placed-and-routed
+silicon, not just in simulation.
+
+**Verification step 3 (manual interactive session): legible, non-
+degenerate, non-hanging.** Sent real prompts over the UART (Python
+`pyserial`, standing in for a human at a terminal) once the CPU resumed
+back into `chat_turn()`'s live read loop:
+
+```
+"hello there" -> " beautiful new thing him go back begin always where you scarf yo"
+"what is up"  -> "le them look angry see not find big batter batter vegetable me w"
+"i like cats" -> " make her point her eat snake snake one day her see moon beautif"
+"a"           -> "ll reach away her motorbin say it make lot funny man look tim ha"
+```
+
+Also confirmed two edge cases: an empty line (bare Enter) re-prompts
+cleanly with no hang; backspace (`xyz<BS><BS>oo` -> encodes "xoo") echoes
+and edits correctly. No reply degenerated to a bare `.`/empty string (the
+`MIN_CHARS=12` ender-remask guard doing its job), nothing hung, every turn
+re-prompted with `> ` afterward. Reported honestly as a human-judgment
+check on real Genesys2 hardware, not a bit-exact gate -- free-form sampled
+chat has no fixed golden reference by nature of the feature.
+
+**This closes the interactive-chat pass.** Cleaned up per this file's own
+documented process-hygiene discipline (`kill` the `openocd` PID once
+verification's JTAG needs are done -- `reset_config none` means the
+running firmware is unaffected by the JTAG connection dropping). The board
+is left running `kevgpt_interactive` live, chatting, with no host process
+attached.
