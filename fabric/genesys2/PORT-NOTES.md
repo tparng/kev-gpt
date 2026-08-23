@@ -2357,3 +2357,78 @@ NOT as "the whole design fits."
 shape (JTAG-program the new bitstream, confirm bit-exact generation on
 physical silicon, mirroring the KV-cache/weight-DMA halves' own real-
 hardware treatment earlier in this file).
+
+### Real hardware bring-up for Option B (D=128/NLAYER=4) -- DONE, bit-exact PASS
+
+**A second, real build-system limit found before this could even build**:
+regenerated `kevgpt_chat`'s own `kevgpt_weights.h` (`fabric.genesys2.
+gen_chat_fw`, against `fabric/export_optionB/goformer.npz`) and tried the
+usual `make app PROJECT=kevgpt_chat` flow -- linker failure, not a Vivado
+or RTL problem this time: `region 'ram0' overflowed by 109188 bytes`.
+Option B's weight image (123,008 words = 492,032 bytes) no longer fits
+X-HEEP's 384KB on-chip `ram0`, which `kevgpt_chat`'s own boot sequence
+embeds the ENTIRE weight image into as a literal `.rodata` C array before
+streaming it out over `wl_we` -- a hard ceiling on model size that has
+nothing to do with `weight_bank_tdp`'s own BRAM budget, and would have hit
+ANY sufficiently large model regardless of how much on-chip weight storage
+the FPGA itself has room for.
+
+**This is precisely the scenario `weight_loader_ddr`'s DMA path exists
+for** -- but `kevgpt_wld_bringup` (built earlier this session) ALSO
+embeds `kevgpt_weight_words[]` via the same shared `kevgpt_weights.h`, so
+it would hit the identical linker overflow. Built a new, minimal app,
+`sw/applications/kevgpt_optionB_bringup/` (own small hand-written
+constants -- `KEVGPT_PLEN`/`NGEN`/`WEIGHT_WORDS_COUNT`/prompt/expected-gen
+-- no embedded weight array at all) that skips CPU-side DDR3 staging
+entirely: the weight image is written directly into DDR3 via **GDB's own
+`restore` command** (`restore <binary> binary 0xF0000000`, targeting
+`EXT_SLAVE_START_ADDRESS` over JTAG, BEFORE the program even starts
+running) rather than through any firmware code path, sidestepping
+`ram0`'s size limit completely -- the CPU never needs to hold the weight
+image in its own address space at all, not even transiently. The raw
+binary was produced by `fabric.genesys2.gen_chat_fw`'s own `wrom_to_words()`
+packing (low-chunk-first 32-bit words, the exact order `weight_loader_
+ddr.sv`'s unpacker expects -- reused verbatim, not re-derived, so the byte
+layout is guaranteed to match what every other path in this project
+already treats as canonical). Firmware: probe -> `kevgpt_wld_load(dev, 0,
+123008)` (trigger the DMA load, poll `wld_done`) -> the same prompt/gen
+loop `kevgpt_chat`/`kevgpt_wld_bringup` use -> compare.
+
+**Real UART result: bit-exact.**
+```
+KEVGPT_OB_PHASE,control_plane
+KEVGPT_OB_ID,0x53515256
+KEVGPT_OB_PHASE,dma_load
+KEVGPT_OB_DMA_DONE
+KEVGPT_OB_STATUS_PRE,0x00000004
+KEVGPT_OB_PHASE,generate
+... (per-pass cycles, KEVGPT_OB_GEN lines) ...
+KEVGPT_OB_CYCLES,256551
+KEVGPT_OB_CMP,i=0,got=1,want=1
+KEVGPT_OB_CMP,i=1,got=41,want=41
+KEVGPT_OB_CMP,i=2,got=30,want=30
+KEVGPT_OB_CMP,i=3,got=34,want=34
+KEVGPT_OB_CMP,i=4,got=26,want=26
+KEVGPT_OB_CMP,i=5,got=1,want=1
+KEVGPT_OB_CMP,i=6,got=41,want=41
+KEVGPT_OB_CMP,i=7,got=29,want=29
+KEVGPT_OB_PASS,generate
+```
+
+All 8 generated tokens `[1, 41, 30, 34, 26, 1, 41, 29]` bit-exact against
+the same golden reference `fabric.stage3.run_vec_kv` already gated against
+in simulation -- on real silicon, weights sourced ENTIRELY through
+`weight_loader_ddr`'s DMA path from DDR3 (never through `wl_we`), for a
+genuinely bigger (2x Option A's depth), genuinely trained model.
+`STATUS_PRE=0x00000004` again confirms `wld_done` latches correctly.
+
+**This closes Phase 4 end to end**: a real model bigger than Option A --
+found via real synth numbers, corrected TWICE by real failures (the
+isolated-checkpoint BRAM undercount at the Vivado stage, the `ram0`
+on-chip-RAM ceiling at the firmware stage) rather than paper estimates,
+each time landing on a smaller, real, working answer instead of a bigger,
+untested one -- is trained, QAT-fine-tuned, gated bit-exact in simulation,
+synthesized, placed & routed with positive timing margin, and now proven
+bit-exact on real Genesys2 hardware. `sequencer_vec.sv`'s three fixed
+capacity constants (`GAMMA_N`/`DQ_N`/`NSACT`) are permanently fixed for
+any future NLAYER, not just this one shape.
