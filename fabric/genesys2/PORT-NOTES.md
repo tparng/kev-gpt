@@ -2224,3 +2224,42 @@ everywhere else in this file.
 NLAYER=8 shape (the earlier synth checks used different shapes for the
 DSP/BRAM feasibility argument, not this exact final candidate); full P&R/
 bitstream/real-hardware bring-up.
+
+### Synth-only Vivado checkpoint for "Option B" (D=128/NLAYER=8) -- DONE, clean, and DEPLOYED
+
+Unlike the earlier two exploratory checks (D=192/NLAYER=4, D=256/NLAYER=4
+-- both reverted immediately after, never committed), this one updates the
+REAL wrapper: `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`'s `u_kevgpt`
+instantiation now reads `NLAYER(8)`/`WWORDS(32768)` (every other parameter
+-- D/D3/D_MLP/NHEAD/VOCAB/TMAX/LANES/P -- unchanged from Option A), since
+this candidate is now a real, trained, QAT-fine-tuned, bit-exact-gated
+checkpoint (`data/ckpt_optionB.qat.pt`, `fabric/export_optionB/
+goformer.npz`), not a sizing-only exploration. ROM `.mem` files generated
+via `write_mems_wideword` directly against this real checkpoint (P=8,
+LANES=64) -- real content this time, not reused/mismatched files from a
+different checkpoint. Regenerated the FuseSoC project from scratch (`rm
+-rf` the build dir, `make vivado-fpga-nobuild`) since `NLAYER` genuinely
+changed, then `make synth`.
+
+**Result: clean, 0 errors.**
+```
+LUT:  99617/203800 = 48.88%
+FF:   55604/407600 = 13.64%
+BRAM: 382/445 (377 RAMB36 + 10 RAMB18, Vivado's own normalized Block RAM
+      Tile count) = 85.84%
+DSP:  803/840 = 95.60%  <- unchanged AGAIN (now confirmed identical across
+                            FOUR different NLAYER values this session: 2,
+                            4 [x2 shapes], and 8)
+```
+`g_kvb_ddr.u_kvb` (`kv_bank_ddr`) = **9 RAMB36+1 RAMB18, byte-for-byte
+unchanged from Option A's own NLAYER=2 build** -- direct empirical
+confirmation, now at the ACTUAL deployed NLAYER=8 shape (not just an
+exploratory check), that the KV cache truly costs nothing extra as depth
+grows. `u_wb` (`weight_bank_tdp`) = 256 RAMB36 at `WWORDS=32768`, matching
+the power-of-2-bucket prediction from the earlier exploration exactly.
+`g_wld.u_wld` (`weight_loader_ddr`) = 135 LUT/418 FF/0 BRAM/0 DSP, tiny as
+always.
+
+This is now the real, committed, in-progress deployment target (both
+repos), not a revert-after-measuring exploration. Next: full P&R/
+bitstream/real-hardware bring-up at this shape.
