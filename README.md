@@ -95,6 +95,47 @@ ceiling **~5.6× (1k → 5,600 tok/s)** while keeping the fabric record bit-exac
 (greedy 3/3, sampling 8/8 unique). The public number (~1,658 tok/s through the
 Cloudflare tunnel) is the remaining WAN+tunnel RTT, not fabric.
 
+## Kevin outgrows the chip (the Genesys2 port)
+
+A second, harder board: a [Digilent Genesys2](https://digilent.com/reference/programmable-logic/genesys-2/start)
+(Kintex-7, `xc7k325tffg900-2`) with X-HEEP + a `cv32e40px` RISC-V core instead
+of the Kria's Arm cores, and **no URAM primitive at all** — the resident
+weight/KV storage that makes the KV260 build fast has to fit in an ordinary
+BRAM tile budget instead. Full engineering log:
+[`fabric/genesys2/PORT-NOTES.md`](fabric/genesys2/PORT-NOTES.md).
+
+**Option A (fully on-chip)**: d=128, 2 layers, 2 heads, the 57-char Kevin-speak
+vocab (0.40M params), weights and KV cache both BRAM-resident — the same
+"everything on-chip, zero DRAM in the token loop" bet as the KV260 build, on a
+part with no URAM to make it easy. Measured on real Genesys2 hardware, 50MHz,
+bit-exact against the integer golden reference: **~11,930-11,985 tok/s**.
+
+**Option B (DDR3-streamed, 2x the depth)**: Option A's own ceiling turned out
+to be BRAM, not compute — its DSP usage sits at 95.6% and (verified
+empirically across five different model shapes, from RTL inspection through
+real synthesis) stays there regardless of depth or width, since it's bounded
+by the fixed per-lane pipeline, not by layer count. So the
+KV cache and the weight image now stream through the board's DDR3 instead of
+sitting resident, via two new modules (`kv_bank_ddr.sv`, `weight_loader_ddr.sv`)
+riding the fork's existing DMA infrastructure. Result: d=128, 4 layers (2x
+Option A's depth), 0.79M params — a genuinely bigger model than a BRAM-only
+build on this chip could ever hold. Real hardware, bit-exact, weights staged
+into DDR3 over JTAG and loaded entirely through the DMA path (the model's
+492KB weight image doesn't even fit in the 384KB on-chip RAM the boot-time
+register stream would otherwise use): **~3,120 tok/s** — honestly ~3.8x
+slower than Option A, the real cost of two DDR3 round-trips a token instead
+of zero. The point isn't speed; it's that streaming buys a model this board
+couldn't host any other way, at a bounded, measured price.
+
+Getting both variants right surfaced real, previously-unknown RTL bugs, each
+caught by the same bit-exact-before-synthesis discipline as the KV260
+build — not found on real silicon after the fact: a clock-domain-crossing
+gap in the DDR arbiter's first draft (every earlier sim gate shared one
+clock, hiding it), a 4-bit progress counter that silently wrapped and
+deadlocked any GEMV needing 16+ output groups, and three ROM-capacity
+constants hardcoded to fit exactly the original reference shape, silently
+corrupting anything deeper with no error at all.
+
 ## What works today
 
 - **Keviniser**: POS-based so it keeps main-verb "do" and drops auxiliary "do".
