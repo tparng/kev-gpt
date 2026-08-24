@@ -2578,3 +2578,151 @@ verification's JTAG needs are done -- `reset_config none` means the
 running firmware is unaffected by the JTAG connection dropping). The board
 is left running `kevgpt_interactive` live, chatting, with no host process
 attached.
+
+## Mini story teller: raw-TinyStories checkpoint + a real Vivado ROM-staging bug
+
+Follow-up ask: make the chatbot tell actual (mini) stories, not just
+single-sentence replies. Two pieces -- a corpus/training change (real,
+worth keeping) and a Vivado build-process bug this uncovered along the way
+(real, now fixed, and will bite any future resynthesis if forgotten again).
+
+**Corpus**: the Kevin-speak checkpoints (Option A/B) are trained on
+`keviniser`-transformed TinyStories -- POS-stripped, telegraphic, and
+(empirically, checked via a 100-char host-side generation at 4 different
+seeds) producing sentence-ending `.`/`!`/`?`/`\n` only very rarely, since
+the transform strips a lot of the sentence structure those characters
+mark. `model/prep_raw_corpus.py` (new) normalizes RAW (non-Kevinised)
+`data/TinyStories-valid.txt` instead -- lowercase-folds (matches this
+project's existing lowercase-only vocab convention and
+`kevgpt_interactive`'s firmware, which already force-lowercases typed
+prompts), normalizes curly quotes/dashes/ellipsis to plain ASCII, drops
+anything outside a fixed common set. Checked empirically: loses 41 of
+19,092,837 characters, all rare encoding artifacts, not real content.
+Natural vocab: 47 chars (`data/char_stories/meta.json`) -- genuinely
+*smaller* than the Kevin-speak 57, not larger (real English needs fewer
+distinct symbols than this project's own POS-substitution/punctuation
+conventions did).
+
+**Trained fresh at Option B's exact shape** (D=128/D3=384/D_MLP=512/
+NHEAD=2/NLAYER=4/block_size=128, ~2.5 min FP + ~6 min QAT on this GPU --
+this corpus is bigger than the Kevin-speak valid split, 18.9M vs a much
+smaller compressed corpus, but training throughput is still ~97 it/s):
+best FP val 0.886 / QAT val 0.907, BOTH markedly better than Option B's
+own FP 1.045 / QAT 1.031 -- real English grammar is a genuinely easier
+next-char prediction task than the keviniser-compressed vocabulary that
+strips predictable function words. Sample text at this point already
+included `"the end. | once upon a time, there was a brave little boy..."`
+-- coherent multi-sentence output, unprompted.
+
+**Firmware**: `kevgpt_interactive/main.c`'s single-sentence generate loop
+became a story loop -- `STORY_SENTENCES=4`, `MAX_GEN_LEN` raised 64->100,
+and the `MIN_CHARS` degenerate-sentence guard now RE-ARMS after every
+accepted ender (`chars_this_sentence` resets to 0), not just the first
+one, so a 4-sentence story can't quietly collapse into one real sentence
+plus three single-character ones.
+
+**Real bug #1 (Python gate, not RTL)**: `run_vec_kv.py`'s sampling gate
+built `gumbel.GumbelRng(seed)` without passing the checkpoint's real
+`vocab` -- silently defaulted to `gumbel.py`'s module-level `VOCAB=193`
+(the KV260 shape). Never caught before since sampling had never been
+exercised against a non-193-vocab checkpoint. Fixed: `GumbelRng(seed,
+vocab=vocab)`, `vocab` now computed before `_sample_stream()` is called
+rather than after.
+
+**Real bug #2 (methodology, not a code bug): VOCAB is a synthesis-time
+parameter, not runtime data.** Tried deploying the story checkpoint's
+natural 47-char vocab directly -- retrained/exported/gated bit-exact in
+simulation, but real hardware needed `xheep_kevgpt_peripheral`'s `VOCAB`
+parameter changed from 57 (Option B) to 47 and RESYNTHESIZED (unlike an
+NLAYER-only or weight-only change, which the deployed bitstream already
+handles generically -- VOCAB is baked into the argmax/dequant/embedding
+hardware's own width and address decode at synthesis time). Did the full
+synth/PnR/bitgen cycle for VOCAB=47 -- clean, 0 errors, WNS=+2.263ns --
+but produced all-zero head logits on real hardware (confirmed via direct
+`RD_SEL=8` readback of individual vocab positions, not just a garbled
+`tok_out`). Padded the checkpoint's vocab back up to 57 with 10 unused
+filler characters (`ABCDEFGHIJ`, ids 47-56, appended AFTER the natural
+47-char `sorted(set(text))` assignment so the real characters keep their
+original ids and the padding entries get zero training gradient -- they
+never appear in the corpus and `encode_char()` already force-lowercases
+input, so they're unreachable from both training and live chat) and
+retrained fresh (FP val 0.886, QAT val 0.907 -- unaffected by the unused
+padding), to reuse Option B's exact, already-proven VOCAB=57 shape.
+
+**Real bug #3, the actual root cause (and the reason bug #2's "fix"
+*also* failed at first): a missing Vivado ROM-staging step, not a hardware
+or checkpoint bug at all.** The VOCAB=57-padded rebuild STILL produced
+all-zero logits -- and, decisively, so did a re-send of Option B's own
+already-proven-good checkpoint onto that same fresh bitstream. Since the
+RTL source diffed byte-identical against the exact commit that built the
+original working Option B bitstream (`git diff` showed only comment
+additions), the bug had to be in the BUILD PROCESS, not the RTL or the
+checkpoint. `synth_1`'s own `runme.log` had the answer directly:
+`CRITICAL WARNING: [Synth 8-4445] could not open $readmem data file
+'gamma_w.mem'/'inv_sact.mem'/'dqm_w.mem'/'dqe_w.mem'/'gumbel_lut.mem'/
+'inv_lut_lo.mem'/'inv_lut_hi.mem'/'seed.mem'/'gelu_lut_e.mem'/
+'gelu_lut_o.mem'/'exp_lut.mem'; ... ignoring`. These 11 files are the
+LayerNorm-gain/dequant-scale/gumbel-noise/fixed-math ROMs
+`sequencer_vec.sv`/`layernorm_vec.sv`/`kv_bank_ddr.sv`/`gelu_lut2.sv`/
+`softmax_f.sv` `$readmemh` **at synthesis time, baked into the bitstream
+itself** -- an architectural fact already documented (Phase 5/6 above) but
+apparently not durably remembered: every prior real build regenerated and
+placed these files by hand before synthesizing; this session's `rm -rf` +
+fresh `fusesoc --build` cycles (done twice, for VOCAB=47 and again for the
+VOCAB=57-padded retry) never did. Missing files -> Vivado silently
+zero-initializes those ROMs and continues -- every dequantized value
+becomes zero regardless of the real (correctly UART-loaded) weight
+matrix, matching the all-zero symptom exactly.
+
+**This also fully explains the DSP utilization mystery** noted along the
+way: both broken rebuilds synthesized to ~550/840 DSP48E1 (vs Option B's
+803/840, on RTL source confirmed byte-identical) -- looked like alarming
+synthesis non-determinism, but was the SAME root cause: with the
+dequant/gumbel ROMs reading as constant zero, Vivado's optimizer correctly
+treats large chunks of that logic as dead/constant-foldable and infers far
+fewer DSP48E1 instances for it. Confirmed directly: after fixing the ROM
+staging (below) and rebuilding, DSP came back to exactly 803/840 (95.60%)
+-- identical to Option B, no mystery left.
+
+**Fix, now a real project artifact, not another one-off snippet**:
+`fabric/genesys2/stage_vivado_roms.py` (new) generates and copies all 11
+ROM `.mem` files into any given directory, reusing
+`write_mems_wideword` (the same code the gate uses) plus the
+gelu-split/inv-lut/gumbel-lut generation verbatim from `run_vec_kv.py`'s
+own `run()`. **Needs staging in BOTH the Vivado project root AND
+`<project>.runs/synth_1/`** (`launch_runs synth_1` spawns its own `vivado
+-mode batch` subprocess with `synth_1/` as CWD, where `$readmemh`'s bare
+relative filenames actually resolve -- confirmed by finding zero
+`could not open` warnings in the very next `synth_1/runme.log` after
+staging). **Must run AFTER `reset_run synth_1`, not before** --
+`reset_run` recreates that directory empty, silently discarding anything
+staged earlier. Rebuilt via three separate Vivado invocations (one Tcl
+script can't mix `exec`-ing a venv Python inside a running Vivado batch
+session -- Vivado's own bundled Python 3.8 sets `PYTHONHOME`/`PYTHONPATH`
+that a `.venv`'s Python 3.12 inherits and chokes on): (1) `open_project` +
+`reset_run synth_1` + `reset_run impl_1`, exit; (2) plain shell,
+`stage_vivado_roms.py`; (3) `open_project` + `launch_runs impl_1 -to_step
+write_bitstream` + `wait_on_run` + the bitstream-copy step from the
+original generated `_run.tcl` (unmodified).
+
+**Real hardware, verified bit-exact**: greedy register-poke probe (same
+JTAG-bypass technique as the interactive-chat pass, prompt "once upon a
+time" encoded against `data/char_stories/meta.json`) against the rebuilt,
+ROM-fixed bitstream: `[5, 1, 40, 28, 25, 38, 25, 1, 43, 21, 39, 1, 21, 1,
+32, 29, 40, 40, 32, 25, 1, 27, 29, 38, 32, 1, 34, 21, 33, 25, 24, 1, 32,
+29, 32, 45, 7, 1, 39, 28]` -- bit-exact against `fabric.stage3.run_vec_kv`'s
+own golden for this checkpoint. Then real interactive chat over UART:
+
+```
+"once upon a time" -> "f he wanted to play. so, the bee had gone first when they had to paint the money. it was the lion wa"
+"the dog ran"       -> "ing away and couldn't find her. she tried to give it to the birds and put it in her red easpact. she"
+"a little girl"     -> " named lily who loved to play with her toy car. daisy wanted to go on an adventure, but she thought,"
+```
+
+Real periods, commas, and quoted dialogue with a question mark in a
+follow-up backspace-edge-case check -- a qualitative step up from the
+Kevin-speak model's punctuation-free rambles, confirming the whole point
+of this pass. Empty-line and backspace edge cases both still work
+correctly on the new firmware build. Cleaned up JTAG/UART processes;
+board left running `kevgpt_interactive` live with the story checkpoint,
+chatting, no host process attached.
