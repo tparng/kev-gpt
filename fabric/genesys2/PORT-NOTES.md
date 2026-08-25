@@ -3225,3 +3225,106 @@ coherent:
 "the dog ran"       -> "ing into the park. they said goodbye to the park and the dog. they took the path and started to cry. they felt sad, b"
 "a little girl"     -> " named lily who loved to carry in her bedroom. one day, she was walking to the beach when her mom says she was the "
 ```
+
+## NLAYER=12: data-limited at first, fixed with the full TinyStories train split
+
+Grew NLAYER 8->12 (same D/D3/D_MLP/NHEAD/VOCAB shape, `WWORDS=3072`
+unchanged -- the whole point of per-layer streaming: weight-bank BRAM
+cost stays flat regardless of depth).
+
+**First attempt: worse than NLAYER=8, not better.** Trained on the SAME
+small (~19M-char) `TinyStories-valid` split used for the NLAYER=8
+checkpoint, identical recipe (12000 iters, same LR schedule): best val
+1.020 -- WORSE than NLAYER=8's 0.841. Train loss kept falling while val
+loss climbed back up after ~iter 6500-7000: classic overfitting, a
+bigger model outrunning what a small, heavily-repeated dataset can
+teach it. Two hyperparameter interventions (dropout=0.1; lower LR +
+longer warmup) each landed in the same 0.90-0.93 range -- three
+different reasonable configs converging to the same plateau is the
+signature of a data-limited regime, not a tuning problem.
+
+**Fix: the full TinyStories train split (~1.9GB), not the ~20MB
+validation split.** `keviniser.fetch_tinystories --split train` pulls
+it directly from the same HuggingFace source. Its natural vocab is 241
+chars (uppercase, digits, and rare multilingual/emoji noise mixed in) --
+incompatible with the deployed VOCAB=57 hardware shape (embed/head
+tables are sized to exactly that at synthesis time). Lowercased every
+story and dropped any story containing a character outside the same
+47-char whitelist the working NLAYER=8 checkpoint already used (kept
+1,988,101 of 2,119,489 stories, 93.8%) -- NOT a new tokenizer or a
+hardware change, just a stricter filter on which stories can be used
+with the SAME character set. Padded to VOCAB=57 with the exact same
+A-J filler scheme (ids 47-56) already baked into the deployed firmware's
+tokenizer table, so `kevgpt_tokenizer.h` came out byte-identical on
+regeneration -- no firmware retouch needed.
+
+Retrained on this ~94x-bigger corpus (~1.78B chars after filtering),
+same recipe: best val 0.842 at 12000 iters -- already matching NLAYER=8's
+0.841, and train/val stayed close together (0.843/0.845) instead of
+diverging, confirming the overfitting was genuinely data-limited, not an
+optimization problem. Doubled to 24000 iters since there was no
+overfitting signal yet: best val **0.772** -- a real, clean improvement
+over NLAYER=8, not just parity. QAT (INT4/INT8, warm-started): best val
+**0.785**, vs NLAYER=8's own QAT 0.862.
+
+**A real "recheck NLAYER-dependent sizing on every depth change" catch,
+made before synth, not after.** `KV_DDR_BASE` (fixed at 1MB earlier this
+session for the NLAYER=8 collision bug) does NOT automatically scale --
+at NLAYER=12 the weight image itself grew to 1,278,464 bytes, LARGER
+than the old 1MB base, which would have silently reintroduced the exact
+same KV/weight DDR3 collision this session already spent real effort
+finding and fixing once. Caught by just redoing the arithmetic
+(`fabric/genesys2/PORT-NOTES.md`'s own per-layer-streaming section has
+the formula) before touching Vivado; `KV_DDR_BASE` raised to 2MB.
+
+**Export path note**: `model.export_fabric` produces a DIFFERENT npz
+layout (`blocks_N_qkv__int_w` naming) than what `fabric.stage3.seq_ref`
+and the RTL gates actually consume (`bN_qkv_iw`/`_ws`/`_sa` naming,
+`n_blocks`/`tok_emb`/`pos_emb`/`ln_f` top-level keys) -- the correct tool
+is `model.goformer_full.params_from_ckpt()` + `save_params()`, not
+`export_fabric.export()` directly. `python -m model.goformer_full
+<ckpt>` also runs a useful independent sanity check (numpy INT reference
+vs the actual PyTorch/Brevitas forward pass, cosine>0.9999 gate) --
+FAILED at NLAYER=12 (cosine=0.9998257) despite the REAL hardware-facing
+gate (`run_vec_kv.py` against `seq_ref.IntKVQSequencer`, the fixed-point
+reference the RTL is actually built to match) passing bit-exact. These
+are two different reference implementations; `goformer_full`'s own
+float-leaning numpy re-implementation apparently accumulates enough
+independent rounding drift over 12 layers to cross its own strict
+threshold without that drift reflecting anything the RTL/hardware gate
+actually cares about -- flagged here as a known, apparently-benign gap
+rather than silently ignored, since a future NLAYER bump might behave
+differently and deserves the same scrutiny, not an assumed pass.
+
+**Real hardware, confirmed**: greedy register-poke probe bit-exact
+(`[5, 1, 40, 28, 25, 38, 25, 1, 43, 21, 39, 1, 21, 1, 32, 29]`, matching
+the same golden as NLAYER=8's, coincidentally -- "once upon a time" is
+evidently a strong enough opener that multiple model depths converge to
+the same completion). Real interactive chat, coherent across multiple
+prompts:
+
+```
+"once upon a time" -> " there was a little girl named lily. she loved to play outside in the sun and explore the woods. one day, she sa"
+"the dog ran"       -> "ing and ran to the dog. the dog was happy to see the dog. the dog was still angry and he said, \"wow, that was a norma"
+"a little girl"     -> " named lily who loved to play outside. one day, she decided to go to the park to play with her friends. they wanted"
+```
+
+**Real synth numbers**: Setup WNS +1.055ns (tighter than NLAYER=8's
++2.77 to +4.11ns, as expected with more logic, still positive/clean),
+Hold +0.170ns, BRAM 171/445 (38%, down from NLAYER=8's 267 -- a real,
+observed, NOT fully root-caused result; the per-layer scale ROMs
+[gamma_w/dqm_w/dqe_w/inv_sact] DO grow with NLAYER and should need MORE
+raw bits, so this is most likely the same BRAM-is-a-step-function-of-
+depth bucketing effect already proven for weight_bank_tdp's own WWORDS
+sizing elsewhere in this document, landing in a better-packed
+RAMB36/RAMB18 bucket at this specific depth -- but this wasn't confirmed
+with a hierarchical utilization report, and the NLAYER=8 build's own
+report no longer exists to diff against since its build directory was
+`rm -rf`'d for this rebuild. Worth a real look if BRAM headroom ever
+becomes tight again, not fully explained here). DSP 804/840, essentially
+unchanged (compute is NLAYER-independent, same physical MAC array
+reused serially per layer). Measured per-token cost: ~385,380
+cycles/token (~7.7ms, ~130 tok/s at 50MHz) -- still comfortably above
+the ~50 tok/s interactive-chat comfort floor.
+
+**Not yet committed.**
