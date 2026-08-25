@@ -22,6 +22,7 @@ fabric/export_legit/
 fabric/export_optionA/
 fabric/export_optionB/
 fabric/export_stories/
+fabric/export_stream8/
 fabric/roofline.png
 
 # Stage 1 sim/synth scratch (regenerable)

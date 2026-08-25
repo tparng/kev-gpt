@@ -20,7 +20,13 @@
 // tb_kv_bank_ddr.sv does, not a blanket -DSYNTHESIS on the command line.)
 module tb_weight_loader_ddr;
   localparam integer LANES  = 64;
-  localparam integer WWORDS = 64;   // small window for a fast gate, not Option A's real 16384
+  // Genesys2 mini-story-teller shape's real per-block window (D=128/D3=384/
+  // D_MLP=512/LANES=64): GW_BLK = GW_QKV+GW_PROJ+GW_FC+GW_MP =
+  // 768+256+1024+1024 = 3072 wide words -- the realistic per-layer-reload
+  // size the per-layer weight-streaming feasibility check (PORT-NOTES.md)
+  // needs a real cycle count for, not the 16/24-word correctness-only
+  // cases below.
+  localparam integer WWORDS = 3072;
   localparam integer ADDR_W = 29;
   localparam integer DATA_W = 256;
   localparam integer WBITS  = LANES * 4;   // = 256 = DATA_W at LANES=64
@@ -86,7 +92,9 @@ module tb_weight_loader_ddr;
 
   localparam [2:0] MIG_CMD_READ = 3'b001;
 
-  mig_behav_model #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .MEM_WORDS(4096), .READ_LATENCY(9)) u_mem (
+  // MEM_WORDS covers the third (realistic-block-size) test case's own
+  // offset + word count -- see base_beat[2]/nwords[2] below.
+  mig_behav_model #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .MEM_WORDS(8192), .READ_LATENCY(9)) u_mem (
       .clk_i(clk), .rst_ni(!rst),
       .app_addr_i(rd_cmd_addr), .app_cmd_i(MIG_CMD_READ), .app_en_i(rd_cmd_valid), .app_rdy_o(app_rdy),
       .app_wdf_data_i({DATA_W{1'b0}}), .app_wdf_mask_i({(DATA_W/8){1'b1}}),
@@ -96,13 +104,17 @@ module tb_weight_loader_ddr;
 
   // ---- source image: fill DDR with a known pseudo-random pattern before
   // each load (mirrors how firmware's boot-time staging, Phase 3, will have
-  // already populated this region) -- two cases, DIFFERENT base beat offset
-  // AND word count each time: the KV-cache gate found real bugs (address
-  // truncation, off-by-ones) that a single small/zero-offset case did not
-  // exercise, so don't repeat a zero-offset-only test here.
+  // already populated this region) -- three cases: two small ones with
+  // DIFFERENT base beat offset AND word count each (the KV-cache gate found
+  // real bugs -- address truncation, off-by-ones -- that a single small/
+  // zero-offset case did not exercise), plus a THIRD sized to GW_BLK=3072
+  // (the mini-story-teller shape's real per-block window) purely to get a
+  // real ld_start-to-ld_done cycle count for the per-layer weight-streaming
+  // feasibility question (PORT-NOTES.md) -- correctness-checked the same
+  // way as the other two, not just timed.
   integer wi, ci, tc;
-  integer base_beat [0:1];
-  integer nwords    [0:1];
+  integer base_beat [0:2];
+  integer nwords    [0:2];
   reg [31:0] lfsr;
   function automatic [31:0] next_lfsr(input [31:0] x);
     next_lfsr = {x[30:0], x[31] ^ x[21] ^ x[1] ^ x[0]};
@@ -110,19 +122,21 @@ module tb_weight_loader_ddr;
 
   integer errors;
   reg [WBITS-1:0] want_word;
+  integer cyc_count;
 
   initial begin
     ld_start = 0; ld_ddr_addr = 0; ld_words = 0; rd_addr_r = 0;
     errors = 0;
-    base_beat[0] = 0;   nwords[0] = 16;
-    base_beat[1] = 100; nwords[1] = 24;
+    base_beat[0] = 0;    nwords[0] = 16;
+    base_beat[1] = 100;  nwords[1] = 24;
+    base_beat[2] = 200;  nwords[2] = 3072;
 
     rst = 1;
     repeat (4) @(posedge clk);
     rst = 0;
     @(posedge clk);
 
-    for (tc = 0; tc < 2; tc = tc + 1) begin
+    for (tc = 0; tc < 3; tc = tc + 1) begin
       // seed DDR starting at base_beat[tc] with nwords[tc]*SUBW sequential
       // 32-bit LFSR values, packed low-chunk-first into 256-bit beats -- the
       // SAME chunk order weight_bank_tdp's own assembler expects (w_data
@@ -145,15 +159,22 @@ module tb_weight_loader_ddr;
 
       // wait for ld_done via a monotonic counter (see PORT-NOTES.md /
       // tb_kv_bank_ddr.sv -- plain wait()/@(posedge ld_done) on this kind of
-      // single-cycle pulse is unreliable under Icarus).
+      // single-cycle pulse is unreliable under Icarus). cyc_count measures
+      // ld_start-to-ld_done latency -- a simulation lower bound (this
+      // behavioral MIG's fixed READ_LATENCY(9) is optimistic vs. real
+      // hardware's full CDC/arbitration path) but a real, non-guessed
+      // number for the per-layer weight-streaming feasibility question.
       begin : wait_done
         reg [3:0] done_cnt;
         done_cnt = 0;
+        cyc_count = 0;
         while (done_cnt == 0) begin
           @(posedge clk);
+          cyc_count = cyc_count + 1;
           if (ld_done) done_cnt = done_cnt + 1;
         end
       end
+      $display("WEIGHT_LOADER_DDR_CYCLES,tc=%0d,words=%0d,cycles=%0d", tc, nwords[tc], cyc_count);
       @(posedge clk);
 
       // ---- readback: compare weight_bank_tdp's resident words against the
@@ -177,7 +198,10 @@ module tb_weight_loader_ddr;
   end
 
   initial begin
-    #200000;
+    // Bumped from 200000 for the new 3072-word case's own readback loop
+    // alone (~6144 cycles = 61440ns at 10ns/cycle) on top of the reload
+    // itself and the two small cases -- generous margin, not tuned tight.
+    #2000000;
     $display("WEIGHT_LOADER_DDR_VERDICT,TIMEOUT");
     $finish;
   end

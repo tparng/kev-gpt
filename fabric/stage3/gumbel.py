@@ -20,7 +20,24 @@ from __future__ import annotations
 
 import math
 
-TEMP = 0.85          # baked into the LUT (the deployed host temperature)
+TEMP = 0.58          # baked into the LUT (the deployed host temperature).
+                      # Recalibrated (was 0.85) after a real-hardware finding:
+                      # 0.85 was tuned against an earlier checkpoint whose
+                      # head-logit std was ~7.01 (Q6.25 real units, prompt
+                      # "once upon a time"); the NLAYER=8 per-layer-streaming
+                      # checkpoint (fabric/export_stream8) has a noticeably
+                      # smaller std (~4.78) -- a real property of the bigger,
+                      # differently-trained model, not a bug. A fixed-
+                      # magnitude Gumbel noise at the old TEMP was then
+                      # comparable to or larger than the actual logit signal,
+                      # so on-chip sampling was noise-dominated (garbled real-
+                      # hardware chat output) while greedy (zero noise) stayed
+                      # bit-exact. Rescaled proportionally to preserve the
+                      # earlier checkpoint's noise-to-signal ratio: 0.85 *
+                      # (4.78/7.01) ~= 0.58. If a future checkpoint's logit
+                      # scale drifts again, recheck this the same way (real
+                      # head-logit std via seq_ref.build + IntKVQSequencer.
+                      # step_head_q25, not guessed).
 GLBITS = 10          # u resolution = 1/1024; LUT = 1024 x 32b = one BRAM tile
 FRAC = 25            # logits are Q6.25
 VOCAB = 193

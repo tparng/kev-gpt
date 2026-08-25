@@ -83,6 +83,23 @@ module sequencer_vec #(
     // are mutually exclusive at elaboration time (generate), not a runtime
     // mux -- KV260's build never even sees kv_bank_ddr's logic.
     parameter               KV_DDR_BACKED = 0,
+    // KV_DDR_BASE: byte offset of the KV cache's own DDR3 region, distinct
+    // from WEIGHTS_DDR_BASE below. Found the hard way (real-hardware-only,
+    // reproducible corruption starting at generate-token 8 under per-layer
+    // weight streaming): with both bases defaulting to 0, kv_bank_ddr's
+    // preallocated (layer,kv,head,pos)-indexed region and weight_loader_
+    // ddr's staged weight image are the SAME physical DDR3 bytes -- every
+    // KV cache write silently overwrites staged weight bytes. Simulation
+    // never caught this because no gate has ever run KV_DDR_BACKED=1 and
+    // WEIGHT_STREAM_PER_LAYER=1 together (tb_seq_vec_kv_stream.sv keeps KV
+    // resident, "unrelated to this gate"). Default stays 0 for every
+    // existing KV_DDR_BACKED=1-only build (kv_bank_ddr is the sole DDR3
+    // consumer there, so 0 is fine); any build that ALSO sets WEIGHT_
+    // STREAM_PER_LAYER=1 MUST override this to a value >= the staged
+    // weight image's total byte size (NLAYER*GW_BLK+GW_HEAD+GW_EMB, in
+    // WBYTES_STRM-sized words) -- see xilinx_core_v_mini_mcu_wrapper_
+    // kevgpt.sv for the real deployed value.
+    parameter integer       KV_DDR_BASE = 0,
     // DDR3-backed weight-window loader (PORT-NOTES.md "weight_loader_ddr
     // wired to top level"): 0 (default) leaves every existing build
     // byte-for-byte untouched -- wld_* outputs tied idle, gemv_banked_
@@ -95,7 +112,34 @@ module sequencer_vec #(
     // reloader are both valid sources of the same port at different
     // times (never driven together; that's a firmware-sequencing
     // invariant, not enforced in hardware here).
-    parameter               WEIGHT_DDR_BACKED = 0
+    parameter               WEIGHT_DDR_BACKED = 0,
+    // Per-layer DDR3 weight streaming (fabric/genesys2/PORT-NOTES.md
+    // "per-layer weight streaming"): 0 (default) leaves every existing
+    // build byte-for-byte untouched -- g_wbase keeps its block-absolute
+    // blk*GW_BLK+WB_XXX addressing into a FULLY resident weight_bank_tdp,
+    // exactly as today. 1 additionally: (a) drops the blk*GW_BLK term
+    // from every g_wbase assignment (QKV/PROJ/FC/MP/HEAD), since under
+    // streaming only ONE block's (or the head's) window is EVER resident
+    // at a time, always starting at on-chip address 0 right after its own
+    // fresh reload; (b) inserts a new S_STRW state between L_COLL's exit
+    // and the real next state (S_QKVRET or S_HEADSET) that triggers
+    // weight_loader_ddr INTERNALLY (mid-inference, once per block plus
+    // once for the head, not just once at firmware boot) and stalls until
+    // it completes. Requires WEIGHT_DDR_BACKED=1 (reuses that same
+    // weight_loader_ddr instance) and WWORDS sized to >= max(GW_BLK,
+    // GW_HEAD), not the whole NLAYER-scaled image -- the actual BRAM win:
+    // weight-bank BRAM cost becomes independent of NLAYER. Real per-layer
+    // reload cost is a measured ~9 cycles/wide-word (a real weight_bank_
+    // tdp write-port-width ceiling, not a DDR3 latency artifact -- see
+    // PORT-NOTES.md's feasibility measurement), not free -- an explicit,
+    // accepted throughput/capacity tradeoff, not a bug.
+    parameter               WEIGHT_STREAM_PER_LAYER = 0,
+    // Byte address within weight_loader_ddr's own DDR3 aperture where the
+    // full weight image starts -- matches send_weights.py/uart_load_
+    // weights()'s existing staging point (ddr_addr=0 in the boot-time
+    // kevgpt_wld_load() call this mode replaces), not a new staging
+    // location.
+    parameter integer       WEIGHTS_DDR_BASE = 0
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -180,6 +224,22 @@ module sequencer_vec #(
     localparam integer WB_HEAD = NLAYER*GW_BLK;                          // head weight base
     localparam integer DR_HEAD = (NLAYER*DQ_BLK)/P;                      // head dequant row base
     localparam integer ARROWS  = (VOCAB + P - 1)/P;                      // argmax rows
+    // per-layer weight streaming (WEIGHT_STREAM_PER_LAYER=1 only): DDR3
+    // byte stride per wide word and 32-bit "loader word" count per wide
+    // word -- same WBITS/SUBW relationship weight_bank_tdp.sv/
+    // weight_loader_ddr.sv already use internally, needed here too since
+    // the DDR3 reload address/word-count arithmetic now lives in the FSM
+    // instead of only in firmware.
+    localparam integer WBITS_STRM  = LANES*4;
+    localparam integer SUBW_STRM   = WBITS_STRM/32;
+    localparam integer WBYTES_STRM = WBITS_STRM/8;
+    // cycles S_STRW idles after wld_ld_done before its first read -- see
+    // that state's own comment (weight_bank_tdp's WRITE_MODE="no_change"
+    // true-dual-port BRAM write/read collision timing, real-hardware-only,
+    // never exercised by the fully-resident design's "load once at boot"
+    // pattern). Cheap relative to a single reload's own thousands of
+    // cycles; not tuned tight against real hardware yet.
+    localparam integer STRW_SETTLE_CYCLES = 32;
     localparam signed [33:0] NEG_INF34 = {1'b1, 33'b0};                  // -2^33 (argmax -inf)
     localparam integer EROWS   = D / P;                                  // emb/gamma rows per set
 
@@ -201,6 +261,24 @@ module sequencer_vec #(
     localparam integer EMB_TOKW     = (EPW > 0) ? (VOCAB*EROWS + EPW - 1)/EPW : 0;
     localparam integer EMB_POS0     = EMB_TOK_BASE + EMB_TOKW;
     localparam integer EMB_POS_BASE = EMB_POS0 + (EMB_POS0 % 2);
+    localparam integer EMB_POSW     = (EPW > 0) ? (TMAX*EROWS + EPW - 1)/EPW : 0;
+    // per-layer weight streaming (WEIGHT_STREAM_PER_LAYER=1 only): the
+    // embed tables (tok_emb+pos_emb, phase-disjoint with block GEMV reads
+    // -- S_EMB runs entirely before any block's weights are touched) are
+    // ALSO addressed through the same resident weight bank, and at small
+    // shapes are comparably sized to one block's own window -- they can't
+    // stay at their old large absolute on-chip offsets once WWORDS shrinks
+    // to one block's size. GW_EMB is the combined tok+pos+alignment-pad
+    // span (from EMB_TOK_BASE through the end of the wrom.mem image),
+    // reloaded as ONE window before S_EMB runs, same mechanism as a block
+    // or the head. EMB_TOK_BASE_STRM/EMB_POS_BASE_STRM are the equivalent
+    // STREAMING-relative on-chip read bases (0-based, since a fresh embed
+    // reload always lands at on-chip address 0, same as every block/head
+    // reload) -- EMB_POS_BASE_STRM keeps the SAME tok->pos relative offset
+    // (EMB_TOKW) the absolute scheme already uses, just based at 0.
+    localparam integer GW_EMB            = (EMB_POS_BASE + EMB_POSW) - EMB_TOK_BASE;
+    localparam integer EMB_TOK_BASE_STRM = 0;
+    localparam integer EMB_POS_BASE_STRM = EMB_TOKW;
 
     // ---- FSM -------------------------------------------------------------------
     localparam [4:0]
@@ -212,9 +290,26 @@ module sequencer_vec #(
       S_MPSET=17, S_RES2=20, S_FIN=21,              // mlp_proj setup (GELU folded into G_RB)
       S_HEADSET=22, S_ARGMAX=23,                    // final LN_f -> head -> argmax
       S_KVW_S=24, S_KVW_F=25, S_KVW_W=26,           // KV quant-write (doc-7 R1)
-      S_CDR=27;                                     // ctx drain from the head catcher
+      S_CDR=27,                                     // ctx drain from the head catcher
+      S_STRW=28;                                    // per-layer weight-stream reload+wait
+                                                      // (WEIGHT_STREAM_PER_LAYER=1 only)
     reg [4:0] st;
     reg [3:0] blk;                           // transformer block 0..NLAYER-1
+    // per-layer weight streaming (WEIGHT_STREAM_PER_LAYER=1 only): strw_ret
+    // holds the REAL destination state (S_QKVRET for a block reload,
+    // S_HEADSET for the head reload) S_STRW jumps to once the reload
+    // completes -- also doubles as the block-vs-head discriminator inside
+    // S_STRW itself, so no separate flag is needed. strw_armed marks
+    // "already pulsed wldi_start, now waiting for wld_ld_done" within one
+    // S_STRW visit. wldi_start/addr/words are the FSM's own internal
+    // trigger into weight_loader_ddr, muxed in at the u_wld instantiation
+    // alongside the existing firmware-facing wld_ld_start/etc. ports.
+    reg [4:0]  strw_ret;
+    reg        strw_armed;
+    reg [5:0]  strw_settle;   // post-reload BRAM write-pipeline settle counter
+    reg        wldi_start;
+    reg [28:0] wldi_addr;
+    reg [31:0] wldi_words;
     reg [10:0] ci;
     reg [$clog2(ROWSM+1)-1:0] fr, orow, dor;
     // read-pipeline delayed addresses + valids (consume stage of each FSM loop)
@@ -243,9 +338,14 @@ module sequencer_vec #(
     wire [13:0] emb_row_w = (etp ? pos : tok_id) * EROWS
                             + {{(14-$clog2(ROWSM+1)){1'b0}}, fr};
     // 32-bit param + 14-bit row word offset, truncated to the address width
-    // (both bases + the largest offset are < WWORDS by the spare-depth budget)
+    // (both bases + the largest offset are < WWORDS by the spare-depth budget,
+    // non-streaming mode -- under streaming, the *_STRM 0-based bases apply
+    // instead, since a fresh embed reload always lands at on-chip address 0)
     wire [$clog2(WWORDS)-1:0] emb_addr_w =
-        (etp ? EMB_POS_BASE : EMB_TOK_BASE) + (emb_row_w >> EPWS);
+        (WEIGHT_STREAM_PER_LAYER
+            ? (etp ? EMB_POS_BASE_STRM : EMB_TOK_BASE_STRM)
+            : (etp ? EMB_POS_BASE      : EMB_TOK_BASE))
+        + (emb_row_w >> EPWS);
     wire emb_sel_w = (st == S_EMB);
 
     // ---- wide-word ROMs ($readmemh: one P-packed word per line) -----------------
@@ -330,10 +430,17 @@ module sequencer_vec #(
     wire [31:0] wld_ldb_data;
     generate
     if (WEIGHT_DDR_BACKED) begin : g_wld
+        // WEIGHT_STREAM_PER_LAYER=1: the FSM's own S_STRW state drives the
+        // loader internally (once per block plus once for the head, every
+        // token), so the firmware-facing wld_ld_start/etc. ports are
+        // unused in that mode -- elaboration-time select (WEIGHT_STREAM_
+        // PER_LAYER is a parameter), not a runtime mux.
         weight_loader_ddr #(.ADDR_W(29), .DATA_W(256)) u_wld (
             .clk(clk), .rst(rst),
-            .ld_start(wld_ld_start), .ld_ddr_addr(wld_ld_ddr_addr),
-            .ld_words(wld_ld_words), .ld_done(wld_ld_done),
+            .ld_start(WEIGHT_STREAM_PER_LAYER ? wldi_start : wld_ld_start),
+            .ld_ddr_addr(WEIGHT_STREAM_PER_LAYER ? wldi_addr : wld_ld_ddr_addr),
+            .ld_words(WEIGHT_STREAM_PER_LAYER ? wldi_words : wld_ld_words),
+            .ld_done(wld_ld_done),
             .wb_ld_rst(wld_ldb_rst), .wb_w_we(wld_ldb_we), .wb_w_data(wld_ldb_data),
             .rd_req_valid(wl_rd_req_valid), .rd_req_ready(wl_rd_req_ready),
             .rd_req_addr(wl_rd_req_addr),
@@ -349,6 +456,32 @@ module sequencer_vec #(
         assign wl_rd_ret_ready = 1'b1;
     end
     endgenerate
+
+`ifndef SYNTHESIS
+    // KV cache / weight-image DDR3 region overlap check -- see KV_DDR_BASE's
+    // own parameter comment for the real-hardware bug this is guarding
+    // against (kv_bank_ddr and weight_loader_ddr silently aliasing onto the
+    // SAME physical DDR3 bytes when both default to base 0). Mirrors kv_
+    // bank_ddr.sv's own row/beat sizing formula (KBITS=8 matches the fixed
+    // .KBITS(8) passed to u_kvb above) so this check tracks that module
+    // without needing to read its internals at elaboration time.
+    localparam integer KVDBG_BEAT_BYTES = 256/8;
+    localparam integer KVDBG_CODE_BEATS = (HEAD_DIM*8 + 255)/256;
+    localparam integer KVDBG_ROW_BYTES  = (KVDBG_CODE_BEATS+1)*KVDBG_BEAT_BYTES;
+    localparam integer KVDBG_HROWS      = NLAYER*2*NHEAD*TMAX;
+    localparam integer KV_IMAGE_BYTES   = KVDBG_HROWS*KVDBG_ROW_BYTES;
+    localparam integer WEIGHT_IMAGE_BYTES = (NLAYER*GW_BLK+GW_HEAD+GW_EMB)*WBYTES_STRM;
+    initial begin
+        if (WEIGHT_STREAM_PER_LAYER && !WEIGHT_DDR_BACKED)
+            $display("sequencer_vec: WARNING WEIGHT_STREAM_PER_LAYER=1 requires WEIGHT_DDR_BACKED=1 -- S_STRW will hang forever waiting for wld_ld_done, which g_wld_off ties permanently low");
+        if (WEIGHT_STREAM_PER_LAYER && (WWORDS < GW_BLK || WWORDS < GW_HEAD || WWORDS < GW_EMB))
+            $display("sequencer_vec: WARNING WEIGHT_STREAM_PER_LAYER=1 needs WWORDS >= max(GW_BLK=%0d, GW_HEAD=%0d, GW_EMB=%0d), got WWORDS=%0d -- g_wbase/emb_addr_w will silently truncate/wrap into weight_bank_tdp", GW_BLK, GW_HEAD, GW_EMB, WWORDS);
+        if (KV_DDR_BACKED && WEIGHT_STREAM_PER_LAYER &&
+            (KV_DDR_BASE < WEIGHTS_DDR_BASE + WEIGHT_IMAGE_BYTES) &&
+            (WEIGHTS_DDR_BASE < KV_DDR_BASE + KV_IMAGE_BYTES))
+            $display("sequencer_vec: WARNING KV_DDR_BASE=%0d..%0d overlaps WEIGHTS_DDR_BASE=%0d..%0d in DDR3 -- kv_bank_ddr writes will silently corrupt staged weight bytes (this is the real-hardware bug that caused reproducible generate-token-8 corruption before KV_DDR_BASE was separated)", KV_DDR_BASE, KV_DDR_BASE+KV_IMAGE_BYTES, WEIGHTS_DDR_BASE, WEIGHTS_DDR_BASE+WEIGHT_IMAGE_BYTES);
+    end
+`endif
 
     gemv_banked_resident_vec #(.LANES(LANES), .P(P), .MMAX(1024), .KMAX(1024), .RLAT(2),
                   .WWORDS(WWORDS), .K2(1), .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_gemv (
@@ -464,7 +597,7 @@ module sequencer_vec #(
     if (KV_DDR_BACKED) begin : g_kvb_ddr
         kv_bank_ddr #(.P(P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(NLAYER),
                       .TMAX(TMAX), .KBITS(8), .ADDR_W(29), .DATA_W(256),
-                      .KV_DDR_BASE(0)) u_kvb (
+                      .KV_DDR_BASE(KV_DDR_BASE)) u_kvb (
             .clk(clk), .rst(rst),
             .wq_start(kb_wstart), .wq_layer(blk), .wq_kv(kvw_kv), .wq_head(kvw_h),
             .wq_pos(pos), .wq_valid(kb_wvalid), .wq_data(kb_wdata_q), .wq_done(kb_wdone),
@@ -520,7 +653,19 @@ module sequencer_vec #(
     reg [11:0] g_dqrow;            // dequant channel-row base (up to NLAYER*DQ_BLK/P = 1152)
     reg [2:0]  g_dst;              // dest: 0 qkv,1 attn,2 mlpbuf(sat16),3 mlp,4 head
     reg [4:0]  g_ret;             // return state after the GEMV
-    reg [3:0]  l_gbase;            // LN gamma set (0=ln1.0,1=ln2.0,...,2*NLAYER=ln_f)
+    // LN gamma set (0=ln1.0,1=ln2.0,...,2*NLAYER=ln_f). Was `reg [3:0]` (max 15) --
+    // a REAL bug, same class as the earlier GAMMA_N/NSACT "hardcoded for NLAYER=4"
+    // fixes but MISSED then: at NLAYER=8, `l_gbase<=NLAYER*2`=16 silently wrapped to
+    // 0, so the FINAL LayerNorm (ln_f) read BLOCK 0's ln1 gamma instead of ln_f's
+    // own gains -- invisible at NLAYER<=7 (2*NLAYER<=14 fits 4 bits), and invisible
+    // under GREEDY decode even at NLAYER=8 (wrong-but-still-reasonable per-channel
+    // gamma distorts head-logit MAGNITUDES channel-by-channel but rarely flips which
+    // channel is largest), but fatal to on-chip Gumbel sampling (found via real-
+    // hardware garbled chat -> simulation-gate reproduction -> per-channel dequant
+    // trace -> gamma_w content check (correct!) -> this register's width). Sized
+    // from GAMMA_N (same "compute from shape params, not a guessed constant"
+    // convention as GAMMA_N/NSACT themselves) instead of another hardcoded width.
+    reg [$clog2(GAMMA_N)-1:0] l_gbase;
     reg        l_dst;              // LN dest: 0 lnout1, 1 lnout2
     reg [4:0]  l_ret;             // return state after the LN
 
@@ -645,6 +790,7 @@ module sequencer_vec #(
             kvp_done<=4'd0; qkv_wrow<=11'd0; vpA<=1'b0;
             rng_state<=32'd0; smp_en<=1'b0;
             gpre_active<=1'b0; gpre_done<=1'b0; gj<=9'd0; gj_dv<=1'b0;
+            strw_armed<=1'b0; strw_settle<=6'd0; wldi_start<=1'b0;
         end else begin
             // SEED write: load the persistent xorshift state + enable sampling. Lives
             // OUTSIDE the FSM case (host writes it once between GOs, core idle). seed==0
@@ -654,8 +800,28 @@ module sequencer_vec #(
                 S_IDLE: if (go) begin
                     fr<=0; frv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0; blk<=4'd0;
                     // block-0 LN1 is FED during the S_EMB commits (LN fusion)
-                    l_gbase<=4'd0; l_dst<=1'b0; l_ret<=S_QKVRET; ln_start<=1'b1;
-                    st<=S_EMB;
+                    l_gbase<=4'd0; l_dst<=1'b0;
+                    ln_start<=1'b1;
+                    // Under streaming, NEITHER the embed tables NOR block 0's
+                    // weights are resident just because the LAST token's
+                    // forward pass ended somewhere else (head, or mid-block on
+                    // an interrupted run) -- EVERY token needs a fresh embed
+                    // reload before S_EMB can run at all. l_ret is armed here
+                    // for the SECOND reload (block 0's weights, needed after
+                    // S_EMB->L_COLL) but strw_ret for THAT hop is set fresh at
+                    // S_EMB's own completion, not here -- this cycle's
+                    // strw_ret is needed IMMEDIATELY for the embed reload
+                    // instead (S_STRW is entered directly, not via L_COLL,
+                    // for this specific hop) and the two would otherwise
+                    // collide in the same register on the same cycle.
+                    if (WEIGHT_STREAM_PER_LAYER) begin
+                        l_ret<=S_STRW;
+                        strw_ret<=S_EMB;
+                        st<=S_STRW;
+                    end else begin
+                        l_ret<=S_QKVRET;
+                        st<=S_EMB;
+                    end
                 end
                 // ---- embed -> xres via the weight bank's embed port (log §36 plan 2):
                 // tok row then pos row per fr, serial (1 fetch/cycle, ~2*EROWS+2 cyc).
@@ -692,7 +858,15 @@ module sequencer_vec #(
                             if (eb2_row==ROWS-1) begin
                                 fr<=0; frv<=0; eb_v<=1'b0; eb2_v<=1'b0; etp<=1'b0;
                                 if (dbg_stop==2'd1) st<=S_FIN;       // DEBUG: stop after embed
-                                else begin orow<=0; st<=L_COLL; end
+                                else begin
+                                    // arm strw_ret fresh for the L_COLL->S_STRW
+                                    // hop l_ret already points at (set back in
+                                    // S_IDLE) -- this is ALWAYS the block-0
+                                    // weight reload (S_EMB only ever precedes
+                                    // block 0), never the head case.
+                                    if (WEIGHT_STREAM_PER_LAYER) strw_ret<=S_QKVRET;
+                                    orow<=0; st<=L_COLL;
+                                end
                             end
                         end
                     end
@@ -720,7 +894,8 @@ module sequencer_vec #(
                 // the pair's K writes commit (R1 contract kept per-read via
                 // the kvp_done gates + V interlocks, not a serial S_KVW block).
                 S_QKVRET: begin
-                    g_wbase<=blk*GW_BLK + WB_QKV; g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
+                    g_wbase<=WEIGHT_STREAM_PER_LAYER ? WB_QKV : (blk*GW_BLK + WB_QKV);
+                    g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
                     g_asel<=blk*4 + 6'd0; g_frac<=7'd16; g_dqrow<=blk*DQB_P + DR_QKV; g_dst<=3'd0;
                     g_ret<=S_AST; ci<=0; civ<=0;
                     hh<=2'd0;
@@ -919,7 +1094,8 @@ module sequencer_vec #(
                     // hh 0..NHEAD-1, HR drain cycles/head instead of 2*HR/pair.
                     if (cdr == HR[4:0]-1'b1) begin
                         if (hh == NHEAD[1:0]-2'd1) begin           // -> proj GEMV
-                            g_wbase<=blk*GW_BLK + WB_PROJ; g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
+                            g_wbase<=WEIGHT_STREAM_PER_LAYER ? WB_PROJ : (blk*GW_BLK + WB_PROJ);
+                            g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
                             g_asel<=blk*4 + 6'd1; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_PROJ; g_dst<=3'd1;
                             l_gbase<=blk*2 + 4'd1; l_dst<=1'b1; l_ret<=S_FCRET;  // LN2 (fed in S_RES1)
                             g_ret<=S_RES1; ci<=0; civ<=0; gv_ldrst<=1'b1; st<=G_AQ;
@@ -951,19 +1127,27 @@ module sequencer_vec #(
                 // mlp_fc GEMV setup (after LN2) --------------------------------
                 S_FCRET: if (dbg_stop==2'd2 && blk==4'd0) st<=S_FIN;  // DEBUG: stop after LN2
                   else begin
-                    g_wbase<=blk*GW_BLK + WB_FC; g_m<=D_MLP[10:0]; g_k<=D[10:0]; g_asrc<=2'd2;
+                    g_wbase<=WEIGHT_STREAM_PER_LAYER ? WB_FC : (blk*GW_BLK + WB_FC);
+                    g_m<=D_MLP[10:0]; g_k<=D[10:0]; g_asrc<=2'd2;
                     g_asel<=blk*4 + 6'd2; g_frac<=7'd12; g_dqrow<=blk*DQB_P + DR_FC; g_dst<=3'd2;
                     g_ret<=S_MPSET; ci<=0; civ<=0; gor<=0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // mlp_proj GEMV setup (GELU already streamed inside G_RB) -------
                 S_MPSET: begin
-                    g_wbase<=blk*GW_BLK + WB_MP; g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
+                    g_wbase<=WEIGHT_STREAM_PER_LAYER ? WB_MP : (blk*GW_BLK + WB_MP);
+                    g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
                     g_asel<=blk*4 + 6'd3; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_MP; g_dst<=3'd3;
-                    // next LN (fed in S_RES2): block blk+1's LN1, or LN_f after the last block
+                    // next LN (fed in S_RES2): block blk+1's LN1, or LN_f after the last block.
+                    // Under streaming, L_COLL's own l_ret is redirected through S_STRW (the
+                    // reload+wait state) instead of jumping straight to S_QKVRET/S_HEADSET --
+                    // strw_ret carries the REAL destination for S_STRW to dispatch to once
+                    // the reload completes.
                     if (blk == NLAYER-1) begin
-                        l_gbase<=NLAYER*2;     l_dst<=1'b0; l_ret<=S_HEADSET;
+                        l_gbase<=NLAYER*2;     l_dst<=1'b0;
+                        strw_ret<=S_HEADSET; l_ret<=WEIGHT_STREAM_PER_LAYER ? S_STRW : S_HEADSET;
                     end else begin
-                        l_gbase<=(blk+4'd1)*2; l_dst<=1'b0; l_ret<=S_QKVRET;
+                        l_gbase<=(blk+4'd1)*2; l_dst<=1'b0;
+                        strw_ret<=S_QKVRET; l_ret<=WEIGHT_STREAM_PER_LAYER ? S_STRW : S_QKVRET;
                     end
                     g_ret<=S_RES2; ci<=0; civ<=0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
@@ -993,7 +1177,12 @@ module sequencer_vec #(
                 end
                 // ---- head GEMV (act = LN_f out in lnout1) -> head_bank -------
                 S_HEADSET: begin
-                    g_wbase<=WB_HEAD; g_m<=VOCAB[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
+                    // under streaming, the head's window is a fresh reload
+                    // landing at on-chip address 0, same as every block --
+                    // WB_HEAD only means something in the fully-resident
+                    // (non-streaming) addressing scheme.
+                    g_wbase<=WEIGHT_STREAM_PER_LAYER ? 20'd0 : WB_HEAD;
+                    g_m<=VOCAB[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
                     g_asel<=4*NLAYER; g_frac<=7'd25; g_dqrow<=DR_HEAD[11:0]; g_dst<=3'd4;
                     g_ret<=S_ARGMAX; ci<=0; civ<=0; gv_ldrst<=1'b1;
                     best_val<=NEG_INF34; best_idx<=9'd0; ar<=0; arv<=0; av1<=0; amv<=0; st<=G_AQ;
@@ -1003,6 +1192,57 @@ module sequencer_vec #(
                         gpre_word = {(P*32){1'b0}};   // blocking: matches the precompute block
                     end else begin
                         gpre_active<=1'b0; gpre_done<=1'b1;
+                    end
+                end
+                // ---- per-layer weight-stream reload+wait (WEIGHT_STREAM_
+                // PER_LAYER=1 only; never entered otherwise). Arms exactly
+                // one weight_loader_ddr load on the first cycle (the embed
+                // tables, block blk's window, or the head's -- discriminated
+                // by strw_ret, which also IS the real destination), then
+                // stalls until wld_ld_done before jumping there. blk is
+                // ALREADY the correct next-block index by the time the
+                // block-reload branch runs: S_RES2 increments it before the
+                // L_COLL->S_STRW transition that reaches this state. -------
+                S_STRW: begin
+                    wldi_start <= 1'b0;
+                    // settle phase FIRST (checked ahead of !strw_armed, since
+                    // strw_armed is cleared the same cycle wld_ld_done fires --
+                    // real-hardware-only finding, PORT-NOTES.md "per-layer
+                    // weight streaming": weight_bank_tdp's WRITE_MODE_A/B=
+                    // "no_change" true-dual-port XPM BRAM has documented
+                    // same-cycle/adjacent-cycle cross-port write/read
+                    // ambiguity Xilinx's own guide flags, which the fully-
+                    // resident design (load once at boot, read much later)
+                    // never exercised but streaming's "read immediately after
+                    // every fresh reload" pattern does, every block/embed/
+                    // head reload, every token. A few idle cycles between the
+                    // last write commit and the first read gives the BRAM's
+                    // real write pipeline time to fully settle; simulation
+                    // (a behavioral memory model, not the real XPM primitive)
+                    // never needed this and stayed bit-exact without it.
+                    if (strw_settle != 6'd0) begin
+                        if (strw_settle == STRW_SETTLE_CYCLES) begin
+                            strw_settle <= 6'd0;
+                            st <= strw_ret;
+                        end else begin
+                            strw_settle <= strw_settle + 1'b1;
+                        end
+                    end else if (!strw_armed) begin
+                        if (strw_ret == S_EMB) begin
+                            wldi_addr  <= WEIGHTS_DDR_BASE + EMB_TOK_BASE*WBYTES_STRM;
+                            wldi_words <= GW_EMB*SUBW_STRM;
+                        end else if (strw_ret == S_HEADSET) begin
+                            wldi_addr  <= WEIGHTS_DDR_BASE + WB_HEAD*WBYTES_STRM;
+                            wldi_words <= GW_HEAD*SUBW_STRM;
+                        end else begin
+                            wldi_addr  <= WEIGHTS_DDR_BASE + blk*GW_BLK*WBYTES_STRM;
+                            wldi_words <= GW_BLK*SUBW_STRM;
+                        end
+                        wldi_start  <= 1'b1;
+                        strw_armed  <= 1'b1;
+                    end else if (wld_ld_done) begin
+                        strw_armed  <= 1'b0;
+                        strw_settle <= 6'd1;
                     end
                 end
                 // ---- P-wide argmax over the VOCAB logits (Q6.25, sync read) --

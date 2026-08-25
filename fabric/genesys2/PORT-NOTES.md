@@ -2726,3 +2726,502 @@ of this pass. Empty-line and backspace edge cases both still work
 correctly on the new firmware build. Cleaned up JTAG/UART processes;
 board left running `kevgpt_interactive` live with the story checkpoint,
 chatting, no host process attached.
+
+## Per-layer weight streaming: breaking the BRAM depth ceiling
+
+Follow-up: even at NLAYER=4, arbitrary prompts (not "once upon a time"-
+style openers) produce incoherent completions -- confirmed a real MODEL
+CAPACITY limit (the same incoherence reproduces in the pure Python
+reference, multiple seeds, even pure greedy decoding -- not a firmware or
+hardware bug). Growing NLAYER or D at all is currently blocked by BRAM
+regardless of direction: `weight_bank_tdp`'s resident cost is a bucketed
+step function of WWORDS (128 RAMB36 for <=16384 words, 256 RAMB36 for
+(16384,32768]), and this project already proved the 256-tile bucket
+doesn't fit this device's real usable budget (`place_design`: "requires
+489... only 445 available") -- true for NLAYER=8 (deeper) and D=192
+(wider, ~32,284 words) alike. Real fix: stop keeping the WHOLE weight
+image resident, stream it from DDR3 one layer at a time.
+
+**Researched first, before writing any RTL**: the DMA engine
+(`fabric/genesys2/rtl/weight_loader_ddr.sv`) already exists, is already
+gated for correctness (`tb_weight_loader_ddr.sv`,
+`WEIGHT_LOADER_DDR_VERDICT,PASS`), and is already instantiated in the
+deployed build (`WEIGHT_DDR_BACKED(1)`) -- it's only ever triggered once,
+by firmware, at boot. `sequencer_vec.sv`'s own `GW_QKV`/`GW_PROJ`/
+`GW_FC`/`GW_MP`/`GW_BLK` localparams and `g_wbase<=blk*GW_BLK+{WB_QKV|
+WB_PROJ|WB_FC|WB_MP}` computation (already used at 4 call sites) are
+exactly the per-layer address stride a per-layer DDR3 reload needs, just
+retargeted from on-chip address space to a DDR3 byte offset. The DDR3-
+staged image itself doesn't need to change -- `send_weights.py`'s
+existing packing is already laid out block-relative. A clean FSM
+insertion point exists between `S_RES2` (end of block `blk`, `blk` itself
+increments here) and `S_QKVRET` (first weight-bank read of block
+`blk+1`) -- the `L_COLL` LayerNorm pass in between never touches the
+weight bank. An older PORT-NOTES.md note ("weight streaming alone
+doesn't unlock a meaningfully bigger model, because KV cache dominates")
+predates KV streaming being built and deployed (`KV_DDR_BACKED(1)` is
+already active, confirmed flat/model-size-independent BRAM cost) -- that
+conclusion is stale for the current build and does not apply here.
+
+### Step 1: feasibility measurement -- real numbers, not a guess
+
+Extended `fabric/genesys2/tb/tb_weight_loader_ddr.sv` with a third test
+case sized to `GW_BLK`=3072 words (the current D=128/D3=384/D_MLP=512/
+LANES=64 shape's real per-block window, vs. the existing 16/24-word
+correctness-only cases) and a cycle counter around the existing
+`ld_start`-to-`ld_done` wait. Compiled directly with iverilog (no
+`run_*.py` harness for this gate yet, matching the testbench's own header
+comment) against `weight_bank_tdp.sv` + `weight_loader_ddr.sv` +
+`mig_behav_model.sv` + a one-line `` `define SYNTHESIS`` shim (needed
+only to skip `mig_read_engine.sv`/`sync_fifo.sv`'s SVA under Icarus,
+inserted in the file list right before them -- `weight_bank_tdp.sv` must
+NOT see `SYNTHESIS` defined, so the shim goes after it, not as a global
+`-D` flag) + `mig_read_engine.sv` + `sync_fifo.sv`.
+
+**Result**: `WEIGHT_LOADER_DDR_CYCLES,tc=2,words=3072,cycles=27660` --
+~9 cycles/word, correctness clean (`WEIGHT_LOADER_DDR_VERDICT,PASS`
+across all 3 cases). ~9 cycles/word held constant across all three test
+sizes (16/24/3072 words), which does NOT match "latency paid once, not
+once per beat" -- traced to a REAL RTL bottleneck, not a simulation-
+fidelity artifact of `mig_behav_model.sv` (whose own header comment is
+explicit it isn't a timing model: "Real latency behavior is a Phase 6
+(real-hardware) concern, not a Phase 2 gate concern" -- checked its read
+pipe directly to rule out the model itself being the limiter: `app_rdy_o`
+is tied high, one command accepted per cycle, genuinely pipelined).
+
+**Root cause: `weight_loader_ddr.sv`'s own drain side.**
+`assign rd_ret_ready = (ldst==LD_RUN) && !beat_have;` -- once a 256-bit
+DMA beat arrives, `rd_ret_ready` drops until all `SUBW=8` of its 32-bit
+chunks have been unpacked one-per-cycle into `weight_bank_tdp`'s existing
+write port (which only accepts one 32-bit chunk per cycle, by design --
+the SAME assembler the firmware boot-load path already uses). This is a
+REAL architectural ceiling of the resident weight bank's write port
+width, present on real hardware exactly as in simulation -- not a DDR3
+latency/CDC question at all, which is what the original plan expected to
+be the limiting factor.
+
+**Real-world translation** (50MHz clock, 20ns/cycle): 27,660 cycles =
+~553us per layer reload. An NLAYER=8 model (doubling again from the
+current NLAYER=4) would cost roughly 8x that in reload alone (~4.4ms) on
+top of compute (~360us, doubled from NLAYER=4's own real ~180us/token) --
+**~4.8ms/token total, a ~27x slowdown vs. NLAYER=4's fully-resident
+~180us/token**, but still >200 tok/s in absolute terms -- far faster than
+any human reads, for an interactive-chat use case. Presented this
+tradeoff to the user with the real numbers rather than assuming either
+direction; **decision: accept the throughput cost and proceed** --
+widening `weight_bank_tdp`'s write port to recover most of this (a real,
+separate RTL change to the assembler + `weight_loader_ddr.sv`'s
+unpacking) stays an explicit, not-yet-needed follow-up, not blocking this
+pass.
+
+### Step 2: RTL integration -- DONE, bit-exact in simulation
+
+Wired the per-layer reload into `sequencer_vec.sv`'s block loop, behind a
+new `WEIGHT_STREAM_PER_LAYER` parameter (default 0, every existing build
+byte-for-byte untouched -- checked via a full regression re-run of
+`fabric.stage3.run_vec_kv` after EVERY edit in this section, `VEC_KV_
+VERDICT match=True` throughout, same exact gold sequence as before any of
+this work started).
+
+**Found one more real design gap while implementing, not just planned
+ahead of time**: the token/position embedding tables (`EMB_TOK_BASE`/
+`EMB_POS_BASE`) are ALSO addressed through the same resident weight bank
+(read via `emb_sel_w`/`emb_addr_w` during `S_EMB`, phase-disjoint with
+block GEMV reads per the RTL's own comment) -- and at this checkpoint's
+shape are comparably sized to one block's own window (`GW_EMB`=2,960 vs
+`GW_BLK`=3,072 words). They can't stay at their old large absolute
+on-chip offsets once `WWORDS` shrinks to one block's size either. Rather
+than keep them separately resident (a real option, costing permanent
+BRAM regardless of NLAYER), extended the same streaming mechanism to
+them too: reloaded once per token, before `S_EMB` runs, via the same
+`S_STRW` state.
+
+**New parameters**: `WEIGHT_STREAM_PER_LAYER` (0 default), `WEIGHTS_DDR_
+BASE` (the DDR3 byte offset the full weight image starts at -- 0,
+matching `send_weights.py`/`uart_load_weights()`'s existing staging
+point unchanged).
+
+**New FSM state, `S_STRW`** (a CALLABLE state, matching this FSM's own
+existing convention for reusable sub-FSMs like `L_COLL`/`G_AQ`): arms
+exactly one `weight_loader_ddr` load on entry (embed tables, block
+`blk`'s window, or the head's -- discriminated by `strw_ret`, which also
+IS the real destination state once the reload completes: `S_EMB`,
+`S_QKVRET`, or `S_HEADSET`), then stalls on `wld_ld_done`. Entered from
+three places: (1) `S_IDLE` directly, for the embed-table reload every
+token needs before `S_EMB` can run at all (block 0's weights aren't
+resident just because the LAST token ended somewhere else -- head, or
+mid-block on an interrupted run); (2) `S_EMB`'s own completion arms
+`strw_ret<=S_QKVRET` fresh (this L_COLL->S_STRW hop is ALWAYS the
+block-0 reload, S_EMB only ever precedes block 0) before falling through
+to the existing `L_COLL` LN-drain state, whose own `l_ret` was set to
+`S_STRW` back at `S_IDLE`; (3) `S_MPSET`, redirecting its existing
+`l_ret<=S_HEADSET`/`S_QKVRET` through `S_STRW` (`strw_ret` carrying the
+real destination) for every inter-block transition, same mechanism.
+
+**`g_wbase` at all five existing call sites** (`S_QKVRET`, `S_CDR`'s
+proj dispatch, `S_FCRET`, `S_MPSET`, `S_HEADSET`) becomes conditional:
+`WEIGHT_STREAM_PER_LAYER ? WB_XXX : (blk*GW_BLK + WB_XXX)` -- under
+streaming, every block's (or the head's) window always starts at
+on-chip address 0 right after its own fresh reload, so the `blk*GW_BLK`
+absolute-addressing term is dropped entirely. `emb_addr_w` gets the same
+treatment via new `EMB_TOK_BASE_STRM=0`/`EMB_POS_BASE_STRM=EMB_TOKW`
+0-based equivalents. `weight_loader_ddr`'s own `ld_start`/`ld_ddr_addr`/
+`ld_words` inputs are muxed (elaboration-time, parameter-selected, not a
+runtime mux) between the existing firmware-facing `wld_ld_*` ports and
+new internal `wldi_start`/`wldi_addr`/`wldi_words` regs S_STRW drives.
+Two `` `ifndef SYNTHESIS`` sanity warnings guard real misconfiguration
+risks: `WEIGHT_STREAM_PER_LAYER` without `WEIGHT_DDR_BACKED` (S_STRW
+would hang forever on a `wld_ld_done` that `g_wld_off` ties permanently
+low), and `WWORDS` sized below `max(GW_BLK, GW_HEAD, GW_EMB)` (silent
+address truncation/wraparound into `weight_bank_tdp`).
+
+### Step 4 (gate): DONE, bit-exact -- the first time weight_loader_ddr has ever been triggered mid-inference
+
+New `fabric/stage3/tb/tb_seq_vec_kv_stream.sv` (no `run_*.py` harness yet,
+matching `tb_weight_loader_ddr.sv`'s own precedent): stages the checkpoint's
+FULL weight image directly into a simulated DDR3 (`mig_behav_model`, via
+`$readmemh("wrom.mem", u_mem.mem)` -- WBITS=DATA_W=256 at LANES=64 makes
+one `wrom.mem` line exactly one DMA beat, no unpacking arithmetic of its
+own to get wrong) instead of bulk-loading it into `weight_bank_tdp` via
+`wl_we`, wires `sequencer_vec`'s `wl_rd_req_*`/`wl_rd_ret_*` ports to a
+real `mig_read_engine`, and drives the SAME PLEN=16/NGEN=40 prompt+gen
+passes `tb_seq_vec_kv.sv`'s own gate already proved bit-exact -- with
+`WEIGHT_DDR_BACKED(1)`, `WEIGHT_STREAM_PER_LAYER(1)`, and `WWORDS(3072)`
+(this checkpoint's `GW_BLK`, the actual BRAM win: down from the fully-
+resident design's 15,376).
+
+**Result: bit-exact.** `got == gold ==
+[5, 1, 40, 28, 25, 38, 25, 1, 43, 21, 39, 1, 21, 1, 32, 29, 40, 40, 32, 25,
+1, 27, 29, 38, 32, 1, 34, 21, 33, 25, 24, 1, 32, 29, 32, 45, 7, 1, 39, 28]`
+-- identical to `tb_seq_vec_kv.sv`'s own already-proven gold sequence for
+this exact checkpoint/prompt/seed, confirming the streaming redesign
+reproduces the fully-resident design's exact numerics, not a separately-
+computed approximation. This is the first time `weight_loader_ddr` has
+ever been exercised mid-inference (every prior real use, including its
+own `tb_weight_loader_ddr.sv` gate, only ever triggered it externally,
+once, at boot).
+
+**Measured throughput, real numbers from this same run**: 147,184
+cycles/pass average (vs. the fully-resident design's own 8,716
+cycles/pass for the identical checkpoint) -- at 50MHz, ~2.94ms/token at
+the CURRENT NLAYER=4 (a ~17x per-token slowdown from streaming
+architecture alone, before growing NLAYER at all -- every token now
+reloads the embed tables + all 4 blocks + the head from scratch, since
+nothing stays resident across a soft_reset). Extrapolating to NLAYER=8
+(fixed embed+head reload cost, block-reload+compute cost roughly
+doubling): ~265k cycles/token, ~5.3ms/token, ~189 tok/s -- consistent
+with the earlier feasibility measurement's own back-of-envelope estimate
+(>200 tok/s), still far faster than human reading speed for interactive
+chat, the already-accepted tradeoff.
+
+**Not yet done**: shrink `WWORDS` in the real deployed wrapper
+(`xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`), train a real checkpoint at
+a bigger NLAYER (NLAYER=8 per the plan), full synth/PnR/bitstream cycle
+(remembering `fabric/genesys2/stage_vivado_roms.py` this time), and
+real-hardware bring-up.
+
+## Per-layer weight streaming at NLAYER=8: a real DDR3 address collision, not a timing bug
+
+Deployed the plan's next step: trained a genuinely bigger checkpoint
+(`data/ckpt_stream8.pt`/`.qat.pt`, NLAYER=8 same D/D3/D_MLP/NHEAD/VOCAB,
+raw-TinyStories corpus -- FP best val 0.841, QAT best val 0.862, real
+improvement over the NLAYER=4 numbers), exported (`fabric/export_stream8/`,
+33 quant layers, 885,248-byte packed image), gated bit-exact in both the
+fully-resident and per-layer-streaming RTL paths, shrunk `WWORDS` to 3072
+in the real wrapper (`.NLAYER(8)`, `.WWORDS(3072)`,
+`.WEIGHT_STREAM_PER_LAYER(1)`), removed a real firmware hang risk
+(`uart_load_weights()`'s `kevgpt_wld_load()` call polls a register that's
+muxed out at elaboration time under streaming -- found via code review,
+fixed before it ever hung on real hardware), and completed a clean
+synth/PnR/bitstream cycle: BRAM 267/445 (60%, down from the earlier
+NLAYER=4-fully-resident build's 360+ despite doubling depth -- the whole
+point), DSP 803/840, WNS +2.288ns.
+
+**Real hardware: wrong output, but precisely reproducible.** The JTAG
+register-poke probe (same technique as every prior real-hardware gate
+this project has used) returned `[5, 1, 40, 28, 25, 38, 25, 38, ...]`
+against golden `[5, 1, 40, 28, 25, 38, 25, 1, ...]` -- correct through the
+first 7 generated tokens, wrong on the 8th, every downstream token then
+diverging further (expected, autoregressive feedback of a wrong token).
+Bit-exact in simulation, wrong on real silicon: a real sim/synth gap, the
+kind this project's own "bit-honest before fast" rule exists to catch
+before trusting a number, not after.
+
+**False lead: looked non-deterministic, was actually a testing mistake.**
+Two back-to-back probe re-runs (no bitstream reprogram between them) gave
+*different* wrong answers each time, both wrong from token 0 -- looked
+exactly like real-hardware CDC metastability (the settle-cycle delay
+between a weight reload finishing and the next read starting had already
+been widened 8->32 cycles with zero effect on the original divergence,
+consistent with a genuine timing issue rather than a tunable race). Traced
+instead to a self-inflicted procedural bug: DDR3 contents do not survive
+an FPGA reconfiguration, and those two probe runs reprogrammed the
+bitstream without re-running `send_weights.py` to re-stage the weight
+image afterward -- the design was reading uninitialized/stale DRAM, a
+different garbage pattern each reprogram. Once the full bring-up sequence
+(reprogram -> `send_weights.py` listening -> `gdb load+continue` to boot
+firmware and stream weights -> `SEND_WEIGHTS_PASS` -> THEN the register-
+poke probe) was followed correctly, the result was exactly reproducible:
+`[5, 1, 40, 28, 25, 38, 25, 38, 25, 1, 43, 29, 39, 40, 28, 29]`, identical
+to the original settle=8 and settle=32 runs. Worth remembering: a
+"different every run" symptom is not proof of hardware nondeterminism if
+the bring-up sequence itself wasn't controlled for -- check the mundane
+explanation (stale/uninitialized external memory) before reaching for
+metastability.
+
+**Real root cause: `KV_DDR_BASE` and `WEIGHTS_DDR_BASE` were both 0.**
+`kv_bank_ddr.sv` preallocates a flat, fixed-size DDR3 region indexed by
+`((layer*2+kv)*NHEAD+head)*TMAX+pos`, sized `NLAYER*2*NHEAD*TMAX` rows *
+96 bytes/row = 393,216 bytes at this shape. `weight_loader_ddr` streams
+the staged weight image starting at `WEIGHTS_DDR_BASE`, 885,248 bytes at
+this shape. `KV_DDR_BASE` was hardcoded to `0` INSIDE `sequencer_vec.sv`'s
+own `kv_bank_ddr` instantiation -- never exposed as a top-level parameter
+-- and the real wrapper's `WEIGHTS_DDR_BASE` is also `0`: two independent
+DMA consumers, same physical DDR3 bytes, from byte 0. KV's 393,216-byte
+footprint sits entirely inside the weight image's own blocks 0-3 (each
+98,304 bytes: `[0,98304)`, `[98304,196608)`, `[196608,294912)`,
+`[294912,393216)`). Every attention-cache write for layers 0-3, at any
+position, silently overwrites staged weight bytes in DRAM. The row-index
+formula explains the specific failure point: only the first few positions
+of each `(layer,kv,head)` combo get written early on, so corruption starts
+as a handful of small (~2.3KB) scattered chunks per token and accumulates
+-- consistent with several early tokens surviving before enough of blocks
+0-3 is clobbered to flip an argmax decision. Simulation never caught this
+because no gate has ever run `KV_DDR_BACKED=1` and
+`WEIGHT_STREAM_PER_LAYER=1` together -- `tb_seq_vec_kv_stream.sv` keeps
+KV resident on purpose ("unrelated to this gate"), so nothing has ever
+populated both DDR3 regions in the same simulated image and checked for
+overlap.
+
+**Fix**: `KV_DDR_BASE` is now a real `sequencer_vec` parameter (default
+0, so every existing `KV_DDR_BACKED`-only build that never touches
+`WEIGHT_STREAM_PER_LAYER` is unaffected), threaded to the internal
+`kv_bank_ddr` instantiation instead of hardcoded. The real wrapper now
+passes `.KV_DDR_BASE(1048576)` (1MB, >2x headroom over the 885,248-byte
+weight image, comfortably inside 29-bit addressing and the board's DDR3
+capacity). Added a sim-only `initial` warning in `sequencer_vec.sv`
+(mirrors `kv_bank_ddr.sv`'s own row/beat sizing formula) that computes
+both regions' real byte footprints and fires if they'd overlap for
+whatever `KV_DDR_BASE`/`WEIGHTS_DDR_BASE`/shape combination a future build
+uses -- this exact bug should be impossible to reintroduce silently again.
+Verified the address-parameterization change doesn't disturb the existing
+NLAYER=8 streaming gate (`tb_seq_vec_kv_stream.sv`, `KV_DDR_BACKED=0` by
+default there, so behavior-neutral by construction) before touching real
+hardware again.
+
+**Fix confirmed on real hardware.** Clean rebuild (BRAM 267/445, DSP
+803/840, Setup WNS +3.506ns, Hold WNS +0.093ns -- no regression from the
+address-only change), reprogrammed, weights re-staged, register-poke
+probe extended to 16 tokens: `[5, 1, 40, 28, 25, 38, 25, 1, 43, 21, 39, 1,
+21, 1, 32, 29]` -- bit-exact against the Python golden, run twice in a
+row, both times identical. The token-8 divergence is gone; no new
+divergence anywhere in the 16-token window. This closes out the address-
+collision bug entirely -- `KV_DDR_BASE`/`WEIGHTS_DDR_BASE` non-overlap is
+now real, verified, and protected by the sim-only overlap check so it
+can't silently regress.
+
+**Not yet done**: sampling-mode and manual interactive chat at NLAYER=8
+(the actual point of growing the model -- human-judgment check for
+whether completions are more coherent than NLAYER=4's).
+
+## Sampling-mode chat garbled at NLAYER=8: a miscalibrated temperature, not a bug
+
+Manual interactive chat over UART (which ALWAYS uses on-chip Gumbel
+sampling -- `main.c`'s `chat_turn()` derives a nonzero seed from
+`kevgpt_cycles()` every turn, never greedy) produced garbage: `"once upon
+a time" -> ",h'maEmejumy. seks m, frogs. lejby tips ail vbujer..."`. The
+greedy register-poke probe never exercises this path at all (SEEDVAL=0
+throughout), so this was the first real test of on-chip sampling under
+the per-layer-streaming NLAYER=8 build.
+
+**Ruled out streaming as the cause first.** `fabric.stage3.run_vec_kv
+--seed 12345` (the FULLY-RESIDENT, non-streaming RTL path) reproduced the
+same `match=False` for `export_stream8` -- the bug has nothing to do with
+per-layer weight streaming. The same test against `export_stories`
+(the earlier, real-hardware-confirmed-coherent NLAYER=4 checkpoint), same
+seed, passed (`match=True`) -- isolating the difference to something
+about the export_stream8 checkpoint/shape itself, not the RTL streaming
+work.
+
+**Ruled out an RTL logic bug via direct instrumentation**, not guessing:
+temporary `$display` traces (removed after use) dumping (1) every
+gumbel_bank noise value the precompute FSM writes and (2) every argmax
+row's post-noise winner, run against BOTH checkpoints at the same seed.
+The raw noise sequence (xorshift advances + LUT reads) was BIT-IDENTICAL
+between the NLAYER=4 and NLAYER=8 builds, as expected (the precompute FSM
+has zero NLAYER dependence in its code) -- ruling out a desync in the
+noise generator itself. The argmax pipeline's own row-by-row reduction
+traced out internally consistent and structurally identical between
+builds (same PLEN=16 pass count, same ARROWS=8 rows/pass). This pointed
+away from an RTL defect and toward the DATA: the actual head-logit
+magnitudes feeding the compare.
+
+**Real root cause, confirmed via `model.goformer_kvq.IntKVQSequencer.
+step_head_q25`**: `export_stream8`'s head-logit std at this prompt is
+~4.78 (Q6.25 real units) vs `export_stories`'s ~7.01 -- a real property
+of the bigger, differently-trained NLAYER=8 model, not a defect. Gumbel
+noise magnitude is a GLOBAL FIXED CONSTANT (`gumbel.TEMP=0.85`, baked
+once into `gumbel_lut.mem`, shared by every checkpoint this project has
+ever deployed) -- at the old TEMP, individual noise draws (commonly
+5-8 real units at the LUT's upper quantiles) were comparable to or larger
+than the ENTIRE spread of this checkpoint's real logit signal, so the
+Gumbel-max "winner" was effectively noise-dominated (near-random),
+matching the garbled real-hardware symptom exactly, while greedy (zero
+noise) stayed bit-exact because it never touches the noise path at all.
+
+**Fix**: `gumbel.TEMP` rescaled 0.85 -> 0.58 (`fabric/stage3/gumbel.py`),
+proportional to the std ratio (0.85 * 4.78/7.01 ~= 0.58), preserving the
+noise-to-signal ratio the earlier, real-hardware-confirmed-coherent
+checkpoint had. `gumbel.TEMP` is gumbel.py's own single source of truth
+for BOTH `gumbel_lut.mem` generation paths (`run_vec_kv.py`'s sim gate AND
+`stage_vivado_roms.py`'s real-hardware ROM staging both call
+`gumbel.make_gumbel_lut()` with no override), so this one-line change
+propagates correctly to both without separate patching. Framed as a
+checkpoint-specific recalibration, not a universal "correct" value -- a
+future checkpoint with a different logit scale should re-measure via the
+same method (`seq_ref.build` + `IntKVQSequencer.step_head_q25`'s real
+std), not reuse this number blindly.
+
+**TEMP recalibration alone did not fix it.** With the new TEMP, 2 of 4
+tested seeds (`12345`, `999999`) started matching, but `seed=1` and
+`seed=42` still diverged (`seed=1`: correct through 7 tokens, wrong on
+the 8th -- `[...,25,45]` vs gold `[...,25,1]`). Since BOTH the RTL's own
+ROM and the Python gold reference derive their Gumbel noise from
+`gumbel.TEMP` identically, a genuine hw-vs-gold MISMATCH cannot be a
+temperature/calibration artifact -- it means a real, independent
+computation bug, unrelated to noise, was ALSO present and TEMP=0.85 had
+simply been masking it (noise so dominant that close comparisons,
+where the bug would show up as a flipped winner, were rare).
+
+**Root-caused via direct RTL instrumentation, one pipeline stage at a
+time** (temporary `$display` traces, each removed after use, each
+cross-checked against an independently-computed Python value from
+`model.goformer_kvq.IntKVQSequencer` / `fabric.stage3.seq_ref`):
+1. Gumbel noise sequence (xorshift advances + LUT reads): BIT-IDENTICAL
+   between RTL and Python. Not the noise generator.
+2. Argmax pipeline structure (row count, pass count): identical between
+   NLAYER=4 and NLAYER=8 builds. Not an argmax/index-mapping bug.
+3. Per-channel head logits (all 57, not just non-argmax ones): EVERY
+   channel differed from Python in absolute value, but the TRUE argmax
+   channel's relative ranking was usually still preserved -- explaining
+   why greedy stayed robust while sampling (sensitive to ALL 57 values)
+   did not.
+4. Dequant math (`gemvy * mant * 2^exp`): verified EXACT using each
+   side's OWN `gemvy` -- `vec_dequant.sv`'s multiply/shift is bit-perfect.
+   Not the scale application.
+5. Raw GEMV accumulator (`gemvy`, pre-dequant): WRONG vs Python's `y_int`,
+   confirming the bug is upstream of dequant, in the GEMV or its input.
+6. On-chip INT8 activation quantization (`aqw`, the RTL's own `ix`):
+   wrong vs Python's `ix`, ruling OUT the weight side and narrowing to
+   the activation path -- specifically its INPUT, the final LayerNorm's
+   output.
+7. `gamma_w.mem`'s `ln_f` entry: decoded and compared against Python's
+   `ln_f_q` array -- EXACT match, all 16 checked values identical. The
+   ROM content was never wrong.
+8. `inv_sact.mem`'s head entry: also an EXACT match against Python's
+   `_inv_sact(head['s_act'])`. Not an export/scale-miscalibration bug
+   either -- this closed out the TEMP-adjacent hypothesis entirely.
+
+**Real root cause**: `l_gbase` (`sequencer_vec.sv`, "LN gamma set" index,
+selects which of `GAMMA_N=2*NLAYER+1` stored LayerNorm gain vectors to
+use -- `0=ln1 of block 0, ..., 2*NLAYER=ln_f`) was declared `reg [3:0]`
+-- 4 bits, max value 15. `l_gbase<=NLAYER*2` for the FINAL LayerNorm
+(`ln_f`, read right before the head GEMV) needs to hold 16 at NLAYER=8.
+16 does not fit in 4 bits: it silently wrapped to 0, so the RTL's final
+LayerNorm pass READ BLOCK 0's OWN `ln1` gamma gains instead of `ln_f`'s
+-- the ROM content was always right (confirmed above); the FSM was
+reading the WRONG ROW of it. This is the exact same class of bug as the
+earlier `GAMMA_N`/`NSACT` "hardcoded for NLAYER=4, silently breaks past
+it" fixes (`fabric/genesys2/PORT-NOTES.md`, "Phase 4 continued -- two
+real NLAYER bugs found") -- but this ONE register was missed at the
+time, because nothing exercised it: at NLAYER=4, `NLAYER*2=8` fits 4
+bits fine (invisible), and even at NLAYER=8 it stayed invisible under
+GREEDY decode, since a wrong-but-still-reasonable-magnitude per-channel
+gamma distorts head-logit MAGNITUDES channel-by-channel without
+reliably flipping which single channel is largest. Gumbel sampling,
+which needs ALL 57 values individually correct (not just the winner's
+identity), had no such robustness margin.
+
+**Fix**: `l_gbase` widened from a hardcoded `[3:0]` to
+`[$clog2(GAMMA_N)-1:0]` -- computed from the actual shape parameter,
+same "don't hardcode a width that happens to work for today's NLAYER"
+discipline the GAMMA_N/NSACT fixes already established. Every other
+`l_gbase` assignment site was checked for the same class of truncation
+(`blk*2+1`, `(blk+1)*2` at intermediate blocks) -- all stay well under
+15 even at NLAYER=8, so only the `ln_f` site (`NLAYER*2`) was ever
+actually broken.
+
+**Verified**: sampling-mode `run_vec_kv.py --seed <n>` at 4 different
+seeds (1, 42, 12345, 999999) against `export_stream8` -- ALL FOUR now
+`match=True` (seeds 1 and 42, the ones that failed even after the TEMP
+recalibration, now pass outright). Greedy regression (ngen=16, both the
+fully-resident and per-layer-streaming RTL paths): still bit-exact,
+unaffected. The earlier NLAYER=4 checkpoint (`export_stories`): also
+unaffected (`NLAYER*2=8` never overflowed 4 bits there, so this fix is
+a no-op for that build, confirmed by re-running its own sampling gate).
+
+**Confirmed on real hardware, full loop closed.** Clean rebuild (Setup
+WNS +2.77 to +4.11ns, Hold +0.108ns, BRAM 267/445, DSP 803/840 --
+identical utilization to every prior NLAYER=8 build, this was a pure
+logic-width fix with no resource-cost change), reprogrammed, weights
+re-staged. Greedy register-poke probe: still bit-exact,
+`[5, 1, 40, 28, 25, 38, 25, 1, 43, 21, 39, 1, 21, 1, 32, 29]`. Real
+interactive chat over UART (sampling mode, the thing that was actually
+broken):
+
+```
+"once upon a time" -> " there was a girl named lily. she loved to play outside in the garden. one day, lily went to the par"
+"the dog ran"       -> "ing to the floor and the tasty bath. he took a big hole and the shovel. he wanted to go to school th"
+"a little girl"     -> " named lily who loved to play with her toys. one day, she found a snack in the park and she was so p"
+```
+
+Coherent, grammatical English across all three -- a dramatic, qualitative
+change from the pre-fix `",h'maEmejumy. seks m, frogs. lejby tips ail
+vbujer..."` garbage. This closes out BOTH bugs this per-layer-streaming
+phase surfaced: the DDR3 `KV_DDR_BASE`/`WEIGHTS_DDR_BASE` address
+collision (streaming-specific, fixed earlier this section) and the
+`l_gbase` width overflow (NOT streaming-specific -- a real, independent,
+pre-existing RTL bug that per-layer streaming's real-hardware bring-up
+happened to be the first thing in this project's history to actually
+exercise Gumbel sampling at NLAYER>4). Both fixes are synced to the
+fork's vendored copies (`sequencer_vec.sv`,
+`xheep_kevgpt_peripheral.sv`), and the sim-only overlap warning
+(`KV_IMAGE_BYTES`/`WEIGHT_IMAGE_BYTES`) plus the width computed from
+`GAMMA_N` instead of a hardcoded literal should make both bugs' specific
+failure modes structurally hard to reintroduce silently.
+
+**Not yet committed** -- both repos have uncommitted work spanning this
+entire per-layer-streaming phase (RTL, firmware, checkpoints, exports,
+this file). Next: commit kev-gpt and the kevgpt-genesys2-soc fork.
+
+## Longer replies: firmware-only, no resynth needed
+
+With both real bugs fixed, chat is coherent but replies were still
+capped short (~100 chars, often mid-sentence) by `kevgpt_interactive/
+main.c`'s own `MAX_GEN_LEN`/`STORY_SENTENCES` constants -- unrelated to
+the hardware/model at all, and with real throughput headroom to spend
+(measured ~188 tok/s per-layer-streaming at NLAYER=8, well above
+interactive-chat speed needs). `MAX_GEN_LEN` raised 100->120,
+`STORY_SENTENCES` 4->8 (doubled, so replies actually use the larger
+budget instead of stopping early on sentence count). The real hard
+ceiling remains the generate loop's own `pos < KEVGPT_TMAX` check, which
+is prompt-length-aware at runtime (unlike the MAX_GEN_LEN constant) and
+was left untouched -- this change only raises the SOFTER cap toward it.
+
+Firmware-only change -- no RTL/bitstream rebuild needed (build via
+`make app PROJECT=kevgpt_interactive TARGET=genesys2 SOURCE=../../../../sw`
+from `hw/vendor/esl_epfl_x_heep/`, note `TARGET=genesys2` not
+`genesys2_kevgpt` -- the latter is the FPGA_BOARD/Vivado-side target
+name only, `mcu-gen`/CMake's own sw-side target is the plain board name;
+using the wrong one fails with a `x-heep.h: No such file` error that
+looks like a missing `make mcu-gen`, but isn't). Reloaded via the
+existing `gdb load+continue` + `send_weights.py` handshake, no
+reprogram. Real-hardware confirmation, same 3 prompts as the sampling
+fix, all noticeably longer (~133 bytes vs. ~110-120 before) and still
+coherent:
+
+```
+"once upon a time" -> " there was a big bear. he was a cold and always wanted to play with his friends. one day, he saw a big tree and "
+"the dog ran"       -> "ing into the park. they said goodbye to the park and the dog. they took the path and started to cry. they felt sad, b"
+"a little girl"     -> " named lily who loved to carry in her bedroom. one day, she was walking to the beach when her mom says she was the "
+```

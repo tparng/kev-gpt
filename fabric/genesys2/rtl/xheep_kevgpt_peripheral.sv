@@ -92,12 +92,27 @@ module xheep_kevgpt_peripheral #(
     // through to sequencer_vec's own KV_DDR_BACKED=1 path; see that
     // parameter's comment in sequencer_vec.sv for the full picture.
     parameter               KV_DDR_BACKED = 0,
+    // KV cache's own DDR3 region base -- see sequencer_vec.sv's KV_DDR_BASE
+    // parameter comment (real-hardware bug: this MUST be kept non-
+    // overlapping with WEIGHTS_DDR_BASE below whenever KV_DDR_BACKED=1 and
+    // WEIGHT_STREAM_PER_LAYER=1 are both set).
+    parameter integer       KV_DDR_BASE = 0,
     // DDR3-backed weight-window loader (PORT-NOTES.md "weight_loader_ddr
     // wired to top level") -- 0 (default) leaves this peripheral's existing
     // build untouched (WLD_* registers still exist but drive an idle
     // sequencer_vec.wld_* port set). 1 threads them through to sequencer_vec's
     // own WEIGHT_DDR_BACKED=1 path; see that parameter's comment.
     parameter               WEIGHT_DDR_BACKED = 0,
+    // Per-layer DDR3 weight streaming (PORT-NOTES.md "per-layer weight
+    // streaming") -- 0 (default) leaves this peripheral's existing build
+    // untouched. 1 threads straight through to sequencer_vec's own
+    // WEIGHT_STREAM_PER_LAYER=1 path (requires WEIGHT_DDR_BACKED=1 too);
+    // see that parameter's comment in sequencer_vec.sv for the full
+    // picture. When 1, WWORDS above should be sized to this checkpoint's
+    // own max(GW_BLK, GW_HEAD, GW_EMB), not the whole NLAYER-scaled image
+    // -- NLAYER-independent, the actual point of this mode.
+    parameter               WEIGHT_STREAM_PER_LAYER = 0,
+    parameter integer       WEIGHTS_DDR_BASE = 0,
     parameter type reg_req_t = reg_pkg::reg_req_t,
     parameter type reg_rsp_t = reg_pkg::reg_rsp_t
 ) (
@@ -233,7 +248,10 @@ module xheep_kevgpt_peripheral #(
     sequencer_vec #(.P(P), .LANES(LANES), .D(D), .D3(D3), .D_MLP(D_MLP), .NHEAD(NHEAD),
                      .VOCAB(VOCAB), .NLAYER(NLAYER), .WWORDS(WWORDS), .TMAX(TMAX),
                      .MEM_PRIMITIVE(MEM_PRIMITIVE), .KV_DDR_BACKED(KV_DDR_BACKED),
-                     .WEIGHT_DDR_BACKED(WEIGHT_DDR_BACKED)) u_seq (
+                     .KV_DDR_BASE(KV_DDR_BASE),
+                     .WEIGHT_DDR_BACKED(WEIGHT_DDR_BACKED),
+                     .WEIGHT_STREAM_PER_LAYER(WEIGHT_STREAM_PER_LAYER),
+                     .WEIGHTS_DDR_BASE(WEIGHTS_DDR_BASE)) u_seq (
         .clk(clk), .rst(core_rst), .go(go_pulse),
         .tok_id(tok_id), .pos(pos), .done(core_done_w), .tok_out(core_tok_out),
         .rd_sel(rd_sel), .rd_addr(rd_addr), .rd_data(core_rd_data),
