@@ -136,6 +136,47 @@ deadlocked any GEMV needing 16+ output groups, and three ROM-capacity
 constants hardcoded to fit exactly the original reference shape, silently
 corrupting anything deeper with no error at all.
 
+**Per-layer weight streaming (breaking the BRAM depth ceiling)**: Option B's
+own DDR3 streaming still loaded the *whole* weight image once and kept it
+resident — depth was still capped by BRAM. The real fix: stop keeping any
+of it resident at all. `sequencer_vec.sv`'s own FSM now reloads just the
+*current* block's window (or the embed tables, or the head's window) from
+DDR3 on demand, once per block per token, via `weight_loader_ddr.sv` —
+making weight-bank BRAM cost independent of depth for the first time. That
+unlocked real depth growth on real hardware: NLAYER 4 → 8 → 12, the last
+sourced by finding and fixing a genuinely data-limited training bug (the
+~19M-char validation-split corpus was too small for a 12-layer model;
+switching to the full ~1.9GB TinyStories train split fixed it) — best val
+loss **0.772 FP / 0.785 QAT**, the best quality this project has produced,
+confirmed on real hardware with coherent multi-sentence completions at
+**~130 tok/s** (~385k cycles/token, 50MHz). Two further attempts (NLAYER=16,
+D=256 width instead of depth) were tried and reported honestly as dead
+ends — NLAYER=16 showed no real quality gain over NLAYER=12, and D=256 hit
+a genuine training instability (not overfitting, not a learning-rate issue)
+that wasn't chased further. The board also grew a real **untethered
+interactive chat mode** (`kevgpt_interactive`): weights load over the same
+UART cable a chat session uses (`fabric/genesys2/send_weights.py`), no
+JTAG/GDB session needed to drive a run.
+
+**Word-level vocabulary (current)**: char-level spends most of every reply's
+token budget spelling words out one character at a time. Swapping in a
+fixed ~1900-word tokenizer (`model/word_data.py` — plain regex split, no
+BPE) lets the same `TMAX=128` context cover many more *words* instead of
+many more *characters*, at the cost of a much bigger embed/head table
+(`VOCAB` 57 → 1900, `WWORDS` 3,072 → 32,768 words to cover the new reload
+window). Real synth stayed clean at the bigger vocab — LUTs 47.9%, Block
+RAM 89.4% (still inside the same BRAM-bucket boundary the char-level build
+used), DSPs 95.7% (vocab-independent, as expected), timing positive
+(WNS=1.65ns) — and real hardware chat works end-to-end (weight stream,
+tokenized encode, on-chip sampling, word-level decode). Stated honestly,
+not swept under "it works": the sampled real-hardware text is rougher and
+more repetitive than the char-level build's own sampled chat, and
+per-token throughput at this shape hasn't been measured on real hardware
+yet — open questions, not yet resolved. Full engineering log, including
+every RTL bug found sizing a much bigger VOCAB into registers that were
+only ever sized for the char-level range:
+[`fabric/genesys2/PORT-NOTES.md`](fabric/genesys2/PORT-NOTES.md).
+
 ## What works today
 
 - **Keviniser**: POS-based so it keeps main-verb "do" and drops auxiliary "do".
