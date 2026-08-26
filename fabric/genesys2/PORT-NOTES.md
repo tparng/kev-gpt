@@ -3327,4 +3327,373 @@ reused serially per layer). Measured per-token cost: ~385,380
 cycles/token (~7.7ms, ~130 tok/s at 50MHz) -- still comfortably above
 the ~50 tok/s interactive-chat comfort floor.
 
-**Not yet committed.**
+Committed as `n12-d128-stable` (both repos) once real hardware was
+confirmed; this is the deployed state the two follow-up experiments below
+branched from.
+
+## NLAYER=16 and D=256: two depth/width growth attempts, both dead ends
+
+**NLAYER=16 (16 layers, same D=128/D3/D_MLP/NHEAD/VOCAB shape as
+NLAYER=12): diminishing returns, not a regression.** Same full-train-
+split recipe as the NLAYER=12 fix above (24000 iters, same corpus). Best
+val landed essentially flat vs NLAYER=12's 0.772 -- no real quality win
+for 4 more layers' worth of BRAM/DSP/cycle cost. Not pursued to synth;
+this is a genuine, informative negative result (the model is not simply
+"more layers = better" at this data/width budget), not a bug or a bad
+training run.
+
+**D=256/NLAYER=12 (doubling width instead of depth): real training
+instability, not overfitting, not a tuning problem.** Same corpus/recipe.
+At `lr=5e-4`: best val 0.774 at iter 8000, then BOTH train and val loss
+climbed together for the rest of training -- not the classic overfitting
+signature (train improving while val worsens), which pointed at
+something optimizer/architecture-level rather than a regularization gap.
+Retried at a lower LR (`lr=2e-4`, longer warmup) per the user's own
+choice after seeing the first result: the instability persisted (got
+worse, if anything) -- ruling out "just needed a gentler LR" as the
+explanation. Best val across the two runs: 0.792. Not pursued further;
+flagged as a real open question if width growth is revisited, not
+resolved here.
+
+Per-layer reload cost (the dominant per-token cost at this shape, see
+NLAYER=12's own ~86%-of-total-cycles measurement above) scales very
+differently with the two axes: linearly with NLAYER (`GW_BLK` is
+per-layer-window-sized, so more layers just means more windows, each the
+same size), but *quadratically* with D (QKV/PROJ/FC/MP weight counts are
+all ~D^2, so doubling D roughly quadruples `GW_BLK`). This is *why*
+NLAYER growth stayed close to linear in cycles/token while D=256 was
+projected at ~4x the reload cost of D=128 (~32 tok/s estimated) for a
+width doubling -- before the instability finding above made the question
+moot. Both explicit follow-ups (further D=256 debugging, NLAYER=16) were
+deprioritized by the user's own choice in favor of the word-level
+vocabulary work below, which had better expected ROI.
+
+## Word-level vocabulary: a fixed ~1900-word tokenizer, replacing char-level
+
+**Motivation.** Char-level VOCAB=57 forces every word to be spelled out
+one character at a time -- most of each `TMAX=128`-token budget (and most
+of each ~130 tok/s reply) is spent on spelling, not content. A fixed
+small word vocabulary trades a bigger embed/head table for far more
+*story* per token: the same TMAX now covers many more words, not many
+more characters.
+
+**Tokenizer design** (`model/word_data.py`): fixed vocabulary of the N
+most-frequent word/punctuation tokens via a simple regex split
+(`[a-z']+|[.,!?;:\"-]`) -- deliberately NOT BPE/subword, to keep the
+encode/decode path trivial and dependency-free, matching this project's
+existing char-level tokenizer's own philosophy. Two reserved ids: 0 =
+`<unk>` (anything outside the fixed vocab), 1 = `<eos>` (story boundary
+-- char-level reused a literal `\n` for this; word-level has no single
+"boundary character" to borrow, so it gets its own token). The remaining
+`vocab_size-2` ids are the that-many most frequent tokens over the
+corpus, sorted alphabetically among themselves for determinism (matching
+`data.py`'s own `sorted(set(text))` convention). Same `<|endoftext|>`-
+delimited corpus format, same `train.bin`/`val.bin`/`meta.json` file
+contract as the char-level `data.py`, so everything downstream
+(`load_split`, `meta["vocab_size"]`) is tokenizer-agnostic --
+`model/train.py --tokenizer word --vocab-size N` dispatches to
+`word_data.prepare_word()` instead of `data.prepare()`, nothing else
+changes.
+
+**Sizing, done BEFORE training, not after** (the same discipline as
+every other shape change in this document): `weight_bank_tdp`'s BRAM
+cost is a step function of `WWORDS` (128-RAMB36 bucket for
+`WWORDS<=16384`, 256-RAMB36 bucket for `WWORDS` in `(16384,32768]`), and
+`WWORDS` must be `>= max(GW_BLK, GW_HEAD, GW_EMB)` under per-layer
+streaming, where `GW_HEAD` and `GW_EMB` both grow with `VOCAB`. At the
+deployed D=128/NLAYER=12/LANES=64 shape: `GW_BLK=3072` (VOCAB-
+independent), and at `VOCAB=1900`, `GW_HEAD=3840` and `GW_EMB=32448` --
+so the embed tables, not the per-block weights, become the single
+largest reload window once the vocabulary gets this big, and `WWORDS`
+must grow to `>=32448` (was `3072` at VOCAB=57) -- still inside the
+256-RAMB36 bucket boundary (`<=32768`), but a real, non-obvious jump
+worth flagging before synth. Measured word-frequency coverage over the
+full 418M-token filtered-TinyStories corpus: 512->86.45%, 900->91.45%,
+1024->92.37%, 1536->94.89%, 1900->96.06%, 2048->96.47%. Picked
+`VOCAB=1900` (user's own choice, "~1536-2048 words, pricier bucket") --
+comfortably inside the 256-tile bucket with room to spare, and a real
+coverage jump over the cheaper ~900-word bucket option.
+
+**Training**: `model/word_data.prepare_word()` over
+`data/TinyStories-train.filtered.txt` (the same corpus NLAYER=12 used),
+`VOCAB=1900` -> 418,492,016 total tokens (414,307,096 train / 4,184,920
+val), `unk_frac=0.0394`. Same D=128/NLAYER=12/NHEAD=2 shape as the
+char-level deployed model, just a new embed/head width and a new
+tokenizer. Trained clean and stable (no instability, unlike D=256): best
+val **2.022** (word-level cross-entropy isn't comparable to the char-
+level numbers above -- different vocabulary, different task difficulty
+per token). QAT (INT4/INT8, warm-started): best val **2.074**. Real
+qualitative win: full multi-sentence coherent stories with proper
+grammar/punctuation inside the same `TMAX=128` budget, instead of
+char-level's mostly-spelling output.
+
+**Export tool gotcha (reused, not new)**: `model.export_fabric` produces
+an npz layout the RTL gates don't consume -- `model.goformer_full.
+params_from_ckpt()` + `save_params()` is the correct tool (same finding
+as NLAYER=12's own note above). `save_params()` does not create its own
+output directory (`mkdir -p fabric/export_word16` first, or it raises
+`FileNotFoundError`).
+
+**A new class of RTL bug, found via a systematic sweep, not by
+accident**: `sequencer_vec.sv` had several hardcoded 9-bit (`[8:0]`, max
+511) and 14-bit (`[13:0]`, max 16383) signal widths sized for the
+largest VOCAB this project had ever actually deployed (char-level,
+<=193) -- the exact same bug *class* as the earlier `GAMMA_N`/`NSACT`/
+`l_gbase` fixes in this file (a register sized to fit the original
+KV260 shape exactly, with nothing before now exercising the boundary).
+At `VOCAB=1900`, every one of these silently truncates or wraps:
+
+- `dor` (the G_RB readback row counter, shared across QKV/PROJ/FC/MP
+  *and* head): declared width only covered `ROWSM` (the largest
+  per-block row count, VOCAB-independent), but the head readback needs
+  to count up to `ARROWS-1=237` (`ARROWS=ceil(VOCAB/P)`), which wrapped
+  a 7-bit `dor` before it ever hit its own exit condition -- an
+  **infinite loop** (simulation timeout at 40M cycles), not a wrong
+  answer. Fixed with `MAXROWS = max(ROWSM, ARROWS)`, `dor` re-declared
+  at `$clog2(MAXROWS+1)` bits (split out from `fr`/`orow`'s own
+  declaration, which stayed narrow since they never see ARROWS-scale
+  values), plus a companion width fix at the `qkv_wrow` feeder-horizon
+  assignment that referenced the old, now-stale width formula.
+- `tok_id`/`tok_out` (the module's own input/output ports): hardcoded
+  `[8:0]` (max 511) -- `VOCAB=1900` needs `$clog2(1900)=11` bits. Any
+  prompt token id or generated token id above 511 was silently
+  truncated at the port boundary, corrupting the computation from the
+  very first embed lookup. Widened to `$clog2(VOCAB)-1:0`, matching a
+  new `VIDXW=$clog2(VOCAB)` localparam.
+- `emb_row_w` (`tok_id*EROWS+fr`, hardcoded `[13:0]`, max 16383): at
+  `VOCAB=1900`, `1899*16=30384 > 16383` -- widened via a new
+  `EMBROWW=$clog2(max(VOCAB,TMAX)*EROWS+EROWS)` localparam (must cover
+  whichever of `VOCAB`/`TMAX` is larger, since this same wire serves
+  both the tok and the pos embed lookup).
+- The argmax winner-index pipeline (`gj`/`gj_d`, `best_idx`/`hidx`,
+  `wm_idx`, `am_idx`, `pi0..pi3`, `ia`/`ib`) -- all hardcoded `[8:0]`,
+  all widened to `VIDXW-1:0`.
+- `gj != VOCAB[8:0]` (the gumbel-noise-precompute loop's own exit
+  check, sampling-mode only): slicing `VOCAB` to 9 bits before
+  comparing evaluates to `1900 & 0x1FF = 364`, not `1900` -- the
+  precompute loop stopped after only 364 of the needed 1900 noise
+  draws. Fixed to `gj != VOCAB[VIDXW-1:0]`.
+- Both fully-resident testbenches (`tb_seq_vec_kv.sv`,
+  `tb_seq_vec_kv_stream.sv`) had the SAME hardcoded-9-bit pattern in
+  their own `tok`/`tok_out`/`prompt[]`/`stream[]` stimulus signals --
+  fixed with a matching `VIDXWP=$clog2(VOCABP)` local to each TB.
+- `xheep_kevgpt_peripheral.sv` (the firmware-facing register file) had
+  the same truncation one level up: `tok_id`'s own register, the
+  `wdata[8:0]` write-side slice, and `core_tok_out`'s readback wire +
+  its `{23'b0, ...}` zero-pad -- fixed the same way, `VIDXW=$clog2
+  (VOCAB)` local to that module (it already carried its own `VOCAB`
+  parameter).
+
+Confirmed via code review as already-correctly-parametric and NOT
+needing changes: `head_bank`'s own array depth (`ARROWS`-sized),
+`ar`/`ard`/`amd`/`ad1` (already `$clog2(ARROWS+1)`-wide), `dqm_w`/
+`dqe_w` (already `DQROWS`-deep, `DQROWS` already threads `DQ_N`/VOCAB
+correctly), `pos` (TMAX-based, correctly left at 9 bits), `at_tcount`/
+`wi`/`wic` (HEAD_DIM/attention-related, confirmed VOCAB-independent via
+their own usage context).
+
+**A gate-usage gotcha that ate real debugging time before the fix
+above was even implicated**: `fabric.stage3.run_vec_kv`'s own CLI
+default (`--lanes 16`) gives `EPW=(LANES*4)/(P*32)=0` at `P=8`, silently
+skipping the token/pos embed table append into `wrom.mem` entirely --
+`S_EMB` then reads uninitialized weight-bank rows unconditionally, and
+EVERY generated token comes back all-X, regardless of checkpoint,
+VOCAB, or NLAYER. This is an *already-documented* gotcha (see the
+Option B sampling-mode section elsewhere in this file: `LANES>=8*P` is
+required) that got rediscovered the hard way here -- confirmed by
+reproducing the exact same all-X failure on `export_optionB` and
+`export_stream8` (both previously verified `match=True` checkpoints) on
+a completely clean, `git stash`-baseline checkout of `sequencer_vec.sv`
+and both testbenches. That ruled out a code regression before the real
+`dor`/`tok_id`/etc. bugs above were even found -- `--lanes 64` (matching
+this project's own deployed LANES value) is required for any
+`run_vec_kv.py` invocation, not just the word-vocab one.
+
+**Verified, fully-resident gate (`fabric.stage3.run_vec_kv`,
+`--lanes 64`, `fabric/export_word16/goformer.npz`), after all fixes
+above**: greedy, `--seed 0`, `--prompt "once upon a time" --ngen 16`:
+**`VEC_KV_VERDICT match=True`**, `hw=gold=[5, 1646, 1790, 12, 945, 659,
+1075, 937, 7, 1415, 971, 1682, 1226, 1153, 809, 1641]`, decoded
+`", there was a little girl named lily. she loved to play outside in
+the"`. On-chip Gumbel sampling also verified at two seeds: `seed=42`,
+`"once upon a time"` -> `match=True`; `seed=999999`, `"the dog ran"` ->
+`match=True` -- proving the `gj != VOCAB[VIDXW-1:0]` sampling-mode fix
+is correct too, not just the greedy path.
+
+**Verified, per-layer-streaming gate** (`tb_seq_vec_kv_stream.sv`, the
+configuration that actually matches real hardware deployment --
+`WEIGHT_STREAM_PER_LAYER=1`, a real `mig_read_engine`+behavioral-DDR3
+stack, `WWORDS=32768` to cover `GW_EMB=32448`): compiled directly with
+`iverilog` (no `run_*.py` harness for this TB yet, matching `tb_
+weight_loader_ddr.sv`'s own precedent -- see that file's header comment
+for the exact file list / `<ai_accel>` path / `define_synth.sv` shim
+needed), reusing the fully-resident gate's own generated `.mem` files.
+Same prompt/seed (`"once upon a time"`, greedy): `gen=[5, 1646, 1790,
+12, 945, 659]` for the first 6 generated tokens -- bit-identical to the
+fully-resident gate's own gold, proving the DDR3-backed per-layer reload
+path (13 reloads/token at this shape: 12 blocks + head, embed reloaded
+once at token-start) reproduces the fully-resident design's exact
+behavior at `VOCAB=1900`, not just at the char-level shapes this path
+was originally proven against. Real wall-clock cost to simulate is high
+(~10 minutes for 6 tokens, driven by the `GW_EMB=32448`-word embed
+reload alone) -- a simulation-only cost, not a real-hardware throughput
+number (the real DDR3 controller runs far faster than Icarus's
+behavioral model + interpreted event simulation).
+
+**Firmware port (`kevgpt_interactive`)**: char-level `main.c` assumed
+1 char = 1 token throughout (typed-line buffer doubled as the token
+array, `kevgpt_stoi`/`kevgpt_itos` were ASCII-indexed/single-char
+tables). Word-level needs a real tokenizer on the firmware side, added
+as an `#ifdef KEVGPT_TOKENIZER_WORD`-gated second code path (both
+tokenizers coexist in the same `main.c`, selected at compile time by
+whichever `kevgpt_tokenizer.h` was regenerated, not a hard fork):
+- `fabric/genesys2/gen_chat_fw.py`'s new `emit_tokenizer_header_word()`
+  emits `kevgpt_itos` as an array of C string literals (one per
+  word/punct token) instead of a `char[]`, plus `KEVGPT_UNK_ID`/
+  `KEVGPT_EOS_ID` -- derived by SCANNING itos for the `<unk>`/`<eos>`
+  strings, not hardcoded 0/1 (see the `build_vocab` bug below).
+- `main.c` adds `kevgpt_word_lookup()` (binary search over
+  `kevgpt_itos[2..VOCAB_SIZE-1]` by `strcmp`, valid because
+  `build_vocab()` guarantees that range is alphabetically sorted),
+  `tokenize_line()` (a C port of `model.word_data.tokenize()`'s regex:
+  scan raw typed chars, group `[a-z']+` runs into one word lookup, each
+  of `.,!?;:"-` into its own single-char lookup, silently skip
+  everything else -- matching `re.findall()`'s own behavior on
+  non-matching characters), and `print_word_token()` (C port of
+  `model.word_data.decode()`'s spacing rule: space before every token
+  except the first, a token starting with `'`, or single-char
+  punctuation). `MIN_CHARS`/`chars_this_sentence` became `MIN_WORD_
+  TOKENS`/`tokens_this_sentence` (word-count-based ender guard, not
+  char-count); `MAX_GEN_LEN` dropped from 120 (chars) to 60 (whole
+  WORDS, far fewer needed to fill the same reply length);
+  `KEVGPT_EOS_ID` is always treated as a stop condition, ending the
+  reply outright (the model predicting the story-boundary token mid-
+  reply means "this story is over").
+- Real build (`make app PROJECT=kevgpt_interactive TARGET=genesys2
+  COMPILER_PREFIX=riscv32-corev- SOURCE=../../../../sw`) compiles clean
+  or the word-level path and fits comfortably in the default 64KB
+  memory region (33.2/58.0 kB ROM, 5.3/6.0 kB data) -- no linker-region
+  bump needed (unlike the much older `kevgpt_chat` app, which bakes the
+  weight image INTO the firmware image itself; `kevgpt_interactive`
+  streams weights over UART into DDR3 at boot, so this port's tokenizer
+  table growth -- ~1900 string literals -- is the only real firmware
+  size cost, and it's small).
+
+**A real, previously-undiscovered bug found while wiring this up**:
+`model.word_data.build_vocab()`'s frequency-counted candidate pool
+(`Counter(tokens)`) included the EOS sentinel token ITSELF (`prepare_
+word()` appends one per story before calling `build_vocab`) -- EOS is
+by far the single most frequent "token" in that stream (~2M
+occurrences, one per story), so it won automatically own a REGULAR
+top-word slot, silently overwriting `stoi["<eos>"]`'s own reserved
+id=1 with whatever position it sorted to alphabetically (id=10, for
+the `word_stream16` checkpoint this session trained). Training itself
+is unaffected (encode() only ever sees the FINAL, self-consistent
+`stoi`, so every real EOS occurrence in the corpus was encoded as
+id=10 consistently throughout), and `model.word_data.decode()` is
+unaffected too (it compares the STRING `"<eos>"`, not the id) -- but
+id=1 ended up a dead, never-trained embedding slot, and anything
+assuming EOS==1 BY CONVENTION instead of by lookup (like this
+session's first draft of the firmware tokenizer header) would have
+been silently wrong. Fixed in `build_vocab()` (excludes EOS from the
+frequency pool, so future retrains don't hit this) AND worked around
+for the ALREADY-TRAINED `word_stream16` checkpoint (`gen_chat_fw.py`'s
+`emit_tokenizer_header_word()` derives `KEVGPT_UNK_ID`/`KEVGPT_EOS_ID`
+by scanning itos for the literal strings, not by hardcoding 0/1) --
+no retrain needed, the checkpoint's own dead id=1 slot is harmless
+once the firmware knows to look up the real id instead of assuming it.
+
+**Real synth/PnR/bitstream**: `.VOCAB(1900)`/`.WWORDS(32768)` threaded
+through `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`'s peripheral
+instantiation (was 57/3072); `.KV_DDR_BASE` raised 2MB->3MB (the weight
+image itself grew from 1,278,464 to 2,340,864 bytes at this VOCAB,
+which would have collided with the OLD 2MB base -- same "recheck on
+every shape change" discipline as every prior NLAYER/VOCAB bump in
+this document). Full `make vivado-fpga-nobuild` + `fabric.genesys2.
+stage_vivado_roms` + `launch_runs impl_1 -to_step write_bitstream`
+(the proven reset_run+restage+relaunch recipe, needed again here --
+the FIRST attempt, staging ROMs only into the project root before a
+one-shot `make vivado-fpga`, reproduced the exact known "`could not
+open $readmem data file`" bug this document already found and fixed
+once for NLAYER=12 char-level: `launch_runs synth_1` spawns its own
+`vivado -mode batch` subprocess with `synth_1/`'s own directory as
+CWD, so the project-root copy alone isn't enough -- killed the
+in-flight (already-wrong) synth run, `reset_run synth_1`+`reset_run
+impl_1`, staged ROMs into BOTH the project root AND `synth_1/` this
+time, relaunched clean). **0 Errors, 0 real Critical Warnings** (all
+42 `CRITICAL WARNING`s were pre-existing, unrelated `set_max_delay`/
+`set_false_path` "no valid objects" constraint-file warnings this
+board's own `.xdc` already carries, confirmed none were the ROM
+`could not open` pattern this time). **Final placed utilization: LUTs
+97,567/203,800 (47.87%), Block RAM 398/445 (89.44% -- up from NLAYER=
+12 char-level's 371.5/445 (83.48%), the real cost of the bigger
+embed/head tables, still fits inside the 256-tile bucket with margin),
+DSPs 804/840 (95.71%, VOCAB-independent as expected). Timing: WNS=
+1.651ns, WHS=0.091ns (both positive -- all constraints met).**
+
+**Real hardware bring-up**: killed a stale `openocd` process left
+running from an earlier session (same "check for stale watchers before
+touching JTAG/UART" discipline as every prior bring-up in this
+document) before programming. `vivado -mode batch -source *_pgm.tcl
+-tclargs xc7k325tffg900-2 <bitstream>.bit` programmed clean.
+**A new sharp edge, found and fixed here**: the established `gdb ...
+-ex continue -batch` load pattern HUNG indefinitely this time -- gdb's
+own `continue` on a `target remote` connection blocks waiting for the
+target to stop, and a free-running firmware loop never does. (Whether
+this differs from an EARLIER session's own successful use of the same
+`continue`-based pattern, elsewhere in this document, wasn't resolved
+-- possibly a GDB/OpenOCD version-specific behavior difference, not
+chased further.) Fixed by using OpenOCD's own `monitor resume` +
+`detach` instead of gdb's `continue` -- resumes the target without
+gdb's blocking wait-for-stop semantics, confirmed via a raw `cat
+/dev/ttyUSB0` capture immediately showing the full expected boot
+sequence (`KEVGPT_INTERACTIVE_PHASE,control_plane` ->
+`KEVGPT_INTERACTIVE_ID,0x53515256` -> `KEVGPT_UART_READY`).
+**A second sharp edge**: `fabric.genesys2.send_weights`'s own stdout,
+redirected to a log file by a host-side orchestration script (to let
+another process poll for the `KEVGPT_UART_READY`-wait marker before
+triggering the JTAG load, matching this document's own documented
+ordering requirement), was BLOCK-buffered instead of line-buffered
+(Python's default when stdout is a file, not a TTY) -- the polling
+script's `until grep -q "waiting for..."` loop saw nothing until the
+whole process exited and flushed everything at once, meaning the JTAG
+load was triggered AFTER `send_weights.py` had already given up and
+timed out, not before. Fixed with `python -u` (force unbuffered
+stdout) -- a real gotcha for host-side scripting around this protocol,
+not a bug in the protocol or firmware themselves.
+
+**`send_weights.py`, real hardware: `SEND_WEIGHTS_PASS`** -- 585,216
+words (2,340,864 bytes) sent, `KEVGPT_UART_LOAD_DONE` +
+`KEVGPT_INTERACTIVE_READY` confirmed on the wire.
+
+**Real interactive chat over UART** (on-chip Gumbel sampling, self-
+seeded from a live cycle counter every turn -- no host-controllable
+seed, same as every prior interactive-chat pass in this document, so
+this is a fair, honest sample of ACTUAL chat quality, not a cherry-
+picked greedy run):
+```
+"once upon a time" -> ", there was a little girl brush food. a <unk> down that was way home was. hours us <unk> a little get out of home to help me of clean up,\". everyone while we in with a a lot together. everyone with with a <unk> and with their together and. everyone anything a"
+"the dog ran"       -> " to his friend and laughed an <unk>"
+"a little girl"     -> " before back back. home to help him to to help him get to help him get. finally, back back down. when it was under in in and make to help in the <unk>"
+```
+Real words, correct spacing/punctuation placement, `<unk>` tokens
+printing as the literal marker (by design, `main.c`'s `print_word_
+token()` never special-cases it beyond that) -- confirms the RTL fix,
+the C tokenizer port, AND the on-chip Gumbel sampling path all work
+correctly together on real hardware. Grammatically rougher than the
+simulation gate's own GREEDY gold text -- expected, matching this
+project's own established pattern (every prior model's sampling-mode
+chat has been noisier than its greedy decode; this is a sampling-
+temperature/model-capacity property, not a new bug) -- and honestly
+worse-sounding prose than the char-level NLAYER=12 build's own sampled
+chat transcript earlier in this document, an OPEN QUESTION not chased
+further this session: whether that's the word-vocab model itself
+being undertrained relative to its larger embed/head parameter count,
+a bug in how `main.c`'s sentence-ending guard interacts with word-level
+MIN_WORD_TOKENS=4 (visibly repetitive phrasing like "to help him to to
+help him get to help him get" suggests the sampling temperature/guard
+combination may need tuning at word-level, not necessarily a
+tokenizer or RTL defect), or genuinely a fair reflection of val loss
+2.022 not translating to fluent multi-sentence prose the way the
+char-level model's 0.772 does -- flagged honestly, not swept under
+"it works."

@@ -25,6 +25,17 @@ from .data import load_split, prepare
 from .gpt import GPT, GPTConfig
 
 
+def _prepare_data(args):
+    """Dispatch to the char- or word-level tokeniser based on --tokenizer.
+    Returns the meta dict; both tokenisers write the same train.bin/val.bin/
+    meta.json shape under args.data_dir, so everything downstream of this
+    call (load_split, meta["vocab_size"]) is tokeniser-agnostic."""
+    if args.tokenizer == "word":
+        from .word_data import prepare_word
+        return prepare_word(args.corpus, args.data_dir, args.vocab_size)
+    return prepare(args.corpus, args.data_dir)
+
+
 def pick_device(requested: str) -> str:
     if requested != "auto":
         return requested
@@ -79,10 +90,17 @@ def estimate_loss(model, splits, block, batch, device, iters=50):
 
 
 def sample(model, meta, device, n_tokens=200, prompt="\n", seed=None):
-    from .data import decode
     if seed is not None:
         torch.manual_seed(seed)  # fixed seed -> comparable samples across evals
     stoi, itos = meta["stoi"], meta["itos"]
+    if meta.get("tokenizer") == "word":
+        from .word_data import decode, tokenize, UNK
+        toks = tokenize(prompt.lower()) or [UNK]
+        ids = torch.tensor([[stoi.get(t, stoi[UNK]) for t in toks]],
+                            dtype=torch.long, device=device)
+        out = model.generate(ids, n_tokens, temperature=0.8, top_k=40)[0].tolist()
+        return decode(out, itos).replace("\n", " | ")
+    from .data import decode
     ids = torch.tensor([[stoi.get(c, 0) for c in prompt]], dtype=torch.long, device=device)
     out = model.generate(ids, n_tokens, temperature=0.8, top_k=40)[0].tolist()
     return decode(out, itos).replace("\n", " | ")
@@ -92,6 +110,13 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog="model.train", description="Train the Kevin GPT.")
     p.add_argument("--corpus", default="data/TinyStories-valid.kevin.txt")
     p.add_argument("--data-dir", default="data/char")
+    p.add_argument("--tokenizer", choices=["char", "word"], default="char",
+                    help="word uses model.word_data's fixed-vocab word tokeniser "
+                         "instead of char-level; needs --vocab-size sized against "
+                         "GW_HEAD/GW_EMB before training (see PORT-NOTES.md).")
+    p.add_argument("--vocab-size", type=int, default=1900,
+                    help="word tokenizer only -- ignored for --tokenizer char "
+                         "(char vocab is whatever the corpus's own char set is).")
     p.add_argument("--out", default="data/ckpt.pt")
     p.add_argument("--device", default="auto")
     p.add_argument("--n-layer", type=int, default=4)
@@ -129,8 +154,10 @@ def main(argv=None):
     torch.manual_seed(1337)
     print(f"device={device}  amp={dtype}")
 
-    meta = prepare(args.corpus, args.data_dir)
-    print(f"vocab={meta['vocab_size']}  train_chars={meta['train_chars']:,}")
+    meta = _prepare_data(args)
+    n_train = meta.get("train_chars", meta.get("train_tokens"))
+    unit = "chars" if "train_chars" in meta else "tokens"
+    print(f"vocab={meta['vocab_size']}  train_{unit}={n_train:,}")
     splits = {"train": load_split(args.data_dir, "train"),
               "val": load_split(args.data_dir, "val")}
 

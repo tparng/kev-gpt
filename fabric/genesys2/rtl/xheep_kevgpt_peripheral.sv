@@ -153,11 +153,19 @@ module xheep_kevgpt_peripheral #(
 );
     wire clk = clk_i;
     wire [5:0] windex = reg_req_i.addr[7:2];
+    // tok_id/core_tok_out width: was hardcoded [8:0] (max 511), fine for
+    // every char-level VOCAB (<=193) this project ever deployed but a real
+    // bug at word-level VOCAB=1900 (PORT-NOTES.md "word-level vocabulary")
+    // -- any prompt token with id>511 silently truncated on write, and any
+    // generated id>511 truncated on readback. Matches sequencer_vec.sv's
+    // own VIDXW=$clog2(VOCAB) fix.
+    localparam integer VIDXW = $clog2(VOCAB);
 
     reg          go_pulse, wl_rst, soft_reset, wl_we;
     reg [1:0]    dbg_stop;
     reg [31:0]   wl_data;
-    reg [8:0]    tok_id, pos;
+    reg [VIDXW-1:0] tok_id;
+    reg [8:0]    pos;
     reg [3:0]    rd_sel;
     reg [10:0]   rd_addr;
     reg [31:0]   seed;
@@ -181,7 +189,7 @@ module xheep_kevgpt_peripheral #(
             case (windex)
                 6'h0: begin go_pulse<=reg_req_i.wdata[0]; wl_rst<=reg_req_i.wdata[1];
                             soft_reset<=reg_req_i.wdata[2]; dbg_stop<=reg_req_i.wdata[4:3]; end
-                6'h2: tok_id  <= reg_req_i.wdata[8:0];
+                6'h2: tok_id  <= reg_req_i.wdata[VIDXW-1:0];
                 6'h3: pos     <= reg_req_i.wdata[8:0];
                 6'h4: begin wl_we<=1; wl_data<=reg_req_i.wdata; end
                 6'h5: rd_sel  <= reg_req_i.wdata[3:0];
@@ -213,7 +221,7 @@ module xheep_kevgpt_peripheral #(
             6'h1: rdata_mux = {29'b0, wld_done_latched, core_busy, done_latched};
             6'h7: rdata_mux = core_rd_data[31:0];
             6'h8: rdata_mux = core_rd_data[63:32];
-            6'h9: rdata_mux = {23'b0, core_tok_out};
+            6'h9: rdata_mux = {{(32-VIDXW){1'b0}}, core_tok_out};
             6'hA: rdata_mux = cycles_latched;
             6'hB: rdata_mux = 32'h5351_5256;              // "SQRV"
             default: rdata_mux = 32'b0;
@@ -230,7 +238,7 @@ module xheep_kevgpt_peripheral #(
     //      identical to gemv_axi_seq_vec.v ----
     wire               core_done_w;
     wire               core_wld_done;
-    wire [8:0]         core_tok_out;
+    wire [VIDXW-1:0]   core_tok_out;
     wire signed [63:0] core_rd_data;
     reg                core_busy, done_latched;
     reg  [31:0]        cycles_run, cycles_latched;

@@ -144,10 +144,18 @@ module sequencer_vec #(
     input  wire        clk,
     input  wire        rst,
     input  wire        go,
-    input  wire [8:0]  tok_id,
+    // tok_id/tok_out width: was hardcoded [8:0] (max 511), fine for every
+    // char-level VOCAB (<=193) this project ever deployed but a REAL bug at
+    // word-level VOCAB=1900 (PORT-NOTES.md "word-level vocabulary") -- ANY
+    // prompt token with id>511 silently truncated on input, corrupting the
+    // whole forward pass from the very first embed lookup. $clog2(VOCAB)
+    // computed here, not guessed; every caller (xheep_kevgpt_peripheral.sv's
+    // own tok_id/core_tok_out regs, both testbenches' tok/tok_out) needs the
+    // same fix -- a port-width change, not an internal-signal-only one.
+    input  wire [$clog2(VOCAB)-1:0] tok_id,
     input  wire [8:0]  pos,
     output reg         done,
-    output reg [8:0]   tok_out,     // argmax token id (after the full forward + head)
+    output reg [$clog2(VOCAB)-1:0] tok_out,  // argmax token id (after the full forward + head)
     // readback: rd_sel picks the bank, rd_addr the element (2-cyc registered). 64-bit so
     // the Q.22 LN/gelu values fit; 32-bit values are sign-extended in their bank.
     input  wire [3:0]  rd_sel,
@@ -224,6 +232,26 @@ module sequencer_vec #(
     localparam integer WB_HEAD = NLAYER*GW_BLK;                          // head weight base
     localparam integer DR_HEAD = (NLAYER*DQ_BLK)/P;                      // head dequant row base
     localparam integer ARROWS  = (VOCAB + P - 1)/P;                      // argmax rows
+    // dor (G_RB's readback/dequant row counter, declared below) drives
+    // EVERY g_dst destination's readback -- qkv/proj/mlp/head -- and was
+    // sized ONLY off ROWSM (D_MLP/P, the biggest BLOCK-side row count) on
+    // the assumption VOCAB would always stay small. Real bug, found via a
+    // real hang: at word-vocab sizes (VOCAB=1900, PORT-NOTES.md "word-
+    // level vocabulary"), the head's own row count (ARROWS=238) exceeds
+    // ROWSM=64, so dor (7 bits, max 127) wrapped before ever reaching
+    // dor==ARROWS-1=237 -- G_RB's own exit condition (see below) never
+    // fires, an infinite loop, not a slow simulation. MAXROWS is sized
+    // from the actual larger of the two, same "compute from shape
+    // params, don't guess a width" discipline as GAMMA_N/NSACT/l_gbase.
+    localparam integer MAXROWS = (ROWSM > ARROWS) ? ROWSM : ARROWS;
+    // width for internal registers that hold an actual VOCAB index (argmax
+    // candidates/winner: gj/gj_d, best_idx, hidx, wm_idx, am_idx, pi0-3,
+    // ia/ib below) -- same "found via a real word-vocab bug" story as
+    // MAXROWS/tok_id/tok_out above. A padded row's out-of-range index
+    // (ia/ib >= VOCAB) is forced to NEG_INF34 before it can ever become a
+    // winner (see S_ARGMAX), so VOCAB itself (not ARROWS*P) is the correct
+    // bound -- a stored winning index is always < VOCAB.
+    localparam integer VIDXW = $clog2(VOCAB);
     // per-layer weight streaming (WEIGHT_STREAM_PER_LAYER=1 only): DDR3
     // byte stride per wide word and 32-bit "loader word" count per wide
     // word -- same WBITS/SUBW relationship weight_bank_tdp.sv/
@@ -242,6 +270,10 @@ module sequencer_vec #(
     localparam integer STRW_SETTLE_CYCLES = 32;
     localparam signed [33:0] NEG_INF34 = {1'b1, 33'b0};                  // -2^33 (argmax -inf)
     localparam integer EROWS   = D / P;                                  // emb/gamma rows per set
+    // emb_row_w's multiplicand is tok_id OR pos (whichever this read is
+    // for), so it must cover the larger of VOCAB/TMAX, not VOCAB alone --
+    // same "found via a real word-vocab bug" story as VIDXW above.
+    localparam integer EMBROWW = $clog2(((VOCAB>TMAX)?VOCAB:TMAX)*EROWS + EROWS);
 
     // ---- embed image in the resident weight URAM's SPARE DEPTH (log §36 plan 2) -
     // The tok/pos embed ROMs (~92 BRAM tiles) are APPENDED to the wrom weight image
@@ -311,7 +343,8 @@ module sequencer_vec #(
     reg [28:0] wldi_addr;
     reg [31:0] wldi_words;
     reg [10:0] ci;
-    reg [$clog2(ROWSM+1)-1:0] fr, orow, dor;
+    reg [$clog2(ROWSM+1)-1:0] fr, orow;
+    reg [$clog2(MAXROWS+1)-1:0] dor;   // widened for VOCAB-scale ARROWS -- see MAXROWS above
     // read-pipeline delayed addresses + valids (consume stage of each FSM loop)
     reg [10:0] cid;  reg civ;
     reg [$clog2(ROWSM+1)-1:0] frd;  reg frv;
@@ -335,8 +368,8 @@ module sequencer_vec #(
     reg        eb2_v, eb2_tp;                // select-stage valid + phase
     reg [$clog2(ROWSM+1)-1:0] eb2_row;       // select-stage xres destination row
     reg [P*32-1:0]    erw_r;                 // REGISTERED selected embed row
-    wire [13:0] emb_row_w = (etp ? pos : tok_id) * EROWS
-                            + {{(14-$clog2(ROWSM+1)){1'b0}}, fr};
+    wire [EMBROWW-1:0] emb_row_w = (etp ? pos : tok_id) * EROWS
+                            + {{(EMBROWW-$clog2(ROWSM+1)){1'b0}}, fr};
     // 32-bit param + 14-bit row word offset, truncated to the address width
     // (both bases + the largest offset are < WWORDS by the spare-depth budget,
     // non-streaming mode -- under streaming, the *_STRM 0-based bases apply
@@ -709,8 +742,8 @@ module sequencer_vec #(
     // P lanes a wide word is written to gumbel_bank[row]. VOCAB advances total — the
     // bit-exact match to gumbel.GumbelRng (state advances BEFORE each logit's noise).
     reg                gpre_active, gpre_done;
-    reg [8:0]          gj;                  // logit counter 0..VOCAB (advance stage)
-    reg [8:0]          gj_d;                // delayed counter (place stage, LUT-read aligned)
+    reg [VIDXW-1:0]    gj;                  // logit counter 0..VOCAB (advance stage)
+    reg [VIDXW-1:0]    gj_d;                // delayed counter (place stage, LUT-read aligned)
     reg                gj_dv;               // place-stage valid
     reg [P*32-1:0]     gpre_word;           // P-wide staging word being assembled
     integer            gl_lane;
@@ -720,12 +753,12 @@ module sequencer_vec #(
     wire [31:0] xs_ns = xs2 ^ (xs2 << 5);            // next state
     wire [9:0]  gpre_idx_w = xs_ns[31:22];           // LUT index = next_state >> 22
 
-    reg signed [33:0] best_val; reg [8:0] best_idx, hidx;  // widened: logit32 + gumbel32
+    reg signed [33:0] best_val; reg [VIDXW-1:0] best_idx, hidx;  // widened: logit32 + gumbel32
     reg [$clog2(ARROWS+1)-1:0] ar;           // argmax row counter
     // Compare values are WIDENED to signed 34-bit: a head logit (signed int32) plus a
     // gumbel noise value (signed int32) can exceed int32; first-index-wins ties kept.
-    reg signed [33:0] wm_val;  reg [8:0] wm_idx;        // word-max tree temporaries
-    reg signed [33:0] am_val;  reg [8:0] am_idx;        // stage-1 registers
+    reg signed [33:0] wm_val;  reg [VIDXW-1:0] wm_idx;        // word-max tree temporaries
+    reg signed [33:0] am_val;  reg [VIDXW-1:0] am_idx;        // stage-1 registers
     reg [$clog2(ARROWS+1)-1:0] amd;  reg amv;
     // argmax 3-stage pipeline (the head_bank -> compare chain was the OOC critical path):
     // stage A registers the row + its gumbel noise, stage B halves P -> P/2 (with noise
@@ -733,10 +766,10 @@ module sequencer_vec #(
     reg [P*32-1:0] hw_r;
     reg [P*32-1:0] gw_r;                      // stage-A registered gumbel word for the row
     reg signed [33:0] pv0, pv1, pv2, pv3;     // P/2 pair maxima
-    reg [8:0]         pi0, pi1, pi2, pi3;
+    reg [VIDXW-1:0]   pi0, pi1, pi2, pi3;
     reg [$clog2(ARROWS+1)-1:0] ad1;  reg av1;
     reg signed [33:0] va, vb;
-    reg [8:0]         ia, ib;
+    reg [VIDXW-1:0]   ia, ib;
 
 
     // ---- synchronous reads (one read register per memory, address muxed) -------
@@ -1034,7 +1067,7 @@ module sequencer_vec #(
                         end
                         // feeder data-ready horizon: rows 0..dor are committed
                         if (g_dst == 3'd0)
-                            qkv_wrow <= {{(11-$clog2(ROWSM+1)){1'b0}}, dor} + 11'd1;
+                            qkv_wrow <= {{(11-$clog2(MAXROWS+1)){1'b0}}, dor} + 11'd1;
                         case (g_dst)
                             3'd0: qkv_bank [dor] <= dword;
                             3'd1: attn_bank[dor] <= dword;
@@ -1347,7 +1380,7 @@ module sequencer_vec #(
             // the LUT address gpre_idx_w = xs_ns>>22 is read in the sync block, value
             // lands next cycle in gumbel_lut_r. gj_d/gj_dv carry the lane to place at.
             if (gpre_active) begin
-                if (gj != VOCAB[8:0]) begin
+                if (gj != VOCAB[VIDXW-1:0]) begin
                     rng_state <= xs_ns;          // persistent state advances once/logit
                     gj_d  <= gj; gj_dv <= 1'b1;
                     gj    <= gj + 9'd1;

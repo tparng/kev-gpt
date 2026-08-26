@@ -34,12 +34,19 @@ RTL_FILES = ["sequencer_vec.sv", "kv_bank.sv", "vec_attn_w.sv", "layernorm_vec.s
 def _encode(meta_path, text):
     m = json.load(open(meta_path))
     stoi = m["stoi"]
+    if m.get("tokenizer") == "word":
+        from model.word_data import tokenize, UNK
+        toks = tokenize(text.lower()) or [UNK]
+        return [stoi.get(t, stoi[UNK]) for t in toks]
     return [stoi.get(c, 0) for c in text]
 
 
 def _decode(meta_path, ids):
     m = json.load(open(meta_path))
     itos = {int(k): v for k, v in m["itos"].items()}
+    if m.get("tokenizer") == "word":
+        from model.word_data import decode
+        return decode(ids, itos)
     return "".join(itos.get(int(i), "?") for i in ids)
 
 

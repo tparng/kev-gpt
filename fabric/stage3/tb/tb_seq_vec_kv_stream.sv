@@ -75,6 +75,10 @@ module tb;
     localparam integer NHEADP  = `NHEADVAL;
     localparam integer VOCABP  = `VOCABVAL;
     localparam integer WWORDSP = `WWORDSVAL;
+    // tok/tok_out/prompt/stream width: was hardcoded 9 bits -- must track
+    // sequencer_vec's own VIDXW (fabric/genesys2/PORT-NOTES.md "word-level
+    // vocabulary").
+    localparam integer VIDXWP = $clog2(VOCABP);
     localparam integer WBITS = LANES * 4;
     localparam integer SUBW  = WBITS / 32;
     localparam integer PLEN  = `PLEN;
@@ -85,11 +89,12 @@ module tb;
 
     reg clk = 1'b0; always #5 clk = ~clk;
     reg rst, go;
-    reg [8:0] tok, pos;
+    reg [VIDXWP-1:0] tok;
+    reg [8:0] pos;
     reg [3:0]  rsel;
     reg [10:0] raddr;
     wire done;
-    wire [8:0] tok_out;
+    wire [VIDXWP-1:0] tok_out;
     wire signed [63:0] rdata;
     reg [31:0] seed_r; reg seed_we_r;
 
@@ -161,13 +166,13 @@ module tb;
         .wl_rd_ret_valid(wl_rd_ret_valid), .wl_rd_ret_ready(wl_rd_ret_ready),
         .wl_rd_ret_data(wl_rd_ret_data));
 
-    reg [8:0] prompt [0:PLEN-1];
-    reg [8:0] stream [0:PLEN+NGEN-1];
+    reg [VIDXWP-1:0] prompt [0:PLEN-1];
+    reg [VIDXWP-1:0] stream [0:PLEN+NGEN-1];
     integer i, fs, fc, cyc0, pi;
     integer dbgcyc = 0;
 
     initial begin
-        rst = 1'b1; go = 1'b0; tok = 9'd0; pos = 9'd0; rsel = 0; raddr = 0;
+        rst = 1'b1; go = 1'b0; tok = 0; pos = 9'd0; rsel = 0; raddr = 0;
         seed_r = 32'b0; seed_we_r = 1'b0;
         // stage the FULL weight image into the simulated DDR3 directly --
         // WBITS(=LANES*4)=256=DATA_W at LANES=64, so one wrom.mem line is
