@@ -25,6 +25,16 @@ class GPTConfig:
     n_embd: int = 256
     dropout: float = 0.0
     bias: bool = False           # RMSNorm-style: no biases, cheaper in fabric
+    z_loss_coef: float = 0.0     # penalizes logsumexp(logits)^2 -- see forward().
+                                  # 0.0 = off (unchanged default behavior); PaLM/
+                                  # ST-MoE use ~1e-4. Added while investigating a
+                                  # width-scaling training instability where logit
+                                  # scale grew unboundedly (unchecked by anything
+                                  # in this architecture) throughout training,
+                                  # amplifying wrong predictions once ranking
+                                  # accuracy plateaued -- see model/train.py's
+                                  # weight-decay param-grouping comment for the
+                                  # fuller investigation.
 
 
 class Block(nn.Module):
@@ -86,6 +96,20 @@ class GPT(nn.Module):
         # at this scale) and a touch of on-chip memory later.
         self.head.weight = self.tok_emb.weight
         self.apply(self._init)
+        # GPT-2-paper residual-projection scaling: the two matrices that write
+        # DIRECTLY into the residual stream (attn.proj, the second MLP Linear)
+        # get std scaled by 1/sqrt(2*n_layer) instead of the flat 0.02 every
+        # other Linear uses -- without it, residual-stream variance grows
+        # with depth AND width uncontrolled, since nothing here dampens each
+        # block's addition to the running sum. Missing this is a real,
+        # previously-undocumented gap in this codebase: every prior
+        # scale-up (D=256 char-level, D=384 word-level) hit the SAME
+        # train+val-climb-together instability signature shortly after
+        # warmup ends, at multiple different peak LR/warmup combos --
+        # pointing at an architectural cause, not just a tuning miss.
+        for pn, p in self.named_parameters():
+            if pn.endswith("attn.proj.weight") or pn.endswith("mlp.2.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
 
     def _init(self, m):
         if isinstance(m, nn.Linear):
@@ -110,9 +134,14 @@ class GPT(nn.Module):
         logits = self.head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1)
-            )
+            flat_logits = logits.view(-1, logits.size(-1))
+            loss = F.cross_entropy(flat_logits, targets.view(-1))
+            if self.cfg.z_loss_coef > 0:
+                # caps logit scale directly (log-sum-exp = the log-normalizer
+                # cross-entropy already computes internally) instead of hoping
+                # weight decay controls it indirectly -- see GPTConfig.z_loss_coef.
+                z = torch.logsumexp(flat_logits, dim=-1)
+                loss = loss + self.cfg.z_loss_coef * z.pow(2).mean()
         return logits, loss
 
     @torch.no_grad()

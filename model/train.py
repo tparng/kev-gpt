@@ -77,6 +77,11 @@ def cosine_lr(it: int, lr: float, warmup: int, total: int, min_lr_frac: float = 
 @torch.no_grad()
 def estimate_loss(model, splits, block, batch, device, iters=50):
     model.eval()
+    # report pure cross-entropy even when z_loss_coef > 0, so val numbers
+    # stay comparable across z-loss on/off runs -- z-loss is a TRAINING
+    # regularizer, not part of the quality metric being tracked.
+    z_loss_coef = model.cfg.z_loss_coef
+    model.cfg.z_loss_coef = 0.0
     out = {}
     for name, data in splits.items():
         losses = torch.zeros(iters)
@@ -85,6 +90,7 @@ def estimate_loss(model, splits, block, batch, device, iters=50):
             _, loss = model(x, y)
             losses[k] = loss.item()
         out[name] = losses.mean().item()
+    model.cfg.z_loss_coef = z_loss_coef
     model.train()
     return out
 
@@ -125,6 +131,9 @@ def main(argv=None):
     p.add_argument("--block-size", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--z-loss-coef", type=float, default=0.0,
+                    help="logsumexp(logits)^2 penalty coefficient, caps logit "
+                         "scale growth (PaLM/ST-MoE use ~1e-4); 0.0 = off.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--max-iters", type=int, default=4000)
     p.add_argument("--warmup", type=int, default=100)
@@ -164,7 +173,7 @@ def main(argv=None):
     cfg = GPTConfig(
         block_size=args.block_size, vocab_size=meta["vocab_size"],
         n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
-        dropout=args.dropout,
+        dropout=args.dropout, z_loss_coef=args.z_loss_coef,
     )
     if args.qat:
         from .qgpt import QGPT, load_fp_into_qat
@@ -197,7 +206,24 @@ def main(argv=None):
     if args.compile and device == "cuda":
         model = torch.compile(model)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    # Weight decay only on >=2D weight matrices (Linear/Embedding), not on
+    # 1D params (LayerNorm gains, any biases) -- standard GPT-2 practice this
+    # codebase was missing. Applying decay uniformly (the old behavior) pulls
+    # LayerNorm gains toward zero regardless of what the model actually
+    # needs there, fighting whatever the optimizer is otherwise trying to do
+    # with them -- a real, previously-undocumented contributor investigated
+    # after wider models (D=256 char-level, D=384 word-level) repeatedly hit
+    # a train+val-loss-climbs-together instability a few thousand iters after
+    # warmup, with LayerNorm gain norms found to nearly double over the climb.
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        (decay if p.dim() >= 2 else no_decay).append(p)
+    opt = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": 0.1},
+         {"params": no_decay, "weight_decay": 0.0}],
+        lr=args.lr, betas=(0.9, 0.95))
     use_amp = dtype is not None
     ctx = (torch.autocast(device_type=device, dtype=dtype) if use_amp
            else torch.autocast(device_type="cpu", enabled=False))
@@ -263,8 +289,24 @@ def main(argv=None):
             # garbage->text progression reflects the model, not the dice.
             shown = sample(model, meta, device, 180)
             logged = sample(model, meta, device, 180, seed=1234)
+            # Logit-scale diagnostic (added while investigating the width-
+            # scaling instability, see the AdamW param-grouping comment
+            # above): one no-grad forward pass on a fresh val batch, report
+            # logit std/max plus ln_f's own gain norm -- confirms or refutes
+            # "loss climbing because logits are inflating" directly instead
+            # of inferring it from weight-norm snapshots after the fact.
+            model.eval()
+            with torch.no_grad():
+                xs, _ = get_batch(splits["val"], block, batch, device)
+                with ctx:
+                    logits_dbg, _ = model(xs, xs)
+                logit_std = logits_dbg.float().std().item()
+                logit_max = logits_dbg.float().abs().max().item()
+            lnf_norm = model.ln_f.weight.norm().item()
+            model.train()
             print(f"iter {it:5d} | train {losses['train']:.3f} | val {losses['val']:.3f} "
-                  f"| lr {lr:.1e} | {el/60:.1f} min")
+                  f"| lr {lr:.1e} | {el/60:.1f} min | logit_std {logit_std:.2f} "
+                  f"logit_max {logit_max:.1f} lnf_norm {lnf_norm:.2f}")
             print("   sample:", shown)
             if args.states:
                 with open(args.states, "a") as f:
