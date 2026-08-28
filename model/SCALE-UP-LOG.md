@@ -639,6 +639,7 @@ tried in this pass — this is the concrete next step, not yet taken.
 | AdamW, `adam-eps=1e-2` | 3.919 @ iter 15000 (still slowly falling) | none | **yes — fixes it, but efficiency mostly lost (~SGD territory)** |
 | AdamW, `adam-eps=3e-4` + gentler decay (decay-iters=8000) | 2.365 @ iter 7500 | ~iter 7500-8000, then climbs 3-4x slower than default AdamW | **partial — dampens but doesn't eliminate; best peak of any config, but not stable** |
 | AdamW, `adam-eps=1e-3` + gentler decay (decay-iters=10000) | **2.606 @ iter 9500** | ~iter 9500-10000, then drifts +0.052 over 5000 iters (~4x gentler than the eps=3e-4 combo) | **yes, close to fully — best practical tradeoff of the sweep** |
+| AdamW, `adam-eps=1e-3` + even gentler decay (decay-iters=13000) | 2.607 @ iter 10500 (plateau, no improvement over decay-iters=10000) | ~iter 11000 (starts before the floor), drifts +0.058 over 4500 iters (same magnitude as decay-iters=10000) | **plateau — recipe already found its ceiling at decay-iters~10000** |
 
 Every AdamW configuration bottoms at essentially the same *relative*
 point — roughly 1500-2500 iterations past wherever warmup ends —
@@ -830,6 +831,55 @@ to `max-iters` (e.g. 13000-14000) to see whether the drift keeps
 shrinking toward zero, or whether it plateaus once eps's stabilizing
 margin is fully substituted for a specific decay length.
 
+### Attempt 11: `eps=1e-3` + `lr-decay-iters=13000` — the plateau
+
+Direct test of Attempt 10's closing question: does stretching the decay
+even further than 10000 keep buying back peak quality / shrinking the
+residual drift, or does it plateau?
+
+```bash
+python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --lr-decay-iters 13000 --adam-eps 1e-3 \
+  --tokenizer word --vocab-size 4096 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_big4096 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_word_big4096_eps1e3_decay13000.pt --states data/states_word_big4096_eps1e3_decay13000.jsonl
+```
+Only a 2000-iter hold this time (13000-15000) instead of the prior
+attempts' 5000-10000-iter holds, since decay itself now eats most of the
+run.
+
+| iter | train | val | lr |
+|---|---|---|---|
+| 4000 | 2.887 | 2.866 | 2.8e-04 |
+| 8000 | 2.647 | 2.629 | 1.5e-04 |
+| **10500** | **2.626** | **2.607 (best)** | 6.3e-05 |
+| 13000 (floor reached) | 2.647 | 2.629 | 3.0e-05 |
+| 15000 | 2.683 | 2.665 | 3.0e-05 (holding) |
+
+**Plateau confirmed — no further improvement.** Best val 2.607 is
+statistically identical to `lr-decay-iters=10000`'s 2.606 (Attempt 10):
+stretching the decay another 3000 iters bought nothing. The end-of-run
+drift (2.607→2.665, +0.058 over 4500 iters) is also essentially the
+same magnitude as Attempt 10's (+0.052 over 5000 iters) — not smaller.
+One new wrinkle: here the climb starts noticeably *before* the LR floor
+is reached (val already rising from iter 11000, ~2000 iters before
+`lr-decay-iters=13000`'s floor at iter 13000), where in every prior
+attempt the climb began right at or after the floor. This is consistent
+with the divergence being tied to an *absolute* LR threshold being
+crossed (however low, still nonzero this early) rather than strictly
+"whenever LR stops moving" — worth keeping in mind for anyone tuning
+further.
+
+**Answer to Attempt 10's open question: it plateaus, doesn't keep
+improving.** `lr-decay-iters=10000` was already at (or past) the
+efficient point on this curve — `eps=1e-3` combined with *some*
+long-ish decay recovers about as much peak quality as this axis alone
+is going to give (~2.6), with a small, roughly constant residual drift
+regardless of exactly how much further the decay is stretched past
+~10000. This closes out the eps/decay-length exploration for this model
+size: **`eps=1e-3`, `lr-decay-iters≈10000` (of 15000) is the
+recommended practical recipe** from this whole investigation — best
+achievable peak without genuine, unbounded divergence.
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -902,9 +952,19 @@ margin is fully substituted for a specific decay length.
    gentleness): stretching the decay at the already-stabilizing
    `eps=1e-3` buys back peak quality at a small, controlled cost to
    flatness, rather than reproducing `eps=3e-4`'s uncontrolled
-   divergence. Not yet tried: stretching `lr-decay-iters` even further
-   (13000-14000) to see if the residual drift keeps shrinking toward
-   zero.
+   divergence. **Attempt 11 then found the ceiling**: pushing
+   `lr-decay-iters` to 13000 gave no further improvement (best val 2.607,
+   statistically identical to decay-iters=10000's 2.606) and the same
+   residual drift magnitude (+0.058 vs +0.052 over a similar span) — a
+   genuine plateau, not a curve still improving. One new detail: at
+   decay-iters=13000 the val climb starts noticeably before the LR floor
+   is reached, unlike every earlier attempt where it began right at the
+   floor — consistent with the divergence tracking an absolute LR
+   threshold rather than strictly "whenever LR goes flat." **Recommended
+   practical recipe from this whole investigation: `eps=1e-3`,
+   `lr-decay-iters≈10000` (of a 15000-iter run)** — best peak this axis
+   reaches (~2.6) without unbounded divergence, and stretching the decay
+   further buys nothing more.
 
 ## Files touched
 
@@ -924,7 +984,7 @@ margin is fully substituted for a specific decay length.
   codebase's prior default), both wired into `AdamW(...)`.
 - New data/checkpoints (all gitignored under `data/`, not checked in —
   regenerate via the commands above): `data/word_big4096/` (VOCAB=4096
-  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (14 checkpoints,
+  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (15 checkpoints,
   one per run above), `data/states_word_big4096*.jsonl` (matching
   per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
   gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot
