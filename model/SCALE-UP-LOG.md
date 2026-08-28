@@ -637,6 +637,7 @@ tried in this pass — this is the concrete next step, not yet taken.
 | AdamW, `adam-beta2=0.9` (lower variance-EMA decay) | 2.218 @ iter 4500 | ~iter 4500, tracks the AdamW-default divergence almost exactly | **no — beta2 isn't the mechanism** |
 | AdamW, `adam-eps=1e-3` | **2.743 @ iter 11500-13500 (genuinely flat, not a snapshot)** | none — holds flat for the entire 10,000-iter window | **yes — fixes it, efficiency mostly retained** |
 | AdamW, `adam-eps=1e-2` | 3.919 @ iter 15000 (still slowly falling) | none | **yes — fixes it, but efficiency mostly lost (~SGD territory)** |
+| AdamW, `adam-eps=3e-4` + gentler decay (decay-iters=8000) | 2.365 @ iter 7500 | ~iter 7500-8000, then climbs 3-4x slower than default AdamW | **partial — dampens but doesn't eliminate; best peak of any config, but not stable** |
 
 Every AdamW configuration bottoms at essentially the same *relative*
 point — roughly 1500-2500 iterations past wherever warmup ends —
@@ -724,6 +725,60 @@ yet tried: whether combining a moderate `eps` increase (e.g. `3e-4` to
 while keeping the flat-hold stability — the natural next calibration
 step for anyone extending this further.
 
+### Attempt 9: `eps=3e-4` + a gentler decay — dampens the divergence, doesn't eliminate it
+
+Attempt 8's closing question: does a moderate `eps` (between the
+default `1e-8` and the fix-strength `1e-3`) combined with a
+longer/gentler LR decay recover closer to the ~2.2 peak while keeping
+`eps=1e-3`'s flat-hold stability?
+
+```bash
+python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --lr-decay-iters 8000 --adam-eps 3e-4 \
+  --tokenizer word --vocab-size 4096 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_big4096 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_word_big4096_eps3e4_decay8000.pt --states data/states_word_big4096_eps3e4_decay8000.jsonl
+```
+`lr-decay-iters=8000` (vs 5000 in every prior attempt) stretches the
+decay from 2000-8000 instead of 2000-5000, reaching the same floor
+(`3.0e-05`) later and holding it for 7000 iters instead of 10,000.
+
+| iter | train | val | lr |
+|---|---|---|---|
+| 4000 | 2.541 | 2.523 | 2.3e-04 |
+| 6000 | 2.409 | 2.390 | 9.8e-05 |
+| **7500** | **2.384** | **2.365 (best)** | 3.5e-05 |
+| 8000 (floor reached) | 2.389 | 2.369 | 3.0e-05 |
+| 10000 | 2.427 | 2.408 | 3.0e-05 (holding) |
+| 12500 | 2.497 | 2.479 | 3.0e-05 (holding) |
+| 15000 | 2.597 | 2.580 | 3.0e-05 (holding) |
+
+**Partial result: this beats `eps=1e-3`'s peak (2.365 vs 2.743) but
+does not reproduce its flat-hold stability.** Val bottoms right around
+where LR reaches its floor (iter 7500-8000, matching the pattern of
+every earlier AdamW run) and then climbs steadily for the remaining
+7000 iters — a real divergence, not noise, but a much gentler slope
+than any other AdamW configuration tried (2.365→2.580 over 7000 iters
+here, vs default AdamW's 2.203→3.570 over 10,000 iters in Attempt 6, or
+`beta2=0.9`'s 2.218→3.527 in Attempt 8 — roughly 3-4x slower per-iter
+growth). So `eps=3e-4` measurably dampens the instability relative to
+default `eps=1e-8`, but doesn't cross the threshold `eps=1e-3` and
+`eps=1e-2` do into genuine flatness — this is a continuous effect (more
+`eps` = less divergence), not a hard on/off switch, and `3e-4` sits
+partway across it. The best-val checkpoint (2.365 @ iter 7500) is
+still, like the pre-Attempt-8 runs, a lucky early snapshot the
+auto-rollback has to catch rather than a point the model settles at and
+stays.
+
+**Answer to Attempt 8's open question**: no, this combo doesn't get
+both the ~2.2-ish peak and flat-hold stability simultaneously — there's
+an efficiency/stability tradeoff along the `eps` axis, and `1e-3` (not
+`3e-4`) is the practical operating point already found in Attempt 8 if
+genuine stability (not just a better rollback target) is the goal.
+Not yet tried: an even gentler decay (e.g. `lr-decay-iters` close to
+`max-iters`, more like a standard single cosine sweep) at `eps=1e-3`,
+which might let the model spend more time at higher effective LR before
+eps's stabilizing effect has to do its work at the floor.
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -777,9 +832,18 @@ step for anyone extending this further.
    `eps=1e-3` is the practical choice (converges to a genuine flat
    val=2.743, not a lucky snapshot) since `eps=1e-2` gives up most of
    Adam's efficiency advantage (floor ~3.9-4.0, close to SGD's own
-   val=4.4). **Not yet tried**: combining a moderate `eps` (e.g.
-   `3e-4`-`1e-3`) with a longer/gentler LR decay to try to recover closer
-   to the ~2.2 peak while keeping the flat-hold stability.
+   val=4.4). **Attempt 9 tested the obvious follow-up** — `eps=3e-4`
+   (between the default and the fix strength) with a longer/gentler
+   decay (`lr-decay-iters=8000` instead of 5000) — and found a
+   continuous tradeoff, not a free lunch: best peak of any AdamW config
+   (2.365 @ iter 7500, beating `eps=1e-3`'s 2.743), but still diverges
+   afterward, just 3-4x slower than default AdamW. `eps` size trades
+   peak quality against hold-stability along a spectrum; `1e-3` remains
+   the practical choice if genuine flatness (not just a better
+   rollback target) is the goal. Not yet tried: an even gentler decay
+   (`lr-decay-iters` close to `max-iters`) at `eps=1e-3` specifically,
+   to see if a slower approach to the floor recovers some peak quality
+   without giving up the flat hold.
 
 ## Files touched
 
@@ -799,7 +863,7 @@ step for anyone extending this further.
   codebase's prior default), both wired into `AdamW(...)`.
 - New data/checkpoints (all gitignored under `data/`, not checked in —
   regenerate via the commands above): `data/word_big4096/` (VOCAB=4096
-  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (12 checkpoints,
+  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (13 checkpoints,
   one per run above), `data/states_word_big4096*.jsonl` (matching
   per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
   gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot
