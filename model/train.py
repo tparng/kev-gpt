@@ -74,6 +74,44 @@ def cosine_lr(it: int, lr: float, warmup: int, total: int, min_lr_frac: float = 
     return lr * (min_lr_frac + (1 - min_lr_frac) * coeff)
 
 
+def layer_grad_norms(model):
+    """Per-layer gradient L2 norms, grouped coarsely enough to read at a
+    glance (one number per block-component) but fine enough to tell WHICH
+    part of the network is producing large/growing gradients -- added while
+    chasing the width-scaling training instability (model/SCALE-UP-LOG.md):
+    every loss-function-level fix tried there (LR, warmup, init scaling,
+    weight decay, z-loss) left the divergence's ONSET TIMING unchanged,
+    which rules out those as the root cause but doesn't say WHERE in the
+    network it originates -- this is the next, lower-level instrument to
+    find that. Call AFTER backward()+unscale_(), BEFORE clip_grad_norm_
+    (clipping is a single global rescale, so it doesn't change the
+    RELATIVE proportions between layers, but measuring pre-clip keeps the
+    raw numbers meaningful on their own, not relative to whatever the clip
+    threshold happens to be).
+    """
+    groups: dict[str, float] = {}
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        n = p.grad.norm().item() ** 2
+        if name.startswith("blocks."):
+            _, idx, rest = name.split(".", 2)
+            comp = {"ln1.weight": "ln1", "ln2.weight": "ln2",
+                    "attn.qkv.weight": "qkv", "attn.proj.weight": "proj",
+                    "mlp.0.weight": "mlp_fc", "mlp.2.weight": "mlp_proj"}.get(rest, rest)
+            key = f"block{idx}.{comp}"
+        elif name in ("tok_emb.weight", "head.weight"):
+            key = "tok_emb"
+        elif name == "pos_emb.weight":
+            key = "pos_emb"
+        elif name == "ln_f.weight":
+            key = "ln_f"
+        else:
+            key = name
+        groups[key] = groups.get(key, 0.0) + n
+    return {k: v ** 0.5 for k, v in groups.items()}
+
+
 @torch.no_grad()
 def estimate_loss(model, splits, block, batch, device, iters=50):
     model.eval()
@@ -134,6 +172,11 @@ def main(argv=None):
     p.add_argument("--z-loss-coef", type=float, default=0.0,
                     help="logsumexp(logits)^2 penalty coefficient, caps logit "
                          "scale growth (PaLM/ST-MoE use ~1e-4); 0.0 = off.")
+    p.add_argument("--layer-grad-log", default=None,
+                    help="append per-block gradient-norm JSONL here every "
+                         "--layer-grad-interval iters (model.SCALE-UP-LOG.md's "
+                         "next diagnostic step); default None = off.")
+    p.add_argument("--layer-grad-interval", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--max-iters", type=int, default=4000)
     p.add_argument("--warmup", type=int, default=100)
@@ -270,6 +313,9 @@ def main(argv=None):
         open(args.states, "w").close()  # truncate any previous run's states
     if args.snapshot_dir:
         os.makedirs(args.snapshot_dir, exist_ok=True)
+    if args.layer_grad_log:
+        os.makedirs(os.path.dirname(args.layer_grad_log) or ".", exist_ok=True)
+        open(args.layer_grad_log, "w").close()
 
     def save_ckpt(path, it, val):
         torch.save({"model": model.state_dict(), "cfg": cfg.__dict__,
@@ -336,6 +382,9 @@ def main(argv=None):
             _, loss = model(x, y)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
+        if args.layer_grad_log and it % args.layer_grad_interval == 0:
+            with open(args.layer_grad_log, "a") as f:
+                f.write(json.dumps({"iter": it, **layer_grad_norms(model)}) + "\n")
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
 

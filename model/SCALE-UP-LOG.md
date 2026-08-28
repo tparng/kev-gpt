@@ -401,6 +401,86 @@ on when or how severely the divergence happens.** This rules out
 logit-scale growth as causal — it's a correlated symptom, not the
 trigger.
 
+### Attempt 5: per-layer gradient-norm logging
+
+The next step flagged in the original write-up: instead of another
+loss-function-level guess, instrument WHERE in the network the gradients
+change character, to see if one specific layer/component is the trigger.
+
+**Code change** (`model/train.py`): a new `layer_grad_norms(model)`
+helper groups every parameter's gradient L2 norm by `blockN.{ln1,ln2,
+qkv,proj,mlp_fc,mlp_proj}`, plus `tok_emb` (tied with `head`), `pos_emb`,
+and `ln_f` — called right after `scaler.unscale_(opt)` and before
+`clip_grad_norm_` (clipping is a single global rescale, so it doesn't
+change the RELATIVE proportions between layers, but pre-clip keeps the
+raw numbers meaningful on their own). New CLI flags: `--layer-grad-log
+PATH` (JSONL output, one line per logged step) and `--layer-grad-interval
+N` (default 100).
+
+```bash
+python -m model.train --max-iters 8000 --lr 3e-4 --warmup 2000 \
+  --tokenizer word --vocab-size 4096 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_big4096 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --layer-grad-log data/gradlog_word_big4096.jsonl --layer-grad-interval 50 \
+  --out data/ckpt_word_big4096_gradlog.pt --states data/states_word_big4096_gradlog.jsonl
+```
+Same val trajectory as every other run at this recipe (best val=2.257 @
+iter 3500, climbing to 2.720 @ iter 8000) — confirms this run is
+representative before trusting the gradient data.
+
+**Per-block totals** (sum of that block's 6 component norms), sampled
+every 500 iters:
+```
+iter   tok_emb  pos_emb  ln_f    blk0   blk1   blk2   blk3  ...  blk9  blk10  blk11
+   0     1.58    0.55   0.03    7.64   7.67   7.00   6.39  ...  4.48   4.49   4.26
+2500     0.39    0.22   0.01    1.04   0.57   0.64   0.66  ...  0.30   0.31   0.33
+3500     0.39    0.23   0.01    1.06   0.50   0.62   0.64  ...  0.35   0.35   0.37
+5000     0.41    0.30   0.01    1.38   0.65   0.78   0.85  ...  0.53   0.49   0.46
+7500     0.47    0.39   0.01    1.90   0.94   1.24   1.31  ...  0.84   0.76   0.65
+```
+(full file: `data/gradlog_word_big4096.jsonl`, gitignored, one JSON object
+per logged iter with all 75 per-component keys — regenerate via the
+command above.)
+
+**Finding: EVERY block bottoms out and re-grows in lockstep, uniformly
+across depth and across attention/MLP sub-components** — this is a
+network-wide, synchronized phenomenon, not one layer misbehaving:
+
+| group | grad-norm minimum | @ iter | value at iter 7950 | relative growth |
+|---|---|---|---|---|
+| tok_emb (tied w/ head) | 0.356 | 2100 | 0.459 | **+29%** |
+| block0 (total) | 0.942 | 2900 | 1.954 | +107% |
+| block5 (total) | 0.446 | 2950 | 1.121 | +151% |
+| block11 (total) | 0.305 | 2350 | 0.654 | +115% |
+
+Every transformer block's gradient norm bottoms out at almost exactly the
+same iteration (2350-2950) that val loss bottoms (3500) and grows by a
+similar, large relative amount (107-151%) regardless of depth — checked
+down to the qkv/proj/mlp_fc/mlp_proj component level (block0 vs block11
+compared directly), same synchronized bottom-then-grow shape everywhere.
+**tok_emb/head is the one clear outlier: its gradient norm stays far more
+stable (+29% vs +107-151% for the transformer stack).**
+
+**Interpretation**: this rules out "one specific layer is the trigger" —
+whatever is happening, it's not localized to a particular depth or to
+attention vs. MLP specifically. The one real asymmetry (embedding/head
+comparatively stable, the full 12-layer transformer stack uniformly
+unstable) also weakens a "big VOCAB=4096 tied embedding/head is the
+problem" hypothesis, since that's exactly the layer that stays *most*
+stable. The synchronized, network-wide growth is consistent with a
+genuine optimization feedback loop rather than a localized bug: cross-
+entropy gradients scale with prediction error, so once the model drifts
+even slightly worse from its iter-3500 optimum (for whatever underlying
+reason — plausibly just normal SGD noise failing to stay inside a narrow
+minimum at this width, with LR still only partially decayed at that
+point), every block's gradients grow together, reinforcing the drift
+further. This is a plausible mechanism, not a proven one — it wasn't
+tested directly (e.g., by comparing gradient-noise magnitude/variance
+across widths, or checking if a much longer, gentler LR decay avoids ever
+leaving the iter-3500 basin in the first place). **Root cause is still
+open**; this rules out where it ISN'T (a single bad layer, the embedding/
+head) more than it pins down where it IS.
+
 ## Summary: every intervention tried, and what it did
 
 | Intervention | Best val | Divergence onset | Changed the core instability? |
@@ -411,6 +491,7 @@ trigger.
 | + weight decay excludes LN gains/biases | 2.262 @ iter 3500 | ~iter 3500 | no |
 | + z-loss @ 1e-4 | 2.261 @ iter 3500 | ~iter 3500 | no (too weak to engage) |
 | + z-loss @ 1e-2 (100x) | 2.244 @ iter 4000 | ~iter 4000 | no (engaged, still no effect) |
+| per-layer gradient logging (no fix, pure diagnostic) | 2.257 @ iter 3500 | ~iter 3500 | n/a — localizes WHERE, not a fix: uniform across all 12 blocks, embedding/head comparatively stable |
 
 Every configuration bottoms at essentially the same *relative* point —
 roughly 1500-2500 iterations past wherever warmup ends — regardless of
@@ -448,16 +529,27 @@ guesses.
    (diverged) one. Anyone repeating this doesn't need to babysit runs for
    divergence; just don't trust a checkpoint's `iter` field to mean "fully
    trained" without checking it against `states.jsonl`'s own val curve.
-4. **Root cause remains open.** Ruled out: LR magnitude, warmup length,
-   missing GPT-2 residual-projection init scaling, weight decay applied to
-   LayerNorm gains, and (at two very different strengths) unconstrained
-   logit growth. All four "fixes" are kept in the codebase as permanent,
-   unconditional improvements (they're correct practice regardless), but
-   none of them is *the* fix. Next real step, if picked back up, is
-   probably per-layer gradient-norm logging across the divergence window
-   (which layer's gradients change character first) or an fp32-vs-bf16
-   isolation run (rule out precision-induced instability specifically) —
-   neither was attempted in this pass.
+4. **Root cause remains open, but "where" is narrower now.** Ruled out as
+   causal: LR magnitude, warmup length, missing GPT-2 residual-projection
+   init scaling, weight decay applied to LayerNorm gains, and (at two very
+   different strengths) unconstrained logit growth — all four "fixes" are
+   kept in the codebase as permanent, unconditional improvements (correct
+   practice regardless), but none of them is *the* fix. Per-layer
+   gradient-norm logging (Attempt 5) further rules out a single
+   misbehaving layer: the growth is synchronized across all 12 transformer
+   blocks and both attention/MLP sub-components, with the embedding/head
+   layer comparatively the MOST stable part of the network (opposite of
+   what a "big tied VOCAB=4096 embedding is the problem" hypothesis would
+   predict). Leading working hypothesis now: a genuine optimization
+   feedback loop (prediction error grows -> gradients grow -> further
+   drift) rather than a localized bug, but this wasn't tested directly.
+   Next real steps, if picked back up: compare gradient-noise
+   magnitude/variance (not just norm) across widths to see if D=384 sits
+   in a genuinely sharper/narrower minimum than D=128; try a much longer,
+   gentler LR decay (never leaving the iter-3500 basin at all rather than
+   recovering from having left it); or an fp32-vs-bf16 isolation run to
+   rule out precision-induced instability specifically. None of these
+   three were attempted in this pass.
 
 ## Files touched
 
@@ -466,10 +558,13 @@ guesses.
   `GPT.forward()`'s optional z-loss term.
 - `model/train.py`: `--z-loss-coef` CLI flag, `AdamW` param-grouping
   (decay/no_decay split, always on), `estimate_loss()`'s z-loss-neutral
-  eval, the new `logit_std`/`logit_max`/`lnf_norm` print at every eval.
+  eval, the new `logit_std`/`logit_max`/`lnf_norm` print at every eval,
+  the `layer_grad_norms()` helper plus `--layer-grad-log`/
+  `--layer-grad-interval` CLI flags (opt-in, default off).
 - New data/checkpoints (all gitignored under `data/`, not checked in —
   regenerate via the commands above): `data/word_big4096/` (VOCAB=4096
-  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (6 checkpoints,
+  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (7 checkpoints,
   one per run above), `data/states_word_big4096*.jsonl` (matching
-  per-eval logs), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot dir —
-  see the overwrite caveat under Attempt 2).
+  per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
+  gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot
+  dir — see the overwrite caveat under Attempt 2).
