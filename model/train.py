@@ -183,6 +183,22 @@ def main(argv=None):
                          "normalization, unlike AdamW -- see model.SCALE-UP-LOG.md's "
                          "Attempt 7 for why this matters. --lr needs to be much "
                          "higher for sgd than adamw (no adaptive scaling).")
+    p.add_argument("--adam-eps", type=float, default=1e-8,
+                    help="AdamW's sqrt(v_hat)+eps denominator floor (torch default "
+                         "1e-8). Attempt 7 pinned the scale-up instability on Adam's "
+                         "variance normalization specifically; a much larger eps "
+                         "(try 1e-3 to 1e-2) makes that denominator less aggressive "
+                         "at small gradient-variance estimates, closer to raw-gradient "
+                         "SGD-like behavior right where it matters. See "
+                         "model/SCALE-UP-LOG.md's Attempt 8.")
+    p.add_argument("--adam-beta2", type=float, default=0.95,
+                    help="AdamW's second-moment (variance) EMA decay (this "
+                         "codebase's prior default 0.95, torch default 0.999). A "
+                         "lower value (try 0.9 or below) makes the variance "
+                         "estimate track recent gradients more responsively "
+                         "instead of averaging over a longer window that may be "
+                         "slow to shrink the effective step. See "
+                         "model/SCALE-UP-LOG.md's Attempt 8.")
     p.add_argument("--max-iters", type=int, default=4000)
     p.add_argument("--warmup", type=int, default=100)
     p.add_argument("--lr-decay-iters", type=int, default=None,
@@ -294,7 +310,7 @@ def main(argv=None):
         opt = torch.optim.AdamW(
             [{"params": decay, "weight_decay": 0.1},
              {"params": no_decay, "weight_decay": 0.0}],
-            lr=args.lr, betas=(0.9, 0.95))
+            lr=args.lr, betas=(0.9, args.adam_beta2), eps=args.adam_eps)
     use_amp = dtype is not None
     ctx = (torch.autocast(device_type=device, dtype=dtype) if use_amp
            else torch.autocast(device_type="cpu", enabled=False))

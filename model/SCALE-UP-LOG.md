@@ -634,6 +634,9 @@ tried in this pass — this is the concrete next step, not yet taken.
 | per-layer gradient logging (no fix, pure diagnostic) | 2.257 @ iter 3500 | ~iter 3500 | n/a — localizes WHERE, not a fix: uniform across all 12 blocks, embedding/head comparatively stable |
 | decay-iters=5000, held flat past that (fully pinned floor LR) | **2.203 @ iter 4500 (best overall)** | ~iter 4500, THEN CONTINUES for 10,000 more iters at frozen LR | **no — rules out LR entirely** |
 | plain SGD+momentum (same ramp/decay/hold structure) | 4.409 @ iter 6000 | ~iter 6000, then FLAT for 9,000 more iters (4.401-4.416 band) | **N/A — no divergence at all; identifies Adam as the cause** |
+| AdamW, `adam-beta2=0.9` (lower variance-EMA decay) | 2.218 @ iter 4500 | ~iter 4500, tracks the AdamW-default divergence almost exactly | **no — beta2 isn't the mechanism** |
+| AdamW, `adam-eps=1e-3` | **2.743 @ iter 11500-13500 (genuinely flat, not a snapshot)** | none — holds flat for the entire 10,000-iter window | **yes — fixes it, efficiency mostly retained** |
+| AdamW, `adam-eps=1e-2` | 3.919 @ iter 15000 (still slowly falling) | none | **yes — fixes it, but efficiency mostly lost (~SGD territory)** |
 
 Every AdamW configuration bottoms at essentially the same *relative*
 point — roughly 1500-2500 iterations past wherever warmup ends —
@@ -648,9 +651,78 @@ Attempt 5's finding (growth synchronized across the whole network, not
 localized to one layer), **the root cause is now identified as Adam's
 optimizer dynamics specifically** (most likely the variance-normalized
 per-parameter step size not actually shrinking at low nominal LR), not
-the model, the data, the width, or the LR schedule. Not yet tried: the
-concrete, targeted fix this points to (a much larger AdamW `eps`, or a
-lower `beta2`) — see Attempt 7's own closing paragraph.
+the model, the data, the width, or the LR schedule. **Attempt 8 then
+found the actual fix**: a much larger `adam-eps` (`1e-3` or `1e-2`)
+eliminates the divergence entirely, while a lower `adam-beta2` (`0.9`)
+does not — pinning the mechanism specifically to the `sqrt(v_hat)+eps`
+denominator floor, not the variance EMA's window length.
+
+### Attempt 8: target Adam's mechanism directly — `eps` fixes it, `beta2` doesn't
+
+Attempt 7 narrowed the fix to two candidates on Adam's own denominator
+(`lr * m_hat / (sqrt(v_hat) + eps)`): a much larger `eps`, or a lower
+`beta2`. This attempt tests both, isolated, against the exact same
+ramp/decay/hold structure as Attempts 6 and 7 (`--lr 3e-4 --warmup 2000
+--lr-decay-iters 5000 --max-iters 15000`, floor `3.0e-05` held from
+iter 5000 to 15000).
+
+**Code change** (`model/train.py`): new `--adam-eps` (default `1e-8`,
+torch's own default) and `--adam-beta2` (default `0.95`, this codebase's
+prior default) flags, both wired into the `AdamW(...)` constructor.
+`--optimizer sgd` is unaffected (still fixed `momentum=0.9`).
+
+```bash
+python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --lr-decay-iters 5000 --adam-eps 1e-2 \
+  --tokenizer word --vocab-size 4096 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_big4096 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_word_big4096_eps1e2.pt --states data/states_word_big4096_eps1e2.jsonl
+# repeat with --adam-eps 1e-3 --out ..._eps1e3.pt --states ..._eps1e3.jsonl
+# repeat with --adam-beta2 0.9 (eps left at default) --out ..._beta2_0.9.pt --states ..._beta2_0.9.jsonl
+```
+
+| iter | eps=1e-2 val | eps=1e-3 val | beta2=0.9 val | baseline (Attempt 6) val |
+|---|---|---|---|---|
+| 4000 | 4.095 | 2.876 | 2.225 | 2.209 |
+| **4500** | 4.069 | 2.830 | **2.218 (best)** | **2.203 (best)** |
+| 5000 (floor reached) | 4.056 | 2.808 | 2.236 | 2.219 |
+| 6000 | 4.038 | 2.791 | 2.298 | 2.282 |
+| 8000 | 4.006 | 2.766 | 2.486 | 2.475 |
+| 10000 | 3.978 | 2.751 | 2.802 | 2.792 |
+| 12500 | 3.947 | **2.743 (best, flat 11500-13500)** | 3.237 | 3.344 |
+| 15000 | **3.919 (best, still slowly falling)** | 2.746 | 3.527 | 3.570 |
+
+**`--adam-beta2 0.9` does not fix it.** Its whole trajectory tracks the
+AdamW-default baseline almost exactly, iter for iter (2.218 vs 2.203
+best, 2.298 vs 2.282 at iter 6000, 3.527 vs 3.570 at iter 15000) —
+lowering beta2 alone leaves the instability fully intact. This rules
+out the "variance EMA window too slow to react" half of Attempt 7's
+hypothesis.
+
+**Both `--adam-eps` values fix it — no divergence, in either case, for
+the entire 10,000-iteration hold period.** `eps=1e-2` is stable but
+pays a steep sample-efficiency cost, settling near val=4.0 (closer to
+SGD's 4.4 than to AdamW's 2.2 — a large `eps` mostly cancels out Adam's
+variance normalization, which is exactly the mechanism responsible, so
+this is the expected trade). `eps=1e-3` is the interesting result: it
+converges smoothly to **val=2.743 and then genuinely holds flat**
+(2.743-2.746 across iters 11500-15000, not still falling and not
+climbing) — a real converged optimum, not a lucky early snapshot ahead
+of divergence. That number (2.743) is numerically worse than the
+default-AdamW/beta2=0.9 *best-checkpoint* value (2.203/2.218), but that
+comparison is misleading: 2.203 was never a stable point the model
+settled at — it was the single best moment glimpsed on the way to a run
+that eventually reached val=3.57. `eps=1e-3` gives up some of that peak
+but is a genuine floor, reachable without needing the auto-rollback to
+gamble-catch it.
+
+**This closes the loop Attempt 7 opened**: the fix is `eps`, not
+`beta2`. `eps=1e-3` is the practical choice — meaningfully more
+efficient than `1e-2` and, unlike default `1e-8`/`beta2=0.9`, converges
+to a value it actually stays at rather than diverging away from. Not
+yet tried: whether combining a moderate `eps` increase (e.g. `3e-4` to
+`1e-3`) with a longer/gentler decay recovers closer to the ~2.2 peak
+while keeping the flat-hold stability — the natural next calibration
+step for anyone extending this further.
 
 ## Conclusions
 
@@ -694,15 +766,20 @@ lower `beta2`) — see Attempt 7's own closing paragraph.
    window. All "fixes" tried along the way are kept in the codebase as
    permanent, unconditional improvements (correct practice regardless),
    even though none of them was *the* fix — the fix has to target Adam's
-   mechanism directly. **Concrete next step, not yet tried**: a much
-   larger AdamW `eps` (default `1e-8`; try `1e-3`-`1e-2`, which makes the
-   `sqrt(v_hat)+eps` denominator less aggressive at small gradient-variance
-   estimates) or a lower `beta2` (default `0.95`; try `0.9` or lower, so
-   the variance estimate tracks recent gradients more responsively) —
-   either would keep Adam's efficiency advantage over SGD (which reached
-   only val=4.4, far short of Adam's own val=2.2 best) while directly
-   addressing the specific mechanism Attempt 7 just confirmed is
-   responsible.
+   mechanism directly. **Attempt 8 then found it**: raising AdamW's `eps`
+   (default `1e-8`) to `1e-3` or `1e-2` eliminates the divergence
+   entirely — the model holds flat for the full 10,000-iteration window
+   instead of climbing — while lowering `beta2` (default `0.95`) to `0.9`
+   does not fix it at all, tracking the default-AdamW divergence almost
+   exactly. This isolates the mechanism specifically to the
+   `sqrt(v_hat)+eps` denominator floor being too small at low
+   gradient-variance estimates, not to the variance EMA's window length.
+   `eps=1e-3` is the practical choice (converges to a genuine flat
+   val=2.743, not a lucky snapshot) since `eps=1e-2` gives up most of
+   Adam's efficiency advantage (floor ~3.9-4.0, close to SGD's own
+   val=4.4). **Not yet tried**: combining a moderate `eps` (e.g.
+   `3e-4`-`1e-3`) with a longer/gentler LR decay to try to recover closer
+   to the ~2.2 peak while keeping the flat-hold stability.
 
 ## Files touched
 
@@ -717,10 +794,12 @@ lower `beta2`) — see Attempt 7's own closing paragraph.
   (decouples the cosine-decay horizon from `--max-iters`, default None =
   same as `--max-iters`, old behavior unchanged), `--optimizer {adamw,sgd}`
   (default `adamw`, unchanged behavior; `sgd` uses `momentum=0.9` with the
-  same decay/no_decay param grouping).
+  same decay/no_decay param grouping), `--adam-eps` (default `1e-8`,
+  torch's own default) and `--adam-beta2` (default `0.95`, this
+  codebase's prior default), both wired into `AdamW(...)`.
 - New data/checkpoints (all gitignored under `data/`, not checked in —
   regenerate via the commands above): `data/word_big4096/` (VOCAB=4096
-  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (9 checkpoints,
+  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (12 checkpoints,
   one per run above), `data/states_word_big4096*.jsonl` (matching
   per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
   gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot
