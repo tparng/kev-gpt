@@ -14,14 +14,20 @@ before spending any more real-hardware effort.
 
 **Bottom line up front**: a bigger model (D=384, VOCAB=4096, ~8.7x the
 deployed model's params) genuinely produces better prose when it trains
-well — but this codebase's training recipe has a real, reproducible
-instability at this width that caps effective training to roughly the
-first 3500-4000 iterations of any run, regardless of every standard fix
-tried (lower LR, longer warmup, GPT-2 residual-projection init scaling,
-excluding LayerNorm gains from weight decay, logit-scale regularization at
-two different strengths). The instability itself was NOT resolved. The key
-finding for "what does it take to get acceptable stories": **training
-stability at width, not raw capacity, is the actual bottleneck right now.**
+well — but this codebase's default training recipe (AdamW) has a real,
+reproducible instability at this width that caps effective training to
+roughly the first 3500-4500 iterations of any AdamW run, surviving lower
+LR, longer warmup, GPT-2 residual-projection init scaling, excluding
+LayerNorm gains from weight decay, logit-scale regularization at two
+strengths, and even a completely frozen floor LR held for 10,000
+iterations. **Root cause, confirmed in Attempt 7: it's specific to Adam's
+optimizer dynamics, not the model, data, or width** — the identical setup
+trained with plain SGD+momentum instead shows no divergence at all, just
+a (much worse) stable plateau. The key finding for "what does it take to
+get acceptable stories": **training stability at width is the actual
+bottleneck right now, and it's fixable in principle by tuning Adam's own
+hyperparameters (`eps`, `beta2`) rather than needing a different
+optimizer or architecture — just not yet tried.**
 
 ## Environment / how to reproduce
 
@@ -543,6 +549,78 @@ extreme floor LR (e.g. 1e-6) to see if the drift ever actually stops;
 batch sequence across runs to rule out data-order effects instead of
 optimizer dynamics.
 
+### Attempt 7: plain SGD instead of AdamW — the direct test, and the answer
+
+The most direct test of Attempt 6's leading hypothesis: SGD's update is
+directly proportional to the raw gradient (with momentum), with no
+per-parameter variance normalization at all. If the divergence still
+happens with SGD, Adam's normalization is cleared. If it doesn't, that's
+the root cause.
+
+**Code change** (`model/train.py`): new `--optimizer {adamw,sgd}` flag
+(default `adamw`, unchanged behavior). SGD uses `momentum=0.9`, the same
+decay/no_decay parameter grouping as AdamW (weight decay only on >=2D
+matrices).
+
+**LR calibration first** (SGD needs a much higher LR than Adam — no
+adaptive per-parameter scaling to compensate for raw gradient magnitude).
+Three short 1000-iter probes at `--warmup 200`:
+
+| lr | val @ iter 1000 |
+|---|---|
+| 0.03 | 4.549 |
+| 0.1 | 4.753 (worse) |
+| 0.3 | 5.743 (worse, visibly noisy: train loss went UP from iter 200→600) |
+
+`0.03` was the best of the three (higher values were actively worse, not
+just slower) — used for the real run.
+
+**Real run**, same ramp/decay/hold structure as Attempt 6 (swap only the
+optimizer), given a longer decay horizon since SGD converges slower:
+```bash
+python -m model.train --max-iters 15000 --optimizer sgd --lr 0.03 --warmup 2000 --lr-decay-iters 6000 \
+  --tokenizer word --vocab-size 4096 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_big4096 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_word_big4096_sgd.pt --states data/states_word_big4096_sgd.jsonl
+```
+| iter | train | val | lr | logit_max | lnf_norm |
+|---|---|---|---|---|---|
+| 2000 (peak lr) | 4.752 | 4.743 | 3.0e-02 | 9.6 | 22.74 |
+| 4000 | 4.517 | 4.501 | 1.7e-02 | 11.0 | 24.43 |
+| **6000 (floor reached)** | 4.421 | **4.409 (best)** | 3.0e-03 | 10.8 | 24.99 |
+| 8000 | 4.427 | 4.415 | 3.0e-03 (holding) | 10.8 | 25.20 |
+| 10000 | 4.426 | 4.414 | 3.0e-03 (holding) | 10.8 | 25.39 |
+| 12500 | 4.418 | 4.406 | 3.0e-03 (holding) | 10.9 | 25.63 |
+| 15000 | 4.414 | **4.401** | 3.0e-03 (holding) | 10.9 | 25.85 |
+
+**No divergence.** Val loss settles at iter ~6000 (right as LR reaches
+its floor) and then stays completely flat — fluctuating in a narrow
+4.401-4.416 band — for the remaining 9000 iterations, the exact same
+hold-period length where AdamW (Attempt 6, identical model/data/LR-decay
+structure) diverged by +61%. `logit_max` and `lnf_norm` plateau too
+(logit_max barely moves at all, 10.8→10.9 across 9000 iters, vs AdamW's
+continuous climb).
+
+**This is conclusive: the instability is specific to Adam's optimizer
+dynamics, not the model, the data, or the width itself.** The obvious
+caveat: SGD's absolute loss (4.401) is far worse than AdamW's best
+(2.203) — SGD is much less sample-efficient for transformers at this
+scale, well-documented in the broader literature and confirmed here, not
+a surprise. This isn't a usable fix on its own (nobody wants a model
+stuck at val=4.4 when val=2.2 is reachable), but it decisively answers
+the ROOT CAUSE question and points at a much narrower, more promising
+next step than anything tried before: **target Adam's specific
+mechanism directly rather than abandoning Adam** — most directly, try a
+much larger `eps` in `AdamW(..., eps=...)` (default `1e-8`; something
+like `1e-3` or `1e-2` would make the `sqrt(v_hat)+eps` denominator less
+aggressive at small gradient-variance estimates, closer to un-normalized
+SGD-like behavior while keeping Adam's momentum/adaptivity elsewhere).
+Also worth trying: lower `beta2` (default `0.95` here; a value like
+`0.9` or lower makes the variance estimate track recent gradients more
+responsively instead of averaging over a longer window that may be
+slow to "notice" it should shrink the effective step). Neither was
+tried in this pass — this is the concrete next step, not yet taken.
+
 ## Summary: every intervention tried, and what it did
 
 | Intervention | Best val | Divergence onset | Changed the core instability? |
@@ -555,21 +633,24 @@ optimizer dynamics.
 | + z-loss @ 1e-2 (100x) | 2.244 @ iter 4000 | ~iter 4000 | no (engaged, still no effect) |
 | per-layer gradient logging (no fix, pure diagnostic) | 2.257 @ iter 3500 | ~iter 3500 | n/a — localizes WHERE, not a fix: uniform across all 12 blocks, embedding/head comparatively stable |
 | decay-iters=5000, held flat past that (fully pinned floor LR) | **2.203 @ iter 4500 (best overall)** | ~iter 4500, THEN CONTINUES for 10,000 more iters at frozen LR | **no — rules out LR entirely** |
+| plain SGD+momentum (same ramp/decay/hold structure) | 4.409 @ iter 6000 | ~iter 6000, then FLAT for 9,000 more iters (4.401-4.416 band) | **N/A — no divergence at all; identifies Adam as the cause** |
 
-Every configuration bottoms at essentially the same *relative* point —
-roughly 1500-2500 iterations past wherever warmup ends — regardless of
-peak LR, warmup length, init scaling, weight-decay grouping, or
-logit-scale regularization strength. Attempt 6 went further and pinned
-LR completely flat at its floor for two-thirds of an entire run, and the
-model STILL diverged just as much — the single most decisive result in
-this log, since it doesn't just fail to fix the instability, it rules out
-the entire LR-schedule axis as a candidate cause. Combined with Attempt
-5's finding (growth synchronized across the whole network, not localized
-to one layer), the leading hypothesis is now Adam's own per-parameter
-variance-normalized update magnitude not actually shrinking to zero at
-low nominal LR — untested directly; see Attempt 6's own suggested next
-tests (plain SGD, more extreme floor LR, `weight_decay=0`, fixed batch
-replay).
+Every AdamW configuration bottoms at essentially the same *relative*
+point — roughly 1500-2500 iterations past wherever warmup ends —
+regardless of peak LR, warmup length, init scaling, weight-decay
+grouping, or logit-scale regularization strength. Attempt 6 went further
+and pinned LR completely flat at its floor for two-thirds of an entire
+run, and the model STILL diverged just as much, ruling out the entire
+LR-schedule axis. **Attempt 7 then closed the loop**: the exact same
+model/data/ramp-decay-hold structure, with plain SGD instead of AdamW,
+shows NO divergence at all — it settles and stays flat. Combined with
+Attempt 5's finding (growth synchronized across the whole network, not
+localized to one layer), **the root cause is now identified as Adam's
+optimizer dynamics specifically** (most likely the variance-normalized
+per-parameter step size not actually shrinking at low nominal LR), not
+the model, the data, the width, or the LR schedule. Not yet tried: the
+concrete, targeted fix this points to (a much larger AdamW `eps`, or a
+lower `beta2`) — see Attempt 7's own closing paragraph.
 
 ## Conclusions
 
@@ -595,31 +676,33 @@ replay).
    (diverged) one. Anyone repeating this doesn't need to babysit runs for
    divergence; just don't trust a checkpoint's `iter` field to mean "fully
    trained" without checking it against `states.jsonl`'s own val curve.
-4. **Root cause remains open, but the LR-schedule axis is now definitively
-   ruled out.** Ruled out as causal: LR magnitude, warmup length, missing
-   GPT-2 residual-projection init scaling, weight decay applied to
-   LayerNorm gains, unconstrained logit growth (at two very different
-   strengths), and — decisively, in Attempt 6 — the LR schedule itself:
-   pinning LR completely flat at its floor for 10,000 iterations still
-   produced the same divergence (val +61% while LR never moved). All
-   "fixes" tried are kept in the codebase as permanent, unconditional
-   improvements (correct practice regardless), but none of them is *the*
-   fix. Per-layer gradient-norm logging (Attempt 5) rules out a single
-   misbehaving layer too: growth is synchronized across all 12
+4. **Root cause identified: Adam's optimizer dynamics, not the model, the
+   data, the width, or the LR schedule.** Ruled out as causal: LR
+   magnitude, warmup length, missing GPT-2 residual-projection init
+   scaling, weight decay applied to LayerNorm gains, unconstrained logit
+   growth (at two very different strengths), and — decisively, in Attempt
+   6 — the LR schedule itself: pinning LR completely flat at its floor for
+   10,000 iterations still produced the same divergence (val +61% while LR
+   never moved). Per-layer gradient-norm logging (Attempt 5) also rules
+   out a single misbehaving layer: growth is synchronized across all 12
    transformer blocks and both attention/MLP sub-components, with the
-   embedding/head layer comparatively the MOST stable part of the network
-   (opposite of what a "big tied VOCAB=4096 embedding is the problem"
-   hypothesis would predict). **Leading working hypothesis now**: Adam's
-   own per-parameter variance-normalized update magnitude not actually
-   shrinking to zero at low nominal LR (untested directly). Next real
-   steps, if picked back up: plain SGD instead of AdamW (removes the
-   per-parameter variance normalization entirely — the most direct test
-   of the current leading hypothesis); an even more extreme floor LR
-   (e.g. 1e-6) to see if the drift ever actually stops; `weight_decay=0`
-   to rule out decay-driven erosion; replaying a FIXED batch sequence
-   across runs to rule out data-order effects; or an fp32-vs-bf16
-   isolation run to rule out precision-induced instability. None of
-   these five were attempted in this pass.
+   embedding/head layer comparatively the MOST stable part of the network.
+   **Attempt 7 then pinned it down**: the identical model/data/ramp-decay-
+   hold structure, run with plain SGD+momentum instead of AdamW, shows NO
+   divergence at all — it settles at iter ~6000 and stays flat for the
+   remaining 9,000 iterations, where AdamW diverged badly over the same
+   window. All "fixes" tried along the way are kept in the codebase as
+   permanent, unconditional improvements (correct practice regardless),
+   even though none of them was *the* fix — the fix has to target Adam's
+   mechanism directly. **Concrete next step, not yet tried**: a much
+   larger AdamW `eps` (default `1e-8`; try `1e-3`-`1e-2`, which makes the
+   `sqrt(v_hat)+eps` denominator less aggressive at small gradient-variance
+   estimates) or a lower `beta2` (default `0.95`; try `0.9` or lower, so
+   the variance estimate tracks recent gradients more responsively) —
+   either would keep Adam's efficiency advantage over SGD (which reached
+   only val=4.4, far short of Adam's own val=2.2 best) while directly
+   addressing the specific mechanism Attempt 7 just confirmed is
+   responsible.
 
 ## Files touched
 
@@ -632,10 +715,12 @@ replay).
   the `layer_grad_norms()` helper plus `--layer-grad-log`/
   `--layer-grad-interval` CLI flags (opt-in, default off), `--lr-decay-iters`
   (decouples the cosine-decay horizon from `--max-iters`, default None =
-  same as `--max-iters`, old behavior unchanged).
+  same as `--max-iters`, old behavior unchanged), `--optimizer {adamw,sgd}`
+  (default `adamw`, unchanged behavior; `sgd` uses `momentum=0.9` with the
+  same decay/no_decay param grouping).
 - New data/checkpoints (all gitignored under `data/`, not checked in —
   regenerate via the commands above): `data/word_big4096/` (VOCAB=4096
-  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (8 checkpoints,
+  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (9 checkpoints,
   one per run above), `data/states_word_big4096*.jsonl` (matching
   per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
   gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot

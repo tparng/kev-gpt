@@ -178,6 +178,11 @@ def main(argv=None):
                          "next diagnostic step); default None = off.")
     p.add_argument("--layer-grad-interval", type=int, default=100)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw",
+                    help="sgd (+momentum=0.9) has no per-parameter variance "
+                         "normalization, unlike AdamW -- see model.SCALE-UP-LOG.md's "
+                         "Attempt 7 for why this matters. --lr needs to be much "
+                         "higher for sgd than adamw (no adaptive scaling).")
     p.add_argument("--max-iters", type=int, default=4000)
     p.add_argument("--warmup", type=int, default=100)
     p.add_argument("--lr-decay-iters", type=int, default=None,
@@ -272,10 +277,24 @@ def main(argv=None):
         if not p.requires_grad:
             continue
         (decay if p.dim() >= 2 else no_decay).append(p)
-    opt = torch.optim.AdamW(
-        [{"params": decay, "weight_decay": 0.1},
-         {"params": no_decay, "weight_decay": 0.0}],
-        lr=args.lr, betas=(0.9, 0.95))
+    # --optimizer sgd: the direct test of the leading scale-up-instability
+    # hypothesis in model/SCALE-UP-LOG.md's Attempt 6 -- Adam's per-parameter
+    # update is VARIANCE-NORMALIZED (lr * m_hat / (sqrt(v_hat)+eps)), so its
+    # effective step size doesn't necessarily shrink to zero even at a tiny
+    # nominal lr. Plain SGD (+momentum) has no such normalization: its step
+    # is directly proportional to the raw gradient, so if the same
+    # bottom-then-diverge pattern still shows up here, that specifically
+    # rules Adam's normalization out too, not just LR scheduling.
+    if args.optimizer == "sgd":
+        opt = torch.optim.SGD(
+            [{"params": decay, "weight_decay": 0.1},
+             {"params": no_decay, "weight_decay": 0.0}],
+            lr=args.lr, momentum=0.9)
+    else:
+        opt = torch.optim.AdamW(
+            [{"params": decay, "weight_decay": 0.1},
+             {"params": no_decay, "weight_decay": 0.0}],
+            lr=args.lr, betas=(0.9, 0.95))
     use_amp = dtype is not None
     ctx = (torch.autocast(device_type=device, dtype=dtype) if use_amp
            else torch.autocast(device_type="cpu", enabled=False))
