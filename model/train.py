@@ -180,6 +180,15 @@ def main(argv=None):
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--max-iters", type=int, default=4000)
     p.add_argument("--warmup", type=int, default=100)
+    p.add_argument("--lr-decay-iters", type=int, default=None,
+                    help="cosine-decay horizon, decoupled from --max-iters -- "
+                         "LR reaches its floor (min_lr_frac*lr) at this iter and "
+                         "HOLDS there for any remaining iters, instead of the "
+                         "decay stretching across the whole run. Default: same "
+                         "as --max-iters (old behavior, decay ends exactly at "
+                         "the last iter). See model/SCALE-UP-LOG.md's Attempt 6 "
+                         "(longer/gentler decay: get to a low LR fast, then see "
+                         "if the model stays stable there for a long time).")
     p.add_argument("--eval-interval", type=int, default=500)
     p.add_argument("--eval-iters", type=int, default=50)
     p.add_argument("--states", default="data/states.jsonl",
@@ -324,7 +333,7 @@ def main(argv=None):
     best_val = float("inf")
     t0 = time.perf_counter()
     for it in range(args.max_iters + 1):
-        lr = cosine_lr(it, args.lr, args.warmup, args.max_iters)
+        lr = cosine_lr(it, args.lr, args.warmup, args.lr_decay_iters or args.max_iters)
         for g in opt.param_groups:
             g["lr"] = lr
 

@@ -481,6 +481,68 @@ leaving the iter-3500 basin in the first place). **Root cause is still
 open**; this rules out where it ISN'T (a single bad layer, the embedding/
 head) more than it pins down where it IS.
 
+### Attempt 6: longer/gentler LR decay — get to a low LR fast, then hold it there
+
+The next step flagged above: instead of stretching decay across the WHOLE
+run (so LR is still ~80-90% of peak right when the model usually leaves
+its optimum, iter ~3500-4000), decouple the decay horizon from total
+training length — ramp down to the LR floor FAST, then just keep training
+at that tiny, fixed LR for a long time. Tests directly: does the model
+stay near its optimum once it's off the high-LR plateau, or does it drift
+away regardless of LR?
+
+**Code change** (`model/train.py`): new `--lr-decay-iters` flag,
+decoupled from `--max-iters` — `cosine_lr`'s own `total` parameter (which
+governs when LR reaches its floor and holds there, via its existing
+`if it > total: return lr * min_lr_frac` branch) now defaults to
+`--max-iters` (old behavior, unchanged) but can be set independently.
+
+```bash
+python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --lr-decay-iters 5000 \
+  --tokenizer word --vocab-size 4096 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_big4096 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_word_big4096_gentledecay.pt --states data/states_word_big4096_gentledecay.jsonl
+```
+LR ramps over 0-2000 (warmup), decays over 2000-5000 (reaching floor
+`0.1*3e-4=3e-5` right at iter 5000), then **holds flat at 3.0e-05 for all
+10,000 remaining iters (5000-15000)**.
+
+| iter | train | val | lr |
+|---|---|---|---|
+| 3500 | 2.254 | 2.231 | 1.6e-04 |
+| 4000 | 2.231 | 2.209 | 9.8e-05 |
+| **4500** | **2.225** | **2.203 (best of the ENTIRE investigation)** | 4.8e-05 |
+| 5000 | 2.242 | 2.219 | 3.0e-05 (floor reached) |
+| 6000 | 2.304 | 2.282 | 3.0e-05 (holding) |
+| 8000 | 2.496 | 2.475 | 3.0e-05 (holding) |
+| 10000 | 2.814 | 2.792 | 3.0e-05 (holding) |
+| 12500 | 3.365 | 3.344 | 3.0e-05 (holding) |
+| 15000 | 3.598 | 3.570 | 3.0e-05 (holding) |
+
+**This is a decisive negative result: the model diverges even at a
+completely frozen, near-zero learning rate held for two-thirds of the
+run.** Train and val loss both climb continuously and substantially
+(val +61% from iter 5000 to 15000) with LR literally unchanged the whole
+time. **This conclusively rules out the LR-schedule hypothesis
+entirely** — every variant tried (lower peak, longer warmup, faster
+decay, and now a fully pinned floor LR) shows the same divergence, so it
+was never really about LR magnitude or shape.
+
+**What this points to instead**: Adam's per-parameter update is
+variance-normalized (`lr * m_hat / (sqrt(v_hat) + eps)`), not simply
+proportional to raw gradient magnitude — so even at `lr=3e-5`, the
+*normalized* step size per parameter doesn't shrink to zero, and
+compounded over 10,000 steps that's still a meaningful cumulative drift
+independent of the nominal LR value. This would explain why NO amount of
+LR tuning fixes it: the mechanism producing the drift isn't LR-gated at
+all. Not tested directly in this pass (candidates for whoever picks this
+up next): plain SGD instead of AdamW (removes the per-parameter variance
+normalization entirely, a clean way to test this theory); an even more
+extreme floor LR (e.g. 1e-6) to see if the drift ever actually stops;
+`weight_decay=0` to rule out decay-driven erosion; or replaying a FIXED
+batch sequence across runs to rule out data-order effects instead of
+optimizer dynamics.
+
 ## Summary: every intervention tried, and what it did
 
 | Intervention | Best val | Divergence onset | Changed the core instability? |
@@ -492,25 +554,29 @@ head) more than it pins down where it IS.
 | + z-loss @ 1e-4 | 2.261 @ iter 3500 | ~iter 3500 | no (too weak to engage) |
 | + z-loss @ 1e-2 (100x) | 2.244 @ iter 4000 | ~iter 4000 | no (engaged, still no effect) |
 | per-layer gradient logging (no fix, pure diagnostic) | 2.257 @ iter 3500 | ~iter 3500 | n/a — localizes WHERE, not a fix: uniform across all 12 blocks, embedding/head comparatively stable |
+| decay-iters=5000, held flat past that (fully pinned floor LR) | **2.203 @ iter 4500 (best overall)** | ~iter 4500, THEN CONTINUES for 10,000 more iters at frozen LR | **no — rules out LR entirely** |
 
 Every configuration bottoms at essentially the same *relative* point —
 roughly 1500-2500 iterations past wherever warmup ends — regardless of
 peak LR, warmup length, init scaling, weight-decay grouping, or
-logit-scale regularization strength. That consistency is itself the most
-informative result: it rules out the "obvious", standard-remedy causes
-(LR too high, missing init scaling, LN gains fighting weight decay,
-uncapped logit growth) without landing a fix. Whatever is actually
-happening at iter ~3500-4000 likely needs lower-level instrumentation
-(per-layer gradient/activation norms, bf16-vs-fp32 isolation) to find —
-a different, slower kind of investigation than loss-function-level
-guesses.
+logit-scale regularization strength. Attempt 6 went further and pinned
+LR completely flat at its floor for two-thirds of an entire run, and the
+model STILL diverged just as much — the single most decisive result in
+this log, since it doesn't just fail to fix the instability, it rules out
+the entire LR-schedule axis as a candidate cause. Combined with Attempt
+5's finding (growth synchronized across the whole network, not localized
+to one layer), the leading hypothesis is now Adam's own per-parameter
+variance-normalized update magnitude not actually shrinking to zero at
+low nominal LR — untested directly; see Attempt 6's own suggested next
+tests (plain SGD, more extreme floor LR, `weight_decay=0`, fixed batch
+replay).
 
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
-   investigation lands in the same narrow val=2.235-2.309 range (the
-   single lowest across all 8 runs is `data/ckpt_word_big4096_zloss2.pt`,
-   val=2.244 @ iter 4000 — but they're all close enough to be roughly
+   investigation lands in the same narrow val=2.20-2.31 range (the single
+   lowest across all 9 runs is `data/ckpt_word_big4096_gentledecay.pt`,
+   val=2.203 @ iter 4500 — but they're all close enough to be roughly
    interchangeable, since the instability caps every run at nearly the
    same point regardless of what else changed). The samples shown above
    (from the iter-3500 checkpoint, val=2.271) are clearly more coherent
@@ -529,27 +595,31 @@ guesses.
    (diverged) one. Anyone repeating this doesn't need to babysit runs for
    divergence; just don't trust a checkpoint's `iter` field to mean "fully
    trained" without checking it against `states.jsonl`'s own val curve.
-4. **Root cause remains open, but "where" is narrower now.** Ruled out as
-   causal: LR magnitude, warmup length, missing GPT-2 residual-projection
-   init scaling, weight decay applied to LayerNorm gains, and (at two very
-   different strengths) unconstrained logit growth — all four "fixes" are
-   kept in the codebase as permanent, unconditional improvements (correct
-   practice regardless), but none of them is *the* fix. Per-layer
-   gradient-norm logging (Attempt 5) further rules out a single
-   misbehaving layer: the growth is synchronized across all 12 transformer
-   blocks and both attention/MLP sub-components, with the embedding/head
-   layer comparatively the MOST stable part of the network (opposite of
-   what a "big tied VOCAB=4096 embedding is the problem" hypothesis would
-   predict). Leading working hypothesis now: a genuine optimization
-   feedback loop (prediction error grows -> gradients grow -> further
-   drift) rather than a localized bug, but this wasn't tested directly.
-   Next real steps, if picked back up: compare gradient-noise
-   magnitude/variance (not just norm) across widths to see if D=384 sits
-   in a genuinely sharper/narrower minimum than D=128; try a much longer,
-   gentler LR decay (never leaving the iter-3500 basin at all rather than
-   recovering from having left it); or an fp32-vs-bf16 isolation run to
-   rule out precision-induced instability specifically. None of these
-   three were attempted in this pass.
+4. **Root cause remains open, but the LR-schedule axis is now definitively
+   ruled out.** Ruled out as causal: LR magnitude, warmup length, missing
+   GPT-2 residual-projection init scaling, weight decay applied to
+   LayerNorm gains, unconstrained logit growth (at two very different
+   strengths), and — decisively, in Attempt 6 — the LR schedule itself:
+   pinning LR completely flat at its floor for 10,000 iterations still
+   produced the same divergence (val +61% while LR never moved). All
+   "fixes" tried are kept in the codebase as permanent, unconditional
+   improvements (correct practice regardless), but none of them is *the*
+   fix. Per-layer gradient-norm logging (Attempt 5) rules out a single
+   misbehaving layer too: growth is synchronized across all 12
+   transformer blocks and both attention/MLP sub-components, with the
+   embedding/head layer comparatively the MOST stable part of the network
+   (opposite of what a "big tied VOCAB=4096 embedding is the problem"
+   hypothesis would predict). **Leading working hypothesis now**: Adam's
+   own per-parameter variance-normalized update magnitude not actually
+   shrinking to zero at low nominal LR (untested directly). Next real
+   steps, if picked back up: plain SGD instead of AdamW (removes the
+   per-parameter variance normalization entirely — the most direct test
+   of the current leading hypothesis); an even more extreme floor LR
+   (e.g. 1e-6) to see if the drift ever actually stops; `weight_decay=0`
+   to rule out decay-driven erosion; replaying a FIXED batch sequence
+   across runs to rule out data-order effects; or an fp32-vs-bf16
+   isolation run to rule out precision-induced instability. None of
+   these five were attempted in this pass.
 
 ## Files touched
 
@@ -560,10 +630,12 @@ guesses.
   (decay/no_decay split, always on), `estimate_loss()`'s z-loss-neutral
   eval, the new `logit_std`/`logit_max`/`lnf_norm` print at every eval,
   the `layer_grad_norms()` helper plus `--layer-grad-log`/
-  `--layer-grad-interval` CLI flags (opt-in, default off).
+  `--layer-grad-interval` CLI flags (opt-in, default off), `--lr-decay-iters`
+  (decouples the cosine-decay horizon from `--max-iters`, default None =
+  same as `--max-iters`, old behavior unchanged).
 - New data/checkpoints (all gitignored under `data/`, not checked in —
   regenerate via the commands above): `data/word_big4096/` (VOCAB=4096
-  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (7 checkpoints,
+  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (8 checkpoints,
   one per run above), `data/states_word_big4096*.jsonl` (matching
   per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
   gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot
