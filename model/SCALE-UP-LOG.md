@@ -640,6 +640,7 @@ tried in this pass — this is the concrete next step, not yet taken.
 | AdamW, `adam-eps=3e-4` + gentler decay (decay-iters=8000) | 2.365 @ iter 7500 | ~iter 7500-8000, then climbs 3-4x slower than default AdamW | **partial — dampens but doesn't eliminate; best peak of any config, but not stable** |
 | AdamW, `adam-eps=1e-3` + gentler decay (decay-iters=10000) | **2.606 @ iter 9500** | ~iter 9500-10000, then drifts +0.052 over 5000 iters (~4x gentler than the eps=3e-4 combo) | **yes, close to fully — best practical tradeoff of the sweep** |
 | AdamW, `adam-eps=1e-3` + even gentler decay (decay-iters=13000) | 2.607 @ iter 10500 (plateau, no improvement over decay-iters=10000) | ~iter 11000 (starts before the floor), drifts +0.058 over 4500 iters (same magnitude as decay-iters=10000) | **plateau — recipe already found its ceiling at decay-iters~10000** |
+| Same recipe (`eps=1e-3`, decay@10000) ported to the deployment shape (D=128/NLAYER=12/VOCAB=1900) | 2.672 @ iter 23000, still improving | none — this shape never diverges, with or without the fix | **N/A — negative transfer: worse than that shape's own existing recipe (val 2.022 @ iter 23000)** |
 
 Every AdamW configuration bottoms at essentially the same *relative*
 point — roughly 1500-2500 iterations past wherever warmup ends —
@@ -880,6 +881,65 @@ size: **`eps=1e-3`, `lr-decay-iters≈10000` (of 15000) is the
 recommended practical recipe** from this whole investigation — best
 achievable peak without genuine, unbounded divergence.
 
+### Attempt 12: porting the recipe to the deployment shape — a negative transfer result
+
+Every attempt above trained the wide D=384/NLAYER=12/VOCAB=4096
+diagnostic shape used to find and reproduce the instability. This
+attempt asks the practical question: does the fix recipe (`eps=1e-3`,
+`lr-decay-iters≈10000`) help the model actually deployed on real
+hardware — D=128/NLAYER=12/NHEAD=2/VOCAB=1900 (`data/ckpt_word16.pt`,
+`fabric/genesys2/PORT-NOTES.md`'s "Word-level vocabulary (current)"
+section, best val 2.022 @ iter 23000 on real Genesys2 silicon)?
+
+```bash
+python -m model.train --max-iters 23000 --lr 3e-4 --warmup 2000 --lr-decay-iters 10000 --adam-eps 1e-3 \
+  --tokenizer word --vocab-size 1900 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_stream16 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16_epsrecipe_23k.pt --states data/states_word16_epsrecipe_23k.jsonl
+```
+(First run stopped at `--max-iters 15000`, val 2.719 @ iter 15000, still
+improving with no divergence; re-run to `--max-iters 23000` — this
+architecture trains fast, 2.61M params, ~9 min total on this GPU — for a
+same-iter-count comparison against the deployed checkpoint.)
+
+| | this recipe (eps=1e-3, decay@10000) | original deployment run (`ckpt_word16.pt`) |
+|---|---|---|
+| peak LR | 3e-4 | ~5e-4 |
+| warmup | 2000 | ~100 (old default) |
+| LR schedule | fast decay to floor by iter 10000, held flat for the remaining 13,000 | standard single cosine sweep across the full 23000-24000 iters |
+| `adam-eps` | 1e-3 | 1e-8 (default; predates the `--adam-eps` flag) |
+| val @ iter 23000 | **2.672** | **2.022** |
+
+**Clear negative transfer: the recipe is worse here, not neutral.**
+Never diverges (still slowly improving through iter 23000, matching the
+port notes' own finding that this narrower shape "trained clean and
+stable... no instability, unlike D=256"), but it converges to a
+meaningfully worse val loss than the deployment checkpoint's own
+existing recipe at the identical iteration count. Two compounding
+reasons, not one: (1) `eps=1e-3` was tuned specifically to counteract a
+failure mode this shape doesn't have — at a width that never needed
+denominator-floor damping, raising `eps` just gives up Adam efficiency
+for a stability benefit that was never at risk, the same tradeoff
+Attempts 8-9 already documented at the wide shape; (2) the fast-decay-
+then-hold schedule (`lr-decay-iters=10000` of 23000) spends 13,000 of
+the run's 23,000 iterations at a frozen `3.0e-05` floor, where the
+original recipe spent that whole span still slowly decaying from a much
+higher peak (5e-4 vs 3e-4) — strictly less effective high-LR training
+time, independent of `eps` at all.
+
+**Takeaway: this fix is scale-specific, not a universal drop-in
+improvement.** It was diagnosed on, and should stay scoped to, model
+shapes wide enough (D>=256-384 at this depth) to actually exhibit the
+Adam-driven divergence documented in Attempts 1-7. The currently
+deployed D=128/NLAYER=12/VOCAB=1900 checkpoint's existing training
+recipe (higher peak LR, standard full-length cosine decay, default
+`adam-eps`) remains the better choice for that shape and should not be
+replaced by this investigation's findings. Not yet tried: whether the
+deployment shape's own recipe (5e-4 peak, full cosine, default eps)
+could be improved further on its own terms — a separate question from
+this attempt, which only tested whether the *wide-model* fix transfers
+(it doesn't).
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -965,6 +1025,22 @@ achievable peak without genuine, unbounded divergence.
    `lr-decay-iters≈10000` (of a 15000-iter run)** — best peak this axis
    reaches (~2.6) without unbounded divergence, and stretching the decay
    further buys nothing more.
+5. **The recipe is scale-specific — it does not transfer to the actual
+   deployed model, and makes it worse if ported blindly.** Attempt 12
+   ported `eps=1e-3` + `lr-decay-iters≈10000` to the real D=128/NLAYER=12/
+   VOCAB=1900 hardware shape (`data/ckpt_word16.pt`) and got a clearly
+   worse result at the same iteration count (val 2.672 vs the deployed
+   checkpoint's own 2.022 @ iter 23000) — never diverges either way, since
+   this narrower shape was never unstable to begin with (matching the
+   port notes' own "trained clean and stable" finding), so `eps=1e-3`
+   only costs Adam's efficiency for a stability benefit that isn't
+   needed, compounded by the recipe's lower peak LR and its fast-decay-
+   then-hold schedule spending most of the run at a frozen floor instead
+   of the deployed recipe's full-length decay from a higher peak. **This
+   fix is scoped to model shapes wide enough to actually exhibit the
+   Adam-driven divergence (D>=256-384 at this depth) — the deployment
+   shape should keep its own existing recipe (higher peak LR, standard
+   full cosine decay, default `adam-eps`), not this investigation's.**
 
 ## Files touched
 
@@ -988,4 +1064,10 @@ achievable peak without genuine, unbounded divergence.
   one per run above), `data/states_word_big4096*.jsonl` (matching
   per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
   gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot
-  dir — see the overwrite caveat under Attempt 2).
+  dir — see the overwrite caveat under Attempt 2). Attempt 12 reuses the
+  existing `data/word_stream16/` tokenizer/bins (the deployment shape's
+  own prepared data, not regenerated) and adds
+  `data/ckpt_word16_epsrecipe.pt` / `data/ckpt_word16_epsrecipe_23k.pt`
+  + matching `data/states_word16_epsrecipe*.jsonl` — deliberately
+  separate filenames from the real deployed `data/ckpt_word16.pt`, which
+  this attempt does not touch or replace.
