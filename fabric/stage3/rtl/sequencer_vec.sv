@@ -252,6 +252,31 @@ module sequencer_vec #(
     // winner (see S_ARGMAX), so VOCAB itself (not ARROWS*P) is the correct
     // bound -- a stored winning index is always < VOCAB.
     localparam integer VIDXW = $clog2(VOCAB);
+    // width for the whole "row index / raw dimension" register family that
+    // was hardcoded [BUSW-1:0] (11 bits, max 2047) throughout this FSM -- ci,
+    // cid/cid1-3, rb0-2, qkv_wrow, gv_m/gv_k/gv_rdaddr, g_m/g_k, and every
+    // *_ra read-address wire (xres/lnout1/lnout2/ctxv/mlpbuf/qkv/attn/mlp/
+    // head_ra, gam_fr) -- found the same way MAXROWS/VIDXW were: `dor` got
+    // fixed once already for the VOCAB=57->1900 jump (see MAXROWS's own
+    // comment above), but that fix wasn't propagated to these SIBLING
+    // registers, which silently assumed 11 bits was always enough. It
+    // wasn't, at VOCAB=16384: ARROWS=2048 needs MAXROWS's own counter to
+    // reach the value 2048 (a loop-exit sentinel, RIDXW=$clog2(MAXROWS+1)
+    // bits), and g_m/g_k store VOCAB itself as a raw dimension value (up
+    // to 16384, DIMW=$clog2(VOCAB+1) bits) when driving the head GEMV --
+    // both exceed 11 bits, the first as a real `iverilog` elaboration
+    // error (negative concatenation-repeat count), the second SILENTLY
+    // (`g_m<=VOCAB[BUSW-1:0]` truncated 16384 to 0, corrupting every head
+    // logit) -- only caught by actually trying VOCAB=16384, not by any
+    // compile-time check. BUSW covers both needs with one consistent
+    // width, floored at 11 to keep every existing smaller-VOCAB shape's
+    // own already-verified bit-exactness byte-for-byte unchanged.
+    localparam integer MAXDIM  = (D3 > D_MLP) ? ((D3 > VOCAB) ? D3 : VOCAB)
+                                              : ((D_MLP > VOCAB) ? D_MLP : VOCAB);
+    localparam integer DIMW    = $clog2(MAXDIM + 1);
+    localparam integer RIDXW   = $clog2(MAXROWS + 1);
+    localparam integer BUSW_RAW = (DIMW > RIDXW) ? DIMW : RIDXW;
+    localparam integer BUSW    = (BUSW_RAW > 11) ? BUSW_RAW : 11;
     // per-layer weight streaming (WEIGHT_STREAM_PER_LAYER=1 only): DDR3
     // byte stride per wide word and 32-bit "loader word" count per wide
     // word -- same WBITS/SUBW relationship weight_bank_tdp.sv/
@@ -356,11 +381,11 @@ module sequencer_vec #(
     reg        wldi_start;
     reg [28:0] wldi_addr;
     reg [31:0] wldi_words;
-    reg [10:0] ci;
+    reg [BUSW-1:0] ci;
     reg [$clog2(ROWSM+1)-1:0] fr, orow;
     reg [$clog2(MAXROWS+1)-1:0] dor;   // widened for VOCAB-scale ARROWS -- see MAXROWS above
     // read-pipeline delayed addresses + valids (consume stage of each FSM loop)
-    reg [10:0] cid;  reg civ;
+    reg [BUSW-1:0] cid;  reg civ;
     reg [$clog2(ROWSM+1)-1:0] frd;  reg frv;
     reg [$clog2(ARROWS+1)-1:0] ard;  reg arv;
 
@@ -466,20 +491,29 @@ module sequencer_vec #(
     // P-group index). The MAC core is the proven gemv_banked_resident.
     reg                gv_ldrst, gv_xwe, gv_start;
     reg  [P*8-1:0]     gv_xdata;
-    reg [10:0]         gv_m, gv_k;
+    reg [BUSW-1:0]         gv_m, gv_k;
     reg [$clog2(WWORDS)-1:0] gv_wbase;
     wire               gv_done;
     // committed-group count (RB overlap) -- width MUST match gemv_banked_
-    // resident_vec's own derived GDONE_W (ceil(MMAX/LANES) groups, MMAX=1024
+    // resident_vec's own derived GDONE_W (ceil(MMAX/LANES) groups, MMAX
     // fixed at the u_gemv instantiation below) or the port connection
     // silently truncates. A hardcoded [3:0] here deadlocked G_RB for any
     // GEMV needing >=16 groups (D_MLP=1024 at LANES=64 needs exactly 16) --
-    // see gdone's own comment in gemv_banked_resident_vec.sv.
-    localparam integer GEMV_MMAX    = 1024;
+    // see gdone's own comment in gemv_banked_resident_vec.sv. That fix
+    // itself was another hardcoded guess (1024, sized for THAT one case),
+    // not derived -- and VOCAB=16384 (the HEAD call's own M dimension)
+    // blew past it the same way, deadlocking G_RB again (this time at
+    // blk=NLAYER-1/head, `gv_gdone` never reaching a high enough count
+    // since the underlying gemv_banked_resident_vec's own MMAX=1024
+    // couldn't count that many groups at all). MMAX now derived from
+    // MAXDIM (the actual widest M any call in this design ever uses --
+    // D3/D_MLP for the block GEMVs, VOCAB for the head) instead of another
+    // hardcoded number, so this doesn't need rediscovering a third time.
+    localparam integer GEMV_MMAX    = MAXDIM;
     localparam integer GEMV_GROUPS  = (GEMV_MMAX + LANES - 1) / LANES;
     localparam integer GDONE_W      = $clog2(GEMV_GROUPS + 1);
     wire [GDONE_W-1:0] gv_gdone;
-    reg [10:0]         gv_rdaddr;
+    reg [BUSW-1:0]         gv_rdaddr;
     wire [P*32-1:0]    gv_yout;
     wire [LANES*8-1:0] emb_pair;            // pair-read data (RPP embed rows)
     // ---- optional DDR-backed weight-window loader (WEIGHT_DDR_BACKED=1
@@ -544,7 +578,7 @@ module sequencer_vec #(
     end
 `endif
 
-    gemv_banked_resident_vec #(.LANES(LANES), .P(P), .MMAX(1024), .KMAX(1024), .RLAT(2),
+    gemv_banked_resident_vec #(.LANES(LANES), .P(P), .MMAX(GEMV_MMAX), .KMAX(1024), .RLAT(2),
                   .WWORDS(WWORDS), .K2(1), .MEM_PRIMITIVE(MEM_PRIMITIVE)) u_gemv (
         .clk(clk), .rst(rst), .m_count(gv_m), .k_count(gv_k), .w_base(gv_wbase),
         .ld_rst(gv_ldrst | wl_rst | wld_ldb_rst),
@@ -552,7 +586,7 @@ module sequencer_vec #(
         .w_data(wl_we ? wl_data : wld_ldb_data),
         .x_we(gv_xwe), .x_data(gv_xdata),
         .start(gv_start), .done(gv_done), .gdone(gv_gdone),
-        .rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout),
+        .rd_addr(gv_rdaddr[$clog2(GEMV_MMAX/P)-1:0]), .y_out(gv_yout),
         .emb_sel(emb_sel_w), .emb_addr(emb_addr_w), .emb_pair(emb_pair));
 
     // ---- vec_dequant (P lanes, runtime frac) -----------------------------------
@@ -598,7 +632,7 @@ module sequencer_vec #(
     reg [8:0]  wic;                         // accepted-word counter (consume stage)
     reg        wiv;                         // (legacy)
     localparam integer HR = HEAD_DIM / P;
-    wire [10:0] aw_src = hh*HR + wi;
+    wire [BUSW-1:0] aw_src = hh*HR + wi;
     reg  [P*32-1:0] q_data_q;                    // registered WITH at_ldv
     reg             ldv0;                        // addr-stage valid (1 ahead of at_ldv)
     // ctx strobes land in a catch buffer, drained into ctxv_bank in S_CDR (HR
@@ -627,7 +661,7 @@ module sequencer_vec #(
     reg [1:0] kvf_st;
     reg       kvf_active;
     reg [3:0] kvp_done;                     // completed (head,K/V) writes 0..2*NHEAD
-    reg [10:0] qkv_wrow;                    // qkv rows committed by G_RB so far
+    reg [BUSW-1:0] qkv_wrow;                    // qkv rows committed by G_RB so far
     reg       vpA;                          // V-read pending (kdone seen, write not)
     wire      kvf_grant = (st != S_ALD) && (st != S_KVW_F);
     // kvp_done value once V for the current head has committed: V for head h
@@ -642,7 +676,7 @@ module sequencer_vec #(
     wire        kb_wdone, kb_rvalid, kb_rdone;
     wire [HEAD_DIM*32-1:0] kb_rdata;             // one dequantised position per beat
     reg  [1:0]  alds;                            // (legacy, unused post single-engine collapse)
-    wire [10:0] kvw_src = (kvw_kv ? 2*D/P : D/P) + kvw_h*HR
+    wire [BUSW-1:0] kvw_src = (kvw_kv ? 2*D/P : D/P) + kvw_h*HR
                           + {{(11-$clog2(ROWSM+1)){1'b0}}, fr};
     // kv_bank's second read port is a fixed interface (shared, unmodified file
     // -- see below) permanently idled here: rd2_start tied low so Vivado can
@@ -707,7 +741,7 @@ module sequencer_vec #(
 
     // ---- callable GEMV / LN parameter registers --------------------------------
     reg [19:0] g_wbase;            // weight base
-    reg [10:0] g_m, g_k;           // dims
+    reg [BUSW-1:0] g_m, g_k;           // dims
     reg [1:0]  g_asrc;             // act source: 0 lnout1, 1 ctxv(>>3), 2 lnout2, 3 mlpbuf
     reg [5:0]  g_asel;             // inv_sact index
     reg signed [6:0] g_frac;       // dequant frac
@@ -742,13 +776,13 @@ module sequencer_vec #(
     // whole GEMV call (set at dispatch, >=2 cycles before the first civ1 multiply),
     // so a free-running registered read is always settled in time.
     reg signed [63:0]  isact_r;
-    reg [10:0]         cid1, cid2;  reg civ1, civ2;
+    reg [BUSW-1:0]         cid1, cid2;  reg civ1, civ2;
     // TIMING (5ns cone aq_prod_r DSP-out -> gv_xdata): the 96-bit conditional
     // negate+round+shift and the clip+pack were one cycle. Stage 2a registers the
     // rounded value (only [31:0] is ever consumed downstream — identical
     // semantics), stage 2b clips+packs. +1 cycle per AQ phase.
     reg signed [31:0]  aq_sh_r [0:P-1];
-    reg [10:0]         cid3;  reg civ3;
+    reg [BUSW-1:0]         cid3;  reg civ3;
     reg signed [31:0]  cb, dqv, hv;
     reg [P*32-1:0]  ww, sw, dword, hw;
     reg [P*8-1:0]   aqw;                     // P-wide act-quant word
@@ -757,7 +791,7 @@ module sequencer_vec #(
     reg [P*24-1:0]  mwr;
     reg [P*8-1:0]   ewr;
     reg signed [63:0] gl_sh;
-    reg [10:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
+    reg [BUSW-1:0] rb0, rb1, rb2; reg rv0, rv1, rv2;
     reg [$clog2(ROWSM+1)-1:0] gor;
     integer pp;
 
@@ -801,25 +835,32 @@ module sequencer_vec #(
 
 
     // ---- synchronous reads (one read register per memory, address muxed) -------
-    wire [10:0] rbr = rd_addr >> LSH;            // board readback row (idle only)
-    wire [10:0] xres_ra   = (st==L_FEED) ? {{(11-$clog2(ROWSM+1)){1'b0}}, fr} :
+    wire [BUSW-1:0] rbr = rd_addr >> LSH;            // board readback row (idle only)
+    // fr/ar/eb_row below are all narrower than BUSW (fr/eb_row <=
+    // $clog2(ROWSM+1) bits, ar <= $clog2(ARROWS+1) bits, both <= BUSW by
+    // construction) -- plain assignment zero-extends correctly, no manual
+    // padding needed (the old hardcoded-11 padding formulas here computed
+    // a negative concatenation-repeat count and failed to compile once
+    // ARROWS+1 needed more than 11 bits, at VOCAB=16384 -- see BUSW's own
+    // comment above).
+    wire [BUSW-1:0] xres_ra   = (st==L_FEED) ? fr :
                             (st==S_RES1 || st==S_RES2) ? ci : rbr;
     // G_AQ counts P-rows directly (one wide word per cycle into the GEMV boundary)
-    wire [10:0] lnout1_ra = (st==G_AQ) ? ci : rbr;
-    wire [10:0] lnout2_ra = (st==G_AQ) ? ci : rbr;
-    wire [10:0] ctxv_ra   = (st==G_AQ) ? ci : rbr;
-    wire [10:0] mlpbuf_ra = (st==G_AQ) ? ci : rbr;
-    wire [10:0] qkv_ra    = (st==S_ALD)   ? aw_src :
+    wire [BUSW-1:0] lnout1_ra = (st==G_AQ) ? ci : rbr;
+    wire [BUSW-1:0] lnout2_ra = (st==G_AQ) ? ci : rbr;
+    wire [BUSW-1:0] ctxv_ra   = (st==G_AQ) ? ci : rbr;
+    wire [BUSW-1:0] mlpbuf_ra = (st==G_AQ) ? ci : rbr;
+    wire [BUSW-1:0] qkv_ra    = (st==S_ALD)   ? aw_src :
                             (st==S_KVW_F) ? kvw_src :
                             (kvf_active && kvf_st==KF_F) ? kvw_src : rbr;
-    wire [10:0] attn_ra   = (st==S_RES1) ? ci : rbr;
-    wire [10:0] mlp_ra    = (st==S_RES2) ? ci : rbr;
-    wire [10:0] head_ra   = (st==S_ARGMAX) ? {{(11-$clog2(ARROWS+1)){1'b0}}, ar} : rbr;
+    wire [BUSW-1:0] attn_ra   = (st==S_RES1) ? ci : rbr;
+    wire [BUSW-1:0] mlp_ra    = (st==S_RES2) ? ci : rbr;
+    wire [BUSW-1:0] head_ra   = (st==S_ARGMAX) ? ar : rbr;
     // LN FEED FUSION: every LN call is fed DURING the state that produces its
     // input rows (S_EMB commit / S_RES1 / S_RES2), so the gamma read tracks the
     // producer's row counter (eb_row in S_EMB — issued one cycle ahead of the
     // commit stage; ci elsewhere). L_GAM/L_FEED are retired.
-    wire [10:0] gam_fr    = (st==S_EMB) ? {{(11-$clog2(ROWSM+1)){1'b0}}, eb_row} : ci;
+    wire [BUSW-1:0] gam_fr    = (st==S_EMB) ? eb_row : ci;
 
     always @(posedge clk) begin
         xres_r   <= xres_bank  [xres_ra];
@@ -1018,7 +1059,7 @@ module sequencer_vec #(
                 // the kvp_done gates + V interlocks, not a serial S_KVW block).
                 S_QKVRET: begin
                     g_wbase<=WEIGHT_STREAM_PER_LAYER ? WB_QKV : (blk*GW_BLK + WB_QKV);
-                    g_m<=D3[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
+                    g_m<=D3[BUSW-1:0]; g_k<=D[BUSW-1:0]; g_asrc<=2'd0;
                     g_asel<=blk*4 + 6'd0; g_frac<=7'd16; g_dqrow<=blk*DQB_P + DR_QKV; g_dst<=3'd0;
                     g_ret<=S_AST; ci<=0; civ<=0;
                     hh<=2'd0;
@@ -1157,7 +1198,7 @@ module sequencer_vec #(
                         end
                         // feeder data-ready horizon: rows 0..dor are committed
                         if (g_dst == 3'd0)
-                            qkv_wrow <= {{(11-$clog2(MAXROWS+1)){1'b0}}, dor} + 11'd1;
+                            qkv_wrow <= dor + 1'b1;
                         case (g_dst)
                             3'd0: qkv_bank [dor] <= dword;
                             3'd1: attn_bank[dor] <= dword;
@@ -1218,7 +1259,7 @@ module sequencer_vec #(
                     if (cdr == HR[4:0]-1'b1) begin
                         if (hh == NHEAD[1:0]-2'd1) begin           // -> proj GEMV
                             g_wbase<=WEIGHT_STREAM_PER_LAYER ? WB_PROJ : (blk*GW_BLK + WB_PROJ);
-                            g_m<=D[10:0]; g_k<=D[10:0]; g_asrc<=2'd1;
+                            g_m<=D[BUSW-1:0]; g_k<=D[BUSW-1:0]; g_asrc<=2'd1;
                             g_asel<=blk*4 + 6'd1; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_PROJ; g_dst<=3'd1;
                             l_gbase<=blk*2 + 4'd1; l_dst<=1'b1; l_ret<=S_FCRET;  // LN2 (fed in S_RES1)
                             g_ret<=S_RES1; ci<=0; civ<=0; gv_ldrst<=1'b1; st<=G_AQ;
@@ -1232,8 +1273,8 @@ module sequencer_vec #(
                 // (ln_start fired at the proj G_RB exit; l_gbase/l_dst/l_ret
                 // were set at the proj dispatch) -> straight to L_COLL.
                 S_RES1: begin
-                    cid <= ci; civ <= (ci != ROWS[10:0]);
-                    if (ci != ROWS[10:0]) ci <= ci + 1'b1;
+                    cid <= ci; civ <= (ci != ROWS[BUSW-1:0]);
+                    if (ci != ROWS[BUSW-1:0]) ci <= ci + 1'b1;
                     ln_vin <= civ;
                     ln_g   <= gam_r;
                     if (civ) begin
@@ -1251,14 +1292,14 @@ module sequencer_vec #(
                 S_FCRET: if (dbg_stop==2'd2 && blk==4'd0) st<=S_FIN;  // DEBUG: stop after LN2
                   else begin
                     g_wbase<=WEIGHT_STREAM_PER_LAYER ? WB_FC : (blk*GW_BLK + WB_FC);
-                    g_m<=D_MLP[10:0]; g_k<=D[10:0]; g_asrc<=2'd2;
+                    g_m<=D_MLP[BUSW-1:0]; g_k<=D[BUSW-1:0]; g_asrc<=2'd2;
                     g_asel<=blk*4 + 6'd2; g_frac<=7'd12; g_dqrow<=blk*DQB_P + DR_FC; g_dst<=3'd2;
                     g_ret<=S_MPSET; ci<=0; civ<=0; gor<=0; gv_ldrst<=1'b1; st<=G_AQ;
                 end
                 // mlp_proj GEMV setup (GELU already streamed inside G_RB) -------
                 S_MPSET: begin
                     g_wbase<=WEIGHT_STREAM_PER_LAYER ? WB_MP : (blk*GW_BLK + WB_MP);
-                    g_m<=D[10:0]; g_k<=D_MLP[10:0]; g_asrc<=2'd3;
+                    g_m<=D[BUSW-1:0]; g_k<=D_MLP[BUSW-1:0]; g_asrc<=2'd3;
                     g_asel<=blk*4 + 6'd3; g_frac<=7'd25; g_dqrow<=blk*DQB_P + DR_MP; g_dst<=3'd3;
                     // next LN (fed in S_RES2): block blk+1's LN1, or LN_f after the last block.
                     // Under streaming, L_COLL's own l_ret is redirected through S_STRW (the
@@ -1278,8 +1319,8 @@ module sequencer_vec #(
                 // LN FUSION: the next LN (set up at S_MPSET) is fed the residual
                 // sum as it is written -> straight to L_COLL.
                 S_RES2: begin
-                    cid <= ci; civ <= (ci != ROWS[10:0]);
-                    if (ci != ROWS[10:0]) ci <= ci + 1'b1;
+                    cid <= ci; civ <= (ci != ROWS[BUSW-1:0]);
+                    if (ci != ROWS[BUSW-1:0]) ci <= ci + 1'b1;
                     ln_vin <= civ;
                     ln_g   <= gam_r;
                     if (civ) begin
@@ -1305,7 +1346,7 @@ module sequencer_vec #(
                     // WB_HEAD only means something in the fully-resident
                     // (non-streaming) addressing scheme.
                     g_wbase<=WEIGHT_STREAM_PER_LAYER ? 20'd0 : WB_HEAD;
-                    g_m<=VOCAB[10:0]; g_k<=D[10:0]; g_asrc<=2'd0;
+                    g_m<=VOCAB[BUSW-1:0]; g_k<=D[BUSW-1:0]; g_asrc<=2'd0;
                     g_asel<=4*NLAYER; g_frac<=7'd25; g_dqrow<=DR_HEAD[11:0]; g_dst<=3'd4;
                     g_ret<=S_ARGMAX; ci<=0; civ<=0; gv_ldrst<=1'b1;
                     best_val<=NEG_INF34; best_idx<=9'd0; ar<=0; arv<=0; av1<=0; amv<=0; st<=G_AQ;

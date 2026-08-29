@@ -4126,3 +4126,253 @@ suggests 4096 (~99.1%) or 8192 (~99.8%) as good candidates, both well
 inside the new `GW_HEAD`-bound ceiling of ~16,384), retrain a tokenizer
 + model at that VOCAB, export, and run one more synth/P&R/bitstream
 cycle at the new (still comfortably small) `GW_HEAD`.
+
+## VOCAB=16384 runbook: full retrain -> real hardware, step by step
+
+Chose the actual edge of what the new `GW_HEAD`-bound ceiling supports
+(`VOCAB=16384` -> `GW_HEAD=ceil(16384/64)*128=32768`, exactly the same
+256-tile/32,768-word bucket boundary the ORIGINAL VOCAB=1900 build's
+old bulk `GW_EMB` used to sit at -- so real BRAM usage for this build
+should land back around the original ~398/445 (89.44%) figure, not
+anywhere near the 171/445 the intermediate WWORDS=3840 test showed;
+that number was for keeping VOCAB=1900 while proving the redesign, not
+for actually spending the freed room). Coverage at this VOCAB:
+**99.96%** (computed earlier this session), vs the deployed VOCAB=1900
+build's 96.05% -- real `<unk>` frequency should drop roughly 10x.
+Recorded here step by step, with the REAL commands actually run and
+their real observed results, not an idealized version, so this is
+repeatable later without re-deriving anything.
+
+**Step 1: retrain at VOCAB=16384**, same deployment shape (D=128,
+NLAYER=12, NHEAD=2, block_size=128) and the best recipe this session's
+own scale-up-instability investigation (`model/SCALE-UP-LOG.md`) found
+for it -- unchanged peak LR/warmup/full-cosine-decay, `adam-eps=3e-4`
+margin (this shape's own sweet spot -- see that log's Attempt 14):
+```bash
+python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 --adam-eps 3e-4 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16384.pt --states data/states_word16384.jsonl
+```
+**Result: best val 2.408 @ iter 15500**, params=4.46M (up from 2.61M at
+VOCAB=1900 -- the bigger embed/head tables), ~18.7 min wall time on this
+GPU. Genuinely stable the entire 24000 iters (val loss plateaus in a
+narrow 2.408-2.427 band from iter ~12000 on, never diverges) -- the
+`eps=3e-4` margin doing its job at this shape exactly as `SCALE-UP-
+LOG.md` found. (Val loss numbers aren't comparable to the VOCAB=1900
+build's own -- cross-entropy scales with vocab size, a bigger vocab has
+higher entropy for the same real quality, not a regression.)
+
+**Step 2: QAT fine-tune**, same recipe as every other QAT pass in this
+project (warm-started, `--max-iters 3000`, defaults otherwise):
+```bash
+python -m model.train --qat --init-from data/ckpt_word16384.pt --max-iters 3000 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16384.qat.pt --states data/states_word16384_qat.jsonl
+```
+**Result: best val 2.338 @ iter 3000, ~11.4 min** -- improved over its
+own FP source (2.408), same pattern the `eps=3e-4` VOCAB=1900 checkpoint
+showed earlier in this document.
+
+**Step 3: export** (`model.goformer_full`, the correct tool for the RTL
+gates -- `model.export_fabric` produces a layout the gates don't
+consume, see this document's own earlier finding):
+```bash
+mkdir -p fabric/export_word16384
+python -c "
+from model.goformer_full import params_from_ckpt, save_params
+p, model, ck = params_from_ckpt('data/ckpt_word16384.qat.pt')
+save_params(p, 'fabric/export_word16384/goformer.npz')
+print('exported OK, cfg:', ck['cfg'])
+"
+```
+**Result: exported OK.**
+
+**Step 4: bit-exact verification BEFORE touching real hardware** -- this
+project's own established discipline ("recheck on every shape change,"
+this document's own repeated finding of VOCAB-size-triggered RTL width
+bugs). Two gates, matching the deployment's real parameters (P=8,
+LANES=64, TMAX=128):
+
+Fully-resident gate first (fast, `fabric.stage3.run_vec_kv`):
+```bash
+python -m fabric.stage3.run_vec_kv \
+  --npz fabric/export_word16384/goformer.npz --meta data/word_v16384/meta.json \
+  --p 8 --lanes 64 --tmax 128 --prompt "once upon a time" --plen 4 --ngen 20 --seed 0 \
+  --dir /tmp/kevbuild_v16384
+```
+**First result: `IVERILOG_COMPILE_FAIL`** -- 2 real compile errors, both
+`Concatenation repeat may not be negative (-1)` (`sequencer_vec.sv:817,
+1160`). Root cause: an 11-bit (`[10:0]`, max 2047) row-index/raw-
+dimension register family hardcoded throughout the FSM (`ci`,
+`cid`/`cid1-3`, `rb0-2`, `qkv_wrow`, `gv_m`/`gv_k`/`gv_rdaddr`, `g_m`/
+`g_k`, and every `*_ra` read-address wire) -- sized for whatever the
+largest VOCAB this project had synthesized before needed (`dor`, the
+sibling register this SAME bug class hit once already at the VOCAB=57
+-> 1900 jump, got fixed then but the fix wasn't propagated to these
+OTHER family members). At VOCAB=16384: `ARROWS=2048` needs a 12-bit
+counter to reach its own loop-exit sentinel value (2048), and `g_m`
+stores `VOCAB` itself as a raw dimension value (16384, 15 bits) when
+driving the head GEMV -- both exceed 11 bits, one as a compile error,
+the other (`g_m<=VOCAB[10:0]`) SILENTLY (16384 truncates to 0 in an
+11-bit slice) -- would have corrupted every head logit without any
+compiler warning at all. Fixed with a new `BUSW` localparam
+(`max(DIMW, RIDXW, 11)`, floored at 11 to keep every existing smaller-
+VOCAB shape's own already-verified bit-exactness byte-for-byte
+unchanged) and widened the whole family to `[BUSW-1:0]`; the three
+manual zero-pad concatenations that had the negative-repeat-count
+compile errors got simplified to plain assignments (safe once the
+destination width naturally covers the source).
+
+**Second result, after that fix: compiles clean, but hangs.** Real
+board-style debug print (`[cyc N] st=... blk=...`, already built into
+`tb_seq_vec_kv.sv`) showed the FSM stuck at `st=8 (G_RB) blk=11 pos=0`
+for 27.5 million cycles straight before hitting the testbench's own
+400M-ns safety timeout -- the exact same STATE (`G_RB`, the readback
+FSM) as the original VOCAB=57->1900 `dor`-wraparound bug this document
+already documents, but a DIFFERENT root cause this time (`dor` itself
+was already correctly widened). Traced to `gemv_banked_resident_vec`'s
+own `MMAX`/`KMAX` parameters -- hardcoded `.MMAX(1024)` at the
+`u_gemv` instantiation, itself ALREADY a prior fix-by-guessing-a-bigger-
+number for an earlier real bug (`GEMV_MMAX`'s own comment: "A hardcoded
+[3:0] here deadlocked G_RB... D_MLP=1024 at LANES=64 needs exactly
+16") -- but never generalized to derive from actual shape parameters.
+`MMAX` sizes `gdone`'s own completion-counter width (`GDONE_W=
+$clog2(ceil(MMAX/LANES)+1)`) -- the HEAD GEMV's own M dimension is
+VOCAB=16384, 16x past the hardcoded 1024 ceiling, so `gv_gdone` could
+structurally never count high enough for `G_RB`'s own readback-gating
+condition (`ci>>GRPSH < gv_gdone`) to ever become true past the first
+1024/LANES=16 groups -- a permanent stall, not a slow simulation.
+(`KMAX` stays at 1024 unchanged -- it sizes a REAL internal memory
+array (`xmem`, depth `KMAX/P`) by the actual reduction length, which
+never exceeds `D_MLP=512` in this design regardless of VOCAB; only
+`MMAX` needed to grow.) Fixed by deriving `GEMV_MMAX` from `MAXDIM`
+(the same "widest M any call in this design ever uses" value the
+`BUSW` fix above already computes -- D3/D_MLP for the block GEMVs,
+VOCAB for the head) instead of another hardcoded guess, so this
+specific bug class shouldn't need rediscovering a third time.
+
+**Third result, after that fix: compiles clean, no hang, but
+`VEC_KV_VERDICT match=False`** -- hardware-generated tokens completely
+wrong and degenerate (`hw=[6234, 15365, 15360, 15360, ...]` repeating
+two or three token IDs, vs a varied, sensible-looking
+`gold=[163, 14470, 15685, 169, ...]`). Two DIFFERENT real bugs were
+layered under this single symptom; both had to be found and fixed
+before the gate went green.
+
+*Bug A -- a second hardcoded-`1024`, not fixed by the `GEMV_MMAX` fix
+above.* Diagnosed by re-running with `plen=4 ngen=1` and a throwaway
+`ifdef`-gated `$display` inside `S_ARGMAX` (best-so-far winner + final
+pick), then a second throwaway dump of every raw per-index head logit
+compared element-by-element against `IntKVQSequencer.step_head_q25`'s
+own logit vector for the identical prompt (`fabric/stage3/seq_ref.py`
++ `model/goformer_kvq.py`, invoked directly from a scratch script --
+not a project tool, just Python REPL-style comparison). Only 2/16384
+logits matched at all -- not a narrow-range bug. Root cause: the
+`u_gemv` instantiation's OWN readback port connection was still
+hardcoded independent of the `GEMV_MMAX` fix:
+```
+.rd_addr(gv_rdaddr[$clog2(1024/P)-1:0]), .y_out(gv_yout)
+```
+`$clog2(1024/8)-1:0` = `[6:0]`, 7 bits, max 127 -- but `gv_rdaddr`
+(now correctly `[BUSW-1:0]`) needs to range over every row of the
+head's own `ARROWS=ceil(VOCAB/P)` output (2048 rows at VOCAB=16384,
+238 at VOCAB=1900), and `gemv_banked_resident_vec`'s `rd_addr` port
+literally IS the row-select address feeding `y_out` (see that module's
+own header comment, `"rd_addr is a P-group index -- y_out = lanes
+[rd_addr*P .. +P-1]"`) -- reads for any row past 127 alias/wrap back
+into rows 0-127, corrupting readback for that entire tail. This is
+WHY the VOCAB=1900 build regressed too, mid-session, once this fix
+landed alongside the `BUSW`/`GEMV_MMAX` changes above (VOCAB=1900's
+own `ARROWS=238` already exceeds 127) -- confirmed by re-running
+`run_vec_kv` against the VOCAB=1900 export (`fabric/export_word16/
+goformer.npz` + `data/word_stream16/meta.json`) with the accumulated
+uncommitted changes and seeing the SAME `match=False` degenerate-
+repeat symptom there, which should NOT have been possible for an
+already-verified shape. Fixed the same way as `GEMV_MMAX` itself --
+derive from the actual parameter instead of a second hardcoded guess:
+```
+.rd_addr(gv_rdaddr[$clog2(GEMV_MMAX/P)-1:0]), .y_out(gv_yout)
+```
+Re-running VOCAB=1900 after this fix: `VEC_KV_VERDICT match=True`,
+exact 20/20 token match -- regression closed. VOCAB=16384, though,
+STILL failed after only this fix -- same `hw=[6234, 15365, ...]`-style
+repeats, unchanged from before Bug A's fix. Diffing the raw per-index
+head logits again (same scratch-script method) showed literally EVERY
+index wrong, including row 0 (which was never in the 128-row-truncated
+range Bug A affected) -- proof of a second, independent bug still
+live.
+
+*Bug B -- the fully-resident test's on-chip weight-bank depth
+(`WWORDS`) was never sized for VOCAB=16384's actual resident image.*
+Backed out the expected pre-dequant GEMV accumulator from gold's own
+head logit (inverting the `vec_dequant.sv` formula by hand using the
+per-channel mant/exponent read out of `dqm_w.mem`/`dqe_w.mem`,
+confirmed correct against `IntSequencer.head["mant"/"exp"]` directly)
+and found hardware's raw accumulator for head channel 0
+(`gv_yout`, dumped via one more throwaway `$display` gated on
+`g_dst==head`) was ~3600 vs an expected ~900 -- the dequant stage
+itself was proven bit-exact given ITS inputs (hand-computed the exact
+same output from the observed accumulator + mant/exp using the
+`vec_dequant.sv` formula and got hardware's own number to the last
+digit); the corruption was upstream, in the WEIGHTS the GEMV was
+actually MAC-ing against. `sequencer_vec`'s `WWORDS` module parameter
+(default 262144 words, sizing the single on-chip `weight_bank_tdp`
+resident-weight memory `run_vec_kv.py`'s fully-resident test streams
+the WHOLE model into) was never overridden by
+`tb/tb_seq_vec_kv.sv` -- it always used that hardcoded default. At
+VOCAB=1900 the full resident image (12 blocks + head + the tok/pos
+embed tables appended per this document's own "log §36 fit-plan 2"
+entry) is ~40.7K words, comfortably under 262144, so this was
+invisible. At VOCAB=16384 the tok_emb table ALONE is
+`16384*128/64=32768` wide words before even packing/padding, and the
+full image (`wc -l wrom.mem`) is **333,824 words** -- past the
+262144-word bucket the write pointer wraps at. The tail of the image
+(everything from word 262144 onward, which lands inside the embed-
+table region given blocks+head only span the first ~69.6K words) got
+written a second time into addresses `[0, 333824-262144) =
+[0, 71680)` -- silently overwriting BOTH block 0's weights (words
+0-36863) AND the entire head's weight window (words 36864-69631) with
+unrelated tail-of-embed-table bytes. That is exactly consistent with
+EVERY head logit being wrong from row 0 onward (block 0's corruption
+alone would already derail the whole forward pass long before the
+head). Fixed by overriding `WWORDS` at the testbench's `sequencer_vec`
+instantiation to the actual image size, which the harness already
+computes and passes in as `\`WROMN` (the exact word count `wc -l
+wrom.mem` reports, already threaded through as a `-DWROMN=<n>`
+`iverilog` define):
+```systemverilog
+sequencer_vec #(.P(P), .LANES(LANES), .TMAX(TMAXP), .D(DP), .D3(3*DP),
+                 .D_MLP(4*DP), .NLAYER(NLAYERP), .NHEAD(NHEADP), .VOCAB(VOCABP),
+                 .WWORDS(`WROMN)) dut ( ...
+```
+(`tb/tb_seq_vec_kv_stream.sv`, the OTHER fully-resident-adjacent
+testbench, already had its own explicit `WWORDSVAL` override sized for
+streaming's much smaller per-block resident window -- unaffected,
+no change needed there.)
+
+**Re-running both shapes after Bug A + Bug B, both via the real
+`fabric.stage3.run_vec_kv` CLI (not the scratch debug builds)**:
+```bash
+python -m fabric.stage3.run_vec_kv \
+  --npz fabric/export_word16/goformer.npz --meta data/word_stream16/meta.json \
+  --p 8 --lanes 64 --tmax 128 --prompt "once upon a time" --plen 4 --ngen 20 --seed 0 \
+  --dir /tmp/kevbuild_v1900_official
+# VEC_KV_VERDICT match=True mode=greedy plen=4 ngen=20 avg_cyc=26827
+
+python -m fabric.stage3.run_vec_kv \
+  --npz fabric/export_word16384/goformer.npz --meta data/word_v16384/meta.json \
+  --p 8 --lanes 64 --tmax 128 --prompt "once upon a time" --plen 4 --ngen 20 --seed 0 \
+  --dir /tmp/kevbuild_v16384_official
+# VEC_KV_VERDICT match=True mode=greedy plen=4 ngen=20 avg_cyc=44007
+# hw gen == gold gen, 20/20 tokens, both decode to the same sentence.
+```
+Fully-resident bit-exact gate is GREEN at VOCAB=16384. Still open:
+Step 4's OTHER half (the per-layer-streaming testbench,
+`tb_seq_vec_kv_stream.sv`, manual `iverilog` build, no `run_*.py`
+wrapper) hasn't been re-run against VOCAB=16384 yet with these three
+fixes -- that, then copying the fixed `sequencer_vec.sv` into the
+vendored `kevgpt-genesys2-soc` tree and the real Vivado
+resynth/board bring-up, are the remaining steps before this runbook is
+complete.

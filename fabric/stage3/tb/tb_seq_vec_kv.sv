@@ -82,8 +82,16 @@ module tb;
     // mlp_ratio=4) rather than adding two more `defines -- HEAD_DIM is left at
     // sequencer_vec's own default (64): this port varies NHEAD, not HEAD_DIM
     // (see PORT-NOTES.md).
+    // WWORDS must cover the full resident weight image (`WROMN wide words --
+    // blocks + head + the appended tok/pos embed tables, log §36 fit-plan 2) --
+    // left at sequencer_vec's own default (262144) this silently wrapped the
+    // weight_bank_tdp write pointer once VOCAB=16384's tok_emb table pushed
+    // the image past that size (333824 words here), overwriting block 0's
+    // weights (and the head's) with tail embed-table bytes -- every downstream
+    // GEMV, not just the head, was reading corrupted weights as a result.
     sequencer_vec #(.P(P), .LANES(LANES), .TMAX(TMAXP), .D(DP), .D3(3*DP),
-                     .D_MLP(4*DP), .NLAYER(NLAYERP), .NHEAD(NHEADP), .VOCAB(VOCABP)) dut (
+                     .D_MLP(4*DP), .NLAYER(NLAYERP), .NHEAD(NHEADP), .VOCAB(VOCABP),
+                     .WWORDS(`WROMN)) dut (
         .clk(clk), .rst(rst), .go(go), .tok_id(tok), .pos(pos), .done(done),
         .tok_out(tok_out), .rd_sel(rsel), .rd_addr(raddr), .rd_data(rdata),
         .wl_rst(wl_rst), .wl_we(wl_we), .wl_data(wl_data), .dbg_stop(dbgstop_r),
