@@ -3697,3 +3697,92 @@ tokenizer or RTL defect), or genuinely a fair reflection of val loss
 2.022 not translating to fluent multi-sentence prose the way the
 char-level model's 0.772 does -- flagged honestly, not swept under
 "it works."
+
+## A new checkpoint from the scale-up-instability investigation (`eps=3e-4`): verified in simulation AND real synthesis
+
+`model/SCALE-UP-LOG.md`'s Adam-instability investigation (started on a
+wider D=384 diagnostic shape, then ported back to check this project's
+actual deployed D=128/NLAYER=12/VOCAB=1900 shape) found that this
+deployment shape carries the same Adam-driven divergence risk as the
+wider model -- just non-deterministically (Attempt 13: re-running the
+exact original recipe, same hyperparameters/architecture/data/fixed
+`torch.manual_seed(1337)`, produced one clean run and one diverging
+run -- GPU floating-point non-determinism near a genuine edge-of-
+stability point, not a seed/batch-order difference). Attempt 14 found a
+practical hedge: keep the deployment recipe's peak LR/warmup/full-
+cosine-decay exactly as-is, add a mild `--adam-eps 3e-4` (this shape's
+own sweet spot -- `1e-4` only partially dampens, `1e-3` costs real
+peak quality). Result: best val **2.203** -- matching or beating the
+best-case unstabilized run's own peak (2.208), with genuine post-peak
+flatness (+0.008 drift over the last ~4500 iters) instead of a lucky-
+run gamble. QAT fine-tune (3000 iters, warm-started, same recipe as
+every other QAT pass in this document) landed at val **2.155** --
+notably *improved* over its own FP source, unlike the original
+`ckpt_word16.pt` -> `ckpt_word16.qat.pt` pass, which slightly regressed
+(2.022 -> 2.074).
+
+**Bit-exact RTL simulation** (`fabric.stage3.run_vec_kv`, `--p 8
+--lanes 64 --tmax 128` -- Genesys2's real deployed parameters, exported
+via `model.goformer_full.params_from_ckpt()`/`save_params()` to
+`fabric/export_word16_epsmild3e4/goformer.npz`): five prompts, one at
+`--ngen 60` and four at `--ngen 120` (near the `TMAX=128` context
+limit), all seeded on-chip Gumbel sampling, all **`VEC_KV_VERDICT
+match=True`** -- token-for-token identical to the Python golden
+reference. Sample (`"once upon a time"`, seed=7): *"there was a little
+girl named amy. she was three years old and loved to explore. one day,
+amy went to the park with her mom. it was a sunny day and amy wanted to
+take a walk. she saw a pond and asked her mom," what is that?" her
+mom"* -- coherent, grammatical, no repetition-loop degradation across
+any of the five samples (unlike some other checkpoints tried earlier in
+the same eps sweep, which fell into noun-fixation loops at this
+length).
+
+**Real Vivado synthesis + implementation + bitstream**, not just
+simulation. The actual buildable Vivado project for this port does
+NOT live in this repo -- it's a separate sibling repo on the same
+machine, `~/RVchatbot/kevgpt-genesys2-soc/` (an X-HEEP SoC checkout
+whose git history matches this repo's own fabric/genesys2 commits
+almost verbatim, vendoring the real `kevgpt_seq` IP core --
+`sequencer_vec.sv`, `xheep_kevgpt_peripheral.sv`, `kevgpt_ddr_bundle.sv`
+-- under `hw/vendor/esl_epfl_x_heep/hw/ip/kevgpt_seq/`). Its Vivado
+project directory
+(`hw/vendor/esl_epfl_x_heep/build/openhwgroup.org_systems_core-v-mini-mcu_1.0.5/genesys2_kevgpt-vivado/`)
+already had a completed build from the `ckpt_word16.pt`/`.qat.pt` pass
+above. Rebuilt with the new checkpoint's ROM content, following this
+document's own established recipe exactly: `fabric.genesys2.
+stage_vivado_roms --npz fabric/export_word16_epsmild3e4/goformer.npz
+--lanes 64 --p 8 --dest <project root>` first, then `reset_run synth_1`
++ `reset_run impl_1` (via `vivado -mode batch`), then re-staged into
+the now-emptied `<project>.runs/synth_1/` (the same "stage AFTER
+reset_run, not before" gotcha this document already found once), then
+`launch_runs impl_1 -to_step write_bitstream -jobs 4` + `wait_on_run`.
+
+**Full clean rebuild, ~26 minutes wall time**: `synth_design Complete!`
+/ `write_bitstream Complete!`, **0 Errors** end to end. Synthesis: 1103
+Infos, 931 Warnings, 4 Critical Warnings (the same pre-existing
+`set_max_delay`/CDC "no valid objects" `.xdc` warnings this document
+already established as harmless, re-confirmed identical here).
+Post-route DRC: 0 Errors, 1441 Warnings (all generic X-HEEP-
+infrastructure `RAMB36 async control check` warnings about CDC/DMA/
+crossbar registers driving `ram0`'s address pins -- unrelated to the
+`kevgpt_seq` IP or its ROMs, present regardless of checkpoint). Final
+timing: **WNS=1.449ns, WHS=0.094ns** (both positive, all constraints
+met -- compare the original build's WNS=1.651ns/WHS=0.091ns: slightly
+less setup margin, essentially identical hold margin, still comfortably
+closing). Utilization is essentially unchanged from the original build,
+as expected (same RTL, same shape parameters -- only the ROM-baked
+LayerNorm-gain/dequant-scale/GELU-LUT/gumbel-LUT *values* differ, not
+their sizes): LUTs 97,584/203,800 (47.88%, vs 97,567/203,800 (47.87%)
+originally), Block RAM 398/445 (89.44%, **exact match**), DSPs 804/840
+(95.71%, **exact match**).
+
+**Not yet done**: programming the resulting `.bit`
+(`<project>.runs/impl_1/xilinx_core_v_mini_mcu_wrapper_kevgpt.bit`)
+onto real hardware and observing a live chat session -- no physical
+Genesys2 board/JTAG cable was available in this session's environment,
+so this checkpoint is verified bit-exact in simulation and
+fully-synthesizable-with-timing-closure in real Vivado P&R, but not
+yet exercised on actual silicon. Whoever has board access next just
+needs to program the bitstream and re-run `send_weights.py` with this
+checkpoint's exported weight image -- no RTL or project changes needed
+beyond what's already staged.
