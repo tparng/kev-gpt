@@ -640,7 +640,8 @@ tried in this pass — this is the concrete next step, not yet taken.
 | AdamW, `adam-eps=3e-4` + gentler decay (decay-iters=8000) | 2.365 @ iter 7500 | ~iter 7500-8000, then climbs 3-4x slower than default AdamW | **partial — dampens but doesn't eliminate; best peak of any config, but not stable** |
 | AdamW, `adam-eps=1e-3` + gentler decay (decay-iters=10000) | **2.606 @ iter 9500** | ~iter 9500-10000, then drifts +0.052 over 5000 iters (~4x gentler than the eps=3e-4 combo) | **yes, close to fully — best practical tradeoff of the sweep** |
 | AdamW, `adam-eps=1e-3` + even gentler decay (decay-iters=13000) | 2.607 @ iter 10500 (plateau, no improvement over decay-iters=10000) | ~iter 11000 (starts before the floor), drifts +0.058 over 4500 iters (same magnitude as decay-iters=10000) | **plateau — recipe already found its ceiling at decay-iters~10000** |
-| Same recipe (`eps=1e-3`, decay@10000) ported to the deployment shape (D=128/NLAYER=12/VOCAB=1900) | 2.672 @ iter 23000, still improving | none — this shape never diverges, with or without the fix | **N/A — negative transfer: worse than that shape's own existing recipe (val 2.022 @ iter 23000)** |
+| Same recipe (`eps=1e-3`, decay@10000) ported to the deployment shape (D=128/NLAYER=12/VOCAB=1900) | 2.672 @ iter 23000, still improving | none — this run didn't diverge (see below: not guaranteed) | **N/A — negative transfer: worse than that shape's own existing recipe (val 2.022 @ iter 23000)** |
+| Reproducing the deployment shape's *original* recipe (lr=5e-4, warmup=100, full cosine, default eps) | 2.208 @ iter 7500, then climbs to 2.398 @ iter 24000 | ~iter 7500-8000, continues the whole rest of the run — same shape of divergence as the wide model, milder | **N/A — a second run of the exact original recipe diverges; the clean 2.022 result wasn't guaranteed by the recipe alone** |
 
 Every AdamW configuration bottoms at essentially the same *relative*
 point — roughly 1500-2500 iterations past wherever warmup ends —
@@ -940,6 +941,93 @@ could be improved further on its own terms — a separate question from
 this attempt, which only tested whether the *wide-model* fix transfers
 (it doesn't).
 
+**Correction, from Attempt 13 below: this attempt's framing — "this
+shape never diverges" — turned out to be wrong.** It was based on a
+single existing run (`ckpt_word16.pt`'s own clean history) plus this
+attempt's own recipe-ported runs, which also happened not to diverge.
+Attempt 13 re-ran the *original* recipe itself and got a real
+divergence on the identical hyperparameters/architecture/data. The
+negative-transfer verdict above (the wide-model fix is the wrong tool
+for this shape, and costs quality here) still stands — but "this shape
+never diverges" does not; see Attempt 13 for the corrected picture.
+
+### Attempt 13: reproducing the original recipe — it's not a fluke, it's variance
+
+Attempt 12 assumed the deployment shape (D=128/NLAYER=12/VOCAB=1900)
+simply doesn't have the instability problem, based on `ckpt_word16.pt`'s
+own clean training history (`data/states_word16.jsonl`: monotonic val
+improvement the entire 24000-iter run, no divergence). This attempt
+re-runs that *exact* original recipe (not the wide-model fix) to check
+whether that clean result reproduces, or was itself a lucky run.
+
+**Recipe reverse-engineered from `data/states_word16.jsonl`'s own LR
+trace** (this checkpoint predates `--lr-decay-iters`/`--adam-eps`, so
+there's no command string to copy — the schedule was inferred by
+matching `cosine_lr()`'s output against the logged `lr` values): peak
+`lr=5e-4`, `warmup=100` (the old default), `max-iters=24000`, no
+`--lr-decay-iters` (single cosine sweep across the whole run, old
+behavior), default `adam-eps=1e-8`.
+
+```bash
+python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 \
+  --tokenizer word --vocab-size 1900 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_stream16 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16_reproduce.pt --states data/states_word16_reproduce.jsonl
+```
+`model.train` has no `--seed` flag, so init and batch order differ from
+the original run even with identical hyperparameters.
+
+| iter | original (`ckpt_word16.pt`) val | reproduction val | reproduction lr |
+|---|---|---|---|
+| 4000 | (not logged at this iter) | 2.266 | 4.7e-04 |
+| **7000-7500** | 2.150 (iter 7000, still improving) | **2.208 (best, iter 7500)** | 4.0e-04 |
+| 10000 | 2.098 | 2.227 | 3.3e-04 |
+| 13000 | 2.066 | 2.265 | 2.5e-04 |
+| 18500 | (not logged at this iter) | 2.340 | 1.1e-04 |
+| 23000 | **2.022 (best, real hardware checkpoint)** | 2.385 | 5.2e-05 |
+| 24000 | 2.022 | **2.398 (final)** | 5.0e-05 |
+
+**Real divergence, not noise.** The original run improves monotonically
+end to end (2.150 → 2.022 over iters 7000-23000, never once regressing
+in the logged evals). The reproduction peaks early (2.208 @ iter 7500)
+and then climbs continuously for the remaining 16,500 iterations to
+2.398 — the same *shape* of unbounded Adam-driven divergence documented
+throughout this whole investigation (Attempts 1-7), just milder in
+magnitude (+0.19 relative rise here vs. the wide model's +0.61-1.35) and
+occurring under a schedule that never holds LR flat (LR keeps decaying
+the entire time, unlike every wide-model attempt's floor-and-hold
+structure) — so the divergence isn't even gated on LR going flat at
+this shape, only on LR being low enough in absolute terms, consistent
+with Attempt 11's "starts before the floor" observation.
+
+**This means the deployment shape does carry real instability risk —
+it just isn't deterministic.** Every AdamW configuration tried on the
+wide D=384 diagnostic shape (9+ runs, every LR schedule/init/weight-
+decay variant in Attempts 1-6) diverged with 100% reliability. Here,
+identical hyperparameters on identical data produced one clean run and
+one diverging run. The likely mechanism is the same one Attempts 1-11
+already characterize (Adam's `sqrt(v_hat)+eps` step size not actually
+shrinking to zero at low nominal LR) — just closer to a knife-edge at
+this narrower width, where whether a given run's specific gradient-
+noise trajectory tips over into the runaway regime depends on
+seed/batch-order, not purely on the hyperparameters.
+
+**Revises Attempt 12's practical recommendation.** "Keep the original
+recipe because this shape doesn't need stabilizing" is no longer
+supportable — the original recipe produced the currently-deployed
+checkpoint by getting a favorable run, not because that recipe is safe
+by construction. The honest options going forward, not yet decided
+between: (a) re-run the original high-LR recipe several more times and
+keep the best (cheap here, ~9-10 min/run, but doesn't fix the
+underlying risk, just plays the odds better); (b) add a *mild*
+stabilizing margin (a smaller `adam-eps` bump than the wide model
+needed, or a shorter floor-hold than Attempt 12's, tuned specifically
+at this width) that trades little peak quality for real protection
+against the divergence seen here; (c) accept the risk and always verify
+any new deployment-shape training run against its own `states.jsonl`
+curve before trusting a checkpoint, the way Conclusion 3 already
+recommends project-wide. Not yet tried: any of the three.
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -1030,17 +1118,36 @@ this attempt, which only tested whether the *wide-model* fix transfers
    ported `eps=1e-3` + `lr-decay-iters≈10000` to the real D=128/NLAYER=12/
    VOCAB=1900 hardware shape (`data/ckpt_word16.pt`) and got a clearly
    worse result at the same iteration count (val 2.672 vs the deployed
-   checkpoint's own 2.022 @ iter 23000) — never diverges either way, since
-   this narrower shape was never unstable to begin with (matching the
-   port notes' own "trained clean and stable" finding), so `eps=1e-3`
-   only costs Adam's efficiency for a stability benefit that isn't
-   needed, compounded by the recipe's lower peak LR and its fast-decay-
-   then-hold schedule spending most of the run at a frozen floor instead
-   of the deployed recipe's full-length decay from a higher peak. **This
-   fix is scoped to model shapes wide enough to actually exhibit the
-   Adam-driven divergence (D>=256-384 at this depth) — the deployment
-   shape should keep its own existing recipe (higher peak LR, standard
-   full cosine decay, default `adam-eps`), not this investigation's.**
+   checkpoint's own 2.022 @ iter 23000), with the recipe's lower peak LR
+   and its fast-decay-then-hold schedule spending most of the run at a
+   frozen floor instead of the deployed recipe's full-length decay from a
+   higher peak. This part of the finding stands: **the fix is scoped to
+   model shapes wide enough to actually exhibit the Adam-driven
+   divergence (D>=256-384 at this depth)** — porting it to a narrower
+   shape just costs quality.
+6. **But the deployment shape is NOT immune to the instability — Attempt
+   12's "this shape never diverges" premise was wrong, corrected by
+   Attempt 13.** Re-running the *original* deployment recipe itself
+   (lr=5e-4, warmup=100, full cosine, default eps — not the wide-model
+   fix) a second time, on identical hyperparameters/architecture/data,
+   produced a real divergence: best val 2.208 @ iter 7500, then a
+   continuous climb to 2.398 @ iter 24000 — the same *shape* of
+   unbounded Adam-driven divergence as the wide model, just milder
+   (+0.19 vs +0.61-1.35) and not gated on LR going flat (this run's LR
+   never stopped decaying). The originally-deployed `ckpt_word16.pt`
+   (val 2.022, monotonic improvement the whole run) is a *favorable*
+   outcome of this recipe, not evidence the recipe is safe by
+   construction — every AdamW config on the wide shape diverged with
+   100% reliability across 9+ runs, but here identical settings produced
+   one clean run and one diverging run, i.e. the instability exists at
+   this width too, just closer to a knife-edge (seed/batch-order
+   dependent) rather than deterministic. **Practical implication: any
+   future training run at this deployment shape should be checked
+   against its own `states.jsonl` curve before trusting the result (see
+   Conclusion 3) — a clean run isn't guaranteed just because the last one
+   was clean.** Whether a mild stabilizing margin (smaller than the wide
+   model needed) is worth the peak-quality cost at this shape is an open
+   question, not resolved here.
 
 ## Files touched
 
@@ -1070,4 +1177,7 @@ this attempt, which only tested whether the *wide-model* fix transfers
   `data/ckpt_word16_epsrecipe.pt` / `data/ckpt_word16_epsrecipe_23k.pt`
   + matching `data/states_word16_epsrecipe*.jsonl` — deliberately
   separate filenames from the real deployed `data/ckpt_word16.pt`, which
-  this attempt does not touch or replace.
+  this attempt does not touch or replace. Attempt 13 adds
+  `data/ckpt_word16_reproduce.pt` + `data/states_word16_reproduce.jsonl`
+  (same deal — separate filename, doesn't touch the real deployed
+  checkpoint).
