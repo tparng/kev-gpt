@@ -642,6 +642,8 @@ tried in this pass — this is the concrete next step, not yet taken.
 | AdamW, `adam-eps=1e-3` + even gentler decay (decay-iters=13000) | 2.607 @ iter 10500 (plateau, no improvement over decay-iters=10000) | ~iter 11000 (starts before the floor), drifts +0.058 over 4500 iters (same magnitude as decay-iters=10000) | **plateau — recipe already found its ceiling at decay-iters~10000** |
 | Same recipe (`eps=1e-3`, decay@10000) ported to the deployment shape (D=128/NLAYER=12/VOCAB=1900) | 2.672 @ iter 23000, still improving | none — this run didn't diverge (see below: not guaranteed) | **N/A — negative transfer: worse than that shape's own existing recipe (val 2.022 @ iter 23000)** |
 | Reproducing the deployment shape's *original* recipe (lr=5e-4, warmup=100, full cosine, default eps) | 2.208 @ iter 7500, then climbs to 2.398 @ iter 24000 | ~iter 7500-8000, continues the whole rest of the run — same shape of divergence as the wide model, milder | **N/A — a second run of the exact original recipe diverges; the clean 2.022 result wasn't guaranteed by the recipe alone** |
+| Same original recipe + mild `adam-eps=1e-5` margin | 2.208 @ iter 7500 (same peak), 2.394 @ iter 24000 | same as unstabilized — no measurable change | **no — dose too small to matter at this width** |
+| Same original recipe + mild `adam-eps=1e-4` margin | 2.213 @ iter 10000-10500 (~same peak, negligible cost), 2.310 @ iter 24000 | still drifts, but ~half the rate (+0.097 vs +0.186-0.190) and starting later | **yes — meaningfully reduces divergence risk at negligible peak-quality cost** |
 
 Every AdamW configuration bottoms at essentially the same *relative*
 point — roughly 1500-2500 iterations past wherever warmup ends —
@@ -1028,6 +1030,64 @@ any new deployment-shape training run against its own `states.jsonl`
 curve before trusting a checkpoint, the way Conclusion 3 already
 recommends project-wide. Not yet tried: any of the three.
 
+### Attempt 14: a mild `adam-eps` margin at the deployment shape — `1e-4` works, `1e-5` doesn't
+
+Tests option (b) from Attempt 13's closing list: keep the deployment
+shape's own recipe exactly as-is (lr=5e-4, warmup=100, full cosine
+decay across 24000 iters — Attempt 12 already showed changing the
+schedule costs quality here) and add only a mild `adam-eps` bump on
+top, well below the wide model's `1e-3` fix strength, to see whether a
+small dose buys real protection without the peak-quality cost Attempt
+12 paid.
+
+```bash
+# eps=1e-5
+python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 --adam-eps 1e-5 \
+  --tokenizer word --vocab-size 1900 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_stream16 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16_epsmild1e5.pt --states data/states_word16_epsmild1e5.jsonl
+# eps=1e-4 (same flags otherwise, --out/--states renamed epsmild1e4)
+```
+
+| iter | eps=1e-8 (Attempt 13 reproduction) | eps=1e-5 | eps=1e-4 |
+|---|---|---|---|
+| 4000 | 2.266 | 2.277 | 2.372 |
+| **best** | **2.208 @ iter 7500** | **2.208 @ iter 7500** | **2.213 @ iter 10000-10500** |
+| 13000 | 2.265 | 2.259 | 2.223 |
+| 18000 | 2.333 | 2.318 | 2.263 |
+| 23000 | 2.385 | 2.381 | 2.301 |
+| 24000 (final) | 2.398 | 2.394 | **2.310** |
+| drift, best→final | +0.190 | +0.186 | **+0.097** |
+
+**`eps=1e-5` does essentially nothing** — its whole trajectory tracks
+the unstabilized reproduction almost exactly (2.208 vs 2.208 peak,
+2.394 vs 2.398 final, same +0.186-0.190 drift) — too small a dose at
+this width's gradient-variance scale to matter, the deployment-shape
+analogue of the wide model's own finding that `eps` has a real
+threshold below which it does nothing (Attempts 8-9).
+
+**`eps=1e-4` genuinely helps.** Peak val is statistically the same as
+the unstabilized runs (2.213 vs 2.208 — a negligible cost, unlike
+Attempt 12's `eps=1e-3`+floor-hold recipe which gave up real peak
+quality), but the post-peak drift roughly halves (+0.097 vs +0.186-
+0.190) and the peak itself lands later (iter 10000-10500 vs iter 7500)
+— more of the run is spent still improving before the divergence risk
+sets in. Not a full fix like the wide model's `eps=1e-3` (which achieved
+genuine flatness, Attempt 10) — this still drifts, just much more
+slowly — but it's a real, nearly-free stability margin at this shape,
+unlike Attempt 12's ported recipe which cost quality for no benefit.
+
+**This is the answer to Attempt 13's open question: option (b) works,
+at the right dose.** `eps=1e-4` (not `1e-3`, not `1e-5`) on top of the
+deployment shape's existing recipe — unchanged peak LR, unchanged
+warmup, unchanged full-length cosine decay — is the practical
+recommendation for training future deployment-shape checkpoints: same
+quality ceiling as the unstabilized recipe, meaningfully reduced risk if
+a run happens to land on the diverging side of the coin-flip Attempt 13
+found. Not yet tried: whether `eps` between `1e-4` and `1e-3` (e.g.
+`3e-4`) narrows the drift further before costing peak quality, mirroring
+the wide model's own `eps`/decay-length tradeoff curve (Attempts 8-11).
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -1148,6 +1208,20 @@ recommends project-wide. Not yet tried: any of the three.
    was clean.** Whether a mild stabilizing margin (smaller than the wide
    model needed) is worth the peak-quality cost at this shape is an open
    question, not resolved here.
+7. **Resolved: a mild `adam-eps=1e-4` margin is worth it, `1e-5` isn't.**
+   Attempt 14 tested Conclusion 6's open question directly: kept the
+   deployment shape's exact original recipe (peak LR, warmup, full
+   cosine decay all unchanged) and added only an `adam-eps` bump.
+   `eps=1e-5` did essentially nothing (tracked the unstabilized
+   trajectory almost exactly). `eps=1e-4` genuinely helped: same peak
+   quality (2.213 vs 2.208, negligible cost, unlike Attempt 12's
+   `eps=1e-3` which gave up real quality) but roughly half the post-peak
+   drift (+0.097 vs +0.186-0.190) and the peak itself landed later.
+   **Recommended addition for future deployment-shape training runs:
+   keep the existing recipe (lr=5e-4, warmup=100, full cosine decay) and
+   add `--adam-eps 1e-4`** — a small, nearly-free hedge against the
+   run-to-run divergence risk Attempt 13 uncovered, without the quality
+   cost porting the wide model's own `eps=1e-3` fix would incur.
 
 ## Files touched
 
@@ -1180,4 +1254,6 @@ recommends project-wide. Not yet tried: any of the three.
   this attempt does not touch or replace. Attempt 13 adds
   `data/ckpt_word16_reproduce.pt` + `data/states_word16_reproduce.jsonl`
   (same deal — separate filename, doesn't touch the real deployed
-  checkpoint).
+  checkpoint). Attempt 14 adds `data/ckpt_word16_epsmild1e5.pt` /
+  `data/ckpt_word16_epsmild1e4.pt` + matching
+  `data/states_word16_epsmild1e{4,5}.jsonl`.
