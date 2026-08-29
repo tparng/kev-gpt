@@ -976,8 +976,10 @@ python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 \
   --data-dir data/word_stream16 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
   --out data/ckpt_word16_reproduce.pt --states data/states_word16_reproduce.jsonl
 ```
-`model.train` has no `--seed` flag, so init and batch order differ from
-the original run even with identical hyperparameters.
+`model.train` calls `torch.manual_seed(1337)` unconditionally
+(`model/train.py:236`) — every run uses the *same* seed, so init and
+batch order are identical across runs, not a source of difference
+between this reproduction and the original.
 
 | iter | original (`ckpt_word16.pt`) val | reproduction val | reproduction lr |
 |---|---|---|---|
@@ -1003,16 +1005,25 @@ this shape, only on LR being low enough in absolute terms, consistent
 with Attempt 11's "starts before the floor" observation.
 
 **This means the deployment shape does carry real instability risk —
-it just isn't deterministic.** Every AdamW configuration tried on the
-wide D=384 diagnostic shape (9+ runs, every LR schedule/init/weight-
-decay variant in Attempts 1-6) diverged with 100% reliability. Here,
-identical hyperparameters on identical data produced one clean run and
-one diverging run. The likely mechanism is the same one Attempts 1-11
-already characterize (Adam's `sqrt(v_hat)+eps` step size not actually
-shrinking to zero at low nominal LR) — just closer to a knife-edge at
-this narrower width, where whether a given run's specific gradient-
-noise trajectory tips over into the runaway regime depends on
-seed/batch-order, not purely on the hyperparameters.
+and, more surprisingly, it isn't even deterministic despite the fixed
+seed.** Every AdamW configuration tried on the wide D=384 diagnostic
+shape (9+ runs, every LR schedule/init/weight-decay variant in Attempts
+1-6) diverged with 100% reliability. Here, *identical* hyperparameters,
+*identical* data, and the *same* `torch.manual_seed(1337)` produced one
+clean run (the original) and one diverging run (this reproduction) —
+with no available source of run-to-run randomness to blame it on. The
+likely mechanism is the same one Attempts 1-11 already characterize
+(Adam's `sqrt(v_hat)+eps` step size not actually shrinking to zero at
+low nominal LR), combined with ordinary GPU floating-point
+non-determinism: CUDA/cuDNN matmul and reduction kernels don't
+guarantee bit-identical results run to run even with a fixed seed (parallel
+reduction order isn't fixed), so two runs' loss curves drift apart by a
+tiny, invisible amount from iteration one — normally irrelevant, but
+this shape sits close enough to a genuine edge-of-stability point that
+which side of it a run lands on is sensitive to that drift. Not
+"random" in the sense of a different seed or data order — genuinely the
+same recipe landing differently due to sub-floating-point-epsilon
+numerical noise compounding near an instability boundary.
 
 **Revises Attempt 12's practical recommendation.** "Keep the original
 recipe because this shape doesn't need stabilizing" is no longer
@@ -1087,6 +1098,22 @@ a run happens to land on the diverging side of the coin-flip Attempt 13
 found. Not yet tried: whether `eps` between `1e-4` and `1e-3` (e.g.
 `3e-4`) narrows the drift further before costing peak quality, mirroring
 the wide model's own `eps`/decay-length tradeoff curve (Attempts 8-11).
+
+**Reproducibility check**: re-ran this exact `eps=1e-4` recipe a second
+time (`data/ckpt_word16_v2.pt`, same command, no `--seed` flag needed
+since `model.train` fixes `torch.manual_seed(1337)` — see the Attempt 13
+correction above) and got an *exact* match with this attempt's own
+numbers: best val 2.213 @ iter 10000-10500, final 2.310 @ iter 24000,
+matching digit-for-digit through the whole run. One pair each isn't
+conclusive, but it's a suggestive contrast with the *default*-eps recipe
+(`ckpt_word16.pt` vs. Attempt 13's reproduction), which diverged from
+itself between two nominally identical runs — consistent with the `eps`
+margin also damping the floating-point-noise sensitivity Attempt 13
+identified, not just the post-peak drift once divergence starts. Kept
+as a separate checkpoint (`data/ckpt_word16_v2.pt`), not promoted over
+the real, hardware-verified `data/ckpt_word16.pt` — that decision is
+left to whoever picks this up next, given the downstream QAT/export/
+real-hardware chain a swap would affect.
 
 ## Conclusions
 
@@ -1198,10 +1225,14 @@ the wide model's own `eps`/decay-length tradeoff curve (Attempts 8-11).
    (val 2.022, monotonic improvement the whole run) is a *favorable*
    outcome of this recipe, not evidence the recipe is safe by
    construction — every AdamW config on the wide shape diverged with
-   100% reliability across 9+ runs, but here identical settings produced
-   one clean run and one diverging run, i.e. the instability exists at
-   this width too, just closer to a knife-edge (seed/batch-order
-   dependent) rather than deterministic. **Practical implication: any
+   100% reliability across 9+ runs, but here identical settings (even
+   the same fixed `torch.manual_seed(1337)` — there's no seed/batch-order
+   difference available to blame) produced one clean run and one
+   diverging run, i.e. the instability exists at this width too, just
+   closer to a knife-edge — sensitive to ordinary GPU floating-point
+   non-determinism (parallel reduction order isn't bit-fixed even under a
+   fixed seed) rather than deterministic given the hyperparameters alone.
+   **Practical implication: any
    future training run at this deployment shape should be checked
    against its own `states.jsonl` curve before trusting the result (see
    Conclusion 3) — a clean run isn't guaranteed just because the last one
@@ -1256,4 +1287,7 @@ the wide model's own `eps`/decay-length tradeoff curve (Attempts 8-11).
   (same deal — separate filename, doesn't touch the real deployed
   checkpoint). Attempt 14 adds `data/ckpt_word16_epsmild1e5.pt` /
   `data/ckpt_word16_epsmild1e4.pt` + matching
-  `data/states_word16_epsmild1e{4,5}.jsonl`.
+  `data/states_word16_epsmild1e{4,5}.jsonl`, plus a reproducibility-check
+  rerun `data/ckpt_word16_v2.pt` / `data/states_word16_v2.jsonl` — a
+  standalone candidate, deliberately not promoted over the real deployed
+  `data/ckpt_word16.pt`.
