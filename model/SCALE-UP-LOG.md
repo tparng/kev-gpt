@@ -639,6 +639,7 @@ tried in this pass — this is the concrete next step, not yet taken.
 | AdamW, `adam-eps=1e-2` | 3.919 @ iter 15000 (still slowly falling) | none | **yes — fixes it, but efficiency mostly lost (~SGD territory)** |
 | AdamW, `adam-eps=3e-4` + gentler decay (decay-iters=8000) | 2.365 @ iter 7500 | ~iter 7500-8000, then climbs 3-4x slower than default AdamW | **partial — dampens but doesn't eliminate; best peak of any config, but not stable** |
 | AdamW, `adam-eps=3e-4` at the *original* decay length (decay-iters=5000, filling Attempt 8's gap) | 2.426 @ iter 7500 | ~iter 8000, drifts +0.111 to iter 15000 | **partial — meaningfully better peak than eps=1e-3 at the same decay length, some residual drift** |
+| AdamW, `adam-eps=3e-4` + even gentler decay (decay-iters=10000) | 2.391 @ iter 6500 — worse than decay-iters=8000's 2.365 | drifts +0.262 to iter 15000, worst of the three eps=3e-4 decay lengths | **worse on both axes — eps=3e-4's decay-length optimum sits at ~8000, unlike eps=1e-3's which improves up to ~10000** |
 | AdamW, `adam-eps=1e-3` + gentler decay (decay-iters=10000) | **2.606 @ iter 9500** | ~iter 9500-10000, then drifts +0.052 over 5000 iters (~4x gentler than the eps=3e-4 combo) | **yes, close to fully — best practical tradeoff of the sweep** |
 | AdamW, `adam-eps=1e-3` + even gentler decay (decay-iters=13000) | 2.607 @ iter 10500 (plateau, no improvement over decay-iters=10000) | ~iter 11000 (starts before the floor), drifts +0.058 over 4500 iters (same magnitude as decay-iters=10000) | **plateau — recipe already found its ceiling at decay-iters~10000** |
 | Same recipe (`eps=1e-3`, decay@10000) ported to the deployment shape (D=128/NLAYER=12/VOCAB=1900) | 2.672 @ iter 23000, still improving | none — this run didn't diverge (see below: not guaranteed) | **N/A — negative transfer: worse than that shape's own existing recipe (val 2.022 @ iter 23000)** |
@@ -821,6 +822,41 @@ Practically: `eps=3e-4` at this decay length is a genuinely attractive
 middle option if a small residual drift (auto-rollback still catches
 the 2.426 peak regardless) is acceptable in exchange for meaningfully
 better quality than `eps=1e-3`'s full-flatness guarantee.
+
+**Second addendum: does `eps=3e-4` keep improving with an even gentler
+decay, the way `eps=1e-3` does (Attempt 10)?** Tested
+`lr-decay-iters=10000` (same as Attempt 10's best `eps=1e-3` config,
+just with `eps=3e-4` instead):
+
+```bash
+python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --lr-decay-iters 10000 --adam-eps 3e-4 \
+  --tokenizer word --vocab-size 4096 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_big4096 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_word_big4096_eps3e4_decay10000.pt --states data/states_word_big4096_eps3e4_decay10000.jsonl
+```
+
+| `eps=3e-4`, `lr-decay-iters=` | peak val | drift, best→final (iter 15000) |
+|---|---|---|
+| 5000 | 2.426 @ iter 7500 | +0.111 |
+| **8000** | **2.365 @ iter 7500 (best peak)** | +0.211 |
+| 10000 | 2.391 @ iter 6500 (before the floor) | **+0.262 (worst drift)** |
+
+**No — the answer is no, and it's non-monotonic, unlike `eps=1e-3`'s
+own curve.** Going from `decay-iters=5000` to `8000` improved the peak
+(2.426→2.365); going further to `10000` made it *worse* on both counts
+at once (peak regresses to 2.391, and drift keeps climbing to +0.262,
+its largest yet). This is a genuinely different shape from `eps=1e-3`'s
+own decay-length sweep, where stretching from 5000→10000 kept improving
+the peak with only a small, roughly-constant drift cost (Attempts 8→10),
+before plateauing at 13000 (Attempt 11). `eps=3e-4`'s sweet spot for
+decay length sits around `8000`, not further out — pushing past it just
+gives the model more high-LR time to drift away in, without a
+compensating peak-quality gain. Practical implication: the eps/decay-
+length interaction isn't a single shared curve across `eps` values —
+each `eps` choice has its own decay-length optimum, and it has to be
+found per-`eps` rather than assumed to transfer (the wide model's
+`eps=1e-3` optimum at decay~10000 does not predict `eps=3e-4`'s optimum,
+which is lower, at decay~8000).
 
 ### Attempt 10: `eps=1e-3` + a gentler decay — the best combo so far
 
@@ -1334,7 +1370,7 @@ real-hardware chain a swap would affect.
   codebase's prior default), both wired into `AdamW(...)`.
 - New data/checkpoints (all gitignored under `data/`, not checked in —
   regenerate via the commands above): `data/word_big4096/` (VOCAB=4096
-  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (16 checkpoints,
+  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (17 checkpoints,
   one per run above), `data/states_word_big4096*.jsonl` (matching
   per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
   gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot
