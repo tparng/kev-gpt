@@ -3824,6 +3824,37 @@ checkpoint's QAT val loss (2.155) being numerically *worse* than the
 originally-deployed one's (2.074) -- another case in this project where
 val loss doesn't cleanly predict subjective sampled quality.
 
+**Four more samples**, captured after reloading the board back to clean
+(non-instrumented) firmware following the throughput investigation
+below -- same on-chip Gumbel sampling, no host-controllable seed:
+```
+"the dragon looked" -> at her and said," i want to <unk> this!" <unk>
+smiled and said," yes! let's go on an adventure!" so the dragon and the
+dragon went off together. they explored the world together and
+enjoyed the view of the day. when they got to the top, they all
+"in a small village" -> and always had a <unk> to help him <unk>. one
+day, the <unk> decided to make lots of <unk>. he put the <unk> in a
+big basket and spread them all together. the <unk> was very happy and
+they both had a lot of fun playing together all day. the <unk> grew
+more <unk> and
+"my favorite toy" -> is broken," timmy replied. but timmy didn't want
+to give up his toy car and he said he didn't want it. timmy got sad
+and said he was sorry." don't worry, timmy. i'll help you find it."
+timmy remembered what his mom said and promised to take care of it
+"the old man said" -> ," i like to <unk> that <unk> <unk>!" the two
+friends shared the <unk>, laughed and had lots of fun. at the end of
+the day, the family said goodbye and the little boy and the <unk>
+said goodbye. the little boy was so happy to have the <unk> <unk>! he
+was
+```
+Generally coherent dialogue/narrative flow, consistent with the three
+samples above. Two real, honest small-model tells worth flagging: "in
+a small village" leans on `<unk>` more heavily than the others (likely
+landed on rarer/out-of-vocabulary nouns for that topic), and "the
+dragon looked" repeats itself ("the dragon and the dragon went off
+together") -- neither a new bug, both the same class of tell already
+documented for this word-vocab build elsewhere in this file.
+
 **Real-hardware throughput measured for the first time at this shape**
 (flagged as "not yet measured" earlier in this document/the README).
 Initial host-side timing (wall-clock around the UART round trip)
