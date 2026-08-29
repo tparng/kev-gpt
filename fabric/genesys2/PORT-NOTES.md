@@ -3786,3 +3786,93 @@ yet exercised on actual silicon. Whoever has board access next just
 needs to program the bitstream and re-run `send_weights.py` with this
 checkpoint's exported weight image -- no RTL or project changes needed
 beyond what's already staged.
+
+**Update: exercised on actual silicon in a later session, board now
+attached.** Programmed the bitstream above via `vivado -mode batch
+-source *_pgm.tcl -tclargs xc7k325tffg900-2 <bitstream>.bit`
+(`SUCCESS!` on the real `xc7k325t_0` device, target
+`Digilent/200300B5E5AAB`), built `kevgpt_interactive`
+(`COMPILER_PREFIX=riscv32-corev-`, toolchain at `~/tools/corev-openhw-
+gcc-ubuntu2204-20240530/bin/`, not on `PATH` by default), loaded via
+`openocd -f quad-x-heep-openocd-genesys2.cfg` + `riscv32-corev-elf-gdb
+... -ex "monitor reset halt" -ex load -ex "monitor resume" -ex detach`
+(the documented `continue`-hangs gotcha above still applies, `monitor
+resume`+`detach` avoided it cleanly), streamed this checkpoint's
+weights via `send_weights.py` (`SEND_WEIGHTS_PASS`, 585,216 words /
+2,340,864 bytes, matching this section's own byte count exactly), and
+ran real interactive chat. Sample replies (on-chip Gumbel sampling,
+self-seeded, no host-controllable seed -- a fair sample):
+```
+"once upon a time" -> , there was a little girl named lily. she loved
+to play with her dolls and her dolls. one day, her little brother came
+to her house to her house. he saw lily's toys and wanted to play with
+them. lily said," hi, my little brother!" he said with a
+"the little robot" -> was <unk> and he was so excited. he asked the
+little boy if he could borrow it. the little boy said," can i borrow
+your toy car?" the little boy said yes. so the little boy helped the
+robot. the little boy was so happy. the little boy and the little
+"she opened the box" -> to her box and <unk> inside. lily heard a noise
+and came to see what was inside. she saw the box was a <unk>. the
+<unk> had a picture of a rabbit and a green friend. he was so happy.
+he said," this is a bear!" he smiled and said,
+```
+Coherent grammar, correct dialogue punctuation, no severe repetition
+loop across any sample -- a real improvement over this document's own
+earlier word-vocab chat transcript (`"to help him to to help him get to
+help him get"`, flagged there as visibly repetitive), despite this
+checkpoint's QAT val loss (2.155) being numerically *worse* than the
+originally-deployed one's (2.074) -- another case in this project where
+val loss doesn't cleanly predict subjective sampled quality.
+
+**Real-hardware throughput measured for the first time at this shape**
+(flagged as "not yet measured" earlier in this document/the README).
+Initial host-side timing (wall-clock around the UART round trip)
+showed a puzzling result: total reply latency was ~1.0-1.03 seconds
+regardless of whether the captured reply looked like 60, 28, or 14
+printed word-tokens -- suggestive of some large *fixed* per-turn
+overhead independent of generation length. **That reading was wrong,
+traced down and corrected, not left standing**: it was a host-side
+parsing artifact (the next turn's `"> "` prompt marker occasionally
+landing inside the capture window and truncating what got counted as
+"this reply's tokens"), not a real hardware anomaly. Confirmed by
+adding temporary instrumentation to `kevgpt_interactive`'s `chat_turn()`
+(printing `kevgpt_cycles(dev)` at four checkpoints -- before
+`soft_reset`, after `soft_reset`, after the prefill loop, and after the
+generation loop, plus the real `gen_len`/`sentences` counters at the
+end -- reverted afterward, not shipped): **`gen_len` is 60 (the full
+`MAX_GEN_LEN` cap) on every real turn tested**, `sentences` landing at
+4 of the `STORY_SENTENCES=8` budget -- confirming `MAX_GEN_LEN=60`, not
+`STORY_SENTENCES`, is almost always the real binding stop condition
+(typical sentence lengths need more than 60/8=7.5 tokens/sentence on
+average, so the sentence cap rarely triggers first). A genuine "short"
+reply was never actually happening -- every turn does essentially the
+same ~64 total forward-pass steps (4 prefill + 60 generated), so every
+turn genuinely takes essentially the same time; the earlier
+"suspiciously constant" reading was actually a *correct* observation,
+just wrongly attributed.
+
+`KEVGPT_REG_CYCLES` (`kevgpt_cycles()`) turned out not to be a
+free-running elapsed-time counter at all -- RTL
+(`xheep_kevgpt_peripheral.sv`): `cycles_run` resets to 0 on every
+`go_pulse` (one `kevgpt_step()` call) and only latches into
+`cycles_latched` when that single step's own `core_done_w` fires, so it
+reports **the cycle cost of the single most recent step**, not a
+cumulative or elapsed total. Read at prefill position 3: **696,419-
+696,423 cycles** (two independent turns, nearly identical); read at the
+final generation position (~63, after the full 60-token run):
+**866,080-866,082 cycles** -- consistent, position-dependent growth
+(13.9ms -> 17.3ms per token at the real 50MHz `REFERENCE_CLOCK_Hz`),
+matching attention cost scaling with KV-cache depth stacked on top of
+the roughly position-independent per-layer DDR3 weight-reload cost this
+document's own architecture section already describes as dominant.
+
+**Real measured throughput: ~58 tokens/sec** (60 generated tokens in
+1.0352-1.0394s wall time across three independent turns; UART
+transmission of the ~270-300-byte reply is a negligible ~23-25ms of
+that, so this is genuinely a compute-bound number, not an artifact of
+serial-link overhead). For comparison, the char-level NLAYER=12 build's
+own real-hardware number (elsewhere in this document) is ~130 tok/s
+(~385k cycles/token) -- this word-vocab shape is markedly slower per
+token, consistent with its much larger `GW_EMB=32,448`-word embed-table
+reload window (vs the char-level build's far smaller vocab) adding real
+per-token cost on top of the same 12-block+head reload structure.
