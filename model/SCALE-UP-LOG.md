@@ -638,6 +638,7 @@ tried in this pass — this is the concrete next step, not yet taken.
 | AdamW, `adam-eps=1e-3` | **2.743 @ iter 11500-13500 (genuinely flat, not a snapshot)** | none — holds flat for the entire 10,000-iter window | **yes — fixes it, efficiency mostly retained** |
 | AdamW, `adam-eps=1e-2` | 3.919 @ iter 15000 (still slowly falling) | none | **yes — fixes it, but efficiency mostly lost (~SGD territory)** |
 | AdamW, `adam-eps=3e-4` + gentler decay (decay-iters=8000) | 2.365 @ iter 7500 | ~iter 7500-8000, then climbs 3-4x slower than default AdamW | **partial — dampens but doesn't eliminate; best peak of any config, but not stable** |
+| AdamW, `adam-eps=3e-4` at the *original* decay length (decay-iters=5000, filling Attempt 8's gap) | 2.426 @ iter 7500 | ~iter 8000, drifts +0.111 to iter 15000 | **partial — meaningfully better peak than eps=1e-3 at the same decay length, some residual drift** |
 | AdamW, `adam-eps=1e-3` + gentler decay (decay-iters=10000) | **2.606 @ iter 9500** | ~iter 9500-10000, then drifts +0.052 over 5000 iters (~4x gentler than the eps=3e-4 combo) | **yes, close to fully — best practical tradeoff of the sweep** |
 | AdamW, `adam-eps=1e-3` + even gentler decay (decay-iters=13000) | 2.607 @ iter 10500 (plateau, no improvement over decay-iters=10000) | ~iter 11000 (starts before the floor), drifts +0.058 over 4500 iters (same magnitude as decay-iters=10000) | **plateau — recipe already found its ceiling at decay-iters~10000** |
 | Same recipe (`eps=1e-3`, decay@10000) ported to the deployment shape (D=128/NLAYER=12/VOCAB=1900) | 2.672 @ iter 23000, still improving | none — this run didn't diverge (see below: not guaranteed) | **N/A — negative transfer: worse than that shape's own existing recipe (val 2.022 @ iter 23000)** |
@@ -688,16 +689,23 @@ python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --lr-decay-iters
 # repeat with --adam-beta2 0.9 (eps left at default) --out ..._beta2_0.9.pt --states ..._beta2_0.9.jsonl
 ```
 
-| iter | eps=1e-2 val | eps=1e-3 val | beta2=0.9 val | baseline (Attempt 6) val |
-|---|---|---|---|---|
-| 4000 | 4.095 | 2.876 | 2.225 | 2.209 |
-| **4500** | 4.069 | 2.830 | **2.218 (best)** | **2.203 (best)** |
-| 5000 (floor reached) | 4.056 | 2.808 | 2.236 | 2.219 |
-| 6000 | 4.038 | 2.791 | 2.298 | 2.282 |
-| 8000 | 4.006 | 2.766 | 2.486 | 2.475 |
-| 10000 | 3.978 | 2.751 | 2.802 | 2.792 |
-| 12500 | 3.947 | **2.743 (best, flat 11500-13500)** | 3.237 | 3.344 |
-| 15000 | **3.919 (best, still slowly falling)** | 2.746 | 3.527 | 3.570 |
+| iter | eps=1e-2 val | eps=1e-3 val | eps=3e-4 val | beta2=0.9 val | baseline (Attempt 6) val |
+|---|---|---|---|---|---|
+| 4000 | 4.095 | 2.876 | 2.509 | 2.225 | 2.209 |
+| **4500** | 4.069 | 2.830 | 2.461 | **2.218 (best)** | **2.203 (best)** |
+| 5000 (floor reached) | 4.056 | 2.808 | 2.442 | 2.236 | 2.219 |
+| 6000 | 4.038 | 2.791 | 2.432 | 2.298 | 2.282 |
+| **7500** | 4.014 | 2.772 | **2.426 (best)** | 2.429 | (not logged at this iter) |
+| 8000 | 4.006 | 2.766 | 2.427 | 2.486 | 2.475 |
+| 10000 | 3.978 | 2.751 | 2.437 | 2.802 | 2.792 |
+| 12500 | 3.947 | **2.743 (best, flat 11500-13500)** | 2.473 | 3.237 | 3.344 |
+| 15000 | **3.919 (best, still slowly falling)** | 2.746 | 2.537 | 3.527 | 3.570 |
+
+(`eps=3e-4`'s own command: identical flags to `eps=1e-3`'s above except
+`--adam-eps 3e-4 --out data/ckpt_word_big4096_eps3e4_decay5000.pt
+--states data/states_word_big4096_eps3e4_decay5000.jsonl` — run
+separately, later, to fill in this exact gap; see the addendum after
+Attempt 9 below.)
 
 **`--adam-beta2 0.9` does not fix it.** Its whole trajectory tracks the
 AdamW-default baseline almost exactly, iter for iter (2.218 vs 2.203
@@ -785,6 +793,34 @@ Not yet tried: an even gentler decay (e.g. `lr-decay-iters` close to
 `max-iters`, more like a standard single cosine sweep) at `eps=1e-3`,
 which might let the model spend more time at higher effective LR before
 eps's stabilizing effect has to do its work at the floor.
+
+**Addendum, filling a gap in Attempt 8's own sweep**: the table above
+pairs `eps=3e-4` with the *gentler* decay (`lr-decay-iters=8000`) — it
+was never tested at Attempt 8's original `lr-decay-iters=5000`
+structure, the same one `eps=1e-3`/`1e-2` were tested against, so the
+two weren't cleanly comparable on decay length alone. Filling that gap:
+
+```bash
+python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --lr-decay-iters 5000 --adam-eps 3e-4 \
+  --tokenizer word --vocab-size 4096 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_big4096 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_word_big4096_eps3e4_decay5000.pt --states data/states_word_big4096_eps3e4_decay5000.jsonl
+```
+Result: best val **2.426 @ iter 7500**, final 2.537 @ iter 15000, drift
+**+0.111**. This slots cleanly between the two extremes already in
+Attempt 8's table, at the *same* decay length: much better peak than
+`eps=1e-3` (2.426 vs 2.743) at the cost of real but modest drift (+0.111
+vs `eps=1e-3`'s ~0), and vastly better than default `eps=1e-8`'s peak
+(2.203, but +1.367 drift to full divergence). Confirms `eps` behaves as
+a genuinely continuous dial on this shape, independent of the decay-
+length axis: `1e-8` (divergent) → `3e-4` (much dampened, some drift) →
+`1e-3` (flat, worse peak) → `1e-2` (flat, much worse peak) — the same
+efficiency/stability tradeoff curve Attempt 9's decay-8000 pairing
+showed, just cleanly isolated from the decay-length variable this time.
+Practically: `eps=3e-4` at this decay length is a genuinely attractive
+middle option if a small residual drift (auto-rollback still catches
+the 2.426 peak regardless) is acceptable in exchange for meaningfully
+better quality than `eps=1e-3`'s full-flatness guarantee.
 
 ### Attempt 10: `eps=1e-3` + a gentler decay — the best combo so far
 
@@ -1298,7 +1334,7 @@ real-hardware chain a swap would affect.
   codebase's prior default), both wired into `AdamW(...)`.
 - New data/checkpoints (all gitignored under `data/`, not checked in —
   regenerate via the commands above): `data/word_big4096/` (VOCAB=4096
-  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (15 checkpoints,
+  tokenizer + train/val bins), `data/ckpt_word_big4096*.pt` (16 checkpoints,
   one per run above), `data/states_word_big4096*.jsonl` (matching
   per-eval logs), `data/gradlog_word_big4096.jsonl` (Attempt 5's per-layer
   gradient-norm trace), `data/ckpts/ckpt_*.pt` (shared per-eval snapshot
