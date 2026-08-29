@@ -4006,3 +4006,123 @@ this -- this touches the core reload FSM, squarely inside this
 project's "bit-honest before fast" rule. Not a quick parameter bump;
 genuine, multi-step RTL engineering, but well-scoped and clearly
 justified by the numbers above.
+
+## Streaming embed lookups: implemented, verified, and real-hardware confirmed
+
+Implemented the proposal above in full. `fabric/stage3/rtl/sequencer_vec.sv`:
+
+- New `EMB_ROWG_W` localparam -- the on-chip streaming embed buffer size
+  (`(EROWS+EPW-1)/EPW` words, same packing `EMB_TOKW`/`EMB_POSW` already
+  use, just sized for ONE row-group instead of VOCAB/TMAX of them --
+  VOCAB-independent, 16 words at this shape). `GW_EMB` itself is
+  UNCHANGED and still means what it always did (the full DDR3 image
+  span, used by `WEIGHT_IMAGE_BYTES`/`send_weights.py`'s own byte count
+  and to locate a given row within the off-chip table) -- only the
+  on-chip BRAM sizing driver changed, not the DDR3-side bookkeeping.
+- New `emb_ph` (reload/read phase: 0=tok row, 1=pos row) and `tok_hold`
+  (a small `[0:ROWS-1]` register array) registers. `weight_loader_ddr`'s
+  boot-load write port has no destination-address input -- `ld_rst`
+  always resets `weight_bank_tdp`'s internal write pointer to 0 -- so
+  the tok row has to be fully read out and held in registers BEFORE the
+  pos-row reload overwrites the same on-chip words; there is no way to
+  land them at two different on-chip addresses simultaneously.
+- `S_EMB`'s body split into two paths (`if (WEIGHT_STREAM_PER_LAYER)`):
+  the streaming path processes ONE row-group per pass (phase 0: hold the
+  tok row in `tok_hold`; phase 1: sum the just-read pos row with the
+  held tok row and commit to `xres_bank`, LN fusion gated on phase 1
+  only, since that's the only phase that ever produces a real xres
+  value) instead of the old interleaved per-cycle tok/pos toggle, which
+  only worked when both tables were simultaneously resident. The
+  non-streaming (fully-resident, `WEIGHT_STREAM_PER_LAYER=0`) path is
+  UNTOUCHED, byte-for-byte identical to before.
+- `S_STRW`'s embed-reload dispatch now computes a `tok_id`/`pos`-
+  dependent small DDR3 window (`EMB_ROWG_W` words, address = `EMB_TOK_
+  BASE + (tok_id*EROWS)>>EPWS` or the pos equivalent) instead of one
+  fixed-address bulk window covering the whole table. `S_EMB`'s own
+  completion re-arms this same dispatch with `emb_ph<=1` for the second
+  (pos-row) reload -- no changes needed to `S_STRW`'s generic settle/
+  completion logic, which already just jumps back to `strw_ret` (S_EMB)
+  once a reload settles, for either phase.
+- Updated the `WWORDS` sizing-check `$display` warning to check against
+  `EMB_ROWG_W` instead of the old bulk `GW_EMB`.
+
+**Verified bit-exact, twice, through the REAL per-layer-streaming DDR3
+path** (`fabric/stage3/tb/tb_seq_vec_kv_stream.sv` -- no `run_*.py`
+harness exists for this TB yet, matching `tb_weight_loader_ddr.sv`'s own
+precedent; compiled directly with `iverilog -g2012`, file list per that
+TB's own header comment: the `run_vec_kv.py` RTL_FILES set +
+`fabric/genesys2/rtl/weight_loader_ddr.sv` + `fabric/genesys2/tb/
+mig_behav_model.sv` + a one-line `` `define SYNTHESIS `` shim (bracketed
+around JUST `mig_read_engine.sv`/`sync_fifo.sv`, reused from
+`~/RVchatbot/kevgpt-genesys2-soc`'s vendored `ai_accel` IP -- `weight_
+bank_tdp.sv` itself must NOT see `SYNTHESIS` defined or it switches to a
+different, non-simulation memory primitive) + the TB itself), at the
+current deployed shape (P=8, LANES=64, D=128, NLAYER=12, NHEAD=2,
+VOCAB=1900, TMAX=128), prompt "once upon a time" (plen=4), 20 greedy
+generated tokens: **`got == gold ==
+[5, 1646, 1790, 12, 945, 659, 1075, 937, 7, 1415, 971, 1682, 1226, 1153,
+809, 1641, 1589, 7, 1136, 406]`** -- identical to `tb_seq_vec_kv.sv`'s
+own already-proven fully-resident gold for this exact checkpoint/
+prompt/seed, at BOTH `WWORDS=32768` (the old value, isolating "is the
+new addressing logic correct" from "does shrinking WWORDS also work")
+and `WWORDS=3840` (the new value, `max(GW_BLK=3072, GW_HEAD=3840,
+EMB_ROWG_W=16)` -- confirming both claims independently, not
+conflating them into one pass/fail.
+
+**Real Vivado synthesis + implementation + bitstream, WWORDS=3840,
+same checkpoint/ROMs as the `eps=3e-4` build earlier in this document**
+(copied the updated `sequencer_vec.sv` into `~/RVchatbot/kevgpt-
+genesys2-soc`'s vendored `kevgpt_seq` IP, changed `.WWORDS(32768)` to
+`.WWORDS(3840)` in `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`, `reset_
+run synth_1`+`reset_run impl_1`, restaged ROMs into the now-emptied
+`synth_1/`, relaunched clean, ~25.5 minutes wall time): **0 Errors, 0
+real Critical Warnings** (same 10 pre-existing constraint-file warnings
+this document already established as harmless, unchanged), **WNS=
+1.507ns / WHS=0.089ns** (both positive, vs the pre-redesign build's
+1.449ns/0.094ns -- comparable, still comfortably closing). **Block RAM:
+171/445 (38.43%), down from 398/445 (89.44%) -- 227 tiles freed, more
+than half the chip's total Block RAM** -- closely matching the design
+proposal's own hand-calculated estimate (~174 tiles) before any of this
+was implemented. LUTs 97,859/203,800 (48.02%, vs 97,584/203,800
+(47.88%) before -- the small real cost of `tok_hold`+`emb_ph`) and DSPs
+804/840 (95.71%, exact match) essentially unchanged, as expected -- this
+was purely a BRAM win, not a compute-structure change.
+
+**Real hardware, confirmed working end to end.** Killed the stale
+`openocd` session, reprogrammed the board with the new bitstream
+(`vivado -mode batch -source *_pgm.tcl`, `SUCCESS!` on the real
+`xc7k325t_0` device), restarted `openocd`, reloaded the SAME firmware
+(unchanged -- tokenizer/VOCAB didn't change, `main.elf` load size
+identical: 34,330 bytes), re-streamed the SAME checkpoint's weights
+(`SEND_WEIGHTS_PASS`, 585,216 words), and ran real interactive chat:
+```
+"once upon a time" -> , there was a little girl named lily. she loved
+to eat <unk>, and she always wanted to eat all the yummy <unk>. one
+day, lily's mom asked her," lily said, i want to eat a <unk>!" lily
+replied," okay, i will eat <unk>!" they ate
+"the little robot" -> had been <unk> in the <unk>. from that day on,
+the two friends were playing together. they were all having fun, but
+they always <unk>. the two friends were with a big and tall <unk>. they
+were very sad and they never <unk> to the other. the two friends were
+sad and angry
+"she opened the box" -> and found a <unk>. she was so happy and thanked
+her friend for helping her find. from that day on, lily made sure to
+always look out for her <unk>. she never felt alone again. the end is
+a special <unk>. and she lived in the <unk> and <unk> all the <unk> in
+the
+```
+Coherent grammar throughout, on-chip Gumbel sampling as every other
+real-hardware sample in this document -- this run happens to lean on
+`<unk>` a bit more than some earlier samples (normal sampling variance
+across different self-seeded runs, not a defect this redesign
+introduced; the checkpoint and its own `unk_frac=0.0394` are unchanged).
+
+**Honest status: this is a verified, working BRAM-savings mechanism,
+not yet a bigger vocabulary.** `VOCAB` is still 1900 in this build --
+the redesign proves the freed BRAM is real and usable, but nothing yet
+spends it. Growing VOCAB for real is the natural next step this
+unblocks, not yet done: pick a target (the coverage table above
+suggests 4096 (~99.1%) or 8192 (~99.8%) as good candidates, both well
+inside the new `GW_HEAD`-bound ceiling of ~16,384), retrain a tokenizer
++ model at that VOCAB, export, and run one more synth/P&R/bitstream
+cycle at the new (still comfortably small) `GW_HEAD`.

@@ -294,23 +294,37 @@ module sequencer_vec #(
     localparam integer EMB_POS0     = EMB_TOK_BASE + EMB_TOKW;
     localparam integer EMB_POS_BASE = EMB_POS0 + (EMB_POS0 % 2);
     localparam integer EMB_POSW     = (EPW > 0) ? (TMAX*EROWS + EPW - 1)/EPW : 0;
-    // per-layer weight streaming (WEIGHT_STREAM_PER_LAYER=1 only): the
-    // embed tables (tok_emb+pos_emb, phase-disjoint with block GEMV reads
-    // -- S_EMB runs entirely before any block's weights are touched) are
-    // ALSO addressed through the same resident weight bank, and at small
-    // shapes are comparably sized to one block's own window -- they can't
-    // stay at their old large absolute on-chip offsets once WWORDS shrinks
-    // to one block's size. GW_EMB is the combined tok+pos+alignment-pad
-    // span (from EMB_TOK_BASE through the end of the wrom.mem image),
-    // reloaded as ONE window before S_EMB runs, same mechanism as a block
-    // or the head. EMB_TOK_BASE_STRM/EMB_POS_BASE_STRM are the equivalent
-    // STREAMING-relative on-chip read bases (0-based, since a fresh embed
-    // reload always lands at on-chip address 0, same as every block/head
-    // reload) -- EMB_POS_BASE_STRM keeps the SAME tok->pos relative offset
-    // (EMB_TOKW) the absolute scheme already uses, just based at 0.
-    localparam integer GW_EMB            = (EMB_POS_BASE + EMB_POSW) - EMB_TOK_BASE;
-    localparam integer EMB_TOK_BASE_STRM = 0;
-    localparam integer EMB_POS_BASE_STRM = EMB_TOKW;
+    // GW_EMB: the FULL combined tok+pos+alignment-pad span on DDR3 (from
+    // EMB_TOK_BASE through the end of the wrom.mem image) -- this is the
+    // real DDR3 image size (used by WEIGHT_IMAGE_BYTES / send_weights.py's
+    // own byte count) and by EMB_TOK_BASE/EMB_POS_BASE below to locate a
+    // GIVEN tok_id/pos row within that off-chip table. It does NOT size
+    // any on-chip BRAM under streaming (see EMB_ROWG_W).
+    localparam integer GW_EMB = (EMB_POS_BASE + EMB_POSW) - EMB_TOK_BASE;
+
+    // ---- streaming embed reload (row-at-a-time, not the whole table) ----------
+    // Fix for the VOCAB/BRAM ceiling documented in PORT-NOTES.md's "streaming
+    // embed lookups" proposal: S_EMB only ever consumes ONE tok_id row and ONE
+    // pos row per token (EROWS sub-rows each) -- reloading the ENTIRE embed
+    // table (GW_EMB words, VOCAB-linear) into weight_bank_tdp every token to
+    // read just those two rows was the actual VOCAB/BRAM-ceiling driver, not
+    // anything S_EMB's own read pattern needed. Under WEIGHT_STREAM_PER_LAYER,
+    // S_STRW now reloads just the CURRENT tok_id's row (via a tok_id-scaled
+    // DDR3 address, EMB_ROWG_W words), then S_EMB reads+holds it in `tok_hold`
+    // (weight_loader_ddr's boot-load write port has no destination-address
+    // input -- ld_rst always resets weight_bank_tdp's internal write pointer
+    // to 0, so the tok row MUST be consumed into registers before the pos
+    // reload overwrites the same on-chip words), then S_STRW reloads the
+    // CURRENT pos row (same on-chip words, same EMB_ROWG_W size), and S_EMB
+    // reads it and commits tok_hold+pos_row to xres_bank exactly as the old
+    // single-shot design did. Both phases land at on-chip word 0 (there is
+    // no separate on-chip base for tok vs pos any more, unlike the old
+    // EMB_TOK_BASE_STRM/EMB_POS_BASE_STRM scheme this replaces), so
+    // EMB_ROWG_W -- not GW_EMB -- is what WWORDS actually needs to cover for
+    // the embed path once this is in place: VOCAB-independent, same
+    // (EROWS+EPW-1)/EPW packing EMB_TOKW/EMB_POSW already use, just sized
+    // for ONE row-group instead of VOCAB/TMAX of them.
+    localparam integer EMB_ROWG_W = (EPW > 0) ? (EROWS + EPW - 1)/EPW : 0;
 
     // ---- FSM -------------------------------------------------------------------
     localparam [4:0]
@@ -351,15 +365,25 @@ module sequencer_vec #(
     reg [$clog2(ARROWS+1)-1:0] ard;  reg arv;
 
     // ---- S_EMB embed fetch through the weight bank's embed port -----------------
-    // Issue alternates tok (etp=0) / pos (etp=1) row fetches, one address/cycle;
+    // NON-STREAMING (WEIGHT_STREAM_PER_LAYER=0, whole table resident at boot):
+    // issue alternates tok (etp=0) / pos (etp=1) row fetches, one address/cycle;
     // the pair lands on emb_pair 1 cycle later (eb_* are the arrival-stage regs).
     // tok row = tok_id*EROWS+fr, pos row = pos*EROWS+fr; word = BASE + row/EPW;
     // pair slot = row % RPP (bases even-aligned). ~2*EROWS+2 cycles per token.
-    reg        etp;                          // fetch phase: 0 = tok row, 1 = pos row
+    // STREAMING (WEIGHT_STREAM_PER_LAYER=1): only ONE EROWS-sized row-group is
+    // ever resident on-chip at a time (see EMB_ROWG_W above) -- emb_ph (0=the
+    // just-reloaded TOK row, 1=the just-reloaded POS row) selects the whole
+    // read PASS, not the cycle; there is no per-cycle etp toggle under
+    // streaming, since interleaving would need both rows resident at once.
+    reg        etp;                          // non-streaming fetch phase: 0=tok,1=pos
+    reg        emb_ph;                       // streaming reload/read phase: 0=tok,1=pos
     reg        eb_v, eb_tp;                  // arrival valid + phase
     reg [2:0]  eb_sel;                       // arrival pair-slot (row % RPP)
     reg [$clog2(ROWSM+1)-1:0] eb_row;        // arrival xres destination row
-    reg [P*32-1:0]    tacc;                  // tok row held for the tok+pos sum
+    reg [P*32-1:0]    tacc;                  // tok row held for the tok+pos sum (non-streaming)
+    reg [P*32-1:0]    tok_hold [0:ROWS-1];   // tok row held per-sub-row (streaming only --
+                                              // the on-chip words get overwritten by the
+                                              // pos-row reload before all ROWS are read)
     reg [LANES*8-1:0] epr;                   // plain-reg pair copy (safe part-select)
     reg [P*32-1:0]    erw;                   // selected embed row
     // TIMING (5ns cone weight-bank BRAM -> xres LUTRAM): the pair-slot select is
@@ -368,17 +392,21 @@ module sequencer_vec #(
     reg        eb2_v, eb2_tp;                // select-stage valid + phase
     reg [$clog2(ROWSM+1)-1:0] eb2_row;       // select-stage xres destination row
     reg [P*32-1:0]    erw_r;                 // REGISTERED selected embed row
+    // non-streaming only -- absolute row index into the resident whole table
     wire [EMBROWW-1:0] emb_row_w = (etp ? pos : tok_id) * EROWS
                             + {{(EMBROWW-$clog2(ROWSM+1)){1'b0}}, fr};
-    // 32-bit param + 14-bit row word offset, truncated to the address width
-    // (both bases + the largest offset are < WWORDS by the spare-depth budget,
-    // non-streaming mode -- under streaming, the *_STRM 0-based bases apply
-    // instead, since a fresh embed reload always lands at on-chip address 0)
+    // 32-bit param + 14-bit row word offset, truncated to the address width.
+    // Non-streaming: absolute row within the resident whole table (both bases
+    // + the largest offset are < WWORDS by the spare-depth budget). Streaming:
+    // `fr` alone, local to the just-reloaded EROWS-sized row-group -- BOTH
+    // phases land at on-chip word 0 (weight_loader_ddr's boot-load write port
+    // has no destination-address input; ld_rst always resets weight_bank_tdp's
+    // write pointer to 0), so there is no separate tok/pos on-chip base any
+    // more, unlike the EMB_TOK_BASE_STRM/EMB_POS_BASE_STRM scheme this replaces.
     wire [$clog2(WWORDS)-1:0] emb_addr_w =
-        (WEIGHT_STREAM_PER_LAYER
-            ? (etp ? EMB_POS_BASE_STRM : EMB_TOK_BASE_STRM)
-            : (etp ? EMB_POS_BASE      : EMB_TOK_BASE))
-        + (emb_row_w >> EPWS);
+        WEIGHT_STREAM_PER_LAYER
+            ? (fr >> EPWS)
+            : (etp ? EMB_POS_BASE : EMB_TOK_BASE) + (emb_row_w >> EPWS);
     wire emb_sel_w = (st == S_EMB);
 
     // ---- wide-word ROMs ($readmemh: one P-packed word per line) -----------------
@@ -507,8 +535,8 @@ module sequencer_vec #(
     initial begin
         if (WEIGHT_STREAM_PER_LAYER && !WEIGHT_DDR_BACKED)
             $display("sequencer_vec: WARNING WEIGHT_STREAM_PER_LAYER=1 requires WEIGHT_DDR_BACKED=1 -- S_STRW will hang forever waiting for wld_ld_done, which g_wld_off ties permanently low");
-        if (WEIGHT_STREAM_PER_LAYER && (WWORDS < GW_BLK || WWORDS < GW_HEAD || WWORDS < GW_EMB))
-            $display("sequencer_vec: WARNING WEIGHT_STREAM_PER_LAYER=1 needs WWORDS >= max(GW_BLK=%0d, GW_HEAD=%0d, GW_EMB=%0d), got WWORDS=%0d -- g_wbase/emb_addr_w will silently truncate/wrap into weight_bank_tdp", GW_BLK, GW_HEAD, GW_EMB, WWORDS);
+        if (WEIGHT_STREAM_PER_LAYER && (WWORDS < GW_BLK || WWORDS < GW_HEAD || WWORDS < EMB_ROWG_W))
+            $display("sequencer_vec: WARNING WEIGHT_STREAM_PER_LAYER=1 needs WWORDS >= max(GW_BLK=%0d, GW_HEAD=%0d, EMB_ROWG_W=%0d), got WWORDS=%0d -- g_wbase/emb_addr_w will silently truncate/wrap into weight_bank_tdp (EMB_ROWG_W, not GW_EMB, is the embed path's real WWORDS driver now -- see EMB_ROWG_W's own comment)", GW_BLK, GW_HEAD, EMB_ROWG_W, WWORDS);
         if (KV_DDR_BACKED && WEIGHT_STREAM_PER_LAYER &&
             (KV_DDR_BASE < WEIGHTS_DDR_BASE + WEIGHT_IMAGE_BYTES) &&
             (WEIGHTS_DDR_BASE < KV_DDR_BASE + KV_IMAGE_BYTES))
@@ -831,7 +859,7 @@ module sequencer_vec #(
             if (seed_we) begin rng_state <= seed; smp_en <= (seed != 32'd0); end
             case (st)
                 S_IDLE: if (go) begin
-                    fr<=0; frv<=0; etp<=1'b0; eb_v<=1'b0; eb2_v<=1'b0; blk<=4'd0;
+                    fr<=0; frv<=0; etp<=1'b0; emb_ph<=1'b0; eb_v<=1'b0; eb2_v<=1'b0; blk<=4'd0;
                     // block-0 LN1 is FED during the S_EMB commits (LN fusion)
                     l_gbase<=4'd0; l_dst<=1'b0;
                     ln_start<=1'b1;
@@ -857,8 +885,70 @@ module sequencer_vec #(
                     end
                 end
                 // ---- embed -> xres via the weight bank's embed port (log §36 plan 2):
-                // tok row then pos row per fr, serial (1 fetch/cycle, ~2*EROWS+2 cyc).
-                S_EMB: begin
+                // tok row then pos row per fr. Non-streaming: serial interleave,
+                // 1 fetch/cycle, ~2*EROWS+2 cyc (whole table already resident).
+                // Streaming: one row-group reload+read PASS per phase (emb_ph),
+                // ~EROWS+2 cyc/pass, plus the S_STRW reload latency between passes
+                // -- see EMB_ROWG_W's comment above for why this can't interleave.
+                S_EMB: if (WEIGHT_STREAM_PER_LAYER) begin
+                    // issue stage: emb_addr_w is combinational from fr this cycle
+                    // (LOCAL row index within the just-reloaded row-group)
+                    eb_v   <= (fr != ROWS[$clog2(ROWSM+1)-1:0]);
+                    eb_sel <= fr[2:0] & RSELM;
+                    eb_row <= fr;
+                    if (fr != ROWS[$clog2(ROWSM+1)-1:0]) fr <= fr + 1'b1;
+                    // select stage: register the pair-slot mux of last cycle's pair
+                    if (eb_v) begin
+                        epr = emb_pair;                         // plain-reg copy first
+                        erw_r <= epr[eb_sel*(P*32) +: P*32];
+                    end
+                    eb2_v <= eb_v; eb2_row <= eb_row;
+                    // commit stage, one cycle behind. Phase 0 (tok row): hold it in
+                    // tok_hold -- the pos row it sums with isn't reloaded yet, and
+                    // xres/LN can't fire until the sum is ready. Phase 1 (pos row):
+                    // sum with the HELD tok row and commit, same as the
+                    // non-streaming path's tok+pos sum. LN FUSION unchanged: each
+                    // committed row also feeds the LN (block-0 LN1 loads during
+                    // the embed, L_FEED dies) -- gated on phase 1 only, since
+                    // that's the only phase that ever produces an xres commit.
+                    ln_vin <= eb2_v && emb_ph;
+                    ln_g   <= gam_r;
+                    if (eb2_v) begin
+                        if (!emb_ph) begin
+                            tok_hold[eb2_row] <= erw_r;
+                        end else begin
+                            for (pp=0; pp<P; pp=pp+1)
+                                ww[pp*32 +: 32] = $signed(tok_hold[eb2_row][pp*32 +: 32])
+                                                + $signed(erw_r[pp*32 +: 32]);
+                            xres_bank[eb2_row] <= ww;
+                            ln_x <= ww;
+                        end
+                        if (eb2_row==ROWS-1) begin
+                            fr<=0; frv<=0; eb_v<=1'b0; eb2_v<=1'b0;
+                            if (!emb_ph) begin
+                                // tok row fully held on-chip -- now reload+read
+                                // the pos row (same on-chip words, overwriting
+                                // the tok row weight_loader_ddr just wrote --
+                                // already safely captured in tok_hold above)
+                                emb_ph   <= 1'b1;
+                                strw_ret <= S_EMB;
+                                st       <= S_STRW;
+                            end else begin
+                                emb_ph <= 1'b0;   // reset for next token
+                                if (dbg_stop==2'd1) st<=S_FIN;   // DEBUG: stop after embed
+                                else begin
+                                    // arm strw_ret fresh for the L_COLL->S_STRW
+                                    // hop l_ret already points at (set back in
+                                    // S_IDLE) -- this is ALWAYS the block-0
+                                    // weight reload (S_EMB only ever precedes
+                                    // block 0), never the head case.
+                                    strw_ret<=S_QKVRET;
+                                    orow<=0; st<=L_COLL;
+                                end
+                            end
+                        end
+                    end
+                end else begin
                     // issue stage: emb_addr_w is combinational from etp/fr this cycle
                     eb_v   <= (fr != ROWS[$clog2(ROWSM+1)-1:0]);
                     eb_tp  <= etp;
@@ -1262,8 +1352,19 @@ module sequencer_vec #(
                         end
                     end else if (!strw_armed) begin
                         if (strw_ret == S_EMB) begin
-                            wldi_addr  <= WEIGHTS_DDR_BASE + EMB_TOK_BASE*WBYTES_STRM;
-                            wldi_words <= GW_EMB*SUBW_STRM;
+                            // ONE row-group at a time (tok_id's row when
+                            // emb_ph==0, pos's row when emb_ph==1 -- S_EMB's own
+                            // completion re-arms this same dispatch with
+                            // emb_ph<=1 for the second reload, see its comment),
+                            // not the whole table. (tok_id or pos)*EROWS locates
+                            // that row within the DDR3-resident tok/pos table;
+                            // >>EPWS converts row->word exactly like EMB_TOKW/
+                            // EMB_POSW's own packing.
+                            wldi_addr  <= WEIGHTS_DDR_BASE + (emb_ph
+                                            ? EMB_POS_BASE + ((pos    * EROWS) >> EPWS)
+                                            : EMB_TOK_BASE + ((tok_id * EROWS) >> EPWS)
+                                          ) * WBYTES_STRM;
+                            wldi_words <= EMB_ROWG_W*SUBW_STRM;
                         end else if (strw_ret == S_HEADSET) begin
                             wldi_addr  <= WEIGHTS_DDR_BASE + WB_HEAD*WBYTES_STRM;
                             wldi_words <= GW_HEAD*SUBW_STRM;
