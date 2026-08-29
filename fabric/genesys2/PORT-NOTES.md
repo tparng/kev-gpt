@@ -3907,3 +3907,102 @@ own real-hardware number (elsewhere in this document) is ~130 tok/s
 token, consistent with its much larger `GW_EMB=32,448`-word embed-table
 reload window (vs the char-level build's far smaller vocab) adding real
 per-token cost on top of the same 12-block+head reload structure.
+
+## Proposed next step: streaming embed lookups to remove the VOCAB/BRAM ceiling
+
+Motivated by wanting to grow VOCAB to cut down `<unk>` frequency (real,
+not hypothetical -- `unk_frac=0.0394` at the current VOCAB=1900). Real
+word-frequency coverage over the full 418M-token filtered-TinyStories
+corpus, computed fresh this session (supersedes the coarser numbers
+quoted earlier in this document by ~0.01-0.05%, same shape): `512->
+86.40%, 900->91.41%, 1024->92.34%, 1536->94.87%, 1900->96.05%, 2048->
+96.45%, 3000->98.24%, 4096->99.12%, 6000->99.64%, 8192->99.82%, 12000->
+99.93%, 16000->99.96%, 24000->32000->99.99%`. The coverage curve looked
+nearly flat right around the current VOCAB (1900->2048 only buys
++0.40%), but that's misleading -- it opens back up substantially past
+2048 (2048->3000 alone buys +1.79%), so growing VOCAB is genuinely
+worth pursuing, not a lost cause.
+
+**But naively growing VOCAB hits a hard BRAM wall, not just "needs more
+engineering".** `GW_EMB` (this build's largest per-layer-streaming
+reload window, see the word-level-vocabulary section above) scales as
+`VOCAB*16+2048` at this shape (`EROWS=D/P=16`, `EPW=1`). The weight
+bank is a single 256-bit-wide (`WBITS=LANES*4=256`) memory; Vivado
+tiles that at 4 RAMB36 tiles per 512-deep block (256/72 bits-per-tile
+rounds up to 4), matching this document's own documented "256-RAMB36
+bucket" exactly (32,768 words / 512 = 64 blocks * 4 = 256 tiles).
+Extrapolating that same tiling to bigger VOCAB (weight-bank tiles
+alone, then + the ~142 tiles everything else on this SoC already uses,
+against this Kintex-7's 445-tile total budget):
+
+| VOCAB | GW_EMB | weight-bank tiles | + ~142 other | Fits in 445? |
+|---|---|---|---|---|
+| 1900 (current) | 32,448 | 256 | 398 | yes (this is the current build) |
+| 2048 | 34,816 | 272 | 414 | yes, barely (~31 tiles left) |
+| 3000 (98.24% cov.) | 50,048 | 392 | 534 | **no -- 89 tiles over** |
+| 4096 (99.12% cov.) | 67,584 | 532 | 674 | **no -- 229 tiles over** |
+
+Even VOCAB=2048 (a negligible coverage gain, 96.05%->96.45%) nearly
+exhausts the whole chip's Block RAM. Any VOCAB that would meaningfully
+cut `<unk>` needs 1.2-1.5x more Block RAM than this part physically
+has, under the current architecture. Not a resynthesis-and-see problem
+-- a real resource ceiling.
+
+**Root cause, and the actual fix.** `sequencer_vec.sv`'s `S_EMB` state
+already reads a NARROW slice per token -- `EROWS=16` sub-rows for the
+token embedding, 16 more for the position embedding (32 total,
+`emb_row_w = (etp ? pos : tok_id) * EROWS + fr`, one row/cycle). The
+waste isn't in that read pattern; it's that the ENTIRE embed table
+(every VOCAB token-row + every TMAX position-row) has to be bulk-DMA'd
+into `weight_bank_tdp` via `weight_loader_ddr` BEFORE that narrow read
+can happen -- once per token, at the FIXED `EMB_TOK_BASE`/
+`EMB_POS_BASE` addresses, regardless of which single row is actually
+needed. **Fix**: replace the one fixed-address bulk reload with two
+small, `tok_id`/`pos`-*dependent* reloads (16 words each) --
+`WEIGHTS_DDR_BASE + (EMB_TOK_BASE + tok_id*EROWS)*WBYTES_STRM` for the
+token row, the equivalent for the position row -- reusing
+`weight_loader_ddr`'s existing on-demand arbitrary-window reload
+mechanism (already proven for per-layer block streaming), just with a
+computed address instead of a constant one, into a buffer sized ~32
+words instead of `GW_EMB`.
+
+**Why this changes the whole VOCAB ceiling, not just trims it a bit**:
+`GW_EMB` scales ~8x steeper with VOCAB than `GW_HEAD` does (`GW_EMB`
+needs one full row per vocab word, slope ~16/VOCAB-unit; `GW_HEAD=
+ceil(VOCAB/LANES)*D` needs only `ceil(VOCAB/64)` row-GROUPS, slope
+~2/VOCAB-unit -- unavoidable, since computing logits genuinely needs a
+score for every vocabulary word, unlike embedding lookup which only
+ever needs one row). Once `GW_EMB` stops being a bulk-reload cost,
+`GW_HEAD` becomes the new binding constraint:
+
+| VOCAB | new GW_HEAD | fits the SAME 256-tile/32,768-word bucket? |
+|---|---|---|
+| 4096 (99.12% cov.) | 8,192 | yes, comfortably |
+| 8192 (99.82% cov.) | 16,384 | yes, comfortably |
+| **16384 (99.96%+ cov.)** | **32,768** | **yes, right at the edge** |
+
+**This redesign alone could support VOCAB up to ~16,000 -- virtually
+eliminating `<unk>` -- inside the EXISTING BRAM budget, no bucket-tier
+increase needed.** Likely bonus, not yet measured: today's embed
+reload is the single largest per-token DDR3 transfer at this VOCAB
+(`GW_EMB=32,448` words vs the redesign's ~32-word replacement, roughly
+1000x less data moved per token) -- this probably also meaningfully
+improves the ~58 tok/s throughput measured above, since that reload is
+a real, currently-dominant per-token cost, though this needs
+re-measuring once implemented, not assumed from the byte-count alone.
+
+**Real scope, not yet started**: new tok_id/pos-dependent DDR3 address
+computation (replacing the current fixed `EMB_TOK_BASE`/`EMB_POS_BASE`
+constant addressing on the DDR3 source side), splitting the single
+embed-reload trigger into two small sequential reloads in
+`sequencer_vec.sv`'s FSM (currently one combined window per this
+document's `strw_ret==S_EMB` handling), shrinking the on-chip embed
+buffer and the `WWORDS`/`GW_EMB` sizing to match, retraining/exporting
+at a real target VOCAB once the RTL change is verified (not before --
+the RTL change is shape-independent and should be gated bit-exact on
+the CURRENT VOCAB=1900 checkpoint first), and full bit-exact
+re-verification against the golden reference before trusting any of
+this -- this touches the core reload FSM, squarely inside this
+project's "bit-honest before fast" rule. Not a quick parameter bump;
+genuine, multi-step RTL engineering, but well-scoped and clearly
+justified by the numbers above.
