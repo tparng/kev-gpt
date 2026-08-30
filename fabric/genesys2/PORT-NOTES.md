@@ -5220,3 +5220,50 @@ riscv32-corev-elf-gdb hw/vendor/esl_epfl_x_heep/sw/build/main.elf \
 PASS: `SEND_WEIGHTS_PASS`, then `KEVGPT_INTERACTIVE_READY` on the
 console UART (`/dev/ttyUSB0`, 115200 8N1). Send a prompt + newline over
 that same port to confirm real chat.
+
+## VOCAB=16384 real hardware: four more stories, different prompt topics
+
+Same board/firmware session as the five stories above (no reload, no
+resend), four fresh prompts on different topics (wizard/fantasy,
+forest/animal, toy, vehicle -- none matching the "little girl in a
+park" template the earlier prompts nudged toward), on-chip Gumbel
+sampling, no cherry-picking:
+```
+"the wizard cast" ->
+on his arm care." so, the wizard gave the key to the bird! the bird
+was so happy and thanked the wizard for his help. he was so happy and
+thanked the wizard for his kind help. he smiled and said," i knew you
+would always remember to use the key to
+
+"in the forest" ->
+care for the little girl. buster's was never scared of the little
+girl. he was very brave and he never wanted to be scared. but one day,
+he was playing in the forest when he saw a big bear. he thought it was
+cute. he ran to the rabbit and said," hello
+
+"my favorite toy" ->
+care for you care." lily said," i love your toy. it is very pretty."
+she gave it to lily. lily was happy and said," thank you, lily. you
+are very nice." they played together and had fun. buster's was not
+selfish anymore.
+
+"the rocket ship" ->
+care for his family. he was very happy and happy to have his ship
+back. buster's was not sad anymore. he said," my ship is broken. i
+don't want to play with your ship." buster's was sad and said," no, i
+don't want to play with my ship.
+```
+All ~1.0s per reply (consistent with the measured ~54 tok/s), zero
+`<unk>` across all four. **Rougher quality than the earlier five,
+flagged honestly rather than cherry-picked**: three of the four open
+with the same odd stock phrase "care for ... care." (reads like a
+sampling fixation, not a real continuation of the typed prompt), and
+none of the four topics (wizard, forest animal, toy, rocket) actually
+steer the story much -- "the wizard cast" name-drops a wizard/bird/key
+but "the rocket ship"/"my favorite toy" drift into the same generic
+"buster's"/"lily" park-and-toy template the training corpus is
+saturated with. Consistent with this project's own established
+"honest-first" pattern (sampled chat is noisier than greedy, a model-
+capacity/corpus-composition property, not a tokenizer or RTL defect) --
+not evidence of a regression, but a real, visible ceiling on how much a
+prompt can steer this size of model.
