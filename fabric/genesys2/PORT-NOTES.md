@@ -4924,4 +4924,299 @@ manual intervention needed this time.
 **Not yet done**: commit the `sequencer_vec.sv` fix (both repos),
 `send_weights.py`'s leftover-buffer fix, and this session's full DDR3-
 tokenizer feature set -- per this project's own standing "only commit
-when explicitly asked" discipline.
+when explicitly asked" discipline. (Since committed and pushed.)
+
+## VOCAB=16384 real hardware: five more stories + measured token rate
+
+Five more real chat prompts, on-chip Gumbel sampling (self-seeded,
+same as every prior chat pass in this document -- no cherry-picking):
+```
+"once upon a time" ->
+, there was a little girl named lily. she loved to play outside and
+explore the world around her. one day, she went to the park with her
+mommy. there, she saw a big tree with a big tree. she wanted to climb
+it, but her mommy said they needed to stay and
+
+"the dog ran" ->
+around the park, and he was happy to be with his friends. at the end
+of the day, tom thanked the dog for letting him play with his toys.
+tom promised to be careful and always remembered the big dog from his
+pond. he went back to the pond to play with his friends.
+
+"a little girl" ->
+named lily care about her blouse. one day, lily and her blouse
+together, when they got home, lily saw a beautiful blouse that she
+liked very much. she wanted to pick it up, so she asked her mom if she
+could buy it for her. her mom told her that it was not
+
+"the sun was" ->
+shining brightly and it was the best day ever. the little girl was so
+happy that she had explored the world around her. she even made a big,
+yellow house and a big house filled with lots of paper. the little
+girl was so excited and couldn't wait to tell her friends about it. she
+
+"she found a" ->
+little bird flying towards her. it seemed to be very high and had lots
+of other animals. it was a very exciting adventure! the little girl
+was so amazed by her new friend, she wanted to go find her new friend.
+she asked her mom if she could go to the park and her mom
+```
+Coherent, grammatically real prose throughout (one visible weak spot:
+"a little girl" free-associates "blouse" oddly and gets slightly
+repetitive -- a model-capacity/sampling-temperature property, not an
+RTL or tokenizer defect, matching this document's own established
+pattern of honestly flagging sampled-chat rough edges rather than
+cherry-picking). All five hit close to `MAX_GEN_LEN=60` words, matching
+every prior real-hardware chat pass in this document.
+
+**Measured real token rate, host-side wall-clock timing** (send the
+prompt over the console UART, time from send to a 3-second quiet
+period on the wire -- the whole turn, prefill included, dominates
+negligibly since prefill is only 3-4 tokens vs ~55 generated):
+```
+'once upon a time': 1.004s, 53 words -> 52.8 tok/s
+'the dog ran':      0.992s, 54 words -> 54.4 tok/s
+'a little girl':    1.008s, 53 words -> 52.6 tok/s
+'the sun was':       0.993s, 55 words -> 55.4 tok/s
+'she found a':       0.991s, 55 words -> 55.5 tok/s
+average: 54.0 words / 0.998s = 54.1 tok/s
+```
+**~54 tokens/sec**, consistent to within ~2 tok/s across five different
+prompts (each generation completing in ~1.0s regardless of content) --
+a real, repeatable number, not a one-off. First attempt at this
+measurement used a naive "wait for the `> ` prompt string" completion
+check that never fired correctly (all four test runs came back at
+suspiciously identical ~90.0s, the artificial deadline, not a real
+completion signal) -- switched to a "no new bytes for 3 seconds"
+quiet-period heuristic instead, which is robust to exact byte-pattern
+matching and confirmed correct by full timestamp instrumentation on one
+run (byte-by-byte arrival times showing the whole ~55-word reply
+streaming out continuously from t=0.004s to t=0.996s, no gaps, then
+genuinely done).
+
+This is notably FASTER than intuition suggested going in -- VOCAB=16384's
+per-layer weight streaming reloads a much bigger head window
+(`GW_HEAD=32768` words) from real DDR3 every single token, ~8.5x bigger
+than the VOCAB=1900 build's own `GW_HEAD=3840` -- worth remembering
+that real DDR3 bandwidth at this design's beat width comfortably
+absorbs that reload cost within the ~1/54s per-token budget; the
+bottleneck this session's own earlier real-hardware throughput
+investigation found (fixed per-token overhead unrelated to prompt
+length, PORT-NOTES.md "Real hardware token rate" section above) does
+not appear to have gotten meaningfully worse at this much bigger VOCAB.
+
+## VOCAB=16384: clean repeatable sequence (final commands only, no detours)
+
+The three sections above are a real chronological diary -- they
+include real dead ends (a 448KB SoC memory config that had to be
+corrected down to 96KB, three separate `make verible`-collateral-damage
+cleanups, a `-jobs 4` Vivado hang, a missed-UART-marker recovery) mixed
+in with the load-bearing steps, and some final commands were only
+narrated by flag name rather than shown complete. This section is the
+distilled, final-correct-order version -- if repeating this whole
+process from a similar starting point (another VOCAB bump, another
+shape change), follow THIS section, not the diary above; the diary is
+for understanding WHY each step exists and what NOT to do, not for
+literal replay. Every value below is the one that actually shipped.
+
+**Where "change VOCAB" actually happens**: it's just two flags in
+Step 1's train command -- `--vocab-size <N> --data-dir data/word_v<N>`.
+`model/train.py`'s `--tokenizer word` path calls
+`model.word_data.prepare_word(corpus, data_dir, vocab_size)`
+internally, so building the new tokenizer (word list, `meta.json`,
+coverage %, train/val bins) is NOT a separate manual step -- it happens
+automatically as part of the training invocation itself. Everything
+else in Step 1's command (`--n-layer`/`--n-head`/`--n-embd`/
+`--block-size`, the `eps=3e-4` recipe) stays whatever this deployment
+shape already uses, unchanged. Every step from here on (2 through 9 --
+the bit-exact gates, `WWORDS`/`KV_DDR_BASE` recompute, the DDR3
+tokenizer blob, the SoC memory map, the Vivado rebuild, real hardware
+bring-up) follows MECHANICALLY once you have a new checkpoint at the
+new VOCAB -- none of it requires re-deriving anything by hand, just
+recomputing each formula against the actual new checkpoint/image
+(`GW_HEAD`, `wc -l wrom.mem`, etc.) as each step already shows. The
+underlying tokenizer MECHANISM itself (`build_vocab()`'s frequency
+ranking, the EOS-exclusion bug, the alphabetical-sort invariant
+`kevgpt_word_lookup()` relies on) is documented once, earlier in this
+file, under "Word-level vocabulary" -- not repeated here, since it
+doesn't change between VOCAB sizes, only the checkpoint's own N does.
+
+**1. Train, QAT, export** (from `kev-gpt`, `.venv` activated):
+```bash
+python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 --adam-eps 3e-4 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16384.pt --states data/states_word16384.jsonl
+
+python -m model.train --qat --init-from data/ckpt_word16384.pt --max-iters 3000 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16384.qat.pt --states data/states_word16384_qat.jsonl
+
+mkdir -p fabric/export_word16384
+python -c "
+from model.goformer_full import params_from_ckpt, save_params
+p, model, ck = params_from_ckpt('data/ckpt_word16384.qat.pt')
+save_params(p, 'fabric/export_word16384/goformer.npz')
+"
+```
+
+**2. Bit-exact gates -- BOTH must pass, BOTH modes** (the real bug this
+runbook found was invisible to `--seed 0`; always also test a nonzero
+seed):
+```bash
+# fully-resident, greedy AND sampled
+python -m fabric.stage3.run_vec_kv \
+  --npz fabric/export_word16384/goformer.npz --meta data/word_v16384/meta.json \
+  --p 8 --lanes 64 --tmax 128 --prompt "once upon a time" --plen 4 --ngen 20 --seed 0 \
+  --dir /tmp/kevbuild_v16384
+python -m fabric.stage3.run_vec_kv \
+  --npz fabric/export_word16384/goformer.npz --meta data/word_v16384/meta.json \
+  --p 8 --lanes 64 --tmax 128 --prompt "once upon a time" --plen 4 --ngen 8 --seed 12345 \
+  --dir /tmp/kevbuild_v16384_seed
+
+# per-layer-streaming (the real DDR3 path hardware uses), manual iverilog build --
+# WWORDSVAL = max(GW_BLK, GW_HEAD, EMB_ROWG_W) for THIS vocab, not WROMN.
+# Rerun with BOTH -DSEEDVAL=0 and a nonzero seed.
+HERE=fabric/stage3; RTL=$HERE/rtl; GEN=fabric/genesys2
+AIACCEL=~/RVchatbot/kevgpt-genesys2-soc/hw/vendor/esl_epfl_x_heep/hw/ip/ai_accel/rtl/accelerator
+RTL_FILES="sequencer_vec.sv kv_bank.sv vec_attn_w.sv layernorm_vec.sv vec_dequant.sv vec_gelu.sv gelu_lut.sv gelu_lut2.sv softmax_f.sv gemv_banked_resident_vec.sv weight_bank_tdp.sv"
+iverilog -g2012 -o sim_stream.vvp \
+  -DPVAL=8 -DLVAL=64 -DWROMN=<wc -l wrom.mem> -DWWORDSVAL=32768 -DTMAXVAL=128 \
+  -DPLEN=4 -DNGEN=8 -DSEEDVAL=12345 -DDVAL=128 -DNLAYERVAL=12 -DNHEADVAL=2 -DVOCABVAL=16384 \
+  $HERE/tb/tb_seq_vec_kv_stream.sv $(for f in $RTL_FILES; do echo $RTL/$f; done) \
+  $GEN/rtl/weight_loader_ddr.sv $GEN/tb/mig_behav_model.sv \
+  <define_synth.sv shim -- see this TB's own header comment> \
+  $AIACCEL/streamer/mig_read_engine.sv $AIACCEL/common/sync_fifo.sv
+vvp sim_stream.vvp   # PASS = generated tokens match the fully-resident gold sequence
+```
+
+**3. Copy the verified RTL into the vendored repo**:
+```bash
+cp fabric/stage3/rtl/sequencer_vec.sv \
+   ~/RVchatbot/kevgpt-genesys2-soc/hw/vendor/esl_epfl_x_heep/hw/ip/kevgpt_seq/rtl/sequencer_vec.sv
+```
+
+**4. Wrapper parameters** (`~/RVchatbot/kevgpt-genesys2-soc/hw/vendor/
+esl_epfl_x_heep/hw/fpga/xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`,
+`u_kevgpt` instantiation) -- the FINAL values, recompute all three from
+the actual checkpoint/image on any future VOCAB/NLAYER change, don't
+copy forward:
+```systemverilog
+.VOCAB (16384),
+.WWORDS(32768),        // max(GW_BLK, GW_HEAD, EMB_ROWG_W) for this VOCAB
+.KV_DDR_BASE(12582912) // clears WEIGHTS_DDR_BASE=0's image + margin --
+                       // recompute from `wc -l wrom.mem` * 32 bytes/word
+```
+
+**5. SoC memory map** (only needed if the tokenizer/firmware doesn't
+fit the *previous* memory map -- check with `mem_usage.py` first before
+touching this; DDR3-resident tokenizer means this rarely needs to
+change again). Final content of `~/RVchatbot/kevgpt-genesys2-soc/hw/
+vendor/esl_epfl_x_heep/configs/cv32e40px_kevgpt.py`'s memory block:
+```python
+memory_ss = MemorySS()
+memory_ss.add_ram_banks([32] * 3)
+memory_ss.add_linker_section(LinkerSection.by_size("code", 0, 0x8000))
+memory_ss.add_linker_section(LinkerSection("data", 0x8000, None))
+system.set_memory_ss(memory_ss)
+```
+Regenerate (from `~/RVchatbot/kevgpt-genesys2-soc/hw/vendor/
+esl_epfl_x_heep/`, MUST `cd` into this dir and `source .venv/bin/
+activate` first -- see [[reference-vivado-genesys2]] for why):
+```bash
+make mcu-gen PYTHON_X_HEEP_CFG=configs/cv32e40px_kevgpt.py \
+             X_HEEP_CFG=configs/python_unsupported.hjson
+```
+Then `git status` and `git checkout --` every file that's PURE
+`make verible` reformatting noise (everything except
+`configs/cv32e40px_kevgpt.py` itself and the legitimately-regenerated,
+TRACKED `hw/core-v-mini-mcu/core_v_mini_mcu.sv`) -- re-apply step 4's
+wrapper edit again if it got swept up in the same revert.
+
+**6. DDR3 tokenizer table + firmware tokenizer header**:
+```bash
+python -m fabric.genesys2.gen_chat_fw \
+  --npz fabric/export_word16384/goformer.npz --meta data/word_v16384/meta.json \
+  --prompt "once upon a time" --ngen 4 --lanes 64 --p 8 \
+  --out /tmp/scratch_weights_header.h \
+  --tokenizer-out ~/RVchatbot/kevgpt-genesys2-soc/sw/applications/kevgpt_interactive/kevgpt_tokenizer.h \
+  --tokenizer-ddr \
+  --tokenizer-blob-out ~/RVchatbot/kevgpt-genesys2-soc/tokenizer_ddr_v16384.bin
+```
+(`--out` is required but unused by `kevgpt_interactive` -- streams
+weights at runtime, doesn't bake them in -- point it at a scratch path.)
+
+**7. Firmware build**:
+```bash
+export PATH=/home/tparng/tools/corev-openhw-gcc-ubuntu2204-20240530/bin:$PATH
+cd ~/RVchatbot/kevgpt-genesys2-soc
+make app PROJECT=kevgpt_interactive TARGET=genesys2 \
+  COMPILER_PREFIX=riscv32-corev- SOURCE=../../../../sw
+```
+(Ignore the trailing `.venv/bin/python: No such file or directory` /
+`mem_usage.py` error -- `main.elf` is already built by that point; run
+`mem_usage.py` directly if you want the real ROM/RAM utilization
+numbers -- see [[reference-vivado-genesys2]].)
+
+**8. Real Vivado rebuild** (full clean rebuild whenever the SoC memory
+map or a wrapper parameter changes -- `reset_run` reuse is NOT
+sufficient for a structural change, see this document's own Option B
+precedent):
+```bash
+cd ~/RVchatbot/kevgpt-genesys2-soc/hw/vendor/esl_epfl_x_heep
+rm -rf build/openhwgroup.org_systems_core-v-mini-mcu_1.0.5/genesys2_kevgpt-vivado
+source ~/tools-2022/Xilinx/Vivado/2022.2/settings64.sh
+source .venv/bin/activate
+make vivado-fpga-nobuild FPGA_BOARD=genesys2_kevgpt SOURCE=../../../sw/
+cd build/openhwgroup.org_systems_core-v-mini-mcu_1.0.5/genesys2_kevgpt-vivado
+make openhwgroup.org_systems_core-v-mini-mcu_1.0.5.xpr
+python -m fabric.genesys2.stage_vivado_roms \
+  --npz fabric/export_word16384/goformer.npz --lanes 64 --p 8 \
+  --dest . --dest ./openhwgroup.org_systems_core-v-mini-mcu_1.0.5.runs/synth_1
+```
+Then, via a small Tcl script (`vivado -mode batch -notrace -source
+build.tcl`, NO `-jobs` flag -- see [[reference-vivado-genesys2]]'s
+`vrs` hang warning):
+```tcl
+open_project openhwgroup.org_systems_core-v-mini-mcu_1.0.5.xpr
+launch_runs synth_1
+wait_on_run synth_1
+launch_runs impl_1 -to_step write_bitstream
+wait_on_run impl_1
+```
+PASS criterion: `write_bitstream completed successfully`, 0 Errors at
+every DRC checkpoint along the way (synth, pre-place, pre-route,
+pre-bitstream).
+
+**9. Real hardware bring-up** (kill any stale `openocd` first):
+```bash
+cd ~/RVchatbot/kevgpt-genesys2-soc/hw/vendor/esl_epfl_x_heep/build/openhwgroup.org_systems_core-v-mini-mcu_1.0.5/genesys2_kevgpt-vivado
+vivado -mode batch -source openhwgroup.org_systems_core-v-mini-mcu_1.0.5_pgm.tcl \
+  -tclargs xc7k325tffg900-2 openhwgroup.org_systems_core-v-mini-mcu_1.0.5.runs/impl_1/xilinx_core_v_mini_mcu_wrapper_kevgpt.bit
+
+cd ~/RVchatbot/kevgpt-genesys2-soc
+openocd -f quad-x-heep-openocd-genesys2.cfg   # leave running in background
+```
+**Start the weight+tokenizer sender FIRST and confirm from its own log
+that it's actually printing "waiting for KEVGPT_UART_READY" before
+triggering the reload** (see [[feedback-confirm-listener-before-triggering]]
+-- getting this ordering wrong is the single most repeated mistake in
+this whole runbook):
+```bash
+# terminal/background job 1 -- start this and CONFIRM it's listening first
+python -u -m fabric.genesys2.send_weights \
+  --npz fabric/export_word16384/goformer.npz --lanes 64 --p 8 \
+  --port /dev/ttyUSB0 \
+  --tokenizer-blob ~/RVchatbot/kevgpt-genesys2-soc/tokenizer_ddr_v16384.bin
+
+# only THEN, in a separate shell:
+export PATH=/home/tparng/tools/corev-openhw-gcc-ubuntu2204-20240530/bin:$PATH
+cd ~/RVchatbot/kevgpt-genesys2-soc
+riscv32-corev-elf-gdb hw/vendor/esl_epfl_x_heep/sw/build/main.elf \
+  -ex "target remote :3333" -ex "monitor reset halt" -ex load \
+  -ex "monitor resume" -ex detach -batch
+```
+PASS: `SEND_WEIGHTS_PASS`, then `KEVGPT_INTERACTIVE_READY` on the
+console UART (`/dev/ttyUSB0`, 115200 8N1). Send a prompt + newline over
+that same port to confirm real chat.
