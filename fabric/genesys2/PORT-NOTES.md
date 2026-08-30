@@ -4368,11 +4368,560 @@ python -m fabric.stage3.run_vec_kv \
 # VEC_KV_VERDICT match=True mode=greedy plen=4 ngen=20 avg_cyc=44007
 # hw gen == gold gen, 20/20 tokens, both decode to the same sentence.
 ```
-Fully-resident bit-exact gate is GREEN at VOCAB=16384. Still open:
-Step 4's OTHER half (the per-layer-streaming testbench,
-`tb_seq_vec_kv_stream.sv`, manual `iverilog` build, no `run_*.py`
-wrapper) hasn't been re-run against VOCAB=16384 yet with these three
-fixes -- that, then copying the fixed `sequencer_vec.sv` into the
-vendored `kevgpt-genesys2-soc` tree and the real Vivado
-resynth/board bring-up, are the remaining steps before this runbook is
-complete.
+Fully-resident bit-exact gate is GREEN at VOCAB=16384.
+
+**Step 4, other half: the real per-layer-streaming DDR3 path.** Manual
+`iverilog` build (no `run_*.py` wrapper, matching every prior use of
+this testbench -- file list per its own header comment: `fabric/
+stage3/rtl/*.sv` + `fabric/genesys2/rtl/weight_loader_ddr.sv` +
+`fabric/genesys2/tb/mig_behav_model.sv` + a `` `define SYNTHESIS ``
+shim + the vendored `mig_read_engine.sv`/`sync_fifo.sv` +
+`tb_seq_vec_kv_stream.sv` itself), `WWORDSVAL=32768` (this VOCAB's
+`max(GW_BLK=3072, GW_HEAD=32768, EMB_ROWG_W=16)`, NOT `WROMN` --
+streaming only needs the largest SINGLE reload window resident,
+`WROMN` sizes the simulated DDR3 image, a different, much bigger
+number):
+```bash
+HERE=fabric/stage3; RTL=$HERE/rtl; GEN=fabric/genesys2
+AIACCEL=~/RVchatbot/kevgpt-genesys2-soc/hw/vendor/esl_epfl_x_heep/hw/ip/ai_accel/rtl/accelerator
+RTL_FILES="sequencer_vec.sv kv_bank.sv vec_attn_w.sv layernorm_vec.sv vec_dequant.sv vec_gelu.sv gelu_lut.sv gelu_lut2.sv softmax_f.sv gemv_banked_resident_vec.sv weight_bank_tdp.sv"
+iverilog -g2012 -o sim_stream.vvp \
+  -DPVAL=8 -DLVAL=64 -DWROMN=333824 -DWWORDSVAL=32768 -DTMAXVAL=128 \
+  -DPLEN=4 -DNGEN=20 -DSEEDVAL=0 -DDVAL=128 -DNLAYERVAL=12 -DNHEADVAL=2 -DVOCABVAL=16384 \
+  $HERE/tb/tb_seq_vec_kv_stream.sv $(for f in $RTL_FILES; do echo $RTL/$f; done) \
+  $GEN/rtl/weight_loader_ddr.sv $GEN/tb/mig_behav_model.sv \
+  <define_synth.sv shim> $AIACCEL/streamer/mig_read_engine.sv $AIACCEL/common/sync_fifo.sv
+vvp sim_stream.vvp
+```
+**Result: `GEN pos=3..22 tok=[163, 14470, 15685, 169, 8129, 5777, 9284,
+8059, 165, 12495, 8268, 14709, 10509, 9824, 6915, 14452, 14002, 165,
+9689, 3620]`** -- bit-identical to the fully-resident gate's own gold
+sequence above (this testbench's own contract: match the fully-
+resident design's output exactly, not a separate golden reference).
+Streaming reproduces fully-resident behavior at VOCAB=16384 too.
+
+**Copied the fixed `sequencer_vec.sv` into the vendored
+`kevgpt-genesys2-soc` tree** (`cp fabric/stage3/rtl/sequencer_vec.sv
+~/RVchatbot/kevgpt-genesys2-soc/hw/vendor/esl_epfl_x_heep/hw/ip/
+kevgpt_seq/rtl/sequencer_vec.sv`), committed in both repos, pushed
+(`kev-gpt`'s `word-vocab` to the `tparng-fork` remote -- `origin`
+there, `MichaelAyles/kev-gpt`, 403s on push, no write access;
+`kevgpt-genesys2-soc`'s `word-vocab` to its own `origin`, a local
+path to `~/RVchatbot/Genesys2AiChatbot`, already tracking this same
+branch, fast-forwardable). Also committed, separately, an EARLIER
+uncommitted change already sitting in that repo from before this
+session's VOCAB=16384 work: `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`'s
+`WWORDS` 32768->3840 shrink (the streaming-embed redesign landing,
+still VOCAB=1900 at that point) -- unrelated to today's bug, kept as
+its own commit rather than bundled in.
+
+**Real Vivado rebuild, step by step (repeatable recipe).**
+
+*Wrapper parameters* (`xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`'s
+`u_kevgpt` instantiation): `.VOCAB(1900)` -> `.VOCAB(16384)`,
+`.WWORDS(3840)` -> `.WWORDS(32768)` (this VOCAB's own
+`max(GW_BLK=3072, GW_HEAD=32768, EMB_ROWG_W=16)`, GW_HEAD now binding
+instead of GW_BLK), `.KV_DDR_BASE(3145728)` -> `.KV_DDR_BASE(12582912)`
+(12MB -- the real resident weight image grew to 10,682,368 bytes,
+confirmed directly against `wc -l wrom.mem`=333,824 words * 32
+bytes/word via `fabric.genesys2.gen_chat_fw`'s own `--out` report;
+3MB would have reintroduced the exact weight/KV DDR3 collision this
+file's own history already found once -- **always recompute this from
+the real staged image size on a VOCAB/NLAYER change, never copy
+forward**).
+
+*Firmware tokenizer table regen* (`kevgpt_interactive`'s
+`kevgpt_tokenizer.h`):
+```bash
+python -m fabric.genesys2.gen_chat_fw \
+  --npz fabric/export_word16384/goformer.npz --meta data/word_v16384/meta.json \
+  --prompt "once upon a time" --ngen 4 --lanes 64 --p 8 \
+  --out /tmp/scratch_weights_header.h \
+  --tokenizer-out ~/RVchatbot/kevgpt-genesys2-soc/sw/applications/kevgpt_interactive/kevgpt_tokenizer.h
+```
+(`--out` is a required arg but its output isn't used by this app --
+`kevgpt_interactive` streams weights over UART at runtime, doesn't
+bake them into firmware -- pointed at a scratch path and discarded.)
+
+**First real blocker, not an RTL bug: firmware wouldn't link.**
+`make app PROJECT=kevgpt_interactive TARGET=genesys2
+COMPILER_PREFIX=riscv32-corev- SOURCE=../../../../sw` failed:
+`section .rodata will not fit in region ram0`, **overflowed by
+166,744 bytes**. VOCAB=16384's tokenizer string table alone is
+~182KB (16,384 word/punctuation literals + a `char*` pointer table),
+but `kevgpt_interactive`'s generated `link.ld` only had a 58KB `ram0`
+(64KB total SoC memory -- X-HEEP's bone-stock default). Not fixable by
+packing the strings more efficiently -- even a maximally compact
+offset+blob encoding is still well over 100KB just for the text data,
+the real floor is the word count, not the encoding. The actual fix:
+this repo already has a bigger memory-map config file prepared and
+waiting, `hw/vendor/esl_epfl_x_heep/configs/cv32e40px_kevgpt.py`
+(`add_ram_banks([64]*5)` + `add_ram_banks_il(8,16,...)` = 448KB total
+SRAM, split 384KB code / 64KB data) -- **but the repo's own root
+`Makefile`'s `mcu-gen` target hardcodes `PYTHON_X_HEEP_CFG=configs/
+cv32e40px_ai_accel.py`** (a literal string in the recipe body, not a
+variable reference -- passing `PYTHON_X_HEEP_CFG=...` to the outer
+`make mcu-gen` invocation does nothing, the sub-make's own explicit
+argument always wins), so `cv32e40px_kevgpt.py` had never actually
+been applied; the currently-generated SoC was still running X-HEEP's
+default tiny memory map. This means the memory-map bump ships WITH
+this VOCAB jump, not before it -- nobody had needed more than 64KB
+until a ~16K-entry string table showed up.
+
+**Regenerating the SoC memory map** (must be run FROM INSIDE
+`hw/vendor/esl_epfl_x_heep/`, in a real shell -- not through the root
+wrapper, not via `make -C`/`-f external.mk` from outside -- both hit
+the same `$(PWD)`-goes-stale-through-nested-make bug the README
+already documents for `make app`/`make vivado-fpga`, resolving
+`$(PYTHON)`/`$(VENV)`-relative paths against the ORIGINAL caller's
+directory instead of `hw/vendor/esl_epfl_x_heep/`):
+```bash
+cd hw/vendor/esl_epfl_x_heep
+PY=python3.8 make venv          # one-time; was already done, "Nothing to be done"
+source .venv/bin/activate       # REQUIRED -- regtool.py's own #!/usr/bin/env python3
+                                 # shebang resolves to system python3 (missing hjson)
+                                 # without this, even though mcu_gen.py itself is invoked
+                                 # via the Makefile's own $(PYTHON) venv path already
+make mcu-gen \
+  PYTHON_X_HEEP_CFG=configs/cv32e40px_kevgpt.py \
+  X_HEEP_CFG=configs/python_unsupported.hjson
+```
+**Result: succeeded, all 44 templates regenerated + soc_ctrl/power_
+manager/pdm2pcm/pad_control/dma reg-gen + boot_rom rebuild all OK.**
+Confirmed via the regenerated (gitignored, `git check-ignore -v`
+confirmed) `sw/linker/link.ld`: `ram0 LENGTH=0x060000` (384KB),
+`ram1 LENGTH=0x010000` (64KB) -- the intended split.
+
+**Second real blocker, unrelated collateral damage: `make verible`
+(one of `mcu-gen`'s own recipe steps) reformatted far more than
+intended.** `git status` afterward showed ~19 modified TRACKED files
+-- not just kevgpt RTL, but entirely unrelated `hw/ip/ai_accel/*`
+files and the OTHER (non-kevgpt) top-level wrapper. Confirmed via
+`git diff --ignore-all-space` (diffs shrank but didn't vanish -- still
+real, just non-semantic: verible's column-alignment style rewrites
+`input  wire        clk,` as `input wire clk,`, `2*NLAYER+1` as
+`2 * NLAYER + 1`, etc., re-flowing lines, not just trimming
+whitespace) that this was 100% cosmetic reformatting, no logic change
+-- confirmed by reading actual hunks, not assumed. Reverted all of it
+(`git checkout --` on every affected file, including
+`sequencer_vec.sv` and `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`,
+which also discarded that file's own real, intended VOCAB/WWORDS/
+KV_DDR_BASE edits made earlier the same session -- re-applied those
+cleanly on the freshly-reverted file afterward, so the final diff is
+ONLY the intended semantic change, no formatting noise mixed in).
+**Lesson for next time: stage/commit real semantic edits to tracked
+`.sv` files BEFORE running `make mcu-gen`, not after** -- `make
+verible` runs unconditionally as part of that target and will
+reformat the whole tree it can reach, regardless of relevance to the
+memory-map change actually being made.
+
+**Firmware rebuild, after the memory-map fix**: same `make app`
+command as above. **Result: linked clean.** `scripts/building/
+mem_usage.py --elf sw/build/main.elf --ld sw/build/main.ld --mcu-pkg
+hw/core-v-mini-mcu/include/core_v_mini_mcu_pkg.sv` (run directly,
+not through `make app`'s own trailing call to it, which hits the same
+stale-`$(PWD)` bug one more time -- harmless, the ELF was already
+built by that point) reports **ram0 (code+rodata): 220.4/384.0 kB
+(57.4%)**, **ram1 (data): 35.3/64.0 kB (55.2%)** -- comfortable
+margin, not a knife's-edge fit.
+
+**Real Vivado project rebuild.** The memory-map regeneration is a
+genuine SoC-structural change (differing RAM bank count/depth, not
+just an already-instantiated module's parameter edit) -- per this
+document's own established precedent ("regenerated the FuseSoC
+project from scratch... since NLAYER genuinely changed", Option B
+section above), did a full clean rebuild rather than trying to reuse
+the existing project via `reset_run`:
+```bash
+rm -rf hw/vendor/esl_epfl_x_heep/build/openhwgroup.org_systems_core-v-mini-mcu_1.0.5/genesys2_kevgpt-vivado   # 575MB, gitignored, regenerable
+cd hw/vendor/esl_epfl_x_heep
+source ~/tools-2022/Xilinx/Vivado/2022.2/settings64.sh
+source .venv/bin/activate
+make vivado-fpga-nobuild FPGA_BOARD=genesys2_kevgpt SOURCE=../../../sw/
+```
+**Result: FuseSoC project regeneration succeeded** (dependency graph,
+IP core-file generation for every `prim_*`/`lowrisc:*` primitive,
+Makefile/Tcl skeleton) -- this stage does NOT invoke Vivado itself
+yet (no `.xpr` produced), confirming "nobuild" really means
+"generate build scripts only." Created the actual Vivado project next
+(`make openhwgroup.org_systems_core-v-mini-mcu_1.0.5.xpr` inside the
+generated project dir, `vivado -mode batch -source
+openhwgroup.org_systems_core-v-mini-mcu_1.0.5.tcl` under the hood) --
+**0 errors**, IP generation (MIG DDR3 controller, clk wizard) clean
+(the usual `Invalid Input Clock Period 200.02 -> 200`/mode-register
+CRITICAL WARNINGs are pre-existing MIG IP quirks this project's
+history already treats as benign, not new).
+
+Staged ROMs (`fabric.genesys2.stage_vivado_roms --npz fabric/
+export_word16384/goformer.npz --lanes 64 --p 8 --dest <project root>
+--dest <project root>/<proj>.runs/synth_1`, `--dest` repeatable for
+both destinations in one call) -- but a first `launch_runs synth_1`
+attempt was killed by an over-eager local shell timeout mid-`wait_on_run`
+(no real failure, just impatience on my end) after only creating the
+`synth_1/` run directory with no actual synthesis output yet written.
+Recovered exactly per this document's own already-proven recipe:
+`reset_run synth_1` + `reset_run impl_1` (harmless/idempotent on a
+never-completed run), **restage ROMs again** (`reset_run` empties the
+run directory, silently discarding anything staged before it -- the
+"stage AFTER reset_run, not before" gotcha this document already
+found once, still true for a fresh project), then relaunch:
+```tcl
+open_project openhwgroup.org_systems_core-v-mini-mcu_1.0.5.xpr
+launch_runs synth_1 -jobs 4
+wait_on_run synth_1
+launch_runs impl_1 -to_step write_bitstream -jobs 4
+wait_on_run impl_1
+```
+(driven via `vivado -mode batch -notrace -source <this>.tcl`,
+backgrounded with `nohup ... &`+`disown` so it survives past any one
+shell command's own lifetime -- this step alone is a real 20-90+
+minute wall-clock build per this document's own prior figures at
+similar shapes.)
+
+**In progress as of this note** -- synth_1/impl_1/bitstream launched,
+not yet complete. Still open once it finishes: confirm 0 errors +
+timing closure + real BRAM/LUT/DSP utilization numbers at this VOCAB
+(expect Block RAM to land back up near the original VOCAB=1900-era
+~89% figure, per this runbook's own opening sizing note -- GW_HEAD=
+32768 sits at the same 256-tile bucket boundary the old bulk GW_EMB
+did), then the real board bring-up: program the bitstream, reload
+firmware, stream weights over UART, confirm real chat at the much
+bigger vocabulary.
+
+**That expectation was wrong -- a real, hard BRAM overflow, not a
+build-process bug.** `place_design` failed: `ERROR: [DRC UTLZ-1]
+Resource utilization: RAMB36E1 over-utilized... requires 522... only
+445 compatible sites are available`. `report_utilization -hierarchical`
+against the `opt_design` checkpoint (`xilinx_core_v_mini_mcu_wrapper_
+kevgpt_opt.dcp`) gave the real breakdown: `u_kevgpt` (kevgpt's own
+weight/KV-cache BRAM, essentially fixed by VOCAB=16384's own `GW_HEAD`
+bucket) = 402 RAMB36 + top-level misc 8 = ~410; `memory_subsystem_i`
+(the X-HEEP CPU-side SRAM, bumped to 448KB earlier in this runbook
+specifically to fit VOCAB=16384's ~182KB firmware-baked tokenizer
+table) = 112 RAMB36. Total 522 vs 445 available -- over by 77. Critically,
+even shrinking `memory_subsystem_i` down to the ACTUAL firmware need
+(~256KB, from Step 4's own `mem_usage.py` figures) only gets it to
+roughly 65-70 tiles -- total ~475-480, still ~30-35 tiles over. **No
+SoC-memory resize closes this gap**: baking a 16,384-word string table
+into on-chip BRAM fundamentally doesn't fit alongside VOCAB=16384's own
+weight tables on this part.
+
+**Fix: move the tokenizer table off on-chip BRAM into DDR3**, read back
+through the SAME already-verified `cpu_ddr_bridge`/`ext_slaves` CPU-DDR3
+path `main.c`'s own `uart_load_weights()` already used for the weight
+image (`volatile uint32_t *ddr = (volatile uint32_t *)EXT_SLAVE_START_
+ADDRESS;` -- a 64MB window at CPU address `0xF0000000`, already
+arbitrated onto the single physical MIG alongside kevgpt's own weight/
+KV DMA traffic via `mig_dual_master_arbiter`, per the wrapper's own
+"Merge kevgpt's own bundle (side A) with cpu_ddr_bridge (side B)"
+comment -- already-verified infrastructure, nothing new to build in
+RTL). Since this core has no data cache, a `const char *` into this
+memory-mapped region behaves exactly like a normal in-SRAM C string for
+every purpose the tokenizer code needs (`strcmp`, indexing, byte
+iteration) -- no special DDR3-aware read path required, just correct
+address arithmetic.
+
+**DDR3 tokenizer blob format** (`fabric.genesys2.gen_chat_fw.
+build_tokenizer_ddr_blob()`): a per-id `uint32` LE offset table
+(`VOCAB` entries, byte offset of that id's null-terminated string,
+relative to the start of the strings section which immediately follows
+the offset table -- `KEVGPT_TOKENIZER_STRINGS_OFFSET = VOCAB*4`, no
+separate stored field needed, firmware computes the same constant),
+then every id's string 0..VOCAB-1 in order, null-terminated,
+concatenated -- same "every id needs an entry, missing ones get an
+empty-string placeholder" handling as the old baked-in `kevgpt_itos[]`.
+**A real bug caught before it reached hardware**: the strings section's
+total byte length is arbitrary (sum of variable string lengths + null
+terminators), not necessarily a multiple of 4 -- but `send_weights.py`'s
+wire protocol moves whole 32-bit words, and `struct.unpack(f"<{len(blob)
+//4}I", blob)` silently TRUNCATES a trailing partial word via integer
+division, no error. First-built blob was 189,446 bytes (`%4 == 2`) --
+caught by a round-trip sanity check (decode every id's string back out
+of the blob via the offset table, diff against `meta.json`'s own
+`itos`, confirm `ids[2:]` stay alphabetically sorted) before ever
+trusting it on real hardware, not by a hardware failure. Fixed by
+padding the whole blob up to a word boundary in
+`build_tokenizer_ddr_blob()` itself; re-verified: 189,448 bytes
+(`%4 == 0`), 0/16384 string mismatches, sort invariant holds.
+
+**`TOKENIZER_DDR_BASE = 16MB`** (`fabric.genesys2.gen_chat_fw`):
+clears `WEIGHTS_DDR_BASE=0`'s own image (10,682,368 bytes at
+VOCAB=16384) and `KV_DDR_BASE=12,582,912`'s own region
+(12,582,912+589,824=13,172,736) with ~2.8MB of margin -- same
+"recompute from the real staged image size on every VOCAB/NLAYER
+change" discipline `KV_DDR_BASE`'s own history already established.
+Firmware-side-only constant -- no RTL parameter needed, since the
+accelerator itself never touches this region, only the CPU does.
+
+**Firmware changes** (`sw/applications/kevgpt_interactive/main.c`):
+generalized `uart_load_weights()` into `uart_load_blob(byte_offset,
+ready_marker, done_marker)`, called twice at boot under
+`KEVGPT_TOKENIZER_DDR` (weights at offset 0 with the original
+`KEVGPT_UART_READY`/`_LOAD_DONE` markers, tokenizer at
+`KEVGPT_TOKENIZER_DDR_BASE` with new `KEVGPT_UART_TOK_READY`/`_TOK_DONE`
+markers, `fabric.genesys2.send_weights --tokenizer-blob` sends both
+over one connection). Added `kevgpt_tok_offset()`/`kevgpt_itos_ddr()`
+(the DDR3 pointer-arithmetic helpers above) behind a `KEVGPT_ITOS(id)`
+macro that resolves to either `kevgpt_itos_ddr(id)` (DDR3 build) or the
+old `kevgpt_itos[id]` (any future non-DDR word-level build) -- swapped
+into `kevgpt_word_lookup()`'s `strcmp` and `print_word_token()`'s string
+fetch, the only two places `kevgpt_itos[]` was ever read. New
+`fabric.genesys2.gen_chat_fw.emit_tokenizer_header_word_ddr()` emits
+only the small constants + `kevgpt_stop_ids[]` (still tiny, stays in
+on-chip SRAM) -- not the string array itself.
+
+**SoC memory-map correction**: the earlier 448KB bump (`configs/
+cv32e40px_kevgpt.py`) is now entirely unnecessary AND actively harmful
+(the thing that caused the overflow) -- shrunk back down. First
+attempt, 64KB total (2x32KB banks, 32KB code / 32KB data): linked, but
+`ld` overflowed `ram1` (DATA) by 3,424 bytes -- `.heap` alone needs more
+than a bare 32KB once stack+bss+heap are accounted for; CODE fit fine
+at 32KB (the link error was only ever about `ram1`). Landed on 96KB
+total (3x32KB banks, 32KB code / 64KB data -- grow the region that was
+actually short, not the one that already fit): links clean,
+`mem_usage.py` reports **code 10.9/32.0kB (34.0%), data 35.3/64.0kB
+(55.2%)** -- comfortable margin on both sides. 96KB costs only ~24
+RAMB36 tiles vs the old 448KB's 112, well inside the ~35-tile headroom
+VOCAB=16384's own BRAM need leaves.
+
+**Same `make verible` collateral-damage pattern as before, twice more**
+(once per `mcu-gen` rerun while iterating on the memory-bank size) --
+same fix each time: `git checkout --` every unintentionally-reformatted
+file (unrelated `ai_accel/*`, the non-kevgpt wrapper, and kevgpt's own
+already-correct RTL), keeping only the real semantic changes
+(`configs/cv32e40px_kevgpt.py`, the legitimately-regenerated-and-
+TRACKED `hw/core-v-mini-mcu/core_v_mini_mcu.sv` -- fewer RAM-bank
+instantiation blocks, a real consequence of the bank-count edit, not
+noise -- and `kevgpt_tokenizer.h`), then re-applying the wrapper's own
+VOCAB/WWORDS/KV_DDR_BASE edit fresh each time `git checkout` discarded
+it along with the noise.
+
+**Real Vivado rebuild, clean project (same "genuine structural change,
+full regen" precedent as before, not a `reset_run` reuse this time
+either)**: `rm -rf` the build dir, `make vivado-fpga-nobuild
+FPGA_BOARD=genesys2_kevgpt SOURCE=../../../sw/`, `make openhwgroup.org
+_systems_core-v-mini-mcu_1.0.5.xpr` (project creation, IP generation --
+0 errors), `fabric.genesys2.stage_vivado_roms` into both the project
+root and `.runs/synth_1/`, then `launch_runs synth_1` (no `-jobs` --
+see the sharp edge below) -> `wait_on_run` -> `launch_runs impl_1
+-to_step write_bitstream` -> `wait_on_run`, backgrounded via `nohup
+... & disown` so it survives past any one shell command's own
+lifetime.
+
+**A real sharp edge found mid-build, unrelated to the RTL/memory-map
+work itself**: the FIRST attempt at this exact recipe used `launch_runs
+synth_1 -jobs 4` (matching the very first VOCAB=16384 attempt earlier
+in this runbook) and hung for over an hour -- `vrs` (Vivado's local
+parallel-job dispatcher for `-jobs N`) sat idle the whole time, every
+process in the tree accumulating near-zero CPU time, the `mig_7series_
+0_synth_1` sub-run's own log frozen mid-line. Not a slow synthesis --
+confirmed via `ps -eo pid,etime,time,%cpu` showing ~0.0-0.3% CPU across
+every vivado/vrs process for 1h44m of wall-clock elapsed time, and the
+job-dispatcher's own `.jobs/vrs_config_N.xml` file untouched since
+creation. Root cause not chased further (this project's OWN prior
+VOCAB=1900 rebuild used `-jobs 4` successfully, so this isn't a
+blanket "never use -jobs here" finding, just an unreliable one in this
+environment) -- killed the whole process tree, `reset_run
+mig_7series_0_synth_1`/`synth_1`/`impl_1`, restaged ROMs (`reset_run`
+wipes the run directory, same "stage AFTER reset_run" gotcha as
+always), relaunched WITHOUT `-jobs`. That attempt synthesized cleanly
+in a normal amount of time with real, multi-process CPU activity
+visible throughout -- this is the recipe now used for every build in
+this runbook (including the DDR3-tokenizer rebuild above).
+
+**Real hardware protocol update needed**: `fabric.genesys2.send_weights`
+now takes `--tokenizer-blob <path>` to send the DDR3 tokenizer blob
+(`fabric.genesys2.gen_chat_fw --tokenizer-ddr --tokenizer-blob-out
+<path>`) right after the weight image, over the same UART connection,
+before real chat can be confirmed at VOCAB=16384.
+
+**Build result: clean, 0 errors throughout, no `-jobs` hang this
+time.** `synth_design`/`place_design`/`route_design`/`write_bitstream`
+all completed successfully -- critically, the `place_design` DRC that
+failed with the RAMB36E1 overflow before this fix now reports **0
+Errors**. Final placed utilization:
+```
+Block RAM Tile: 440/445 (98.88%) -- RAMB36/FIFO 434/445, RAMB18 12/890
+Slice LUTs:     98,630/203,800 (48.40%)
+DSPs:           803/840 (95.60%, VOCAB-independent as expected)
+Timing: WNS=2.257ns, WHS=0.092ns (both positive -- all constraints met,
+        0 failing endpoints on setup (2124 total) or hold (1980 total))
+```
+**98.88% Block RAM -- only 5 tiles of margin left**, tighter than this
+runbook's own "should land back near VOCAB=1900's ~89%" opening guess
+(that guess didn't account for the ~24-tile cost of even the shrunk
+96KB SoC memory, or synth/place-time BRAM inference differences from
+the VOCAB=1900 build's own numbers) -- fits, but there is essentially
+no headroom left in this shape for anything that adds even a few more
+BRAM tiles (a bigger VOCAB, a bigger SoC memory, or a new on-chip
+buffer) without either shrinking something else first or hitting this
+exact overflow again. Timing has real margin (2.257ns WNS) despite the
+BRAM tightness. `.bit` at `<project>.runs/impl_1/xilinx_core_v_mini_
+mcu_wrapper_kevgpt.bit`.
+
+**Still open**: real hardware bring-up -- program this bitstream,
+reload firmware (built against `KEVGPT_TOKENIZER_DDR`), stream the
+weight image AND the new DDR3 tokenizer blob over UART
+(`fabric.genesys2.send_weights --tokenizer-blob tokenizer_ddr_v16384.
+bin`), confirm real chat at VOCAB=16384 with the DDR3-resident
+tokenizer table -- not yet exercised on real hardware as of this note.
+
+## VOCAB=16384 real hardware: a genuine hang, root-caused and fixed (Gumbel-precompute counter width)
+
+Real hardware bring-up (bitstream above, firmware reload, weight+
+tokenizer UART transfer -- all clean) hung on the FIRST real chat
+prompt: `kevgpt_step()` polls `STATUS.done` forever. JTAG halt+readback
+confirmed a genuine hang, not just slow -- `STATUS=0x00000006`
+(BUSY=1, DONE=0) and `CYCLES=0x000a5de2` **frozen** across a 1-second
+gap (re-halted, re-read, identical value both times). Backtrace showed
+the CPU itself stuck in `chat_turn`'s prefill loop at `pos=3` (the 4th
+and LAST prompt token) -- notably the exact step where `main.c` writes
+the `SEED` register for the first time that turn, immediately before
+this `kevgpt_step()` call (`if (i+1==plen) { ...; kevgpt_seed(...); }
+kevgpt_step(...)`) -- `pos=0,1,2` (greedy, no seed yet) had already
+completed successfully.
+
+**Isolation, step by step, per the user's own real-time debugging
+input** ("try the previous version", "there must be a hang, don't wait
+if it's not responding"): rebuilt the OLD VOCAB=1900 config from source
+(the actual `.bit` was destroyed by an earlier `rm -rf`, but the RTL
+parameters were still recoverable) as a full clean isolation build --
+synth/place/route/bitstream all clean, 0 errors. Programmed it, reloaded
+firmware, streamed its own weight+tokenizer blobs, sent the SAME prompt
+-- **got a real, complete, coherent generated reply, no hang at all.**
+This conclusively isolated the bug to VOCAB=16384 specifically, not the
+UART/JTAG/board procedure (a real early false lead: two send_weights.py
+invocations in a row produced zero UART traffic because the `READY`/
+`TOK_READY` markers had already been silently consumed by a prior
+crashed/mistimed connection attempt before any listener was open for
+them -- exactly the "start listening before triggering the reload"
+gotcha this document already flags, refound the hard way here. Fixed by
+sending the blob directly once JTAG readback confirmed firmware was
+already parked waiting for it, bypassing the marker wait -- not a new
+bug, just the same known procedural trap).
+
+**Given `pos=3` is the first call with `smp_en=1` (on-chip Gumbel
+sampling engaged, seed just written) and `pos=0-2` (greedy) already
+succeeded, suspicion fell on the Gumbel precompute logic specifically
+-- and critically, EVERY bit-exact simulation gate run against
+VOCAB=16384 so far used `--seed 0` (greedy) exclusively. The sampling
+path had never been independently verified at this VOCAB at all**, in
+simulation or otherwise -- real hardware chat always samples
+(self-seeded from a live cycle counter), so this was a real, load-
+bearing gap in this runbook's own "bit-exact before touching hardware"
+discipline, not just an edge case. Confirmed by reproducing the SAME
+hang in simulation: `fabric.stage3.run_vec_kv --seed 12345` (nonzero,
+forces sampling) timed out at 300s where `--seed 0` always passed
+instantly. Manual `iverilog` build with the TB's own periodic `[cyc N]
+st=...` debug print showed the FSM parked at `st=23` (`S_ARGMAX`) `blk=
+11 pos=3`, cycle count frozen from 3,000,000 through 22,500,000+ straight
+-- the exact same state/position the real-hardware JTAG readback
+already pointed at, now reproducible in minutes instead of requiring a
+board.
+
+**Root cause**: `sequencer_vec.sv`'s Gumbel-precompute logit counter
+(`gj`/`gj_d`, fills `gumbel_bank` with per-logit noise "riding" the head
+GEMV, armed in `S_HEADSET` when `smp_en=1`) was declared `[VIDXW-1:0]`
+(`VIDXW=$clog2(VOCAB)`) -- correct for holding WINNER indices (which
+only ever need to represent `0..VOCAB-1`, per this file's own existing
+comment on `ia`/`ib`/`best_idx`/etc.), but `gj`'s own advance-stage exit
+check needs to detect `gj` reaching the SENTINEL value `VOCAB` itself
+(one past the last valid index) -- and compared it against
+`VOCAB[VIDXW-1:0]`. At VOCAB=16384 (`VIDXW=14`), the value 16384 needs
+15 bits to represent at all; truncating it to the low 14 bits gives
+**exactly 0**. Since `gj` starts at 0, `gj != 0` is false on the very
+first check of the very first sampling-enabled forward pass -- the
+advance body (`gj_d<=gj; gj_dv<=1; gj<=gj+1`) never runs even once,
+`gumbel_bank` never gets a single word written, `gpre_done` never
+fires, and `S_ARGMAX` (`if (gpre_done) begin ... end`, gating the ENTIRE
+argmax reduction) waits for a condition that can structurally never
+become true -- a permanent hang, not a slow computation. This bug class
+**only bites VOCAB values that are an exact power of 2** (`$clog2`
+under-counts by exactly one bit for representing the value itself, not
+just values up to it minus one) -- VOCAB=1900's own `VIDXW=11` bits
+already holds 1900 exactly (1900 < 2048), no truncation, which is
+exactly why the isolation rebuild above came back clean. A genuinely
+new instance of this project's own recurring "hardcoded/under-derived
+width, only exposed at a specific shape" bug class, this time hiding
+behind an UNTESTED CODE PATH (sampling) rather than an untested VOCAB
+value per se.
+
+**Fix**: widened `gj`/`gj_d` from `[VIDXW-1:0]` to `[VIDXW:0]` (one more
+bit, matching this file's own established "+1 for a sentinel" pattern,
+e.g. `RIDXW=$clog2(MAXROWS+1)`) and the comparison to `VOCAB[VIDXW:0]`
+(15 bits, holds 16384 exactly, no truncation) -- both halves of the fix
+were necessary: fixing only the comparison without widening `gj` itself
+would let the counter correctly start advancing, but then silently WRAP
+back to 0 after processing the last valid index (`16383+1` doesn't fit
+in a 14-bit register), turning the hang into an infinite re-loop instead
+of curing it.
+
+**Verification**: recompiled, reran the same `--seed 12345` case --
+**progresses cleanly past the former freeze point, reaches `TB_DONE`**.
+Ran the real `fabric.stage3.run_vec_kv` CLI (not just the manual debug
+build) for full golden-reference comparison, two different prompts/
+seeds:
+```
+VEC_KV_VERDICT match=True mode=sample(seed=12345) plen=4 ngen=8 avg_cyc=43575
+VEC_KV_VERDICT match=True mode=sample(seed=777) plen=3 ngen=15 avg_cyc=43791
+```
+Both bit-exact against the Python golden Gumbel-max sampler -- the
+second prompt/seed's own generated text genuinely diverges from what
+greedy decoding would produce (not a coincidental greedy-match, real
+evidence the sampling path itself is being exercised and verified, not
+just "didn't hang this time"). Per-layer-streaming re-verification
+(the actual path real hardware uses, `tb_seq_vec_kv_stream.sv`,
+`--seed 12345`) still in progress as of this note.
+
+**Per-layer-streaming re-verification also passed** (the actual DDR3
+path real hardware uses, `tb_seq_vec_kv_stream.sv --seed 12345`):
+reaches `TB_DONE`, generated tokens `[163, 14470, 15685, 169, 8129,
+5777, 9284, 8059]` match the fully-resident gold sequence exactly (this
+testbench's own pass criterion). Copied the fixed `sequencer_vec.sv`
+into the vendored `kevgpt-genesys2-soc` tree.
+
+**Real Vivado rebuild with the fix, end to end**: restored the
+wrapper's `.VOCAB(16384)`/`.WWORDS(32768)`/`.KV_DDR_BASE(12582912)`
+(reverted to the VOCAB=1900 isolation-test values during the isolation
+build above), regenerated the VOCAB=16384 tokenizer header+DDR3 blob,
+rebuilt firmware (clean), full clean Vivado rebuild (`rm -rf` + `make
+vivado-fpga-nobuild` + project creation + ROM staging + `launch_runs
+synth_1`/`impl_1` via the no-`-jobs` recipe) -- **0 errors throughout,
+`write_bitstream completed successfully`.**
+
+**Real hardware, full end-to-end confirmation**: programmed the new
+bitstream, restarted OpenOCD, reloaded firmware, sent the weight image
+AND the DDR3 tokenizer blob over UART (`fabric.genesys2.send_weights
+--tokenizer-blob tokenizer_ddr_v16384.bin` -- `SEND_WEIGHTS_PASS`, both
+markers caught cleanly this time, no missed-marker recovery needed),
+sent the prompt `"once upon a time"` over the console UART. **Real,
+complete, coherent generated reply, no hang**:
+```
+once upon a time
+, there was a little girl named lily. she loved to play outside and
+explore the world around her. one day, lily's mommy told her that she
+had to go to the park to play. lily wanted to go on the swings and
+slide, but her mommy said they couldn't go to the park.
+>
+```
+VOCAB=16384 -- retrained, QAT'd, bit-exact verified (both fully-
+resident and per-layer-streaming, both greedy AND sampled modes), real
+Vivado synth/place/route/bitstream clean, real hardware chat confirmed
+working, DDR3-resident tokenizer table in place -- this runbook's
+original ask ("retrain at VOCAB=16384 and rebuild") is DONE.
+
+**One real send_weights.py protocol bug found and fixed along the
+way** (separate from the RTL fix, both needed to reach this point):
+the leftover-buffer bug described further up this section (a marker
+arriving packed with the previous one in the same `ser.read()` chunk
+was silently dropped, since each `_wait_for_marker` call started from
+an empty buffer) -- fixed by threading leftover bytes between
+sequential `_send_blob` calls. Confirmed fixed on this final run: the
+`TOK_READY` marker (which arrived packed with `LOAD_DONE`, exactly the
+scenario that bit the very first attempt) was caught correctly with no
+manual intervention needed this time.
+
+**Not yet done**: commit the `sequencer_vec.sv` fix (both repos),
+`send_weights.py`'s leftover-buffer fix, and this session's full DDR3-
+tokenizer feature set -- per this project's own standing "only commit
+when explicitly asked" discipline.

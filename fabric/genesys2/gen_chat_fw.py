@@ -25,11 +25,29 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 import tempfile
 
 from fabric.stage3 import seq_ref
 from fabric.stage3.run_sequencer import write_mems_wideword
 from model.goformer_kvq import IntKVQSequencer
+
+# Byte offset into DDR3 (ext_slaves-window-relative -- the same address space
+# WEIGHTS_DDR_BASE/KV_DDR_BASE describe from the accelerator's own side) where
+# the DDR3-resident tokenizer table (build_tokenizer_ddr_blob() below) is
+# staged. PORT-NOTES.md "VOCAB=16384 runbook": VOCAB=16384's ~182KB firmware-
+# baked tokenizer string table didn't fit in on-chip BRAM alongside that
+# VOCAB's own much bigger weight/KV-cache BRAM need (RAMB36E1 overflow at
+# `place_design`, no SoC-memory resize closes the gap) -- moved the table to
+# DDR3 instead, read back through the same already-verified cpu_ddr_bridge/
+# ext_slaves CPU-DDR3 path uart_load_weights() already uses for the weight
+# image. 16MB clears WEIGHTS_DDR_BASE=0's own image (10,682,368 bytes at
+# VOCAB=16384) and KV_DDR_BASE=12,582,912's own region
+# (12,582,912+589,824=13,172,736) with ~2.8MB of margin -- MUST be rechecked
+# against those two on every VOCAB/NLAYER change, same "recompute from the
+# real staged image size" discipline KV_DDR_BASE's own history already
+# established.
+TOKENIZER_DDR_BASE = 16 * 1024 * 1024
 
 
 def _encode(meta_path, text):
@@ -127,6 +145,102 @@ def emit_tokenizer_header_word(out_path, meta_path):
         if missing:
             f.write(f"/* NOTE: ids {missing} had no itos entry in this checkpoint's "
                      f"meta.json (dead slots, see above) -- filled with \"\". */\n\n")
+
+        f.write("/* token ids whose word IS a sentence-ending '.', '!', or '?' --\n"
+                 " * KEVGPT_EOS_ID is ALSO always a stop condition (the story-boundary\n"
+                 " * token) but is handled separately in main.c, not listed here. */\n")
+        f.write(f"#define KEVGPT_STOP_COUNT {len(stop_ids)}u\n")
+        f.write(f"static const uint16_t kevgpt_stop_ids[KEVGPT_STOP_COUNT] = {{"
+                + ", ".join(str(i) for i in stop_ids) + "};\n\n")
+        f.write("#endif\n")
+
+
+def build_tokenizer_ddr_blob(meta_path) -> bytes:
+    """DDR3-resident tokenizer table (PORT-NOTES.md "VOCAB=16384 runbook",
+    tokenizer-off-BRAM fix): a per-id uint32 LE offset table (VOCAB entries,
+    byte offset of that id's null-terminated string, relative to the START
+    OF THE STRINGS SECTION which immediately follows the offset table -- so
+    `KEVGPT_TOKENIZER_STRINGS_OFFSET = VOCAB*4` needs no separate stored
+    field, main.c/this function both compute it the same way), followed by
+    every id's string 0..VOCAB-1 in order, null-terminated, concatenated.
+    Same "every id needs an entry, missing ones get a harmless empty-string
+    placeholder" handling as emit_tokenizer_header_word()'s kevgpt_itos[]
+    (a checkpoint trained before model.word_data.build_vocab()'s EOS-
+    exclusion fix can have a dead id=1 slot -- see that function's own
+    docstring). Read back through cpu_ddr_bridge's ext_slaves window by
+    plain C pointer dereference (no data cache on this core, no special
+    DDR3-aware read path needed) -- see main.c's kevgpt_itos_ddr()."""
+    m = json.load(open(meta_path))
+    itos = {int(k): v for k, v in m["itos"].items()}
+    vocab = m["vocab_size"]
+    assert m.get("tokenizer") == "word"
+
+    strings = []
+    for i in range(vocab):
+        s = itos.get(i, "")
+        assert all(ord(ch) < 128 for ch in s), (
+            f"itos[{i}]={s!r} has non-ASCII characters -- DDR3 strings are "
+            "plain null-terminated C strings and can't represent it"
+        )
+        strings.append(s.encode("ascii"))
+
+    offsets = []
+    off = 0
+    for s in strings:
+        offsets.append(off)
+        off += len(s) + 1  # +1 for the null terminator
+    offset_table = b"".join(struct.pack("<I", o) for o in offsets)
+    strings_blob = b"".join(s + b"\x00" for s in strings)
+    blob = offset_table + strings_blob
+    # send_weights.py's wire protocol moves whole 32-bit words -- the offset
+    # table is already word-aligned (vocab*4 bytes) but the strings section's
+    # total length is arbitrary (sum of variable string lengths + null
+    # terminators), so pad the WHOLE blob up to a word boundary or the last
+    # partial word silently drops on the wire (struct.unpack's own
+    # len(blob)//4 truncates, not an error -- caught by round-tripping this
+    # blob back through _decode and diffing against meta.json before ever
+    # trusting it on real hardware).
+    pad = (-len(blob)) % 4
+    return blob + b"\x00" * pad
+
+
+def emit_tokenizer_header_word_ddr(out_path, meta_path):
+    """DDR3-resident counterpart to emit_tokenizer_header_word() above: emits
+    ONLY the small constants + kevgpt_stop_ids (still tiny, stays in on-chip
+    SRAM) -- NOT kevgpt_itos[] itself, which at VOCAB=16384 is ~182KB, too
+    big to bake into firmware .rodata alongside VOCAB=16384's own much
+    bigger weight/KV-cache BRAM need (RAMB36E1 over-utilized at
+    `place_design`, PORT-NOTES.md "VOCAB=16384 runbook" -- no SoC-memory
+    resize closes that gap). The actual strings + offset table are
+    build_tokenizer_ddr_blob()'s job, streamed into DDR3 by
+    fabric.genesys2.send_weights alongside the weight image."""
+    m = json.load(open(meta_path))
+    itos = {int(k): v for k, v in m["itos"].items()}
+    vocab = m["vocab_size"]
+    assert m.get("tokenizer") == "word"
+
+    from model.word_data import UNK, EOS
+    unk_id = next(i for i, w in itos.items() if w == UNK)
+    eos_id = next(i for i, w in itos.items() if w == EOS)
+
+    stop_words = (".", "!", "?")
+    stop_ids = [i for i in range(vocab) if i not in (unk_id, eos_id) and itos.get(i) in stop_words]
+
+    with open(out_path, "w") as f:
+        f.write("/* Auto-generated by fabric/genesys2/gen_chat_fw.py "
+                "(emit_tokenizer_header_word_ddr) -- do not hand-edit.\n")
+        f.write(" * Regenerate after retraining/re-exporting the word-vocab checkpoint.\n")
+        f.write(" * kevgpt_itos strings live in DDR3, not here -- see\n")
+        f.write(" * build_tokenizer_ddr_blob() / fabric.genesys2.send_weights. */\n")
+        f.write("#ifndef KEVGPT_TOKENIZER_H\n#define KEVGPT_TOKENIZER_H\n\n")
+        f.write("#include <stdint.h>\n\n")
+        f.write("#define KEVGPT_TOKENIZER_WORD 1\n")
+        f.write("#define KEVGPT_TOKENIZER_DDR 1\n")
+        f.write(f"#define KEVGPT_VOCAB_SIZE {vocab}u\n")
+        f.write(f"#define KEVGPT_UNK_ID {unk_id}u\n")
+        f.write(f"#define KEVGPT_EOS_ID {eos_id}u\n")
+        f.write(f"#define KEVGPT_TOKENIZER_DDR_BASE {TOKENIZER_DDR_BASE}u\n")
+        f.write(f"#define KEVGPT_TOKENIZER_STRINGS_OFFSET ({vocab}u*4u)\n\n")
 
         f.write("/* token ids whose word IS a sentence-ending '.', '!', or '?' --\n"
                  " * KEVGPT_EOS_ID is ALSO always a stop condition (the story-boundary\n"
@@ -248,6 +362,14 @@ def main(argv=None):
     ap.add_argument("--tokenizer-out", default=None,
                      help="also emit the stoi/itos/stop-id header kevgpt_interactive needs "
                           "(e.g. .../kevgpt_interactive/kevgpt_tokenizer.h)")
+    ap.add_argument("--tokenizer-ddr", action="store_true",
+                     help="emit the DDR3-resident tokenizer variant (constants only, no "
+                          "kevgpt_itos[] array -- PORT-NOTES.md VOCAB=16384 runbook) instead "
+                          "of the fully-baked-in header. Word-level tokenizer only.")
+    ap.add_argument("--tokenizer-blob-out", default=None,
+                     help="with --tokenizer-ddr: also write the DDR3 blob "
+                          "(build_tokenizer_ddr_blob()) to this path, for "
+                          "fabric.genesys2.send_weights to stream over UART")
     a = ap.parse_args(argv)
 
     prompt_ids = _encode(a.meta, a.prompt)
@@ -272,11 +394,23 @@ def main(argv=None):
     if a.tokenizer_out:
         os.makedirs(os.path.dirname(a.tokenizer_out), exist_ok=True)
         meta = json.load(open(a.meta))
-        if meta.get("tokenizer") == "word":
+        if a.tokenizer_ddr:
+            assert meta.get("tokenizer") == "word", "--tokenizer-ddr is word-level only"
+            emit_tokenizer_header_word_ddr(a.tokenizer_out, a.meta)
+        elif meta.get("tokenizer") == "word":
             emit_tokenizer_header_word(a.tokenizer_out, a.meta)
         else:
             emit_tokenizer_header(a.tokenizer_out, a.meta)
         print(f"wrote {a.tokenizer_out}")
+
+    if a.tokenizer_blob_out:
+        assert a.tokenizer_ddr, "--tokenizer-blob-out only makes sense with --tokenizer-ddr"
+        blob = build_tokenizer_ddr_blob(a.meta)
+        os.makedirs(os.path.dirname(a.tokenizer_blob_out) or ".", exist_ok=True)
+        with open(a.tokenizer_blob_out, "wb") as f:
+            f.write(blob)
+        print(f"wrote {a.tokenizer_blob_out}: {len(blob)} bytes "
+              f"({len(blob) // 4} words, DDR3 base 0x{TOKENIZER_DDR_BASE:x})")
 
 
 if __name__ == "__main__":

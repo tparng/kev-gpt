@@ -804,8 +804,24 @@ module sequencer_vec #(
     // P lanes a wide word is written to gumbel_bank[row]. VOCAB advances total — the
     // bit-exact match to gumbel.GumbelRng (state advances BEFORE each logit's noise).
     reg                gpre_active, gpre_done;
-    reg [VIDXW-1:0]    gj;                  // logit counter 0..VOCAB (advance stage)
-    reg [VIDXW-1:0]    gj_d;                // delayed counter (place stage, LUT-read aligned)
+    // gj/gj_d need to hold the SENTINEL value VOCAB itself, not just valid
+    // indices 0..VOCAB-1 -- VIDXW=$clog2(VOCAB) only guarantees the latter.
+    // At VOCAB=16384 (an exact power of 2) that's a real, silent bug: the
+    // advance-stage exit check below used to compare against
+    // `VOCAB[VIDXW-1:0]`, which truncates 16384 to 0 in 14 bits -- since gj
+    // starts at 0, `gj != 0` is false on the very FIRST check, the advance
+    // body never runs even once, gumbel_bank never fills, gpre_done never
+    // fires, and S_ARGMAX (gated on gpre_done) hangs forever. Only power-
+    // of-2 VOCAB values hit this (VOCAB=1900's own VIDXW=11 bits already
+    // holds 1900 exactly, no truncation) -- found via a real sampling-mode
+    // hang (greedy/seed=0 never exercises this precompute path at all,
+    // which is why the seed=0 bit-exact gate never caught it). Widened by
+    // one bit (matching this file's own "+1 for a sentinel" convention,
+    // e.g. RIDXW=$clog2(MAXROWS+1)) so gj can represent VOCAB itself
+    // without wrapping after the last valid index increments past
+    // VOCAB-1.
+    reg [VIDXW:0]      gj;                  // logit counter 0..VOCAB (advance stage)
+    reg [VIDXW:0]      gj_d;                // delayed counter (place stage, LUT-read aligned)
     reg                gj_dv;               // place-stage valid
     reg [P*32-1:0]     gpre_word;           // P-wide staging word being assembled
     integer            gl_lane;
@@ -1522,7 +1538,7 @@ module sequencer_vec #(
             // the LUT address gpre_idx_w = xs_ns>>22 is read in the sync block, value
             // lands next cycle in gumbel_lut_r. gj_d/gj_dv carry the lane to place at.
             if (gpre_active) begin
-                if (gj != VOCAB[VIDXW-1:0]) begin
+                if (gj != VOCAB[VIDXW:0]) begin
                     rng_state <= xs_ns;          // persistent state advances once/logit
                     gj_d  <= gj; gj_dv <= 1'b1;
                     gj    <= gj + 9'd1;
