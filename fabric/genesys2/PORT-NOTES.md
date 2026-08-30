@@ -5267,3 +5267,252 @@ saturated with. Consistent with this project's own established
 capacity/corpus-composition property, not a tokenizer or RTL defect) --
 not evidence of a regression, but a real, visible ceiling on how much a
 prompt can steer this size of model.
+
+## Final architecture reference: Genesys2 deployment as of VOCAB=16384
+
+Everything above is diary -- what follows is a settled description of
+the system as it stands, cross-checked against the actual current RTL
+and firmware source rather than restated from earlier prose. Treat this
+section as the reference; if anything above contradicts it, this
+section wins.
+
+**System overview.** An X-HEEP SoC (`cv32e40px`, `configs/
+cv32e40px_kevgpt.py`) runs on the Genesys2's Kintex-7 (`xc7k325tffg900
+-2`), with a custom fabric-resident tiny-transformer inference core
+(`xheep_kevgpt_peripheral` wrapping the unmodified `sequencer_vec`
+core) attached through X-HEEP's generic `ext_peripheral` hook -- the
+same attach point `ai_accel` used in this SoC's other lineage, no
+X-HEEP core changes needed. A single physical MIG DDR3 controller
+serves THREE independent consumers, arbitrated in two stages: the
+accelerator's own DMA traffic (per-layer weight-window reloads via
+`weight_loader_ddr` + the DDR3-backed KV cache via `kv_bank_ddr`,
+bundled by `kevgpt_ddr_bundle` into one app-level stream) is side A of
+a `mig_dual_master_arbiter`; the CPU's own direct DDR3 access, through
+`cpu_ddr_bridge`'s `ext_slaves` memory window (CPU address `0xF0000000`,
+64MB), is side B. That CPU-side path was originally wired for boot-time
+weight staging over UART and now does double duty: it is ALSO how
+firmware reads the tokenizer's string table live, at inference time
+(see "DDR3 memory map" below) -- no new hardware was needed for that,
+just a second consumer of an already-arbitrated path.
+
+```mermaid
+flowchart TB
+    CPU["cv32e40px CPU<br/>(X-HEEP core_v_mini_mcu)"]
+
+    subgraph PERIPH["xheep_kevgpt_peripheral"]
+        REGS["reg_req_t/reg_rsp_t shell<br/>CTRL/STATUS/TOK_ID/POS/SEED/<br/>RD_SEL/RD_ADDR/RD_DATA/TOK_OUT/CYCLES"]
+    end
+
+    subgraph SEQBOX["sequencer_vec (the FSM)"]
+        SEQ["sequencer_vec"]
+        GEMV["gemv_banked_resident_vec<br/>+ weight_bank_tdp"]
+        ATTN["vec_attn_w + softmax_f"]
+        LN["layernorm_vec"]
+        DQ["vec_dequant"]
+        GELU["vec_gelu + gelu_lut2"]
+        SEQ --> GEMV
+        SEQ --> ATTN
+        SEQ --> LN
+        SEQ --> DQ
+        SEQ --> GELU
+    end
+
+    subgraph BUNDLE["kevgpt_ddr_bundle"]
+        WLD["weight_loader_ddr"]
+        KVDDR["kv_bank_ddr"]
+        MUX["mig_read_mux2"]
+        WLD --> MUX
+        KVDDR --> MUX
+    end
+
+    BRIDGE["cpu_ddr_bridge<br/>ext_slaves window<br/>0xF0000000, 64MB"]
+    ARB["mig_dual_master_arbiter"]
+    MIG["genesys2_mig_native_shell<br/>MIG DDR3 controller"]
+    DDR3[("DDR3 SDRAM<br/>weights @0 / KV @12MB / tokenizer @16MB")]
+
+    CPU -->|register writes/polls| REGS
+    CPU -->|direct loads/stores| BRIDGE
+    REGS <--> SEQ
+    SEQ -->|S_STRW reload trigger| WLD
+    SEQ <-->|KV read/write| KVDDR
+
+    BUNDLE -->|side A, clk_gen domain| ARB
+    BRIDGE -->|side B| ARB
+    ARB -->|ui_clk domain| MIG
+    MIG <--> DDR3
+```
+Solid arrows are the control/data paths described in the module
+inventory below; the two arrows converging on `mig_dual_master_arbiter`
+are the two arbitrated sides ("System overview" above) -- `BUNDLE`'s
+own internal DMA streams cross from `clk_gen` into `ui_clk` inside
+`kevgpt_ddr_bundle` itself (the `async_fifo_gray` CDC, not drawn
+separately here), while `cpu_ddr_bridge` does its own CDC the same way
+on side B.
+
+**Deployed model shape.** `D=128` (residual width), `D3=384` (QKV
+width, `3*D`), `D_MLP=512` (MLP hidden width, `4*D`), `NHEAD=2`,
+`HEAD_DIM=64` (`sequencer_vec`'s own fixed default -- this port varies
+`NHEAD`, not `HEAD_DIM`), `NLAYER=12`, `VOCAB=16384`, `TMAX=128`
+(context window), `LANES=64` (systolic PE lanes / nibbles per wide
+weight word -- capped below the KV260 lineage's `LANES=128` by a real
+LUT/DSP overflow on this smaller part, see `xheep_kevgpt_peripheral
+.sv`'s own comment), `P=8` (read/write boundary width, GEMV boundary
+and every wide-word bank's per-cycle lane count), `WWORDS=32768` (the
+on-chip resident weight bank's depth in `LANES*4`-bit wide words --
+sized to `max(GW_BLK, GW_HEAD, EMB_ROWG_W)` for this VOCAB, `GW_HEAD`
+binding at exactly this VOCAB). `KV_DDR_BACKED=1`, `WEIGHT_DDR_BACKED=1`,
+and `WEIGHT_STREAM_PER_LAYER=1` are all set -- this deployment keeps
+NEITHER the weight image NOR the KV cache fully BRAM-resident; both
+stream from DDR3 (see below).
+
+**RTL module inventory.** `sequencer_vec` is the whole design's FSM --
+one state machine walking token-embed lookup, all `NLAYER` transformer
+blocks, final LayerNorm, head projection, and argmax, calling out to
+the shared datapath bricks below as callable sub-routines (a GEMV call,
+an LN call) rather than duplicating logic per block. `gemv_banked_
+resident_vec` is the systolic INT4(weight) x INT8(activation) GEMV
+core -- `LANES` PEs wide, banked activation/output memory, reading its
+resident weight image through `weight_bank_tdp` (a true-dual-port
+on-chip memory, `MEM_PRIMITIVE="block"` here since the Kintex-7 part
+has no URAM, unlike the KV260 lineage's `"ultra"`). `vec_attn_w` +
+`softmax_f` implement attention (one full head-width position per
+cycle, softmax pipelined to 1 element/cycle). `layernorm_vec` does
+gamma-only LayerNorm, `P`-wide I/O, a single-pass algebraic variance
+computation (no second data pass) with a pipelined Newton rsqrt.
+`vec_dequant` applies the per-channel mantissa/exponent dequant
+(`P` lanes/cycle, bit-exact to the scalar reference) that turns each
+GEMV's raw INT32 accumulator into a real-valued activation. `vec_gelu`
+(built from `gelu_lut2`, a BRAM-saving 2-lanes-per-table variant of the
+single-lane `gelu_lut`) applies GELU via an 8192-entry LUT with 3-bit
+linear interpolation. `kv_bank` (the fully on-chip KV cache) exists in
+the source tree but is NOT instantiated in this deployment at all --
+`KV_DDR_BACKED=1` selects `kv_bank_ddr` exclusively at elaboration
+(a Verilog `generate`, not a runtime mux); `kv_bank_ddr` is a byte-for-
+byte port of `kv_bank`'s own quantize/dequantize contract onto DMA
+read/write packets instead of direct on-chip BRAM ports, guaranteeing
+identical results for identical inputs by construction. `weight_loader_
+ddr` reloads one weight window (one block, or the head, or -- in the
+now-superseded bulk-embed design -- the embed tables) into the SAME
+resident `weight_bank_tdp` from DDR3, triggered internally by
+`sequencer_vec`'s own `S_STRW` state every block/embed/head, every
+token; it is deliberately single-buffered (compute waits for the
+reload to finish, no double-buffering yet) to avoid touching `gemv_
+banked_resident_vec`'s own timing-critical, backpressure-free MAC
+pipeline. `kevgpt_ddr_bundle` merges `kv_bank_ddr`'s and `weight_loader_
+ddr`'s independent DMA streams into one app-level bundle AND does the
+real clock-domain crossing between them (`gen_clk`/`clk_gen`, PLL-
+derived from MIG's `ui_clk`, measured 50MHz on this board, is a
+genuinely different frequency from `ui_clk` itself, not just a renamed
+wire) via `async_fifo_gray`, the same CDC primitive `cpu_ddr_bridge`
+already uses for its own clock boundary; `mig_read_mux2` inside that
+bundle time-multiplexes `kv_bank_ddr`'s and `weight_loader_ddr`'s reads
+onto one shared `mig_read_engine`, since Phase 0's own bandwidth
+headroom made two independent read engines unnecessary. `xheep_kevgpt_
+peripheral` is the register-interface shell around unmodified
+`sequencer_vec` (a flat X-HEEP `reg_req_t`/`reg_rsp_t` port instead of
+`gemv_axi_seq_vec.v`'s AXI4-Lite, same register map/semantics/IDCODE
+`"SQRV"`). `xilinx_core_v_mini_mcu_wrapper_kevgpt` is the real top-
+level FPGA wrapper tying everything together: X-HEEP's `core_v_mini_
+mcu` instance, `xheep_kevgpt_peripheral` on the `ext_peripheral` hook,
+MIG + `genesys2_mig_native_shell` + the clock wizard, `cpu_ddr_bridge`,
+and `mig_dual_master_arbiter`. `cpu_ddr_bridge` is the CPU's own direct
+DDR3 path (via X-HEEP's `ext_slaves` crossbar window, OBI, single-
+outstanding since CPU loads/stores are latency-sensitive single-word
+ops, not bulk DMA) -- unmodified from its origin in this SoC's other
+lineage, now doing double duty for both boot-time weight/tokenizer
+staging over UART and live tokenizer-string reads during inference.
+**One open, honestly-flagged caveat**: the CDC wiring between `kevgpt_
+ddr_bundle`'s two real clock domains and `mig_dual_master_arbiter` has
+only ever been gated in simulation on ONE shared clock (predating the
+CDC fix) -- genuinely concurrent two-clock-domain traffic through the
+arbiter has not been independently re-verified, only argued to be
+correct by construction. Real hardware chat working end-to-end is
+evidence this is fine in practice, not proof.
+
+**DDR3 memory map.** Three regions, all firmware/software-level
+conventions (no RTL parameter enforces the tokenizer region; only
+`WEIGHTS_DDR_BASE`/`KV_DDR_BASE` are real `sequencer_vec` parameters) --
+`WEIGHTS_DDR_BASE=0`: the full per-layer-streaming weight image,
+10,682,368 bytes at this VOCAB (`NLAYER*GW_BLK+GW_HEAD+GW_EMB`, `wc -l
+wrom.mem` * 32 bytes/word), read by `weight_loader_ddr`, written once
+at boot by firmware via `cpu_ddr_bridge`. `KV_DDR_BASE=12582912` (12MB):
+`kv_bank_ddr`'s own KV-cache region, 589,824 bytes (`NLAYER*2*NHEAD*
+TMAX` rows * a fixed per-row byte count, VOCAB-independent), read AND
+written by `kv_bank_ddr` only -- never touched by the CPU directly.
+`TOKENIZER_DDR_BASE=16777216` (16MB, `fabric.genesys2.gen_chat_fw
+.TOKENIZER_DDR_BASE`): the DDR3-resident tokenizer table (a per-id
+offset table + concatenated null-terminated strings, 189,448 bytes at
+this VOCAB), written once at boot by firmware over UART (the same
+`cpu_ddr_bridge` path) and read live, every generated/typed token, by
+firmware's own `kevgpt_itos_ddr()` -- never touched by the accelerator
+at all. All three ranges must stay non-overlapping (each base was
+chosen with real headroom over the other two's actual measured sizes,
+not guessed) -- `sequencer_vec.sv` carries a simulation-only `$display`
+overlap check between the first two; the tokenizer range has no such
+check since the accelerator never sees it, so it's the one range
+that would fail silently if it were ever miscomputed.
+
+**SoC CPU-side memory map.** 96KB total (`configs/cv32e40px_kevgpt.py`:
+`add_ram_banks([32]*3)`, three continuous 32KB banks, no interleaved
+banks), split 32KB code / 64KB data (`LinkerSection.by_size("code", 0,
+0x8000)`, data from `0x8000`). This is deliberately small: `kevgpt_
+interactive` neither bakes the weight image nor the tokenizer table
+into firmware -- both stream over UART into DDR3 at boot -- so the only
+real ROM/RAM cost left is the firmware binary itself (`mem_usage.py`:
+~11/32KB code, ~35/64KB data). An earlier attempt at this VOCAB bumped
+this map to 448KB specifically to fit the tokenizer table IN firmware
+before the DDR3-tokenizer redesign; that bump is gone entirely now, and
+going back to it would reintroduce the real RAMB36 overflow the DDR3
+redesign fixed (see "Real BRAM budget" below).
+
+**One-token data flow.** Firmware pulses `CTRL.go` after writing
+`TOK_ID`/`POS` (and, once per chat turn, `SEED`, which also enables
+on-chip Gumbel-max sampling for every subsequent call that turn).
+`sequencer_vec` enters `S_EMB`, looks up the token/position embedding
+rows (row-streamed from DDR3 in small, VOCAB/TMAX-sized windows, not a
+bulk table reload -- the "streaming embed lookups" redesign), then
+loops over blocks 0..`NLAYER-1`: each block's own weight window is
+reloaded from DDR3 via `S_STRW` (`weight_loader_ddr`, gated on `wld_
+ld_done`) BEFORE that block's QKV/attention/MLP GEMVs run (`S_QKVRET`
+-> `S_AST`/`S_ALD`/`S_ACL` attention -> `S_RES1` -> `S_FCRET`/`S_MPSET`
+MLP -> `S_RES2`, with the shared `G_AQ`/`G_WAIT`/`G_RB` GEMV callable
+sequence and `L_GAM`/`L_FEED`/`L_COLL` LayerNorm callable sequence
+invoked from each of those). After the last block, `S_HEADSET`
+reloads the head's own weight window (the single largest reload at
+this VOCAB, `GW_HEAD=32768` words) and arms the Gumbel-noise precompute
+(`gpre_active`, filling `gumbel_bank` one logit per cycle, riding the
+head GEMV -- skipped entirely in greedy mode) before entering `S_ARGMAX`,
+which waits for `gpre_done` and then reduces all `VOCAB` logits (Gumbel
+noise added first when sampling) down to a single winning token id,
+written to `TOK_OUT`, before `S_FIN` raises `STATUS.done`.
+
+**Real BRAM budget.** Final placed utilization on the xc7k325t: 440/445
+RAMB36E1 tiles (98.88%) -- essentially maxed out, ~5 tiles of margin.
+Of that, the accelerator's own resident weight/KV BRAM (`weight_bank_
+tdp`'s `WWORDS=32768`-deep image plus everything else inside `u_kevgpt`)
+accounts for roughly 410 tiles; the SoC's own 96KB CPU memory accounts
+for the remaining ~24. Any future growth on this board (bigger VOCAB,
+more layers, a bigger SoC memory bump, a new on-chip buffer) will very
+likely need to shrink something else first, not just be added on top --
+see [[project-kevgpt-vocab16384-status]].
+
+**Firmware/software stack.** `kevgpt_interactive`'s `main.c` is a
+single-threaded, blocking control loop: read a typed line off the
+console UART one character at a time (with backspace handling), run a
+C port of `model.word_data.tokenize()`'s own regex (`tokenize_line()`,
+grouping `[a-z']+` runs and treating `.,!?;:"-` as single-char tokens)
+combined with a binary search over the alphabetically-sorted vocabulary
+(`kevgpt_word_lookup()`, `strcmp` against `KEVGPT_ITOS(id)`), prefill
+each resulting token id via `kevgpt_step()` (write `TOK_ID`/`POS`, pulse
+`CTRL.go`, poll `STATUS.done`, read `TOK_OUT`), then keep calling `kevgpt_
+step()` to generate, applying a masked-argmax remask fallback
+(`remask_pick()`) if a sentence-ending token would fire before the
+minimum word count, until `MAX_GEN_LEN`/`TMAX`/`STORY_SENTENCES` caps
+out. `KEVGPT_ITOS(id)` resolves to `kevgpt_itos_ddr(id)` under
+`KEVGPT_TOKENIZER_DDR` (this deployment): `kevgpt_tok_offset()` reads a
+`uint32_t` from the DDR3-resident offset table via a plain `volatile`
+pointer into `cpu_ddr_bridge`'s `ext_slaves` window, and `kevgpt_itos_
+ddr()` returns a `const char *` computed from that offset -- since this
+core has no data cache, that pointer behaves exactly like a normal
+in-SRAM C string for every purpose (`strcmp`, indexing, byte iteration)
+with no special DDR3-aware I/O code anywhere in the tokenizer path.
