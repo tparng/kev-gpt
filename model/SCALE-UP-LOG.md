@@ -1204,6 +1204,70 @@ the real, hardware-verified `data/ckpt_word16.pt` — that decision is
 left to whoever picks this up next, given the downstream QAT/export/
 real-hardware chain a swap would affect.
 
+### Attempt 15: eps between `3e-4` and `1e-3` — is there a better dose than `3e-4`?
+
+Attempt 14 recommended `eps=3e-4` for the deployment shape but flagged an
+open question: does any value between `3e-4` (the deployment shape's own
+minimal fix) and `1e-3` (the wide model's fix) do better, or is `3e-4`
+already the sweet spot? This attempt tests three doses in that gap —
+`5e-4`, `7e-4`, `1e-3` — on top of the exact same unchanged deployment
+recipe as Attempt 14 (`lr=5e-4, warmup=100`, full cosine decay across
+24000 iters, D=128/NLAYER=12/NHEAD=2/VOCAB=1900).
+
+```bash
+python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 --adam-eps 5e-4 \
+  --tokenizer word --vocab-size 1900 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_stream16 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16_eps5e4.pt --states data/states_word16_eps5e4.jsonl
+# repeat with --adam-eps 7e-4 (out/states renamed eps7e4)
+# repeat with --adam-eps 1e-3 (out/states renamed eps1e3)
+```
+
+| iter | eps=1e-8 (Att.13) | eps=1e-4 (Att.14) | eps=3e-4 (Att.14) | eps=5e-4 | eps=7e-4 | eps=1e-3 |
+|---|---|---|---|---|---|---|
+| 4000 | 2.266 | 2.372 | 2.475 | 2.559 | 2.635 | 2.714 |
+| 8000 | 2.209 | 2.230 | 2.275 | 2.324 | 2.385 | 2.454 |
+| 12000 | 2.258 | 2.217 | 2.215 | 2.244 | 2.287 | 2.351 |
+| 16000 | 2.304 | 2.247 | 2.205 | 2.210 | 2.240 | 2.301 |
+| 20000 | 2.355 | 2.278 | 2.203 | 2.190 | 2.213 | 2.268 |
+| 24000 (final) | 2.398 | 2.310 | 2.211 | **2.187** | 2.204 | 2.256 |
+| **best** | 2.208 @ 7500 | 2.213 @ 10500 | 2.203 @ 19500 | **2.185 @ 23000** | 2.204 @ 24000 | 2.256 @ 24000 |
+| drift, best→final | +0.190 | +0.097 | +0.008 | **+0.001** | +0.000 | +0.000 |
+
+**`eps=5e-4` is the new best result of the whole investigation — it beats
+`eps=3e-4` on both axes at once.** Peak val 2.185 (vs 2.203), reached
+later (iter 23000 vs 19500, i.e. still improving for longer before
+leveling off) and holding essentially exact-flat afterward (+0.001 drift
+over the last 1000 iters — noise, not a trend). This is the closest any
+stabilized run has come to the original unstabilized `ckpt_word16.pt`'s
+2.022, while still being a genuine converged floor rather than a
+best-checkpoint gamble.
+
+**`eps=7e-4` and `eps=1e-3` are NOT worse doses in the same sense `1e-4`
+was — they're just slower, and hadn't finished converging by iter
+24000.** Both are still monotonically falling at the final logged point
+(no peak-then-plateau shape at all, unlike every other config in this
+sweep), so "best = final" for both is an artifact of the run ending, not
+evidence of an early plateau. This matches the pattern first seen in
+Attempt 8 (`eps=1e-2` was "still slowly falling" at iter 15000 on the
+wide model) and Attempt 9 (larger `eps` trades peak quality for
+stability along a continuous spectrum) — larger `eps` damps the
+denominator more aggressively, which buys stability margin at the cost
+of slower effective progress. Within this fixed 24000-iteration budget,
+that tradeoff nets out worse for `7e-4`/`1e-3` than for `5e-4`; whether a
+longer run lets `7e-4` or `1e-3` eventually overtake `5e-4`'s 2.185 is an
+open question, not tested here.
+
+**This supersedes Attempt 14's `eps=3e-4` recommendation.** For the
+deployment shape's own recipe (unchanged peak LR, warmup, full-length
+cosine decay) at a 24000-iteration budget, `eps=5e-4` is both the best
+peak found across the whole eps sweep (1e-8 through 1e-3) and, unlike the
+unstabilized run's own best-checkpoint snapshot, a value the model
+actually settles at rather than passes through on the way to divergence.
+Not yet tried: doses between `3e-4` and `5e-4`, or a longer run at
+`7e-4`/`1e-3` to see if the "still falling" trajectory eventually crosses
+`5e-4`'s floor.
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -1346,11 +1410,29 @@ real-hardware chain a swap would affect.
    second run each (`torch.manual_seed(1337)` is fixed — see Conclusion
    6's correction), consistent with the eps margin also damping the
    floating-point-noise sensitivity behind Attempt 13's run-to-run split,
-   not just the drift once divergence starts. **Recommended addition for
-   future deployment-shape training runs: keep the existing recipe
-   (lr=5e-4, warmup=100, full cosine decay) and add `--adam-eps 3e-4`**
-   — matches or beats the unstabilized recipe's own best-case peak, with
-   genuine stability instead of a lucky-run gamble.
+   not just the drift once divergence starts. Recommended at the time:
+   keep the existing recipe (lr=5e-4, warmup=100, full cosine decay) and
+   add `--adam-eps 3e-4` — matches or beats the unstabilized recipe's
+   own best-case peak, with genuine stability instead of a lucky-run
+   gamble. **Superseded by Conclusion 8 below.**
+8. **`eps=5e-4`, not `3e-4`, is the best dose found for the deployment
+   shape.** Attempt 15 swept the gap between Attempt 14's `3e-4` and the
+   wide model's `1e-3`. `eps=5e-4` beat `3e-4` on both peak quality
+   (2.185 vs 2.203) and flatness (+0.001 vs +0.008 drift) — the best
+   result of the entire investigation, and the closest any stabilized
+   run has gotten to the original unstabilized checkpoint's 2.022.
+   Larger doses (`7e-4`, `1e-3`) were not better in the same sense `1e-4`
+   was worse than `3e-4` in Attempt 14 — they simply hadn't finished
+   converging within the 24000-iteration budget (still monotonically
+   falling at the final logged point, no plateau reached), consistent
+   with the general "larger eps trades peak quality for stability
+   margin, and takes longer to get there" pattern first seen at the wide
+   shape in Attempts 8-9. **Current recommendation for future
+   deployment-shape training runs: keep the existing recipe (lr=5e-4,
+   warmup=100, full cosine decay) and add `--adam-eps 5e-4`.** Whether a
+   longer run lets `7e-4` or `1e-3` eventually overtake `5e-4`'s 2.185,
+   or whether a dose between `3e-4` and `5e-4` does even better, remains
+   untested.
 
 ## Files touched
 
