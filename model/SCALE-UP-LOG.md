@@ -1316,6 +1316,64 @@ is whether a longer training budget lets `7e-4` or `1e-3` (Attempt 15's
 "still falling" configs) eventually overtake `5e-4` — not whether
 anything between `3e-4` and `5e-4` does, which this attempt rules out.
 
+### Attempt 17: a longer run at `eps=7e-4`/`1e-3` — does more room let them overtake `eps=5e-4`?
+
+Attempt 15 left `eps=7e-4` and `eps=1e-3` unresolved: both were still
+monotonically falling at iter 24000 with no plateau, so their apparent
+loss to `eps=5e-4` might just be an artifact of the run ending too
+early. This attempt gives both 50% more room: `--max-iters 36000`
+instead of `24000`, same `lr=5e-4, warmup=100` otherwise.
+
+**Important schedule caveat**: since `model.train`'s cosine schedule
+spans `lr_decay_iters or max_iters` (`model/train.py:371`), and neither
+recipe sets `--lr-decay-iters`, raising `--max-iters` to 36000 doesn't
+just bolt 12000 extra iterations onto the existing 24000-iter run — it
+stretches the cosine decay to span the whole 36000 iters, so LR stays
+higher for longer at every matching iteration (e.g. at iter 24000: LR
+is `5.0e-05`, fully decayed, in the original run, vs `1.63e-04`, still
+mid-decay, in the stretched run). This is a genuinely different
+schedule shape, not "the same run continued," the same caveat Attempts
+9-11 dealt with when pairing `eps` changes with decay-length changes on
+the wide model.
+
+```bash
+python -m model.train --max-iters 36000 --lr 5e-4 --warmup 100 --adam-eps 7e-4 \
+  --tokenizer word --vocab-size 1900 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_stream16 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16_eps7e4_long36k.pt --states data/states_word16_eps7e4_long36k.jsonl
+# repeat with --adam-eps 1e-3 (out/states renamed eps1e3_long36k)
+```
+
+| | eps=7e-4 @24k (Att.15) | eps=7e-4 @36k | eps=1e-3 @24k (Att.15) | eps=1e-3 @36k |
+|---|---|---|---|---|
+| val @ iter 24000 | 2.204 (final) | 2.232 (mid-decay, LR still 1.63e-04) | 2.256 (final) | 2.260 (mid-decay) |
+| val @ iter 32000-33000 | — | 2.222 | — | **2.239 (best)** |
+| best val | 2.204 @ 24000 | 2.221 @ 30500 | 2.256 @ 24000 | 2.239 @ 33000 |
+| final val | 2.204 | 2.228 @ 36000 | 2.256 | 2.241 @ 36000 |
+| drift, best→final | +0.000 | +0.008 | +0.000 | +0.002 |
+| vs `eps=5e-4`'s 2.185 | worse | **worse** | worse | **worse** |
+
+**Neither config overtakes `eps=5e-4`, even with 50% more iterations and
+a matched, fully-decayed schedule.** `eps=1e-3`'s best improves from
+2.256 (24k, still falling) to 2.239 (36k, genuine peak with only +0.002
+drift after) — real progress, but still well short of `5e-4`'s 2.185.
+`eps=7e-4` is the more surprising result: its 36k best (2.221) is
+**worse** than its own 24k run's final value (2.204). Stretching the
+decay to give more nominal room didn't help it reach a better floor —
+it kept LR elevated for longer at every comparable iteration (val 2.232
+vs 2.204 at the matched iter-24000 point) without buying enough extra
+benefit from the added tail to compensate, similar in spirit to how
+Attempts 9-11 found gentler decay is not a free lunch at the wide
+model — more decay room only helps if the config actually needs it, and
+past a point it just wastes high-LR training time.
+
+**This closes Attempt 15's open question: `eps=5e-4` is the real winner,
+not an artifact of the 24000-iteration budget cutting off `7e-4`/`1e-3`
+too early.** Combined with Attempt 16 (no better dose between `3e-4`
+and `5e-4`), the practical recommendation (Conclusion 8) is now fully
+closed on both sides of `5e-4` — nothing lower, and nothing higher with
+more room, has beaten it.
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -1481,9 +1539,15 @@ anything between `3e-4` and `5e-4` does, which this attempt rules out.
    16 confirmed this: every dose between `3e-4` and `5e-4` (`3.5e-4`,
    `4e-4`, `4.5e-4`) improved monotonically toward `5e-4` with no
    interior optimum, so `5e-4` is the best point of that whole range,
-   not just the best of the values originally tried. Whether a longer
-   run lets `7e-4` or `1e-3` (Attempt 15's still-converging configs)
-   eventually overtake `5e-4`'s 2.185 remains untested.
+   not just the best of the values originally tried. **Attempt 17 closed
+   the remaining question**: giving `7e-4` and `1e-3` 50% more iterations
+   (`36000` vs `24000`, with a matched, fully-decayed schedule rather
+   than the same schedule mid-decay) still doesn't let either overtake
+   `5e-4` — best results 2.221 and 2.239 respectively, both clearly worse
+   than `5e-4`'s 2.185. `eps=5e-4` is a genuine winner, not an artifact
+   of the 24000-iteration budget cutting the higher-`eps` runs off too
+   early — nothing tested below it or above it, with or without more
+   training room, has beaten it.
 
 ## Files touched
 
