@@ -1268,6 +1268,54 @@ Not yet tried: doses between `3e-4` and `5e-4`, or a longer run at
 `7e-4`/`1e-3` to see if the "still falling" trajectory eventually crosses
 `5e-4`'s floor.
 
+### Attempt 16: doses between `3e-4` and `5e-4` — filling the gap, no local optimum found
+
+Attempt 15 left one gap open: does anything strictly between `3e-4` and
+`5e-4` beat `5e-4`, or is `5e-4` itself the best point in that range?
+This attempt tests three doses in between — `3.5e-4`, `4e-4`, `4.5e-4`
+— on the same unchanged deployment recipe as Attempts 14-15 (`lr=5e-4,
+warmup=100`, full cosine decay across 24000 iters,
+D=128/NLAYER=12/NHEAD=2/VOCAB=1900).
+
+```bash
+python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 --adam-eps 3.5e-4 \
+  --tokenizer word --vocab-size 1900 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_stream16 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16_eps3_5e4.pt --states data/states_word16_eps3_5e4.jsonl
+# repeat with --adam-eps 4e-4 (out/states renamed eps4e4)
+# repeat with --adam-eps 4.5e-4 (out/states renamed eps4_5e4)
+```
+
+| iter | eps=3e-4 (Att.14) | eps=3.5e-4 | eps=4e-4 | eps=4.5e-4 | eps=5e-4 (Att.15) |
+|---|---|---|---|---|---|
+| 4000 | 2.475 | 2.495 | 2.517 | 2.538 | 2.559 |
+| 8000 | 2.275 | 2.284 | 2.297 | 2.311 | 2.324 |
+| 12000 | 2.215 | 2.220 | 2.225 | 2.235 | 2.244 |
+| 16000 | 2.205 | 2.199 | 2.201 | 2.205 | 2.210 |
+| 20000 | 2.203 | 2.193 | 2.189 | 2.190 | 2.190 |
+| 24000 (final) | 2.211 | 2.198 | 2.192 | 2.188 | **2.187** |
+| **best** | 2.203 @ 19500 | 2.193 @ 20500 | 2.188 @ 21000 | 2.187 @ 22500 | **2.185 @ 23000** |
+| drift, best→final | +0.008 | +0.005 | +0.004 | +0.002 | **+0.001** |
+
+**No local optimum between `3e-4` and `5e-4` — every metric improves
+monotonically as `eps` rises through the gap.** Best val (2.203 → 2.193
+→ 2.188 → 2.187 → 2.185), drift (+0.008 → +0.005 → +0.004 → +0.002 →
++0.001), and the peak's iteration (19500 → 20500 → 21000 → 22500 →
+23000, i.e. the model keeps improving for longer before leveling off at
+higher `eps`) all move the same direction in lockstep. `5e-4` remains
+the best point of this whole sub-sweep, sitting right at the edge of the
+tested range rather than in the interior — there is no dip-and-rise
+shape here, unlike the wider gap tested in Attempt 15 where `7e-4`/`1e-3`
+looked worse only because they hadn't finished converging within budget.
+
+**This confirms, rather than revises, Attempt 15's recommendation.**
+`eps=5e-4` stays the practical choice (Conclusion 8 unchanged). The open
+question is now sharper, not resolved: since the trend is still rising
+at `5e-4` with no interior optimum below it, the real remaining question
+is whether a longer training budget lets `7e-4` or `1e-3` (Attempt 15's
+"still falling" configs) eventually overtake `5e-4` — not whether
+anything between `3e-4` and `5e-4` does, which this attempt rules out.
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -1429,10 +1477,13 @@ Not yet tried: doses between `3e-4` and `5e-4`, or a longer run at
    margin, and takes longer to get there" pattern first seen at the wide
    shape in Attempts 8-9. **Current recommendation for future
    deployment-shape training runs: keep the existing recipe (lr=5e-4,
-   warmup=100, full cosine decay) and add `--adam-eps 5e-4`.** Whether a
-   longer run lets `7e-4` or `1e-3` eventually overtake `5e-4`'s 2.185,
-   or whether a dose between `3e-4` and `5e-4` does even better, remains
-   untested.
+   warmup=100, full cosine decay) and add `--adam-eps 5e-4`.** Attempt
+   16 confirmed this: every dose between `3e-4` and `5e-4` (`3.5e-4`,
+   `4e-4`, `4.5e-4`) improved monotonically toward `5e-4` with no
+   interior optimum, so `5e-4` is the best point of that whole range,
+   not just the best of the values originally tried. Whether a longer
+   run lets `7e-4` or `1e-3` (Attempt 15's still-converging configs)
+   eventually overtake `5e-4`'s 2.185 remains untested.
 
 ## Files touched
 
