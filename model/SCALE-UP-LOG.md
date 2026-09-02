@@ -1374,6 +1374,172 @@ and `5e-4`), the practical recommendation (Conclusion 8) is now fully
 closed on both sides of `5e-4` — nothing lower, and nothing higher with
 more room, has beaten it.
 
+### Attempt 18: QAT the `eps=5e-4` deployment checkpoint (VOCAB=1900)
+
+With `eps=5e-4` confirmed as the best FP recipe (Attempts 15-17), this
+attempt fine-tunes it through QAT, the step every checkpoint needs
+before it's a real deployment candidate — same recipe as every other
+QAT pass in this project (warm-started, `--max-iters 3000`, defaults
+otherwise).
+
+```bash
+python -m model.train --qat --init-from data/ckpt_word16_deploy_eps5e4.pt --max-iters 3000 \
+  --tokenizer word --vocab-size 1900 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_stream16 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16_deploy_eps5e4.qat.pt --states data/states_word16_deploy_eps5e4_qat.jsonl
+```
+
+**Result: best val 2.153 @ iter 3000** — improved over its own FP
+source (2.185), the same pattern the `eps=3e-4` checkpoint's QAT pass
+showed (2.203 → 2.155, `fabric/genesys2/PORT-NOTES.md`'s "A new
+checkpoint from the scale-up-instability investigation" section), not
+the regression the original unstabilized `ckpt_word16.pt` → `.qat.pt`
+pass had (2.022 → 2.074). A second data point for the pattern that
+`eps`-stabilized FP checkpoints tolerate QAT fine-tuning better than
+the unstabilized recipe's lucky-snapshot checkpoint does.
+
+### Attempt 19: bit-exact RTL verification of the `eps=5e-4` QAT checkpoint (VOCAB=1900)
+
+Exported via `model.goformer_full.params_from_ckpt()`/`save_params()`:
+
+```bash
+python -c "
+from model.goformer_full import params_from_ckpt, save_params
+p, model, ck = params_from_ckpt('data/ckpt_word16_deploy_eps5e4.qat.pt')
+save_params(p, 'fabric/export_word16_deploy_eps5e4/goformer.npz')
+"
+```
+
+Then five prompts through `fabric.stage3.run_vec_kv` at Genesys2's real
+deployed RTL parameters (`--p 8 --lanes 64 --tmax 128`), matching the
+`eps=3e-4` checkpoint's own five-prompt precedent (one shorter run, four
+near the `TMAX=128` context limit), all seeded on-chip Gumbel sampling:
+
+```bash
+python -m fabric.stage3.run_vec_kv \
+  --npz fabric/export_word16_deploy_eps5e4/goformer.npz --meta data/word_stream16/meta.json \
+  --p 8 --lanes 64 --tmax 128 --prompt "once upon a time" --plen 4 --ngen 60 --seed 7 \
+  --dir /tmp/kevbuild_deploy_eps5e4_p1
+# + 4 more prompts at --ngen 120, seeds 1-4 (see Files touched)
+```
+
+| prompt | plen | ngen | seed | verdict |
+|---|---|---|---|---|
+| "once upon a time" | 4 | 60 | 7 | `match=True` |
+| "the little dog" | 3 | 120 | 1 | `match=True` |
+| "one day a girl named lily" | 6 | 120 | 2 | `match=True` |
+| "there was a boy who" | 5 | 120 | 3 | `match=True` |
+| "the old man walked into" | 5 | 120 | 4 | `match=True` |
+
+**5/5 `VEC_KV_VERDICT match=True`** — token-for-token identical to the
+Python golden reference in every run. `fabric/export_word16_deploy_eps5e4/goformer.npz`
+is bit-exact verified at the real deployed RTL parameters. Not yet done:
+real Vivado synthesis/implementation or programming onto actual
+silicon — this checkpoint is verified in simulation only.
+
+### Attempt 20: porting `eps=5e-4` to VOCAB=16384 — does the fix transfer to the real deployed shape?
+
+Everything above (Attempts 1-19) targeted **VOCAB=1900**, this log's
+own original scope. But the checkpoint actually flashed and running on
+real Genesys2 hardware is **VOCAB=16384** (`data/ckpt_word16384.pt` →
+`.qat.pt`, see `fabric/genesys2/PORT-NOTES.md`) — trained with
+`--adam-eps 3e-4`, ported from this log's own Attempt 14 finding *before*
+Attempts 15-17 found `5e-4` beats `3e-4` at VOCAB=1900. This attempt
+asks the obvious follow-up: does `eps=5e-4` also beat `eps=3e-4` at
+VOCAB=16384, the shape that actually matters now?
+
+```bash
+python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 --adam-eps 5e-4 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16384_deploy_eps5e4.pt --states data/states_word16384_deploy_eps5e4.jsonl
+```
+
+| | eps=3e-4 (deployed) | eps=5e-4 (new) |
+|---|---|---|
+| best val | **2.4085** | 2.4212 |
+| best iter | 15500 | 21500 |
+| final val | 2.4266 | **2.4241** |
+| drift, best→final | +0.0181 | **+0.0029** |
+
+**No — `eps=5e-4` is a regression at VOCAB=16384, not an improvement.**
+Its peak (2.4212) is clearly worse than the deployed `eps=3e-4`
+checkpoint's own peak (2.4085), the opposite of what Attempts 15-17
+found at VOCAB=1900. It does buy real stability — much less post-peak
+drift (+0.0029 vs +0.0181), enough that its *final*-iteration value
+edges out `eps=3e-4`'s final value — but since `model.train`'s
+auto-rollback saves the best-val checkpoint, not the final one, that
+stability doesn't translate into a better deployment candidate here.
+**The `eps=5e-4` finding does not transfer across vocab sizes** — VOCAB
+size changes the loss landscape enough that each shape needs its own
+`eps` tuning, not just a straight port of the last shape's answer.
+
+### Attempt 21: VOCAB=16384's own eps sweep — finding this shape's actual sweet spot
+
+Since `5e-4` overshot, this attempt sweeps back toward `3e-4` —
+`3.5e-4`, `4e-4`, `4.5e-4` — the same increments Attempt 16 used, on
+the same unchanged VOCAB=16384 recipe.
+
+```bash
+python -m model.train --max-iters 24000 --lr 5e-4 --warmup 100 --adam-eps 3.5e-4 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16384_eps3_5e4.pt --states data/states_word16384_eps3_5e4.jsonl
+# repeat with --adam-eps 4e-4 (out/states renamed eps4e4)
+# repeat with --adam-eps 4.5e-4 (out/states renamed eps4_5e4)
+```
+
+| eps | best val | best iter | final val | drift |
+|---|---|---|---|---|
+| 3e-4 (deployed) | 2.4085 | 15500 | 2.4266 | +0.0181 |
+| **3.5e-4 (best)** | **2.4070** | 20000 | 2.4183 | +0.0113 |
+| 4e-4 | 2.4164 | 20000 | 2.4267 | +0.0103 |
+| 4.5e-4 | 2.4146 | 21500 | 2.4196 | +0.0050 |
+| 5e-4 | 2.4212 | 21500 | 2.4241 | +0.0029 |
+
+**`eps=3.5e-4` is the best dose found for VOCAB=16384** — best val
+2.4070, a small but real improvement over the deployed `3e-4`'s 2.4085,
+and meaningfully more stable post-peak (drift +0.0113 vs +0.0181).
+
+**Unlike VOCAB=1900 (Attempt 16), this is NOT a clean monotonic ramp.**
+`eps=4e-4`'s best val (2.4164) is genuinely worse than both its
+neighbors, `3.5e-4` (2.4070) and `4.5e-4` (2.4146) — a real dip, not
+noise (both flanking runs are consistently better across the whole
+tail of their trajectories, not just at the best-val point). Drift
+*does* still shrink monotonically with rising eps (0.0181 → 0.0113 →
+0.0103 → 0.0050 → 0.0029), so the stability-vs-eps relationship holds
+even where the quality-vs-eps relationship doesn't. **Takeaway: the
+per-shape sweet spot has to be found per shape — VOCAB=16384's
+non-monotonic landscape here is a second data point (after Attempt 20)
+that a finding from one vocab size doesn't reliably predict another's,
+even the direction of the curve.**
+
+### Attempt 22: QAT the VOCAB=16384 `eps=3.5e-4` winner — the FP-level edge vanishes
+
+```bash
+python -m model.train --qat --init-from data/ckpt_word16384_eps3_5e4.pt --max-iters 3000 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16384_eps3_5e4.qat.pt --states data/states_word16384_eps3_5e4_qat.jsonl
+```
+
+| | FP best val | QAT best val (iter 3000) |
+|---|---|---|
+| eps=3e-4 (deployed) | 2.4085 | **2.3385** |
+| eps=3.5e-4 (new) | **2.4070** | 2.3392 |
+
+**QAT improves over its FP source** (2.4070 → 2.3392), continuing the
+pattern from Attempts 18 and the `eps=3e-4` checkpoint's own QAT pass.
+But the FP-level edge `eps=3.5e-4` had over the deployed `eps=3e-4`
+(2.4070 vs 2.4085, a real if small win) **inverts after QAT** — the
+deployed checkpoint's QAT result (2.3385) is now marginally better than
+the new candidate's (2.3392), a 0.0007 gap that's noise-level, not a
+real difference either way. **Net result: at VOCAB=16384, this whole
+`eps` excursion (Attempts 20-22) ends in a wash at the QAT level** —
+neither a clear win nor a clear loss over what's already deployed. Not
+yet bit-exact verified via `fabric.stage3.run_vec_kv`, and not promoted
+over the real deployed `data/ckpt_word16384.qat.pt`.
+
 ## Conclusions
 
 1. **Capacity helps.** Every run's best-val checkpoint from this whole
@@ -1548,6 +1714,27 @@ more room, has beaten it.
    of the 24000-iteration budget cutting the higher-`eps` runs off too
    early — nothing tested below it or above it, with or without more
    training room, has beaten it.
+9. **The `eps` finding is VOCAB-specific — it does not transfer from
+   VOCAB=1900 to VOCAB=16384, the shape actually deployed on real
+   hardware.** Everything in Conclusions 1-8 was diagnosed at VOCAB=1900
+   (this log's original scope) or the wider D=384 diagnostic shape;
+   VOCAB=16384 is a third, separate shape with its own loss landscape.
+   Attempt 20 found `eps=5e-4` is a clear *regression* at VOCAB=16384
+   (best val 2.4212 vs the deployed `eps=3e-4`'s 2.4085) despite being
+   the clear winner at VOCAB=1900 — the opposite direction. Attempt 21's
+   own VOCAB=16384 sweep found a different, smaller winner (`eps=3.5e-4`,
+   best val 2.4070, a modest +0.0015 improvement) via a genuinely
+   non-monotonic curve (`4e-4` dips below both its neighbors), unlike
+   VOCAB=1900's clean monotonic ramp in Attempt 16. Attempt 22 then found
+   even that modest FP-level edge vanishes after QAT (2.3392 vs the
+   deployed checkpoint's 2.3385 — a 0.0007 gap, noise-level). **Net
+   practical conclusion: do not port an `eps` value found at one VOCAB
+   size to another without re-sweeping at the target shape** — not just
+   the specific number, but even the *direction* of the eps-vs-quality
+   relationship can flip. At VOCAB=16384 specifically, the currently
+   deployed `eps=3e-4` QAT checkpoint remains the best candidate found
+   so far; the `eps=3.5e-4` alternative (Attempt 21-22) is a wash, not
+   an improvement, and has not been promoted.
 
 ## Files touched
 
@@ -1585,4 +1772,20 @@ more room, has beaten it.
   matching `data/states_word16_epsmild{1e5,1e4,3e4}.jsonl`, plus a
   reproducibility-check rerun `data/ckpt_word16_v2.pt` /
   `data/states_word16_v2.jsonl` — all standalone candidates, deliberately
-  not promoted over the real deployed `data/ckpt_word16.pt`.
+  not promoted over the real deployed `data/ckpt_word16.pt`. Attempts
+  15-17 add `data/ckpt_word16_eps{5e4,7e4,1e3,3_5e4,4e4,4_5e4}.pt` +
+  matching `states*.jsonl`, plus the Attempt 17 long-schedule reruns
+  `data/ckpt_word16_eps{7e4,1e3}_long36k.pt`. Attempt 18 adds
+  `data/ckpt_word16_deploy_eps5e4.qat.pt` /
+  `data/states_word16_deploy_eps5e4_qat.jsonl` (QAT of the `eps=5e-4`
+  winner). Attempt 19 adds `fabric/export_word16_deploy_eps5e4/goformer.npz`
+  (bit-exact verified, VOCAB=1900). Attempts 20-22 pivot to VOCAB=16384
+  (see [[feedback-use-vocab16384-not-1900]] and
+  [[feedback-hw-target-genesys2-ddr3]] — VOCAB=1900 is retired as of
+  this point, all further training should target VOCAB=16384 only) and
+  add `data/ckpt_word16384_deploy_eps5e4.pt` / `data/ckpt_word16384_eps{3_5e4,4e4,4_5e4}.pt`
+  + matching `states*.jsonl`, and `data/ckpt_word16384_eps3_5e4.qat.pt` /
+  `data/states_word16384_eps3_5e4_qat.jsonl` — none promoted over the
+  real deployed `data/ckpt_word16384.pt` / `.qat.pt`, and none of the
+  VOCAB=16384 candidates has been bit-exact verified yet (unlike the
+  VOCAB=1900 `eps=5e-4` checkpoint in Attempt 19).

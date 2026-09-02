@@ -5516,3 +5516,261 @@ ddr()` returns a `const char *` computed from that offset -- since this
 core has no data cache, that pointer behaves exactly like a normal
 in-SRAM C string for every purpose (`strcmp`, indexing, byte iteration)
 with no special DDR3-aware I/O code anywhere in the tokenizer path.
+
+## Repetition guards: taming degenerate sampled-story loops (firmware-only, no RTL changes)
+
+Real sampled chat, on real hardware, showed a recurring class of
+degenerate output the user could paste directly: "once upon a time" ->
+"...she wanted to climb it, but her mommy said they needed to stay..."
+was fine, but other replies looped -- "big tree with a big tree",
+"big house and a big house". ChatGPT-style generic advice (repetition
+penalty, top-k/top-p, no-repeat-ngram) was evaluated against this
+project's ACTUAL fixed-function accelerator before touching anything:
+the deployed engine does a single-pass on-chip Gumbel-max tournament
+over all VOCAB=16384 logits with a baked ROM temperature (no sort
+primitive, no per-token host visibility into the full distribution by
+design -- that's the bandwidth-wall thesis), so most of that generic
+advice doesn't map onto this hardware. What DOES map: `main.c` already
+had a real, proven precedent for "reject-and-resample-on-collision" --
+`remask_pick()`, the existing masked-argmax fallback used when a
+stop-token would fire before `MIN_WORD_TOKENS`. Generalizing that one
+mechanism turned out to be the right lever.
+
+**Implementation** (`kevgpt_interactive/main.c`, commit `d4770d2`,
+pushed to `origin/word-vocab`): `remask_pick()` became a thin wrapper
+around a new `remask_pick_excluding(dev, extra[], n_extra)` -- same
+full-VOCAB linear scan over `kevgpt_read_bank(dev, 8, i)` (head logits,
+Q6.25), same "only paid when it actually collides" cost model (4
+register round-trips per excluded-candidate check; unconditional
+per-token use would dominate the cycle budget, so every caller below
+fires only on an actual collision). Three guards wired into `chat_turn`'s
+generation loop, in order:
+1. **Immediate exact doubling** ("yummy yummy") -- `tok == last_tok`.
+2. **Immediate near-duplicate stem** ("bustled bustle") -- different
+   vocab ids, but one word's string is a prefix of the other's
+   (`is_stem_repeat()`, `MIN_STEM_LEN=4` to avoid short-word false
+   positives like "he"/"hello").
+3. **Delayed bigram recurrence** ("big tree ... big tree") -- tracks
+   every accepted token this reply in `hist[MAX_GEN_LEN]`; before
+   accepting a candidate, checks whether `(last_tok, tok)` already
+   occurred earlier in the same reply.
+
+All three are deliberately EXACT/prefix/bigram checks, not "was this
+token used recently" -- the latter would forbid ordinary function-word
+reuse ("she"/"the"/"and" recur constantly in fluent prose within a few
+words of each other).
+
+**A real bug, found only via real-hardware diagnostic instrumentation,
+not static reasoning**: the first version of guard 3 fired far more
+than the "occasional collision" cost model assumed -- 2 to 7 times per
+short reply, flooding output with generic greedy-argmax fallback words
+("care", "buster's", "donkey's", "curled") that were often MORE
+jarring than the repeats they replaced. Added a temporary
+`KEVGPT_REPEAT_DEBUG` build flag (per-guard fire counters + a
+`[BIGRAM last,before -> after]` print at every firing) and reloaded on
+real hardware to see it directly: most firings were on bigrams like
+`(".", "buster's")` or `(".", "she")` -- a PERIOD followed by a common
+sentence-starter, which recurs in literally every multi-sentence story
+and is not a loop at all. Root cause: the bigram-history scan checked
+`!is_stop_id(tok)` (the current candidate) but never checked whether
+`hist[k]` (the PRECEDING word in the historical pair) was itself a stop
+id. Fixed with one added condition (`!is_stop_id(hist[k])`, plus the
+symmetric `!is_stop_id(last_tok)` at the outer gate). Re-tested on real
+hardware: bigram fires dropped to legitimate-looking counts (0-7 per
+reply, but now firing on real recurring content bigrams like
+`("the","dog")` -> `"ball"`, correctly steering a story that kept
+wanting to repeat "the dog" into a coherent "ball" sub-plot instead).
+`KEVGPT_REPEAT_DEBUG` was stripped before the final commit -- confirmed
+via a rebuild+reload+retest that the stripped binary behaves
+identically to the instrumented one (same guard logic, just no debug
+prints).
+
+**Real-hardware verification, several rounds** (each round: kill/
+restart `openocd` and `send_weights.py` as needed, full reset+load+
+resume firmware reload, `SEND_WEIGHTS_PASS` on the ~10.7MB weight image
++ tokenizer blob at 115200 baud -- each transfer genuinely takes ~15
+minutes at that baud rate, not a quick check -- then chat over the
+console UART): confirmed the exact-doubling and stem-doubling guards
+eliminate their target patterns outright (no more "yummy yummy",
+"bustled, bustled", "bustled bustle" observed after the fix), and the
+bigram guard, post stop-id-exemption fix, fires on genuine content
+recurrence without the false-positive flood.
+
+**Two real hardware debugging detours hit along the way** (both now in
+[[reference-vivado-genesys2]], not repeated in full here): (1) Vivado's
+`*_pgm.tcl` resolved to a STALE, no-longer-live `hw_target` (two
+registrations differing only by a trailing character, `...AA` dead vs
+`...AAB` live) -- fixed by probing `get_hw_targets` directly and
+pinning the live one via the `HW_TARGET` env var the script already
+reads. (2) A JTAG USB re-enumeration event killed BOTH `openocd`'s
+connection AND a separately-running `send_weights.py` UART transfer
+AT THE SAME TIME (same physical board/hub, two FTDI chips) -- the
+UART side gave zero error, just hung silently in a blocked
+`ser.write()` for ~26 minutes before being diagnosed via a `devnum`
+sysfs check. Neither was a logic/RTL bug; both were transient USB/JTAG
+session state, fixed by killing and restarting fresh.
+
+**Honest final finding, from a proper controlled test, not a single
+eyeballed sample**: comparing the guarded firmware against the
+unmodified baseline with a 5-seed x 5-prompt sweep (25 samples each),
+scored by an objective detector (flag if any bigram recurs 3+ times in
+one sample, exempting punctuation-adjacent pairs) -- **7/25 flagged on
+the guarded checkpoint vs 8/25 on baseline, a statistical tie.** The
+guards demonstrably eliminate the SPECIFIC narrow patterns they target
+(confirmed on real hardware, not just in this software sweep), but they
+do NOT change the deployed model's overall tendency to loop -- that
+turned out to be a property of the model's own capacity/training level,
+not something a reactive firmware-side guard can fully suppress (the
+identical repetition class shows up in the plain FP software model with
+zero guards involved, and in a genuinely bigger D=384 teacher model
+too -- see the follow-up investigation below). Two follow-up attempts
+to close that gap -- extending training to 60000 iterations (both at
+the deployed `eps=3e-4` and at the more-stable `eps=1e-3`), and
+distillation from a D=384 teacher into a much larger synthetic
+fine-tuning corpus (24,918 filtered samples, 2.1M tokens, after an
+initial 283-sample attempt catastrophically overfit) -- were both tried
+and both came back negative: neither beat the baseline's val loss or
+its measured repetition rate. Recorded in detail, not repeated here, in
+this session's `model/SCALE-UP-LOG.md`-adjacent memory
+(`project-kevgpt-word-vocab-quality-ceiling` if consulting saved
+session memory) so a future session doesn't re-attempt either without
+a genuinely new angle.
+
+## Distillation from a bigger teacher: clean repeatable sequence (final commands only, no detours)
+
+The negative result above is real and shouldn't be re-derived blindly,
+but the PROCESS is legitimate and worth being able to re-run exactly --
+e.g. with a bigger/cleaner synthetic corpus, a different teacher shape,
+or after some other change makes it worth re-checking. All three
+pipeline stages are now real, committed, reusable scripts (`model/
+gen_synth_corpus.py`, `model/filter_synth_corpus.py`, `model/
+prep_synth_ft_data.py` -- promoted from one-off scratchpad scripts,
+each independently smoke-tested), not one-off shell history. Commands
+below are the exact ones that produced the numbers already reported in
+this document.
+
+**1. Train the teacher.** A wider (D=384 vs the deployed D=128), more
+capable model at the SAME vocab as the deployment target (VOCAB=16384 --
+avoids any cross-vocab re-tokenization complication later), using the
+stability recipe `model/SCALE-UP-LOG.md`'s Attempt 11 already found for
+this width (`eps=1e-3`, `lr-decay-iters=10000` of a 15000-iter run):
+```bash
+python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --lr-decay-iters 10000 --adam-eps 1e-3 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_teacher_d384_v16384.pt --states data/states_teacher_d384_v16384.jsonl
+```
+**Result: best val 2.743 @ iter 9500, ~37 min wall time** on this GPU
+(D=384 trains at ~6.8 it/s vs the deployed D=128 shape's ~24-55 it/s --
+budget accordingly). Sanity-check the teacher's OWN raw training-log
+samples before proceeding -- this recipe/shape still shows real
+repetition on its own ("the sun was shining and the sun was shining"),
+it is not a clean gold-standard generator; that's expected, not a sign
+something went wrong.
+
+**2. Generate a synthetic corpus from the teacher.**
+```bash
+python -m model.gen_synth_corpus data/ckpt_teacher_d384_v16384.pt \
+  --corpus data/TinyStories-train.filtered.txt \
+  --out data/teacher_synth_corpus.txt --n-samples 50000
+```
+**Result: 50,048 samples in ~33 min** (~26 samples/s at the default
+`--batch 128` -- tested up to `--batch 512` with no further speedup,
+compute-bound at this model size, not batch-size-bound). `--n-samples
+600` (the first attempt) is a trap: looks like a reasonable quick test,
+but the resulting corpus is far too small to fine-tune on without severe
+overfitting (see step 4's own warning).
+
+**3. Filter for degenerate repetition.**
+```bash
+python -m model.filter_synth_corpus data/teacher_synth_corpus.txt \
+  --out data/teacher_synth_corpus_filtered.txt
+```
+**Result: kept ~24,918 / 50,048 (~50%).** If the kept fraction comes out
+much lower than this (e.g. single digits or the input almost entirely
+dropped), the filter is almost certainly hitting the punctuation-adjacent
+false-positive bug already found and fixed once (see `model.
+filter_synth_corpus`'s own docstring) -- check `--show-dropped`'s output
+for whether the flagged bigrams are real content loops or just normal
+sentence-starter reuse before trusting a low keep-rate.
+
+**4. Tokenize the filtered corpus against the EXISTING deployed vocab**
+(NOT a fresh vocab -- the synthetic corpus is far too small to build a
+real 16384-word vocabulary from scratch, and the fine-tune must stay
+vocabulary-compatible with the checkpoint it warm-starts from):
+```bash
+python -m model.prep_synth_ft_data data/teacher_synth_corpus_filtered.txt \
+  --src-meta data/word_v16384/meta.json --out-dir data/word_v16384_synth_ft
+```
+**Result: 2,113,247 tokens (2,007,585 train / 105,662 val), unk_frac=0.0**
+(0 by construction -- every word came from a model already using this
+exact vocab). **This token count is the load-bearing number in this
+whole pipeline.** The first attempt (600 raw -> 283 filtered) produced
+only 22,830 train tokens here -- at `--batch-size 64 --block-size 128`
+(the training defaults), that's under 3 "epochs"-worth of unique
+128-token windows per single training iteration, and even a modest
+3000-iteration/`lr=1e-4` fine-tune collapsed train loss to ~0.05 while
+val loss climbed from 1.71 to 3.85 -- catastrophic memorization,
+producing whole-sentence VERBATIM repeats in generated output ("they
+wished they had not played with the dog. they wished they had not
+played with the dog."). The 50,000-raw-sample run above avoids this by
+being ~93x bigger.
+
+**5. Fine-tune the deployed small model on the filtered corpus.** At
+`--batch-size 64 --block-size 128` (defaults), one epoch over ~2M train
+tokens is ~245 iterations; `--max-iters 2000` here is ~8 epochs --
+enough real exposure without an excessive iteration count relative to a
+still-fairly-narrow (all-synthetic, single-teacher-style) corpus:
+```bash
+python -m model.train --init-from data/ckpt_word16384.pt --lr 1e-4 --warmup 100 \
+  --tokenizer word --vocab-size 16384 --corpus data/teacher_synth_corpus_filtered.txt \
+  --data-dir data/word_v16384_synth_ft --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_word16384_distilled.pt --states data/states_word16384_distilled.jsonl \
+  --max-iters 2000
+```
+**Result: train loss 1.79->1.23, val loss 1.88->1.36, tracking closely
+together the whole run (final gap ~0.13)** -- a HEALTHY trajectory,
+unlike step 4's overfitting warning case (gap ~3.8). This confirms the
+corpus-size fix worked at the training-mechanics level. It does NOT by
+itself mean the output is better -- see step 6.
+
+**6. Verify with a seeded multi-sample sweep, not one eyeballed
+generation.** A single unseeded `model.sample` run per prompt is not
+evidence of anything -- sampling variance alone can make one draw look
+clean and the next look broken on the IDENTICAL checkpoint (this
+happened directly in this session: an initial "no more repeats!" claim
+from 5 unseeded samples was contradicted by a second unseeded run on the
+same checkpoint minutes later). Score BOTH the new checkpoint and the
+original baseline with the SAME fixed-seed sweep and the SAME objective
+detector -- `model.filter_synth_corpus.is_degenerate()` is exactly this
+detector, reusable directly:
+```python
+import torch
+from model.sample import load
+from model.word_data import decode, tokenize, UNK
+from model.filter_synth_corpus import is_degenerate
+
+prompts = ["once upon a time", "the sun was", "the dog ran", "a little girl", "she found a"]
+seeds = [1, 2, 3, 4, 5]
+model, meta, it, val = load("data/ckpt_word16384_distilled.pt", "cuda")
+stoi, itos = meta["stoi"], meta["itos"]
+flagged = 0
+for seed in seeds:
+    for prompt in prompts:
+        torch.manual_seed(seed)
+        ids = torch.tensor([[stoi.get(t, stoi[UNK]) for t in tokenize(prompt.lower())]], device="cuda")
+        out = model.generate(ids, 60, temperature=0.58, top_k=None)[0].tolist()
+        text = decode(out, itos)
+        if is_degenerate(text):
+            flagged += 1
+print(f"{flagged}/{len(seeds)*len(prompts)} flagged")
+```
+Run the IDENTICAL script against `data/ckpt_word16384.pt` (the baseline)
+for the comparison to mean anything. **Actual result from this session:
+7/25 (28%) flagged on the distilled checkpoint vs 8/25 (32%) on
+baseline -- a statistical tie, no measurable improvement.** This is the
+real, final verdict for the whole pipeline as tried: it fixes the
+overfitting failure mode from too little data, but does not close the
+gap to the char-level model's fluency, and does not measurably reduce
+this model's baseline repetition rate. `data/ckpt_word16384_distilled.pt`
+was NOT promoted over the deployed checkpoint.
