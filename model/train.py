@@ -169,6 +169,12 @@ def main(argv=None):
     p.add_argument("--block-size", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--attn-fp32", action="store_true",
+                    help="do attention's QK^T + softmax in explicit fp32 instead "
+                         "of trusting SDPA's opaque autocast-dtype path, matching "
+                         "GPT-Neo's own GPTNeoSelfAttention precision convention. "
+                         "Diagnostic for model.SCALE-UP-LOG.md's Phase 2 attention "
+                         "comparison -- default off, unchanged SDPA behavior.")
     p.add_argument("--z-loss-coef", type=float, default=0.0,
                     help="logsumexp(logits)^2 penalty coefficient, caps logit "
                          "scale growth (PaLM/ST-MoE use ~1e-4); 0.0 = off.")
@@ -247,6 +253,7 @@ def main(argv=None):
         block_size=args.block_size, vocab_size=meta["vocab_size"],
         n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
         dropout=args.dropout, z_loss_coef=args.z_loss_coef,
+        attn_fp32=args.attn_fp32,
     )
     if args.qat:
         from .qgpt import QGPT, load_fp_into_qat

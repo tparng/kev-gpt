@@ -1736,6 +1736,1224 @@ over the real deployed `data/ckpt_word16384.qat.pt`.
    so far; the `eps=3.5e-4` alternative (Attempt 21-22) is a wash, not
    an improvement, and has not been promoted.
 
+## Phase 2: why does `SauravP97/tiny-stories-hf` train stably at similar
+   width/depth when kev-gpt's own recipe doesn't?
+
+### Motivation
+
+Everything above answers "how do we survive Adam's divergence at this
+width" with a stabilizing `eps` margin. It doesn't answer a harder
+question the reference repo
+[`SauravP97/tiny-stories-hf`](https://github.com/SauravP97/tiny-stories-hf)
+raises directly: that repo trains an 8-layer, hidden_size=256 GPT-Neo
+(~19M params, comparable scale to kev-gpt's own D=384 diagnostic shape)
+to genuinely coherent, low-repetition TinyStories completions, with a
+plain HF `Trainer` run and no special stabilization. If their recipe is
+simply stable at this width/depth and kev-gpt's isn't, the `eps` fix
+above is a patch over a solvable difference, not the actual ceiling.
+
+**First check: is their claim even real, not a cherry-picked README?**
+Ran a seeded, multi-prompt sweep against their published checkpoint using
+this repo's own objective repetition detector
+(`model.filter_synth_corpus.is_degenerate`) — the same detector already
+used to score kev-gpt's own generations, so results are comparable
+without eyeballing either side:
+```bash
+python model/tinystories_hf_repro/sweep_tiny_stories_hf.py
+```
+(loads `SauravP97/tiny-stories-19M` from the Hub, 5 seeds x 5 prompts =
+25 samples, `max_new_tokens=60` to match kev-gpt's own sampling
+convention — an earlier run at `max_new_tokens=150` gave a misleadingly
+high flag rate, a length-mismatch artifact of the detector, not a real
+quality difference). **Result: 7/25 flagged** — clearly not perfect, but
+qualitatively much cleaner than kev-gpt's own real-hardware output
+("to help him to to help him get to help him get"). Their claim is real
+enough to be worth root-causing, not a false lead.
+
+**Second check: does porting their exact hyperparameters onto kev-gpt's
+own D=384/VOCAB=16384 word-level model fix the divergence?** Four direct
+attempts, all diverged — each is a genuine falsification, not a dead
+end, and each is what motivated the methodology below instead of a fifth
+guess:
+
+| Attempt | Change from kev-gpt's own recipe | Result |
+|---|---|---|
+| long-run, `eps=1e-3` | bare cosine, 140000-iter target | diverged, killed @ iter 36000 (val 3.400) — `data/ckpt_teacher_d384_v16384_long.pt` |
+| long-run 2, `eps=3e-3` | `lr-decay-iters=15000` (fast-decay-then-hold, per Attempt 6-11's own finding) | diverged, killed @ iter 84000 (val 3.796) — `data/ckpt_teacher_d384_v16384_long2.pt` |
+| `beta2=0.999`, `eps=1e-8` | matches HF `Trainer`'s own Adam defaults exactly | diverged (best val 2.316 @ iter 3500, final 4.598 @ iter 15000) — `data/ckpt_teacher_d384_v16384_beta2test.pt` |
+| `batch_size=8` | matches the reference repo's own batch size, everything else kev-gpt's own default | diverged worst of all four (best val 3.212 @ iter 3500-4000, final 5.696 @ iter 15000) — `data/ckpt_teacher_d384_v16384_batch8test.pt` |
+
+None promoted or committed (all in gitignored `data/`). Porting single
+hyperparameters from their recipe onto kev-gpt's own model/loop, one at a
+time, in this direction, kept failing — which is the point where the
+methodology flipped:
+
+**Reproduce their recipe faithfully first (proving it's genuinely
+stable, not a lucky README run), then walk it toward kev-gpt's own setup
+one variable at a time, checking for divergence at each step** — instead
+of guessing which of kev-gpt's own hyperparameters to try importing into
+their architecture. Every step below holds a `MAX_STEPS`/`OUT_STATES`
+CLI signature (`sys.argv[1]`/`sys.argv[2]`, default 15000 steps) and logs
+one JSON line per eval (every 500 steps) to `--out-states`, so any step
+can be re-run standalone.
+
+**Quick-reference table — what changed at each step, and the LR
+schedule used** (kept updated as new steps are added; every step used
+peak `lr=5e-4` unless noted):
+
+| Step | Axis changed | Schedule | Result |
+|---|---|---|---|
+| 0 (repro) | — (baseline, HF Trainer) | linear, no warmup | stable, val 1.712 |
+| 1 (loop mechanics) | HF Trainer → kev-gpt's own loop | linear, no warmup | stable, val 1.708 |
+| 2a (weight_decay) | 0.01 → 0.1 | linear, no warmup | stable, val 1.674 |
+| 2b (beta2) | 0.999 → 0.95 | linear, no warmup | stable, val 1.812 |
+| 2c (batch_size) | 8 → 64 | linear, no warmup | stable, val 1.376 |
+| 3 (tokenizer) | BPE → kev-gpt word vocab | linear, no warmup | stable, val 1.454 |
+| 4 (attention scope) | local/windowed → global | linear, no warmup | stable, val 1.459 |
+| 5 (attention class) | GPT-Neo module → kev-gpt's real `CausalSelfAttention`, at D=256/n_layer=8 | linear, no warmup | stable, val 1.449 |
+| 6 (width/depth) | D=256/n_layer=8 → D=384/n_layer=12 (kev-gpt's actual diverging shape) | linear, no warmup | stable, val 1.284 |
+| 7 (LR schedule) | linear-no-warmup → kev-gpt's real `cosine_lr`, `warmup=100` | **cosine + warmup=100** | stable, val 1.311 |
+| 8 (data framing) | per-story padded rows → kev-gpt's real flat-stream `get_batch`/`load_split`, `block=128` | cosine + warmup=100 | stable, val 1.728 |
+| sanity check | literal `python -m model.train`, bare CLI defaults (`lr=1e-3`) — the real production entry point, not this harness | kev-gpt's real cosine + warmup=100 | **diverged** — val 2.371 @ iter 2500 → 4.731 @ iter 15000, reproducing the original signature exactly |
+| 9 (precision mechanism) | fp16+`GradScaler` → kev-gpt's real `amp_dtype()`: bf16, `GradScaler` disabled | cosine + warmup=100 | stable, val 1.716 |
+| 10 (peak LR) | `lr=5e-4` → kev-gpt's real `--lr` default, `1e-3` | cosine + warmup=100 | stable, val 1.719 |
+
+Every axis above tested at kev-gpt's own default `eps=1e-8`/`beta2=0.95`
+except where the row itself is testing `beta2` (2b). See each step's own
+section below for the full per-500-step trajectory and analysis.
+
+### Step 0: reproduce `SauravP97/tiny-stories-hf`'s exact recipe
+
+`model/tinystories_hf_repro/repro_hf_recipe.py` — plain HF `Trainer`,
+their exact config: `GPTNeoConfig(hidden_size=256, num_layers=8,
+num_heads=16, attention_types=[[["local"], 8]])` (GPT-Neo **local/
+windowed** attention, not kev-gpt's own global attention), GPT-Neo-125M
+BPE tokenizer (~50257 vocab, no `<unk>` ever), `roneneldan/TinyStories`
+raw dataset (same underlying corpus kev-gpt already uses via
+`keviniser.fetch_tinystories`, but NOT Kevinised — their repo trains on
+the raw text), `per_device_train_batch_size=8`, `learning_rate=5e-4`,
+`weight_decay=0.01`, `fp16=True`, and HF `TrainingArguments`' own
+defaults for everything not set explicitly — reverse-engineered to be
+`adam_beta2=0.999`, `adam_epsilon=1e-8`, `max_grad_norm=1.0`, and
+`lr_scheduler_type="linear"` with **zero warmup** (pure linear decay from
+`lr` to 0 over `max_steps` — confirmed by matching this run's own logged
+LR values against the formula `lr*(1-step/max_steps)`; nothing in
+`TrainingArguments` sets `warmup_steps`/`warmup_ratio`, so HF's default
+`linear` scheduler starts decaying from step 0).
+
+```bash
+cd ~/tiny-stories-hf && source venv/bin/activate   # user's own existing HF venv, not a new isolated one
+pip install "accelerate>=1.1.0"                     # HF Trainer's own hard requirement, was missing
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/repro_hf_recipe.py 15000 /tmp/repro_hf_states.jsonl
+```
+Result: val 10.87 (step 0) -> **1.712 @ step 15000**, monotonic the whole
+way, zero divergence. This is the reference/ground-truth trajectory
+every ablation step below is compared against — their claim of stable
+training at this width/depth is real on this hardware, not
+recipe-specific luck.
+
+### Step 1: swap the framework — HF `Trainer` -> kev-gpt's own manual loop
+
+`model/tinystories_hf_repro/ablation_step1_framework.py` — same
+architecture/tokenizer/data/hyperparameters as Step 0 (batch=8, lr=5e-4,
+weight_decay=0.01, beta2=0.999, eps=1e-8, their exact linear-no-warmup
+schedule), but the training loop mechanics are now kev-gpt's own:
+`autocast`+`GradScaler`, manual `AdamW` with kev-gpt's decay/no_decay
+param-grouping (`p.dim() >= 2` gets weight decay, matching
+`model/train.py`), `clip_grad_norm_(..., 1.0)`, manual `opt.step()` —
+isolates "does kev-gpt's own loop code introduce the instability" from
+every hyperparameter *value* difference, which come later.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step1_framework.py 15000 /tmp/ablation1_states.jsonl
+```
+
+**First run found a real efficiency gap** (val 2.831 vs Step 0's 1.712 at
+the same step count) — user directly asked whether the dataset actually
+matched; confirmed yes (HF `datasets.map()`'s cache fingerprint matched),
+but chasing that question surfaced the real bug: a **double-shift labels
+bug**. `get_batch()` was pre-shifting `x = rows[:, :-1]`, `y = rows[:,
+1:]` (nanoGPT convention) before handing both to a HF `*ForCausalLM`
+model that ALSO shifts internally (`shift_logits = logits[:, :-1]`,
+`shift_labels = labels[:, 1:]`) — so the model was being trained against
+labels two positions ahead of its predictions on every single step.
+Fixed by passing the full, unshifted sequence (`x = rows; y =
+rows.clone()`), matching what `DataCollatorForLanguageModeling` itself
+does. A second, smaller confound was fixed at the same time: kev-gpt's
+own bf16-by-default convention (`amp_dtype()`) was silently overriding
+their explicit `fp16=True` — forced `dtype = torch.float16` to match.
+
+After both fixes, a 500-step smoke test tracked the reference closely
+(val 3.708 vs their 3.576), and the full 15000-step run **converged to
+val 1.7084**, matching Step 0's 1.712 almost exactly. **Conclusion:
+kev-gpt's own loop mechanics are NOT the cause of the divergence** — once
+ported correctly, they're functionally equivalent to HF `Trainer`'s.
+
+### Step 2a: `weight_decay` 0.01 -> 0.1 (kev-gpt's own value)
+
+`model/tinystories_hf_repro/ablation_step2a_weightdecay.py` — only
+change from Step 1: `WEIGHT_DECAY = 0.1`.
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step2a_weightdecay.py 15000 /tmp/ablation2a_states.jsonl
+```
+Result: no divergence, final val **1.6742 @ step 15000** (best **1.6712
+@ step 13500**) — slightly *better* than Step 1. **`weight_decay` ruled
+out** as a cause; kept at kev-gpt's own value for every subsequent step.
+
+### Step 2b: `beta2` 0.999 -> 0.95 (kev-gpt's own value)
+
+`model/tinystories_hf_repro/ablation_step2b_beta2.py` — Step 2a plus
+`BETA2 = 0.95` (weight_decay=0.1 carried forward).
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step2b_beta2.py 15000 /tmp/ablation2b_states.jsonl
+```
+Result: no divergence, but consistently worse than Step 2a throughout
+the run (~0.14-0.16 higher val loss at matched steps), final val
+**1.8119 @ step 15000**. **`beta2` ruled out as a standalone cause of
+catastrophic divergence** — it's a real, measurable efficiency cost (a
+slower-reacting variance EMA makes each step less well-calibrated), not
+an instability trigger. This mirrors Attempt 8 above, where lowering
+`beta2` on kev-gpt's own D=384/VOCAB=4096 shape *also* didn't move the
+divergence at all — consistent evidence that `beta2` isn't on the causal
+path in either direction.
+
+### Step 2c: `batch_size` 8 -> 64 (kev-gpt's own default)
+
+`model/tinystories_hf_repro/ablation_step2c_batchsize.py` — Step 2b plus
+`BATCH = 64` (weight_decay=0.1 + beta2=0.95 carried forward), the last of
+the three individual hyperparameter differences. This laptop's GPU has
+only 7.62GB total VRAM; a batch=64/seq_len=512/vocab~50257 causal-LM
+loss computation OOMs (`logits.float()` alone needs ~6.1GB) — fixed with
+**gradient accumulation**: `MICRO_BATCH = 8`, `ACCUM_STEPS = 8`, looping
+8 micro-batches of 8 with each `.backward()` scaled by `1/ACCUM_STEPS`
+before a single `scaler.step(opt)` per full effective-batch step. This
+reproduces batch=64's true gradient-noise statistics without
+materializing the full batch in one forward pass — a resource
+workaround, not a change to what's being tested.
+```bash
+# smoke test first (500 steps) to confirm no OOM/crash before committing to the full run
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step2c_batchsize.py 500 /tmp/ablation2c_smoke_states.jsonl
+# full run
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step2c_batchsize.py 15000 /tmp/ablation2c_states.jsonl
+```
+Smoke test: clean exit, no OOM (val 3.18 @ step 500 of a 500-step-total
+schedule — LR fully decayed within the smoke test's own compressed
+horizon, not comparable to the other steps' step-500 values).
+
+**The full run hung twice before completing** — both times with the
+same signature (main Python thread pegged at ~100% CPU, GPU utilization
+~0-1%, power draw at idle 20W/80W, no traceback/OOM/dmesg error, no new
+output for hours), just at different step counts (~8500ish the first
+time, exactly step 11065 mid-micro-batch the second time, pinned down
+precisely by the heartbeat prints added after the first hang). The
+user's own explanation for at least the second hang: pausing/resuming an
+unrelated Jupyter notebook sharing the same GPU can stall another
+process's CUDA calls. Both hangs were unrecoverable — **the script never
+saved a checkpoint**, only eval stats to `OUT_STATES`, so killing the
+hung process lost all training progress each time (the underlying model/
+optimizer state only ever lived in the killed process's GPU memory).
+Fixed by adding real checkpoint save/resume: every eval step now also
+writes `model.state_dict()`/`opt.state_dict()`/`scaler.state_dict()` to
+`CKPT` (`sys.argv[3]`, defaults to `OUT_STATES` with `_ckpt.pt` in place
+of `.jsonl`); if `CKPT` already exists at startup, training resumes from
+that step instead of restarting at 0. Verified with a 20-step round-trip
+(run to completion, rerun same paths, confirms "resumed at step 21" and
+exits immediately without redoing work) before relaunching the real run.
+
+**Third attempt, clean start, completed all 15000 steps without
+incident**:
+
+| step | val | | step | val |
+|---|---|---|---|---|
+| 0 | 10.911 | | 8000 | 1.4578 |
+| 500 | 2.814 | | 8500 | 1.4893 |
+| 1000 | 2.293 | | 9000 | 1.4964 |
+| 1500 | 1.989 | | 9500 | 1.5090 |
+| 2000 | 1.936 | | 10000 | 1.4622 |
+| 2500 | 1.867 | | 10500 | 1.4134 |
+| 3000 | 1.736 | | 11000 | 1.4152 |
+| 3500 | 1.747 | | **11500** | **1.3605 (best)** |
+| 4000 | 1.597 | | 12000 | 1.3766 |
+| 4500 | 1.600 | | 12500 | 1.4465 |
+| 5000 | 1.586 | | 13000 | 1.4033 |
+| 5500 | 1.631 | | 13500 | 1.3852 |
+| 6000 | 1.550 | | 14000 | 1.3880 |
+| 6500 | 1.510 | | 14500 | 1.3655 |
+| 7000 | 1.536 | | **15000** | **1.3762 (final)** |
+| 7500 | 1.504 | | | |
+
+349.0 minutes total (~5h49m). Val loss oscillates in a narrow 1.36-1.63
+band from step ~6000 onward, trending gently downward overall (best
+1.3605 @ step 11500, final 1.3762 @ step 15000) — never once shows the
+sustained, runaway climb that characterizes every diverged AdamW run
+earlier in this log (compare Experiment 1's train+val climbing together
+for 21,500 of 24,000 iterations, or Attempt 6's val +61% at a frozen
+floor LR). **`batch_size` ruled out as a cause of divergence** — this is
+the last of the three individual kev-gpt hyperparameters
+(`weight_decay=0.1`, `beta2=0.95`, `batch_size=64`), and with all three
+now combined together on the reference architecture/tokenizer/data, the
+run is still fully stable. **All three of kev-gpt's own hyperparameter
+VALUES are cleared as the cause of the divergence kev-gpt's own D=384/
+VOCAB=16384 word-level model shows.** The two remaining untested axes are
+the tokenizer (BPE, ~50257 vocab, no `<unk>` vs kev-gpt's closed
+word-level vocab with an `<unk>` fallback) and the architecture (GPT-Neo
+local/windowed attention vs kev-gpt's own global attention) — one of
+those two is now the leading candidate for what actually differs between
+a recipe that trains stably at this width/depth and one that doesn't.
+
+### Reproducing this investigation from scratch
+
+```bash
+cd ~/tiny-stories-hf && source venv/bin/activate   # or any venv with torch+cuda, transformers, datasets, accelerate>=1.1.0
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/sweep_tiny_stories_hf.py                              # sanity-check their published checkpoint's quality first
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/repro_hf_recipe.py 15000 /tmp/repro_hf_states.jsonl   # Step 0
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step1_framework.py 15000 /tmp/ablation1_states.jsonl
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step2a_weightdecay.py 15000 /tmp/ablation2a_states.jsonl
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step2b_beta2.py 15000 /tmp/ablation2b_states.jsonl
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step2c_batchsize.py 500 /tmp/ablation2c_smoke_states.jsonl   # smoke first, real GPU VRAM permitting
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step2c_batchsize.py 15000 /tmp/ablation2c_states.jsonl
+```
+First run of `repro_hf_recipe.py` downloads `roneneldan/TinyStories`
+(~2GB, unauthenticated HF Hub, can be slow — launch with `nohup ... &`
+and monitor the cache dir size rather than trusting a foreground
+timeout) and tokenizes the full 2.1M-row train split (~5 min, cached by
+`datasets.map()`'s fingerprint after the first run — copying a script to
+a new filename invalidates that cache and forces re-tokenization, so
+expect the ~5 min hit again per new script name in this directory).
+Each script prints one line every 500 steps and writes matching JSON
+lines to the path in `sys.argv[2]`; watch for `torch.OutOfMemoryError`
+(a real 7.62GB VRAM ceiling on this hardware, not a bug — resolved for
+batch=64 via the gradient-accumulation constants at the top of
+`ablation_step2c_batchsize.py`, adjust `MICRO_BATCH` down further on a
+smaller GPU) and for `ImportError: ... requires accelerate>=1.1.0` (`pip
+install "accelerate>=1.1.0"` in whichever venv is running these).
+`ablation_step2c_batchsize.py` specifically also checkpoints model/
+optimizer/scaler state to `sys.argv[3]` (default: `sys.argv[2]` with
+`_ckpt.pt` in place of `.jsonl`) every 500 steps and auto-resumes from it
+if present at startup — if a run of that script hangs (watch for the
+per-micro-batch heartbeat lines going stale in the log, GPU utilization
+near 0% via `nvidia-smi`, and a killed process's TIME still climbing in
+`ps`, all simultaneously — the exact signature seen twice in this
+investigation), kill it and just re-run the identical command; it picks
+up from the last saved step instead of restarting at 0.
+
+### The architecture axis: GPT-Neo local/windowed attention vs kev-gpt's global attention
+
+With all three of kev-gpt's own hyperparameters cleared (Steps 2a-2c),
+the two remaining candidates are the tokenizer and the attention
+mechanism. Comparing `CausalSelfAttention` (`model/gpt.py`) against the
+installed `transformers` library's `GPTNeoSelfAttention` (confirmed by
+direct instantiation that `SauravP97/tiny-stories-hf`'s exact config
+selects `_attn_implementation="eager"`, i.e. the manual path below, not
+a fused SDPA/flash kernel) surfaces several real differences:
+
+1. **Windowed vs. full attention.** kev-gpt: full causal attention via
+   `F.scaled_dot_product_attention(..., is_causal=True)` — every token
+   attends to all previous tokens. GPT-Neo "local": a token only attends
+   to the previous `window_size` tokens (default 256), via
+   `bias = torch.bitwise_xor(bias, torch.tril(bias, -window_size))`. In
+   this specific repro, `attention_types=[[["local"], 8]]` makes *all*
+   8 layers local (not GPT-Neo's own default alternating
+   global/local), and `window_size=256` is exactly half of
+   `max_position_embeddings=512` — so the effective (indirect,
+   stacked-layer) receptive field already covers the full sequence by
+   layer 2 of 8. The restriction is real but much weaker than "windowed
+   attention" usually implies at these specific settings.
+2. **No `1/sqrt(head_dim)` scaling.** GPT-Neo's `_attn` computes
+   `torch.matmul(query, key.transpose(-1, -2))` with no division by
+   `sqrt(head_dim)` anywhere — confirmed deliberate, not an oversight
+   (even the FlashAttention2 variant explicitly passes
+   `softmax_scale=1.0` to override the default). kev-gpt's SDPA call
+   always applies the standard scaling internally. This cuts *against*
+   GPT-Neo's choice being a stabilizing factor — omitting the scaling
+   is the numerically *less* safe option, and their `head_dim=16`
+   (`hidden_size=256/num_heads=16`) is smaller than kev-gpt's own
+   `head_dim=64` convention, compounding it further — yet their recipe
+   still trains cleanly (Step 0).
+3. **Explicit fp32 QK^T + softmax.** GPT-Neo upcasts query/key to fp32
+   before the QK^T matmul regardless of the active autocast dtype, and
+   casts the softmax output back down afterward — an explicit,
+   auditable precision path. kev-gpt's SDPA call has no equivalent: the
+   actual compute dtype of the fused kernel is opaque, decided by
+   whichever backend SDPA dispatches to under `autocast`. Given this
+   whole investigation is about logit-scale/gradient-variance blowup at
+   width, and Step 1 earlier in this Phase already found one real
+   silent precision confound (bf16-vs-fp16), this looked like the most
+   promising untested lead — cheap to isolate (one code path, one CLI
+   flag) versus a full tokenizer swap.
+4. **QKV/bias structure and dropout plumbing** differ too (kev-gpt: one
+   fused `qkv` Linear, `bias=False` everywhere by convention; GPT-Neo:
+   three separate `q_proj`/`k_proj`/`v_proj`, `out_proj` always
+   `bias=True`) but aren't live differences at these dropout=0 settings
+   and aren't a plausible instability mechanism on their own.
+
+**Tested #3 directly — falsified.** Added `GPTConfig.attn_fp32` /
+`--attn-fp32` (`model/gpt.py`, `model/train.py`): when set,
+`CausalSelfAttention.forward` bypasses SDPA and does the manual
+GPT-Neo-style computation instead — `q`/`k` upcast to `.float()` before
+the matmul, scaled by `1/sqrt(head_dim)` (kept, since scaling itself is
+a separate variable from precision — see #2 above), causal-masked,
+softmaxed, then cast back to `v`'s dtype before the second matmul.
+Single-variable test against the exact same vanilla, *unstabilized*
+recipe `beta2test`/`batch8test` used (default `--adam-eps 1e-8`,
+default `--adam-beta2 0.95`, `--lr 3e-4 --warmup 2000`, no
+`--lr-decay-iters` override) — the setup already known to diverge
+without the Attempt-11 `eps=1e-3` fix:
+```bash
+python -m model.train --max-iters 15000 --lr 3e-4 --warmup 2000 --attn-fp32 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_teacher_d384_v16384_fp32attn.pt --states data/states_teacher_d384_v16384_fp32attn.jsonl
+```
+Throughput (~7.5 it/s) was comparable to the SDPA baseline (~6.8 it/s) —
+the manual path isn't meaningfully slower at this scale.
+
+| iter | val | logit_max | lnf_norm |
+|---|---|---|---|
+| 0 | 9.782 | 2.5 | 19.60 |
+| 2000 | 2.611 | 19.4 | 24.59 |
+| 3500 | 2.348 | 22.1 | 30.09 |
+| **4000** | **2.346 (best)** | 25.0 | 31.70 |
+| 5000 | 2.400 | 27.5 | 34.76 |
+| 8500 | 2.973 | 28.9 | 43.95 |
+| 11000 | 3.552 | 34.8 | 48.45 |
+| 15000 | 4.462 | 43.5 | 51.81 |
+
+Bottoms at iter 4000 — the same onset point every unstabilized AdamW
+run at this width has shown throughout this entire log — then climbs
+continuously for the remaining 11,000 iterations to val=4.462, with
+`logit_max`/`lnf_norm` growing unbounded the whole way, the identical
+signature Attempts 1-9 already characterized in exhaustive detail.
+**The explicit fp32 QK^T upcast alone does not prevent the divergence.**
+Whatever lets GPT-Neo's recipe train stably without any Adam-side
+stabilization, it isn't this — the precision path around the attention
+matmul was a plausible, cheap-to-test lead, and it's now cleanly ruled
+out, the same way Attempts 1-4 ruled out LR schedule, init scaling,
+weight-decay grouping, and z-loss earlier in this log. `GPTConfig.
+attn_fp32` / `--attn-fp32` are kept in the codebase (default off,
+zero behavior change) as a reusable diagnostic, not removed just
+because this test came back negative.
+
+**Where this leaves the architecture axis**: #1 (windowing) and #2 (no
+`sqrt(head_dim)` scaling) remain untested directly, though #2 argues
+against itself (the safer choice is already what kev-gpt does) and #1
+is weak at these specific settings (window≈seq_len/2, all-local). The
+tokenizer axis (BPE/no-`<unk>` vs kev-gpt's closed word-level vocab with
+an `<unk>` fallback) is now the strongest remaining untested candidate.
+
+### Step 3: swap the tokenizer — GPT-Neo BPE -> kev-gpt's own closed word-level vocab
+
+`model/tinystories_hf_repro/ablation_step3_tokenizer.py` — Step 2c's
+script (already at ALL of kev-gpt's own hyperparameter values:
+`weight_decay=0.1`, `beta2=0.95`, `batch_size=64` via gradient
+accumulation) with only the tokenizer swapped: replaced the GPT-Neo-125M
+BPE tokenizer with kev-gpt's own `model/word_data.py` closed word-level
+vocab, reusing `data/word_v16384/meta.json`'s `stoi` directly (bit-
+identical to the real deployed VOCAB=16384 tokenizer, not regenerated).
+Kept the same per-story framing Steps 0-2c used (one row = one story,
+regex-tokenized, `<eos>` appended, truncated/padded to `SEQ_LEN=512`
+with `<eos>` as filler, every `<eos>`-valued label position masked —
+mirrors `pad_token==eos_token` from the BPE runs) rather than kev-gpt's
+own flat-stream/random-window sampling convention
+(`model/data.py`'s `load_split`), specifically to keep this a clean
+single-variable swap instead of confounding tokenizer with data framing.
+`GPTNeoConfig(vocab_size=16384, ...)` — everything else (architecture,
+hidden_size=256, num_layers=8, num_heads=16, `attention_types=[[["local"],
+8]]`, LR=5e-4 linear-no-warmup schedule) unchanged from Step 2c.
+Sanity-checked the tokenizer directly before the full run (round-trips a
+sample sentence exactly, 0 `<unk>` on ordinary text) — see the "Reproducing
+this investigation from scratch" commands below.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step3_tokenizer.py 15000 /tmp/ablation3_states.jsonl
+```
+Model is 10.64M params (smaller than Step 2c's 19.31M — the tied
+embedding/head table shrinks from ~50257×256 to 16384×256 with the
+closed vocab). Throughput comparable to the BPE runs.
+
+| step | val | | step | val |
+|---|---|---|---|---|
+| 0 | 9.747 | | 8000 | 1.631 |
+| 500 | 2.881 | | 8500 | 1.563 |
+| 1000 | 2.425 | | 9000 | 1.529 |
+| 1500 | 2.188 | | 9500 | 1.580 |
+| 2000 | 2.027 | | 10000 | 1.552 |
+| 2500 | 1.884 | | 10500 | 1.507 |
+| 3000 | 1.850 | | 11000 | 1.488 |
+| 3500 | 1.783 | | 11500 | 1.507 |
+| 4000 | 1.754 | | 12000 | 1.482 |
+| 4500 | 1.744 | | 12500 | 1.466 |
+| 5000 | 1.728 | | 13000 | 1.483 |
+| 5500 | 1.660 | | **13500** | **1.446 (best)** |
+| 6000 | 1.654 | | 14000 | 1.484 |
+| 6500 | 1.663 | | 14500 | 1.468 |
+| 7000 | 1.618 | | **15000** | **1.454 (final)** |
+| 7500 | 1.634 | | | |
+
+276.5 minutes total. Val loss trends downward the entire run, oscillating
+in a narrow 1.45-1.9 band from step ~3000 onward — no bottom-then-climb
+shape anywhere, including well past iter 4000 (where the fp32-attention
+test above turned upward) and past iter 11065 (where Step 2c's own
+transient GPU hangs happened, unrelated but the same iteration range).
+**Tokenizer ruled out as a cause of divergence** — kev-gpt's own closed
+word-level vocab, substituted directly into the reference architecture/
+hyperparameters, trains exactly as stably as GPT-Neo's own BPE tokenizer
+did in Steps 0-2c.
+
+**This clears every axis tested so far**: framework/loop mechanics
+(Step 1), all three individual hyperparameters (Steps 2a-2c), attention
+precision (the `--attn-fp32` test), and now the tokenizer (Step 3) are
+all ruled out, one at a time, as standalone causes of the divergence
+kev-gpt's own D=384/VOCAB=16384 model shows under its own default
+recipe. What remains: (a) windowed/local vs. global attention *scope*
+itself (distinct from the precision test — never directly varied; Steps
+0-3 all kept GPT-Neo's local/windowed attention throughout), and (b) the
+possibility that no single axis is sufficient alone — the instability
+might only appear from a *specific combination* neither this walk nor
+the original SCALE-UP-LOG's own Attempts 1-22 has tried (e.g. kev-gpt's
+own global attention combined with kev-gpt's own default `eps=1e-8`,
+which is what actually diverges, vs. every stable run in this Phase
+being GPT-Neo's local attention regardless of which other axis changed).
+Testing (a) directly — porting kev-gpt's own `GPT`/`CausalSelfAttention`
+class (global, SDPA-based) into this same walk, holding data/hyper-
+parameters at their now-fully-kev-gpt values — is the natural next step
+and hasn't been attempted yet.
+
+### Step 4: swap attention SCOPE only — GPT-Neo local/windowed -> GPT-Neo "global"
+
+`model/tinystories_hf_repro/ablation_step4_globalattn.py` — Step 3's
+script (kev-gpt's own closed word-level vocab, `weight_decay=0.1`,
+`beta2=0.95`, `batch_size=64` via gradient accumulation) with exactly
+one line changed: `attention_types=[[["global"], 8]]` in place of
+`[[["local"], 8]]`. Deliberately stayed inside `GPTNeoSelfAttention`
+(not a full port of kev-gpt's own SDPA-based `CausalSelfAttention`) to
+isolate attention *scope* alone — a full class swap would also change
+scaling (kev-gpt scales by `1/sqrt(head_dim)`, GPT-Neo doesn't),
+precision path (GPT-Neo's explicit fp32 QK^T upcast vs kev-gpt's opaque
+fused SDPA kernel), and Q/K/V/bias structure all at once, confounding
+several already-distinct variables from the earlier architecture
+comparison.
+
+**Verified directly, three ways, that this run really trained the
+revised config** (prompted by a direct question mid-run about whether
+the process might silently still be running Step 3's local-attention
+code): (1) `/proc/<pid>/cmdline` showed the process executing
+`ablation_step4_globalattn.py`, not a stale copy; (2) the on-disk file
+at that path contains `attention_types=[[["global"], 8]]` (unedited
+since the process started, so this is what it read at import time); (3)
+instantiating the identical `GPTNeoConfig` fresh confirmed
+`attention_layers == ['global']*8`, and directly inspecting the
+resulting causal-mask buffer showed row 300 attends all the way back to
+column 0 (301 allowed positions) — if still windowed at `window_size=256`
+it would cut off 44 columns short of that.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step4_globalattn.py 15000 /tmp/ablation4_states.jsonl
+```
+
+| step | val | | step | val |
+|---|---|---|---|---|
+| 0 | 9.753 | | 8000 | 1.593 |
+| 500 | 2.865 | | 8500 | 1.604 |
+| 1000 | 2.342 | | 9000 | 1.539 |
+| 1500 | 2.161 | | 9500 | 1.559 |
+| 2000 | 2.046 | | 10000 | 1.580 |
+| 2500 | 1.921 | | 10500 | 1.513 |
+| 3000 | 1.824 | | 11000 | 1.470 |
+| 3500 | 1.772 | | 11500 | 1.493 |
+| 4000 | 1.797 | | 12000 | 1.480 |
+| 4500 | 1.696 | | 12500 | 1.512 |
+| 5000 | 1.715 | | 13000 | 1.487 |
+| 5500 | 1.702 | | **13500** | **1.417 (best)** |
+| 6000 | 1.633 | | 14000 | 1.422 |
+| 6500 | 1.678 | | 14500 | 1.475 |
+| 7000 | 1.594 | | **15000** | **1.459 (final)** |
+| 7500 | 1.587 | | | |
+
+278.1 minutes total. Val loss trends downward the whole run, oscillating
+in a narrow 1.4-1.9 band from step ~5000 onward — no bottom-then-climb
+shape anywhere, essentially indistinguishable in character (and closely
+comparable numerically) from Step 3's own trajectory (best 1.446 @ step
+13500, final 1.454 @ step 15000, vs. this run's 1.417 @ step 13500,
+1.459 @ step 15000). **Attention scope (local/windowed vs. global) ruled
+out as a cause of divergence** — switching it, alone, with every other
+axis held at kev-gpt's own values, changes essentially nothing about the
+training dynamics.
+
+**This clears every axis identified in the Phase 2 architecture
+comparison, individually**: loop mechanics (Step 1), all three
+hyperparameters (Steps 2a-2c), attention precision (`--attn-fp32`),
+tokenizer (Step 3), and now attention scope (Step 4) — none of them,
+tested alone, reproduces kev-gpt's own D=384/VOCAB=16384 divergence.
+Two possibilities remain, both un-eliminated by this walk: (a) the
+divergence needs kev-gpt's own *specific* attention implementation
+(SDPA's opaque precision path + `1/sqrt(head_dim)` scaling + fused
+qkv + `head_dim=64`, all together, not any one swapped into GPT-Neo's
+module) — the only test that would settle this is literally substituting
+kev-gpt's own `GPT`/`CausalSelfAttention` class into this harness, not
+an approximation of one axis inside GPT-Neo's own code; or (b) no single
+architectural or tokenizer axis is sufficient alone, and the instability
+is a property of the *combination* already tested exhaustively in this
+log's own Attempts 1-22 (Adam's variance normalization interacting with
+width, fixed by `eps`) — i.e. the reference recipe isn't stable because
+of anything architectural at all, it simply never needed the `eps`
+fix because nothing about GPT-Neo's setup was ever compared against
+kev-gpt's own *unstabilized* `eps=1e-8` default until this whole Phase 2
+walk, and every single Phase 2 run (Steps 0-4) used kev-gpt's default
+`eps=1e-8`/`beta2=0.95` and never diverged regardless of architecture,
+tokenizer, or hyperparameters — while kev-gpt's own D=384/VOCAB=16384
+model reliably diverges at those same default settings. That asymmetry
+(GPT-Neo-based configs never diverge at `eps=1e-8`; kev-gpt's own GPT
+class reliably does) now can only be explained by something in kev-gpt's
+own `CausalSelfAttention`/`GPT` implementation itself, making the direct
+class-swap test the clear next step.
+
+### Step 5: port kev-gpt's own real `GPT`/`CausalSelfAttention` class in — still no divergence, and why that's not yet the full answer
+
+`model/tinystories_hf_repro/ablation_step5_kevgptattn.py` — replaces
+GPT-Neo entirely: `sys.path.insert(0, "/home/tparng/kev-gpt"); from
+model.gpt import GPT, GPTConfig` — kev-gpt's real, unmodified production
+class, not an approximation inside GPT-Neo's module. Held at kev-gpt's
+own convention: `head_dim=64` (`n_head=4`, `n_embd=256` — matching
+kev-gpt's real deployed/diagnostic models, not GPT-Neo's `head_dim=16`),
+`bias=False` everywhere, `attn_fp32=False` (kev-gpt's real default SDPA
+path, not the already-falsified diagnostic branch). `n_layer=8` to match
+Step 4's depth as closely as possible. Same data as Steps 3-4 (kev-gpt's
+own word-level VOCAB=16384, per-story padded-to-512 framing, `eos`-
+masked) and same hyperparameters (`weight_decay=0.1`, `beta2=0.95`,
+`eps=1e-8` default, `batch_size=64` via grad accumulation, `lr=5e-4`
+linear-no-warmup). kev-gpt's own `GPT.forward` uses a pre-shift
+convention (`x=data[i:i+block]`, `y=data[i+1:i+1+block]`, matching
+`model/train.py`'s own `get_batch`) and has no built-in loss-masking
+mechanism (its real flat-stream training never needs one) — the harness
+calls `model(x)` with `targets=None` to get logits only, then computes
+`F.cross_entropy(..., ignore_index=-100)` itself, keeping kev-gpt's own
+model code completely untouched while preserving the same eos-masking
+convention Steps 0-4 used.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step5_kevgptattn.py 15000 /tmp/ablation5_states.jsonl
+```
+10.49M params (comparable to Steps 3-4's ~10.6M). Notably faster than
+every GPT-Neo-based step (56.5 min total vs. Steps 3-4's 276-278 min) —
+kev-gpt's fused SDPA call is meaningfully cheaper than GPT-Neo's manual
+eager-mode attention (full matmul/mask/softmax/matmul, no fused kernel).
+
+| step | val | | step | val |
+|---|---|---|---|---|
+| 0 | 9.746 | | 8000 | 1.599 |
+| 500 | 3.001 | | 8500 | 1.574 |
+| 1000 | 2.441 | | 9000 | 1.553 |
+| 1500 | 2.164 | | 9500 | 1.577 |
+| 2000 | 2.012 | | 10000 | 1.565 |
+| 2500 | 1.866 | | 10500 | 1.511 |
+| 3000 | 1.832 | | 11000 | 1.517 |
+| 3500 | 1.802 | | 11500 | 1.533 |
+| 4000 | 1.775 | | 12000 | 1.529 |
+| 4500 | 1.712 | | 12500 | 1.541 |
+| 5000 | 1.723 | | 13000 | 1.495 |
+| 5500 | 1.665 | | 13500 | 1.501 |
+| 6000 | 1.688 | | 14000 | 1.499 |
+| 6500 | 1.661 | | 14500 | 1.466 |
+| 7000 | 1.612 | | **15000** | **1.449 (best = final)** |
+| 7500 | 1.638 | | | |
+
+56.5 minutes total. Val loss trends downward the entire run, oscillating
+in the same narrow ~1.4-2.0 band Steps 3-4 showed, with the true minimum
+landing right at the last logged step rather than climbing away from an
+earlier peak — the cleanest of the five Phase 2 runs so far, if
+anything. **kev-gpt's own real attention class, ported in unmodified,
+does not diverge either.**
+
+**This is a real result, but it does NOT close the investigation — it
+narrows what's actually been tested.** Every Phase 2 run (Steps 0-5) has
+held three things fixed at the *reference recipe's* values, never at
+kev-gpt's own actual production values, because they were inherited
+from Step 0's faithful reproduction and never flagged as a variable in
+their own right:
+1. **Width/depth**: `n_embd=256, n_layer=8` throughout — the reference
+   repo's own shape, not kev-gpt's actual diverging shape
+   (`n_embd=384, n_layer=12`, `n_head=6`, from the original SCALE-UP-LOG's
+   Experiment 1 onward). Step 5 tests kev-gpt's real attention CLASS,
+   but not at the width where the divergence was ever actually observed.
+2. **LR schedule**: `lr=5e-4`, pure linear decay from step 0, no warmup
+   — the reference's own schedule (confirmed in Step 0 by reverse-
+   engineering HF `TrainingArguments`' defaults), never kev-gpt's own
+   actual recipe (cosine decay, `warmup=100`, different peak/floor
+   shape entirely).
+3. **Data framing**: per-story, padded/truncated to a fixed 512-token
+   row, `eos`-masked — never kev-gpt's own actual flat continuous-
+   stream/random-contiguous-window sampling (`model/data.py`'s
+   `load_split` + `get_batch`), which has no padding, no story
+   boundaries treated specially, and a much shorter `block_size=128` in
+   the real deployed/diagnostic recipes.
+
+None of these three was ever the variable under test in Steps 0-5 —
+they were the fixed scaffolding the whole walk was built on top of,
+carried over unexamined from Step 0's reproduction. **The real, still-
+open question**: does kev-gpt's own attention class, AT kev-gpt's own
+actual diverging width/depth (`n_embd=384, n_layer=12, n_head=6`), still
+train cleanly inside this harness (kev-gpt tokenizer, `eps=1e-8`
+default, this harness's LR schedule/data framing)? If it diverges once
+scaled up to that shape — with every other axis this Phase 2 walk has
+already cleared held fixed — that would finally isolate **width/depth
+itself**, in combination with kev-gpt's own attention implementation, as
+the trigger neither the original SCALE-UP-LOG (which never isolated
+architecture from data/LR-schedule) nor this Phase 2 walk (which never
+varied width/depth) has directly tested. If it *still* doesn't diverge
+even at that width, the remaining candidates would be the LR
+schedule shape or the data-framing convention themselves — both still
+completely unexamined by this entire investigation.
+
+### Step 6: scale Step 5 UP to kev-gpt's actual diverging shape — still no divergence
+
+`model/tinystories_hf_repro/ablation_step6_fullscale.py` — Step 5
+verbatim, with exactly the `GPTConfig` width/depth changed:
+`n_embd=384, n_layer=12, n_head=6` (`head_dim=384/6=64`, same convention
+as Step 5, just wider/deeper) in place of `n_embd=256, n_layer=8,
+n_head=4` — the original SCALE-UP-LOG's own Experiment-1-onward
+diverging shape, reproduced exactly (`n_layer=12`, `n_head=6`, `n_embd=384`).
+Everything else identical to Step 5: kev-gpt's own real, unmodified
+`GPT`/`CausalSelfAttention` class, kev-gpt's own word-level VOCAB=16384
+tokenizer, `weight_decay=0.1`, `beta2=0.95`, `eps=1e-8` default,
+`batch_size=64` via grad accumulation, `lr=5e-4` linear-no-warmup,
+per-story padded-to-512 data framing.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step6_fullscale.py 15000 /tmp/ablation6_states.jsonl
+```
+27.53M params — matches the original SCALE-UP-LOG's Experiment 1 exactly
+(`22.82M` there was VOCAB=4096; this is VOCAB=16384, hence larger,
+consistent with a bigger tied embedding/head table at the same
+width/depth).
+
+| step | val | | step | val |
+|---|---|---|---|---|
+| 0 | 9.764 | | 8000 | 1.420 |
+| 500 | 2.854 | | 8500 | 1.466 |
+| 1000 | 2.256 | | 9000 | 1.453 |
+| 1500 | 2.072 | | 9500 | 1.416 |
+| 2000 | 1.880 | | 10000 | 1.392 |
+| 2500 | 1.788 | | 10500 | 1.354 |
+| 3000 | 1.728 | | 11000 | 1.336 |
+| 3500 | 1.680 | | 11500 | 1.403 |
+| 4000 | 1.653 | | 12000 | 1.367 |
+| 4500 | 1.653 | | 12500 | 1.326 |
+| 5000 | 1.557 | | 13000 | 1.326 |
+| 5500 | 1.541 | | **13500** | **1.283 (best)** |
+| 6000 | 1.526 | | 14000 | 1.299 |
+| 6500 | 1.552 | | 14500 | 1.376 |
+| 7000 | 1.445 | | **15000** | **1.284 (final)** |
+| 7500 | 1.443 | | | |
+
+114.9 minutes total. Val loss trends downward the entire run, including
+through and past iter 4000-4500 — exactly the onset window where the
+original SCALE-UP-LOG's Experiment 1 (this identical `n_embd=384,
+n_layer=12, n_head=6, VOCAB` shape, bare defaults, cosine+warmup=100
+schedule) peaked at val=2.309 and then climbed continuously to
+val=5.634 by iter 24000. Here, at iter 4000-4500 val is 1.653 (flat, not
+peaking) and continues falling for the entire remaining 10,500 iterations
+to a final 1.284 — a completely different trajectory shape at the
+identical architecture. **kev-gpt's own real attention class, at
+kev-gpt's own actual diverging width/depth, still does not diverge in
+this harness.**
+
+**This closes the loop on architecture and width entirely.** Every
+axis this whole Phase 2 walk identified as a candidate — loop mechanics,
+all three hyperparameters, attention precision, tokenizer, attention
+scope, the full real attention class, and now width/depth itself, tested
+at the EXACT shape that reliably diverges elsewhere in this log — has
+been individually ruled out. What's left is exactly the two structural
+axes flagged at the end of Step 5, now the only ones left standing:
+1. **LR schedule shape**: this whole Phase 2 walk (Steps 0-6) has used
+   `lr=5e-4`, pure linear decay from step 0, no warmup — the reference
+   recipe's own schedule. The original SCALE-UP-LOG's own divergence was
+   always observed under kev-gpt's actual recipe: cosine decay,
+   `warmup=100`, a completely different peak/floor shape and a much
+   sharper LR ramp at the very start.
+2. **Data framing**: per-story, padded/truncated to a fixed 512-token
+   row, `eos`-masked, sampled by full-story index — vs kev-gpt's own
+   actual flat continuous-stream/random-contiguous-window sampling
+   (`model/data.py`'s `load_split`/`get_batch`), no padding, no
+   story-boundary handling, `block_size=128` (vs this harness's 511).
+
+Both remain completely untested by this entire investigation (the
+original SCALE-UP-LOG's Attempts 1-22, and this Phase 2 walk's Steps
+0-6). Given every other axis is now cleared, one of these two — most
+plausibly the LR schedule, since Attempt 6 in the original SCALE-UP-LOG
+already showed the divergence is NOT gated on LR continuing to decay
+(freezing it at a low floor for 10,000 iterations didn't stop the
+climb) but never tested starting from a genuinely different schedule
+*shape* — is now the leading candidate for the actual root cause.
+
+### Step 7: swap the LR schedule SHAPE — linear-no-warmup -> kev-gpt's real cosine+warmup=100 — still no divergence
+
+`model/tinystories_hf_repro/ablation_step7_cosinewarmup.py` — Step 6
+verbatim, with only the LR schedule function changed: a direct copy of
+`model/train.py`'s own `cosine_lr(it, lr, warmup, total, min_lr_frac=0.1)`
+in place of the reference recipe's `linear_lr_no_warmup`. Peak
+`lr=5e-4` unchanged (only the shape — warmup, then cosine decay to a
+0.1x floor — is new); `warmup=100` matches kev-gpt's own `--warmup`
+CLI default exactly. Smoke-tested first (200 steps) to confirm the
+schedule values match the formula exactly: step 0 logged `lr=5.00e-06`
+(`5e-4 * 1/100`, warmup start) and step 200 (smoke test's own `total`)
+logged `lr=5.00e-05` (the `0.1x` floor, reached exactly at the end) —
+both exact.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step7_cosinewarmup.py 15000 /tmp/ablation7_states.jsonl
+```
+
+| step | val | lr | | step | val | lr |
+|---|---|---|---|---|---|---|
+| 0 | 9.811 | 5.0e-06 | | 8000 | 1.422 | 2.54e-04 |
+| 500 | 2.676 | 4.99e-04 | | 8500 | 1.408 | 2.30e-04 |
+| 1000 | 2.229 | 4.96e-04 | | 9000 | 1.373 | 2.07e-04 |
+| 1500 | 1.922 | 4.90e-04 | | 9500 | 1.396 | 1.85e-04 |
+| 2000 | 1.792 | 4.82e-04 | | 10000 | 1.385 | 1.64e-04 |
+| 2500 | 1.713 | 4.72e-04 | | 10500 | 1.320 | 1.44e-04 |
+| 3000 | 1.682 | 4.59e-04 | | 11000 | 1.342 | 1.25e-04 |
+| 3500 | 1.679 | 4.45e-04 | | 11500 | 1.325 | 1.09e-04 |
+| 4000 | 1.635 | 4.28e-04 | | 12000 | 1.299 | 9.35e-05 |
+| 4500 | 1.563 | 4.10e-04 | | 12500 | 1.282 | 8.05e-05 |
+| 5000 | 1.513 | 3.90e-04 | | 13000 | 1.273 | 6.97e-05 |
+| 5500 | 1.561 | 3.69e-04 | | **13500** | **1.248 (best)** | 6.12e-05 |
+| 6000 | 1.488 | 3.47e-04 | | 14000 | 1.351 | 5.50e-05 |
+| 6500 | 1.470 | 3.24e-04 | | 14500 | 1.262 | 5.12e-05 |
+| 7000 | 1.438 | 3.01e-04 | | **15000** | **1.311 (final)** | 5.0e-05 |
+| 7500 | 1.471 | 2.77e-04 | | | | |
+
+115.9 minutes total. Val loss trends downward the entire run, including
+through iter 3500-4000 (val 1.679->1.635, LR still at 4.28-4.45e-04 —
+*higher* than Step 6's linear-schedule LR at the same iters, 3.83-3.67e-04,
+since cosine decay stays closer to peak for longer than linear decay
+early on) — no turn, no climb, nothing resembling the original
+SCALE-UP-LOG's divergence signature at the identical architecture. One
+noisy point at iter 14000 (val jumped to 1.351 from iter 13500's 1.248)
+recovered immediately at iter 14500 (1.262), confirming it was noise,
+not a trend. **kev-gpt's own real LR schedule (cosine decay,
+`warmup=100`), at kev-gpt's own actual diverging shape, with kev-gpt's
+own real attention class, still does not diverge.**
+
+**This closes the second of the two remaining leads from Step 6.**
+Every axis identified across the entire investigation — loop mechanics,
+all three hyperparameters, attention precision, tokenizer, attention
+scope, the full real attention class, width/depth at the actual
+diverging shape, and now the LR schedule shape itself — has been
+individually ruled out as a standalone cause. **Exactly one axis remains
+completely untested, in either this Phase 2 walk or the original
+SCALE-UP-LOG's Attempts 1-22: the data-framing convention** — per-story,
+padded/truncated to a fixed 512-token row with `eos`-masking (every run
+in this entire Phase 2 walk, Steps 0-7) vs. kev-gpt's own actual flat
+continuous-stream/random-contiguous-window sampling
+(`model/data.py`'s `load_split`/`get_batch`, `block_size=128`, no
+padding, no per-story boundaries, no masking of any kind). Every other
+piece of kev-gpt's real recipe — architecture, width, depth, tokenizer,
+optimizer hyperparameters, LR schedule — has now been reproduced
+faithfully in this harness without reproducing the divergence. If a
+final step running kev-gpt's own real `GPT`/`CausalSelfAttention` class
+against kev-gpt's own real flat-stream data pipeline (not this harness's
+per-story dataset) still doesn't diverge, the honest conclusion would be
+that the original divergence is not reproducible from first principles
+in a from-scratch harness at all, and might instead depend on something
+about `model/train.py`'s own exact execution environment/state (e.g.
+`torch.manual_seed(1337)` combined with this specific GPU's kernel
+selection, floating-point non-determinism noted already in the original
+log's Conclusion 6) rather than any single identifiable design choice.
+
+### Step 8: swap the DATA FRAMING — per-story padded rows -> kev-gpt's real flat-stream pipeline — still no divergence
+
+`model/tinystories_hf_repro/ablation_step8_flatstream.py` — the last
+untested axis. Drops the entire HF-`datasets`-derived pipeline (no
+`load_dataset`, no per-story tokenize/pad/truncate, no `<eos>`-masking)
+and replaces it with kev-gpt's own real data pipeline, verbatim:
+`np.memmap` over `data/word_v16384/train.bin`/`val.bin` (the exact
+pre-tokenized corpus the real deployed/diagnostic checkpoints train
+on — not regenerated) plus a direct copy of `model/train.py`'s own
+`get_batch` (random contiguous `block`-length windows, x/y pre-shifted
+by one, no padding, no per-story boundaries, every position a real
+training target). `block_size=128`, matching the original SCALE-UP-LOG's
+own convention exactly (Steps 0-7 all used `block=511`, inherited from
+the reference recipe's `seq_len=512`). Uses kev-gpt's own
+`GPT.forward(idx, targets)` directly, unmodified, with its own built-in
+loss (no manual `ignore_index` wrapper needed — nothing to mask,
+matching kev-gpt's real training exactly). Peak `lr=5e-4` and the
+cosine+`warmup=100` schedule carried over unchanged from Step 7 (already
+cleared); `weight_decay=0.1`, `beta2=0.95`, `eps=1e-8` default,
+`n_embd=384/n_layer=12/n_head=6` carried over from Step 6.
+
+Also drops the gradient-accumulation workaround entirely — `block=128`
+needs far less memory than `block=511` did (`64*128*16384*4 bytes ≈
+537MB` for the float32 logits cast, vs. the `~6.1GB` that forced
+`MICRO_BATCH`/`ACCUM_STEPS` before), a genuine consequence of matching
+kev-gpt's own real block size, not a separate choice.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step8_flatstream.py 15000 /tmp/ablation8_states.jsonl
+```
+27.53M params (same as Steps 6-7). Notably faster than every prior
+step (31.0 min total) — no HF dataset download/tokenize overhead, no
+padding, no gradient accumulation, and a much shorter `block=128` per
+forward pass.
+
+| step | val | | step | val |
+|---|---|---|---|---|
+| 0 | 9.822 | | 8000 | 1.880 |
+| 500 | 2.997 | | 8500 | 1.842 |
+| 1000 | 2.609 | | 9000 | 1.814 |
+| 1500 | 2.392 | | 9500 | 1.805 |
+| 2000 | 2.312 | | 10000 | 1.813 |
+| 2500 | 2.204 | | 10500 | 1.787 |
+| 3000 | 2.146 | | 11000 | 1.767 |
+| 3500 | 2.079 | | 11500 | 1.780 |
+| 4000 | 2.057 | | 12000 | 1.757 |
+| 4500 | 2.026 | | 12500 | 1.745 |
+| 5000 | 1.984 | | 13000 | 1.757 |
+| 5500 | 1.955 | | **13500** | **1.713 (best)** |
+| 6000 | 1.909 | | 14000 | 1.726 |
+| 6500 | 1.926 | | 14500 | 1.724 |
+| 7000 | 1.868 | | **15000** | **1.728 (final)** |
+| 7500 | 1.905 | | | |
+
+(Val-loss magnitudes here aren't directly comparable to Steps 0-7's —
+this is a genuinely different task framing: shorter context (`block=128`
+vs 511), no end-of-story padding making the tail of short sequences
+trivially predictable. Only the *shape* of the trajectory is the
+relevant signal.) Val loss trends downward the entire run, including
+cleanly through iter 3500-4500 — the historically critical zone, and the
+single most faithful reproduction of the original diverging setup
+anywhere in this investigation (real attention class, real diverging
+shape, real LR schedule, real data pipeline, all simultaneously).
+**Still no divergence.**
+
+**This is the decisive result of the whole investigation.** Every axis
+identified across BOTH the original SCALE-UP-LOG (Attempts 1-22: LR
+magnitude/warmup/decay-length, GPT-2 residual-projection init scaling,
+weight-decay/LayerNorm grouping, z-loss at two strengths, SGD vs AdamW,
+`eps`/`beta2`) and this entire Phase 2 walk (loop mechanics, all three
+individual hyperparameters, attention precision, tokenizer, attention
+scope, the full real attention class, width/depth at the exact diverging
+shape, LR schedule shape, and now data framing) has now been tested,
+individually, and none of them alone reproduces the divergence in a
+from-scratch harness built to match kev-gpt's real recipe as closely as
+possible at every step. **The honest conclusion: this specific
+instability is not reproducible from first principles by varying one
+design choice at a time** — which leaves two live possibilities, neither
+resolved by this investigation:
+1. It requires a *combination* of choices this systematic one-axis-at-a-
+   time walk structurally cannot find (every step here changed exactly
+   one thing relative to an already-stable baseline; a combination that
+   only diverges when TWO OR MORE specific values coincide would never
+   surface this way).
+2. It's genuinely execution-state-dependent rather than deterministic
+   given the recipe alone — the original log's own Conclusion 6 already
+   found this directly: the identical deployment-shape recipe, same
+   fixed `torch.manual_seed(1337)`, diverged on one run and didn't on
+   another, attributed there to ordinary GPU floating-point
+   non-determinism (parallel reduction order isn't bit-fixed even under
+   a fixed seed). If that's the real mechanism, no amount of harness-
+   level ablation can find "the" cause, because there isn't a single
+   deterministic one.
+
+**The cheapest remaining check, not yet done**: run `model.train` itself
+— the actual production entry point, not this harness — with the exact
+flags from the original SCALE-UP-LOG's Experiment 1 or a later Attempt,
+on this same machine, right now. If it still diverges today, the
+instability is confirmed real and live in the current codebase (meaning
+something differs between this Phase 2 harness and the real training
+path that all eight steps here failed to isolate). If it doesn't
+diverge this time, that's independent evidence for possibility 2 above.
+
+### Sanity check: the real `model.train`, bare defaults — it still diverges today
+
+```bash
+python -m model.train --max-iters 15000 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 6 --n-embd 384 --block-size 128 \
+  --out data/ckpt_sanity_d384_v16384_bare.pt --states data/states_sanity_d384_v16384_bare.jsonl
+```
+Bare CLI defaults, nothing overridden: `--lr` defaults to `1e-3`,
+`--warmup` to `100`, `--adam-eps` to `1e-8`, `--adam-beta2` to `0.95` —
+the literal, never-stabilized recipe, same shape (`n_embd=384,
+n_layer=12, n_head=6, VOCAB=16384, block_size=128`) as every Phase 2
+Step 6-8 above. `throughput: 9.7 it/s` (`--smoke 5`), ~26 min budget.
+
+| iter | val | logit_max | lnf_norm |
+|---|---|---|---|
+| 0 | 9.782 | 2.5 | 19.60 |
+| 2000 | 2.379 | 24.2 | 31.39 |
+| **2500** | **2.371 (best)** | 29.6 | 33.31 |
+| 4000 | 2.475 | 30.5 | 38.73 |
+| 6000 | 2.722 | 27.5 | 45.85 |
+| 9000 | 3.262 | 31.6 | 56.23 |
+| 12000 | 4.028 | 42.0 | 64.44 |
+| 15000 | 4.731 | 48.0 | 69.38 |
+
+Bottoms at iter 2500, then climbs continuously for the remaining 12,500
+iterations to val=4.731, `logit_max`/`lnf_norm` growing unbounded the
+whole way — the exact signature the original SCALE-UP-LOG documented
+throughout Attempts 1-9. **The real production training path still
+diverges today, on this exact hardware.** `model.train`'s own
+auto-rollback correctly saved the iter-2500 checkpoint
+(`data/ckpt_sanity_d384_v16384_bare.pt`, val=2.371).
+
+Sampled both the rollback checkpoint (iter 2500, val 2.371) and the
+diverged end (`data/ckpts/ckpt_15000.pt`, val 4.731) at 3 prompts each
+(`python -m model.sample <ckpt> --prompt "..." -n 80 --seed 1`) for a
+direct quality comparison. Degradation is real but more subtle than the
+val-loss gap alone suggests — mostly odd, slightly incoherent phrasing
+("provide her with a special touch," "noticed a find and an apple," an
+abrupt unprompted mid-story restart) rather than outright gibberish or
+repetition:
+
+> **iter 2500** ("once upon a time"): *"...bobo loved to hop around in
+> the grass with his friends. one day, while playing with the rain, he
+> saw a big cat running towards him. the cat was scared and ran away..."*
+>
+> **iter 15000** ("once upon a time"): *"...she had a special light that
+> she put in in her room ready for a special makeup. every day after
+> that, her parents would provide her with a special touch. surprise was
+> to organize their hair in the kitchen..."*
+
+**This confirms the instability is real, live, and reproducible via the
+actual codebase — not an artifact of anything in this Phase 2 harness.
+Since Step 8 (kev-gpt's real attention class + real data pipeline + real
+LR schedule + real hyperparameters, everything this walk could match)
+did NOT diverge, something concrete still differs between Step 8 and
+this sanity run.** Diffing the two scripts line-by-line against
+`model/train.py` directly (not from memory) surfaced two real,
+previously-untested candidates:
+
+1. **Precision mechanism.** `model/train.py`'s `amp_dtype()`:
+   ```python
+   def amp_dtype(device):
+       if device == "cuda":
+           return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+   ```
+   This GPU supports bf16 (confirmed: the smoke test printed
+   `amp=torch.bfloat16`). Critically, `GradScaler` construction is
+   `enabled=(device == "cuda" and dtype == torch.float16)` — since
+   `dtype` is `torch.bfloat16` here, **this evaluates to `enabled=False`.
+   The real recipe never uses loss scaling at all**: no dynamic scale
+   factor, no gradient-overflow detection, no silently-skipped optimizer
+   steps. Every single Phase 2 script (Steps 0-8) used fp16 autocast
+   with `GradScaler` **enabled** — inherited unbroken from Step 0's
+   faithful reproduction of the reference recipe's `fp16=True` — which
+   has a real, qualitatively different safety-valve behavior: it can
+   silently skip an update whenever a gradient overflows, then shrink
+   the scale and retry. This axis was never varied anywhere in either
+   investigation.
+2. **Peak LR magnitude.** `--lr` defaults to `1e-3` in `model/train.py`;
+   every Phase 2 script used `5e-4` (Step 0's inherited value; Step 7
+   only tested schedule *shape*, always at that same 5e-4 peak). This
+   sanity run is the first anywhere in this document to use the real
+   `1e-3` default.
+3. **Seed.** `model/train.py` calls `torch.manual_seed(1337)` once
+   before data/model construction; no Phase 2 script sets any seed.
+   Weaker candidate — the original log's own Conclusion 6 already showed
+   the *same* seed doesn't guarantee reproducibility on this GPU.
+
+Checked and ruled out as real differences: `weight_decay`/`beta2`/`eps`
+defaults match exactly; `clip_grad_norm_(..., 1.0)` matches;
+`eval_iters` (50 vs this harness's 20) only affects measurement noise,
+not training dynamics (eval never feeds back into the loop).
+
+### Step 9: swap the PRECISION MECHANISM — fp16+GradScaler -> kev-gpt's real bf16/no-scaler — still no divergence
+
+`model/tinystories_hf_repro/ablation_step9_bf16noscaler.py` — Step 8
+verbatim, with only `dtype`/`GradScaler` changed to a direct copy of
+`model/train.py`'s own construction:
+```python
+dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+scaler = torch.amp.GradScaler(enabled=(device == "cuda" and dtype == torch.float16))
+```
+Peak `lr=5e-4` unchanged (Step 8's value — only the precision mechanism
+is the new variable, isolating it from the LR-magnitude candidate).
+Smoke-tested first to confirm the mechanism actually engages as
+expected: printed `amp dtype: torch.bfloat16` and `GradScaler enabled:
+False`, matching the sanity run exactly.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step9_bf16noscaler.py 15000 /tmp/ablation9_states.jsonl
+```
+
+| step | val | | step | val |
+|---|---|---|---|---|
+| 0 | 9.778 | | 8000 | 1.875 |
+| 500 | 3.031 | | 8500 | 1.867 |
+| 1000 | 2.610 | | 9000 | 1.834 |
+| 1500 | 2.424 | | 9500 | 1.833 |
+| 2000 | 2.275 | | 10000 | 1.803 |
+| **2500** | **2.214** | | 10500 | 1.789 |
+| 3000 | 2.142 | | 11000 | 1.777 |
+| 3500 | 2.095 | | 11500 | 1.754 |
+| 4000 | 2.062 | | 12000 | 1.772 |
+| 4500 | 2.027 | | 12500 | 1.759 |
+| 5000 | 1.967 | | 13000 | 1.729 |
+| 5500 | 1.974 | | 13500 | 1.729 |
+| 6000 | 1.935 | | 14000 | 1.761 |
+| 6500 | 1.933 | | 14500 | 1.740 |
+| 7000 | 1.903 | | **15000** | **1.716 (best = final)** |
+| 7500 | 1.898 | | | |
+
+30.4 minutes total. At iter 2500 — the exact iteration where the bare-
+defaults sanity run bottomed (val=2.371) and turned upward — this run's
+val is 2.214 and still falling. The whole trajectory strictly trends
+downward with normal noise, ending at its own lowest point at iter
+15000. **The precision mechanism alone — bf16 with GradScaler disabled,
+matching the real recipe exactly — does not reproduce the divergence.**
+
+**This narrows the two remaining candidates to one.** Precision
+mechanism is now cleared the same way every other axis was: peak LR
+magnitude (`1e-3` vs the `5e-4` used everywhere in Phase 2, including
+this step) is the only concrete, unexamined difference left between
+Step 9 and the sanity run that diverged. Seed remains a weaker,
+un-eliminated candidate given Conclusion 6's own non-determinism
+finding. The natural next step is Step 9 with `lr=1e-3` substituted for
+`5e-4` — the last identified variable.
+
+### Step 10: swap PEAK LR — 5e-4 -> kev-gpt's real `--lr` default, 1e-3 — still no divergence
+
+`model/tinystories_hf_repro/ablation_step10_lr1e3.py` — Step 9 verbatim,
+`LR = 1e-3` in place of `5e-4`. Schedule shape (cosine, `warmup=100`)
+and everything else (bf16/no-scaler, kev-gpt's real attention class,
+real data pipeline, real diverging shape, real hyperparameters) held
+exactly as Step 9. This is the last concretely identified difference
+between this Phase 2 harness and the sanity run that reproduced the
+original divergence — every other axis in both the original SCALE-UP-LOG
+(Attempts 1-22) and this entire Phase 2 walk (Steps 0-9) has now been
+tested and individually cleared. Smoke-tested first: step 0 logged
+`lr=1.00e-05` (`1e-3 * 1/100`) and step 100 logged `lr=1.00e-03` (peak,
+warmup complete) — exact match to the formula.
+
+```bash
+python /home/tparng/kev-gpt/model/tinystories_hf_repro/ablation_step10_lr1e3.py 15000 /tmp/ablation10_states.jsonl
+```
+
+| step | val | | step | val |
+|---|---|---|---|---|
+| 0 | 9.829 | | 8000 | 1.883 |
+| 500 | 2.869 | | 8500 | 1.851 |
+| 1000 | 2.527 | | 9000 | 1.823 |
+| 1500 | 2.387 | | 9500 | 1.826 |
+| 2000 | 2.260 | | 10000 | 1.804 |
+| **2500** | **2.196** | | 10500 | 1.776 |
+| 3000 | 2.114 | | 11000 | 1.769 |
+| 3500 | 2.079 | | 11500 | 1.756 |
+| 4000 | 2.080 | | 12000 | 1.743 |
+| 4500 | 2.017 | | 12500 | 1.728 |
+| 5000 | 1.980 | | 13000 | 1.743 |
+| 5500 | 1.981 | | 13500 | 1.729 |
+| 6000 | 1.970 | | 14000 | 1.728 |
+| 6500 | 1.931 | | 14500 | 1.731 |
+| 7000 | 1.901 | | **15000** | **1.719 (best = final)** |
+| 7500 | 1.891 | | | |
+
+30.5 minutes total. At iter 2500 — now with the LR trajectory itself
+matching the sanity run exactly (`lr=9.44e-04` here vs the sanity run's
+`9.4e-04` at the same iter, since both use `lr=1e-3`/`warmup=100`/cosine)
+— this run's val is 2.196 and still falling, vs. the sanity run's
+val=2.371 that turned upward at exactly this point. The whole
+trajectory strictly trends downward with normal noise, ending at its
+lowest point at iter 15000. **Peak LR magnitude does not reproduce the
+divergence either.**
+
+**Every concretely identified difference between this harness and the
+real `model.train` recipe has now been tested and exhausted.** The
+sanity check confirmed the divergence is real and live in the current
+codebase. A line-by-line diff against `model/train.py` surfaced exactly
+three candidates: precision mechanism (Step 9, cleared), peak LR
+magnitude (Step 10, cleared), and seed. With the first two both cleared
+— at kev-gpt's real diverging architecture, real data pipeline, real
+LR schedule (shape AND magnitude), real precision mechanism, real
+hyperparameters, all simultaneously — **the only unmatched variable left
+anywhere in this investigation is `torch.manual_seed(1337)`**, which
+`model/train.py` sets once before data/model construction and no Phase
+2 script sets at all. This is a weak candidate on its own: the original
+SCALE-UP-LOG's own Conclusion 6 already found that the *identical* seed,
+on the *identical* recipe, produced one clean run and one diverging run
+— meaning seed value alone does not deterministically control the
+outcome on this GPU (parallel reduction order in CUDA kernels isn't
+bit-fixed even under a fixed seed). Given that, matching the seed in a
+future run might still flip an individual outcome, but wouldn't
+constitute proof of *the* cause even if it did — it would just be
+consistent with what Conclusion 6 already established: this instability
+appears to be genuinely stochastic given the recipe, not deterministically
+caused by any single design choice this investigation was able to vary
+and check.
+
+### Closing quality check: does any of this actually matter for the generated stories?
+
+Ties back to Phase 2's original motivation (does
+`SauravP97/tiny-stories-hf` produce genuinely better prose, and does
+avoiding kev-gpt's own divergence close that gap) with a direct,
+same-methodology comparison across four checkpoints: **A** (kev-gpt,
+auto-rollback @ iter 2500, val 2.371 — what the diverging sanity run
+actually produced), **B** (kev-gpt, diverged end @ iter 15000, val
+4.731), **C** (kev-gpt, Step 10's fully-trained-without-divergence
+checkpoint @ iter 15000, val 1.719 — the best of the three, and the
+practical payoff of this whole Phase 2 walk), and the **reference**
+(`SauravP97/tiny-stories-19M`, the published checkpoint Phase 2's own
+sanity sweep already scored at 7/25 flagged, `max_new_tokens=60`, back
+near the start of this investigation).
+
+**Sweep 1 (matches the original sanity-sweep methodology): 25 samples
+each (5 seeds x 5 prompts), `max_new_tokens=60`.** A: 17/25 flagged.
+B: 6/25. C: 9/25. At this length the detector is discriminating, not
+saturated, so these numbers are informative on their own — but not in
+the direction raw val loss would predict. **A (lowest/"best" val loss)
+is the MOST repetitive of the three; B (worst val loss, diverged) is
+the LEAST.** The reason is training exposure, not loss quality: A was
+caught by auto-rollback at iter 2500 — only 2500 gradient steps — while
+B and C both trained the full 15,000 steps. A's flagged samples show
+genuine stuck-loop repetition within a single story (e.g. the same
+character repeatedly reintroduced as subject: `"the cat said... the
+cat took... the cat said... the cat smiled..."`, or literal adjacent-
+phrase doubling: `"it was so pretty and pretty... see it again and see
+it again"`). B's divergence shows up differently — fewer bigram-
+recurrence flags, but outright glitches instead: literal word-stutters
+(`"she put it in in her room"`, `"the best apple she had ever had had
+tasted"`) and sentences that don't parse (`"she eventually had one
+very special meeting the way"`) — consistent with divergence being a
+miscalibration/overconfidence problem, not a repetition problem. **C —
+what this whole Phase 2 walk was chasing — has the best val loss of the
+three (1.719) and sits between A and B on the repetition metric, with
+no comparable glitches or stuck-loops in its own flagged samples.**
+
+**Sweep 2 (longer horizon, closer to real usage): 12 samples each (3
+seeds x 4 prompts), `max_new_tokens=250`, run against A/B/C AND the
+reference model with the identical methodology.** All four saturate the
+detector (A: 12/12, B: 11/12, C: 11/12, reference: 12/12) — at this
+length every model naturally strings together 2-3 stories per
+continuation, and template recurrence across separate stories (`"the
+little girl... the little girl"`, `"the end. the end."`) trips the
+bigram rule regardless of underlying quality. **The detector stops
+being the useful signal here; the qualitative read is what actually
+differs.** The reference model has noticeably cleaner grammar/
+orthography (proper capitalization, correctly formatted quotation
+marks — kev-gpt's checkpoints are lowercase/space-unnormalized by the
+keviniser pipeline's own convention, not a training artifact) but its
+own distinct repetition tic: nearly every sample pads out with stacked
+`"The end. The end. The end."`, a more mechanical, more conspicuous
+repetition than anything A/B/C produced. C (kev-gpt, no divergence) is
+the closest of the three kev-gpt checkpoints to the reference's
+fluency, without that stacked-ending habit, modulo the lowercase
+orthography difference.
+
+**Practical conclusion**: avoiding the divergence (Step 10's
+achievement, however it was accomplished) produces a real, measurable
+quality improvement over the checkpoint kev-gpt's own production
+training actually yields today (C's 1.719 val vs. the sanity run's
+2.371 rollback / 4.731 diverged-end, and fewer stuck-loop repetitions
+than the rollback specifically) — genuinely closing a meaningful chunk
+of the gap toward the reference model's own quality, though not
+eliminating every difference (orthography is a separate, deliberate
+project convention; the reference's own "The end." stacking shows even
+a well-regarded published checkpoint has its own repetition
+signature at this scale). Sweep scripts (not checked in, regeneratable):
+`/tmp/claude-*/scratchpad/sweep_three_models.py` (Sweep 1),
+`sweep_three_models_long.py` / `sweep_tinystories_hf_long.py` (Sweep 2).
+
 ## Files touched
 
 - `model/gpt.py`: `GPTConfig.z_loss_coef` (new field, default 0.0/off),
@@ -1789,3 +3007,75 @@ over the real deployed `data/ckpt_word16384.qat.pt`.
   real deployed `data/ckpt_word16384.pt` / `.qat.pt`, and none of the
   VOCAB=16384 candidates has been bit-exact verified yet (unlike the
   VOCAB=1900 `eps=5e-4` checkpoint in Attempt 19).
+- **Phase 2** adds `model/tinystories_hf_repro/` (new directory,
+  standalone scripts, not wired into `model/train.py`'s own CLI):
+  `repro_hf_recipe.py` (Step 0), `ablation_step1_framework.py` (Step 1),
+  `ablation_step2a_weightdecay.py` / `ablation_step2b_beta2.py` /
+  `ablation_step2c_batchsize.py` (Steps 2a-2c), and
+  `sweep_tiny_stories_hf.py` (the seeded quality check against the
+  published `SauravP97/tiny-stories-19M` checkpoint). All run against
+  the user's own `~/tiny-stories-hf/venv` (HF `transformers`/`datasets`/
+  `accelerate`), not this repo's own `.venv` — kev-gpt's own
+  `requirements.txt` is untouched. Each writes its states JSONL to
+  `/tmp/` (not this repo's `data/`, since these runs don't produce a
+  kev-gpt-format checkpoint) — treat those as scratch, regenerate via
+  the "Reproducing this investigation from scratch" commands above
+  rather than expecting them to persist.
+- The architecture-axis attn-precision test adds `model/gpt.py`:
+  `GPTConfig.attn_fp32` (new field, default `False`) and
+  `CausalSelfAttention.forward`'s manual fp32-QK^T branch (only taken
+  when `attn_fp32=True`; SDPA path fully unchanged otherwise); and
+  `model/train.py`: `--attn-fp32` CLI flag threaded into `GPTConfig`
+  (default off). Also adds `data/ckpt_teacher_d384_v16384_fp32attn.pt` +
+  `data/states_teacher_d384_v16384_fp32attn.jsonl` — negative result,
+  not promoted, kept for reference alongside the other falsified
+  Phase-2 attempts.
+- Step 3 adds `model/tinystories_hf_repro/ablation_step3_tokenizer.py`
+  (reads `data/word_v16384/meta.json` directly, no other kev-gpt-repo
+  dependency — runs standalone in `~/tiny-stories-hf/venv` like the rest
+  of `tinystories_hf_repro/`). States JSONL at `/tmp/ablation3_states.jsonl`
+  (scratch, not persisted) — negative result (no divergence), so nothing
+  in `data/` to show for it.
+- Step 4 adds `model/tinystories_hf_repro/ablation_step4_globalattn.py`
+  (copy of Step 3, one line changed: `attention_types`). States JSONL at
+  `/tmp/ablation4_states.jsonl` (scratch) — negative result, nothing in
+  `data/`.
+- Step 5 adds `model/tinystories_hf_repro/ablation_step5_kevgptattn.py`
+  (imports `model.gpt.GPT`/`GPTConfig` directly via `sys.path.insert(0,
+  "/home/tparng/kev-gpt")`, same trick `sweep_tiny_stories_hf.py` already
+  used for `model.filter_synth_corpus` — no changes to kev-gpt's own
+  `model/gpt.py`). States JSONL at `/tmp/ablation5_states.jsonl`
+  (scratch) — negative result at this width/depth, nothing in `data/`.
+- Step 6 adds `model/tinystories_hf_repro/ablation_step6_fullscale.py`
+  (copy of Step 5, `GPTConfig` width/depth changed to `n_embd=384,
+  n_layer=12, n_head=6`). States JSONL at `/tmp/ablation6_states.jsonl`
+  (scratch) — negative result at kev-gpt's actual diverging shape,
+  nothing in `data/`.
+- Step 7 adds `model/tinystories_hf_repro/ablation_step7_cosinewarmup.py`
+  (copy of Step 6, `linear_lr_no_warmup` replaced with a verbatim copy of
+  `model/train.py`'s own `cosine_lr`). States JSONL at
+  `/tmp/ablation7_states.jsonl` (scratch) — negative result, nothing in
+  `data/`.
+- Step 8 adds `model/tinystories_hf_repro/ablation_step8_flatstream.py`
+  (drops HF `datasets` entirely; uses `np.memmap` over the existing
+  `data/word_v16384/train.bin`/`val.bin` + a verbatim copy of
+  `model/train.py`'s own `get_batch`). States JSONL at
+  `/tmp/ablation8_states.jsonl` (scratch) — negative result (the
+  decisive one), nothing in `data/`.
+- Sanity check adds `data/ckpt_sanity_d384_v16384_bare.pt` (auto-rollback,
+  iter 2500, val 2.371) + `data/states_sanity_d384_v16384_bare.jsonl`,
+  via the real `python -m model.train` CLI (no new script) — **positive
+  result**: reproduces the original divergence today. Per-eval snapshots
+  landed in the shared `data/ckpts/` dir (see Attempt 2's overwrite
+  caveat) — `data/ckpts/ckpt_02500.pt` / `ckpt_15000.pt` used for the
+  before/after sample comparison.
+- Step 9 adds `model/tinystories_hf_repro/ablation_step9_bf16noscaler.py`
+  (copy of Step 8, `dtype`/`GradScaler` construction replaced with a
+  verbatim copy of `model/train.py`'s own `amp_dtype()` logic). States
+  JSONL at `/tmp/ablation9_states.jsonl` (scratch) — negative result,
+  nothing in `data/`.
+- Step 10 adds `model/tinystories_hf_repro/ablation_step10_lr1e3.py`
+  (copy of Step 9, `LR = 1e-3` in place of `5e-4`). States JSONL at
+  `/tmp/ablation10_states.jsonl` (scratch) — negative result (the last
+  concretely identified variable, now also cleared), nothing in
+  `data/`.
