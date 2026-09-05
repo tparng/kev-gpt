@@ -2954,6 +2954,195 @@ signature at this scale). Sweep scripts (not checked in, regeneratable):
 `/tmp/claude-*/scratchpad/sweep_three_models.py` (Sweep 1),
 `sweep_three_models_long.py` / `sweep_tinystories_hf_long.py` (Sweep 2).
 
+## Phase 3: deploying Model C's recipe to real Genesys2 hardware
+
+Model C (Step 10, D=384/n_layer=12/n_head=6, the fully-trained-without-
+divergence checkpoint Phase 2 produced) is the natural next thing to
+put on real silicon — Phase 2's whole point was finding a recipe that
+avoids the divergence kev-gpt's own production training hits.
+
+### Model C's actual shape (D=384) is blocked by a hard BRAM overflow
+
+This project's own sizing formula (`GW_BLK = ceil(3D/LANES)·D +
+ceil(D/LANES)·D + ceil(4D/LANES)·D + ceil(D/LANES)·4D`, LANES=64;
+verified exact against the deployed D=128 shape's own documented
+`GW_BLK=3072`) gives:
+
+| | D=128 (deployed) | D=384 (Model C) | ratio |
+|---|---|---|---|
+| `GW_BLK` (per layer) | 3,072 words | 27,648 words | 9x |
+| `GW_HEAD` (vocab GEMV, dominant term) | 32,768 words | 98,304 words | 3x |
+| On-chip weight-streaming buffer → RAMB36 | 402/445 (already ~90%) | ≈3x that ≈ 1,206/445 | — |
+
+This isn't a close call needing synthesis to confirm — `fabric/genesys2/
+PORT-NOTES.md` already documents a real `place_design` failure at the
+*current* D=128 shape (`ERROR: [DRC UTLZ-1] ... requires 522 ... only
+445 compatible sites are available`, fixed only by moving the tokenizer
+table off on-chip BRAM into DDR3, with the weight-related BRAM itself
+already at 402/445). Scaling the dominant `GW_HEAD` term 3x on a design
+already at ~90% utilization is a hard, structural no — no RTL
+parameter or repacking trick changes this on this specific part
+(xc7k325t). **D=384 cannot deploy on this hardware.**
+
+### Retargeting Model C's recipe to D=128 — the deployable shape
+
+Model C's actual D=384 weights can't transfer to D=128 at all (no
+weight-level relationship between different widths) — "retargeting"
+means training fresh at D=128 with Model C's exact recipe (bare
+defaults: `lr=1e-3`, `warmup=100`, `eps=1e-8` default, `beta2=0.95`
+default, real bf16/no-scaler, real flat-stream data, real cosine
+schedule — every one of these already IS `model/train.py`'s own
+default behavior; Model C's whole contribution was proving these
+defaults, applied faithfully, don't have to diverge).
+
+```bash
+python -m model.train --max-iters 15000 \
+  --tokenizer word --vocab-size 16384 --corpus data/TinyStories-train.filtered.txt \
+  --data-dir data/word_v16384 --n-layer 12 --n-head 2 --n-embd 128 --block-size 128 \
+  --out data/ckpt_stepC_d128_v16384.pt --states data/states_stepC_d128_v16384.jsonl
+```
+Auto-rollback caught the best point at **iter 8000, val=2.380** — mild
+upward drift afterward (final val=2.456 @ iter 15000), matching the
+"knife-edge, not catastrophic" pattern this shape's own bare recipe has
+shown before (original SCALE-UP-LOG Attempt 13), not D=384's runaway
+divergence.
+
+QAT fine-tune (2000 iters, `--qat --init-from`): val **improved** to
+**2.318** — QAT helped here, unlike Model C's own D=384 QAT (which
+regressed slightly, best val landing at iter 0).
+
+```bash
+python -m model.export_fabric data/ckpt_stepC_d128_v16384.qat.pt --out fabric/export_stepC_d128_v16384
+# 2176.0 KB packed weights, budget 3072 KB -> FITS
+python -m model.validate_goformer --ckpt data/ckpt_stepC_d128_v16384.qat.pt --export fabric/export_stepC_d128_v16384
+# worst cosine 1.0000000 -> PASS (gate 0.9999)
+```
+RTL bit-exact gate, matching this project's own 5-prompt precedent
+exactly (`--p 8 --lanes 64 --tmax 128`, `fabric.stage3.run_vec_kv`):
+
+| prompt | plen | ngen | seed | verdict |
+|---|---|---|---|---|
+| "once upon a time" | 4 | 60 | 7 | `match=True` |
+| "the little dog" | 3 | 120 | 1 | `match=True` |
+| "one day a girl named lily" | 6 | 120 | 2 | `match=True` |
+| "there was a boy who" | 5 | 120 | 3 | `match=True` |
+| "the old man walked into" | 5 | 120 | 4 | `match=True` |
+
+**5/5, bit-exact.** Same architecture as the already-deployed shape
+(confirmed via the actual synthesized source, not inferred: `.NLAYER
+(12)` in `xilinx_core_v_mini_mcu_wrapper_kevgpt.sv`) — no new RTL,
+no re-synthesis needed for this part. Loaded via the existing UART
+boot path (`fabric.genesys2.send_weights`, `fabric.genesys2.
+chat_over_uart`) onto the real board: `SEND_WEIGHTS_PASS`,
+`KEVGPT_INTERACTIVE_READY`, live chat at **~50 tok/s**.
+
+One real process-hygiene gotcha hit and fixed along the way (already
+documented in this project's own history, hit again here): a stale
+`openocd` process from a prior session silently held the JTAG/UART
+interface, causing `/dev/ttyUSB0` to not enumerate. Fix: kill the stale
+process, **reprogram the bitstream fresh** (guaranteed full fabric
+reset — a JTAG-only CPU reset alone doesn't clear stale peripheral
+state), restart `openocd`, confirm exactly one UART reader, only then
+load. A `hw_target` race (`ERROR: [Labtools ...] No devices detected`)
+on the first programming attempt self-resolved on retry once
+`hw_server` was warm.
+
+### A live-hardware vs. software quality gap, found and investigated
+
+Same checkpoint, same prompts — but the FIRST 25-sample live-hardware
+sweep (5 seeds × 5 prompts via `chat_over_uart`) looked meaningfully
+rougher than the software samples used throughout Phase 2:
+
+| | flagged/25 | "care" occurrences |
+|---|---|---|
+| Live hardware (before recalibration) | 8/25 (32%) | 66 (2.64/sample) |
+| Software, `temp=0.8/top_k=40` (Phase 2's own convention) | 5/25 (20%) | 5 (0.20/sample) |
+
+Root-caused in two steps. **Step 1**: `chat_over_uart.py` has no
+`--seed`/`--temperature`/`--top-k` flags at all — the board's on-chip
+Gumbel-max sampler (`fabric/stage3/gumbel.py`) runs on its own free-
+running cycle-counter-seeded noise, over the FULL vocab, no top-k
+truncation. Re-running the software sweep matched to that config
+(`temperature=0.58, top_k=None`) reproduced the flagged-rate gap
+exactly (8/25 both) but left the "care" gap almost unchanged (5 vs 66)
+— **the overall degenerate-rate gap was a sampling-methodology mismatch
+in my own earlier comparison, not a hardware bug; the "care" bias was
+real and unexplained by config.**
+
+**Step 2**: measuring this checkpoint's real head-logit std (via the
+*correct*, D-agnostic golden reference — `model.goformer_kvq.
+IntKVQSequencer(kbits=8, vbits=8, rotate=False, divfree=True)`, the
+exact class the passing RTL gates use; NOT `fabric.stage3.seq_ref.
+IntSequencer` directly, which still hardcodes `C=256`/`NHEAD`/
+`HEAD_DIM` from the old KV260 D=256 shape and throws `IndexError` at
+D=128) gave **mean std 3.734** (15 steps / 5 prompts, min 2.15, max
+6.65) — ~22% *below* `gumbel.py`'s own calibration reference (std
+~4.78 for `TEMP=0.58`). Git history pinpointed why: `TEMP=0.58` was
+set in commit `6b49ed2` (2026-08-26 00:25:50), calibrated for the
+**NLAYER=8** shape then deployed — but `NLAYER` grew to 12 only
+**4h45m later** (`ddce9f7`, 05:10:15, same day), and `gumbel.py` has had
+**zero commits since**. The Gumbel noise magnitude has been running on
+a stale, shallower-model calibration since the very first NLAYER=12
+deployment — not something this session's new checkpoint introduced,
+a pre-existing latent condition this investigation happened to be the
+first to measure precisely enough to notice.
+
+### Recalibration: measure, edit, re-synthesize, re-flash, re-test
+
+```python
+new_TEMP = 0.58 * (3.734 / 4.78)   # ~= 0.4531, rounded to 0.45
+```
+`fabric/stage3/gumbel.py`: `TEMP = 0.58 -> 0.45`, comment rewritten
+with the full measurement/git-history chain above (matching this
+file's own prior recalibration comment's rigor, not a bare number
+change).
+
+Since the Gumbel LUT is baked into the bitstream at synthesis time
+(not reloadable over UART like weights), this required a real rebuild
+— but only a ROM-content change, not a structural RTL edit, so the
+lighter `reset_run` recipe sufficed (no full project regen):
+```bash
+# 1) reset (must happen BEFORE staging, not after -- reset_run empties the run dir)
+open_project openhwgroup.org_systems_core-v-mini-mcu_1.0.5.xpr
+reset_run synth_1; reset_run impl_1
+
+# 2) stage ROMs (plain shell, after the reset)
+python -m fabric.genesys2.stage_vivado_roms \
+  --npz fabric/export_stepC_d128_v16384/goformer.npz --lanes 64 --p 8 \
+  --dest <project root> --dest <project root>/*.runs/synth_1
+
+# 3) build -- NO -jobs flag (this project's own documented gotcha:
+#    launch_runs synth_1 -jobs 4 hung for 1h44m+ at near-zero CPU once
+#    before, a Vivado `vrs` parallel-dispatcher bug, not a slow build)
+open_project openhwgroup.org_systems_core-v-mini-mcu_1.0.5.xpr
+launch_runs synth_1;              wait_on_run synth_1
+launch_runs impl_1 -to_step write_bitstream;  wait_on_run impl_1
+```
+Result: **0 Errors, 356 Warnings, 0 Critical Warnings, "Bitgen
+Completed Successfully"**, ~27 minutes wall clock (well inside this
+project's own 20-90 min prior-build range). Reprogrammed, reloaded
+firmware, reloaded weights (`SEND_WEIGHTS_PASS` again, same
+10,682,368+189,448-byte image — confirms architecture unchanged),
+re-ran the identical 25-sample sweep:
+
+| | flagged/25 | "care" | "buster's" (new) |
+|---|---|---|---|
+| Before (`TEMP=0.58`, stale) | 8/25 (32%) | 66 (2.64/sample) | present, not counted |
+| **After (`TEMP=0.45`)** | **3/25 (12%)** | **23 (0.92/sample)** | **39 (1.56/sample)** |
+| Software baseline (`temp=0.58/top_k=None`, matched config) | 8/25 | 5 (0.20/sample) | — |
+
+**Real, measurable improvement**: flag rate 32%→12% (better than even
+the matched-config software baseline), "care" down ~2.9x. **Not fully
+resolved**: a new, milder fixation token ("buster's", stuck as the
+repeated subject across several sentences) appeared in its place — the
+same *kind* of phenomenon, reduced but not eliminated. This suggests
+either a residual precision/sampling difference between real silicon
+and the golden-reference simulation that a handful of seeded bit-exact
+gates wouldn't catch, or some inherent property of this checkpoint's
+own token-probability landscape under full-vocab (no-top-k) sampling
+specifically — not yet distinguished. Open for further investigation,
+not closed.
+
 ## Files touched
 
 - `model/gpt.py`: `GPTConfig.z_loss_coef` (new field, default 0.0/off),
@@ -3079,3 +3268,17 @@ signature at this scale). Sweep scripts (not checked in, regeneratable):
   `/tmp/ablation10_states.jsonl` (scratch) — negative result (the last
   concretely identified variable, now also cleared), nothing in
   `data/`.
+- **Phase 3** adds `data/ckpt_stepC_d128_v16384.pt` (D=128 retarget, FP,
+  iter 8000, val 2.380) + `data/states_stepC_d128_v16384.jsonl`;
+  `data/ckpt_stepC_d128_v16384.qat.pt` (QAT, val 2.318) + `data/
+  states_stepC_d128_v16384_qat.jsonl`; `fabric/export_stepC_d128_v16384/`
+  (both the `model.export_fabric` linears-only export and the
+  `model.goformer_full` `goformer.npz` used by the RTL gates) — this
+  checkpoint IS now the one actually flashed on the real board, real
+  quality caveats and all. Also `data/ckpt_stepC_d384_v16384_fp.pt` /
+  `.qat.pt` (Model C's own D=384 QAT, val 1.845 — never deployed, kept
+  for reference alongside the BRAM-overflow finding). Edits `fabric/
+  stage3/gumbel.py` (`TEMP` 0.58 -> 0.45, comment rewritten with the
+  full measurement chain) — this is a real, permanent, committed source
+  change, requiring a bitstream rebuild to take effect (already done and
+  reflected in the real board's current state as of this log entry).

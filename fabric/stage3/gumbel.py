@@ -20,24 +20,33 @@ from __future__ import annotations
 
 import math
 
-TEMP = 0.58          # baked into the LUT (the deployed host temperature).
-                      # Recalibrated (was 0.85) after a real-hardware finding:
-                      # 0.85 was tuned against an earlier checkpoint whose
-                      # head-logit std was ~7.01 (Q6.25 real units, prompt
-                      # "once upon a time"); the NLAYER=8 per-layer-streaming
-                      # checkpoint (fabric/export_stream8) has a noticeably
-                      # smaller std (~4.78) -- a real property of the bigger,
-                      # differently-trained model, not a bug. A fixed-
-                      # magnitude Gumbel noise at the old TEMP was then
-                      # comparable to or larger than the actual logit signal,
-                      # so on-chip sampling was noise-dominated (garbled real-
-                      # hardware chat output) while greedy (zero noise) stayed
-                      # bit-exact. Rescaled proportionally to preserve the
-                      # earlier checkpoint's noise-to-signal ratio: 0.85 *
-                      # (4.78/7.01) ~= 0.58. If a future checkpoint's logit
-                      # scale drifts again, recheck this the same way (real
-                      # head-logit std via seq_ref.build + IntKVQSequencer.
-                      # step_head_q25, not guessed).
+TEMP = 0.45          # baked into the LUT (the deployed host temperature).
+                      # Recalibrated (was 0.58) after a real-hardware finding:
+                      # 0.58 was tuned on 2026-08-26 (commit 6b49ed2) against
+                      # the NLAYER=8 checkpoint then deployed (head-logit std
+                      # ~4.78, Q6.25 real units) -- but NLAYER grew 8->12 the
+                      # SAME day, ~4h45m later (commit ddce9f7), and TEMP was
+                      # never rechecked against the new depth. Measured directly
+                      # (data/ckpt_stepC_d128_v16384.qat.pt, the model.
+                      # tinystories_hf_repro Phase-2 investigation's D=128
+                      # retarget -- see model/SCALE-UP-LOG.md) via the SAME
+                      # proven-correct golden reference the real bit-exact
+                      # gates use (seq_ref.build + IntKVQSequencer(kbits=8,
+                      # vbits=8, rotate=False, divfree=True).step(), NOT the
+                      # stale seq_ref.IntSequencer directly -- that class still
+                      # hardcodes C=256/NHEAD/HEAD_DIM from the old KV260 D=256
+                      # shape and throws IndexError at D=128): mean head-logit
+                      # std 3.734 across 15 steps / 5 prompts (min 2.15, max
+                      # 6.65) -- ~22% LOWER than the stale 4.78 calibration
+                      # point, the SAME direction (smaller real signal vs a
+                      # too-large fixed noise magnitude) as the original
+                      # noise-dominated-garbling failure this file's own history
+                      # already documents once. Rescaled proportionally to
+                      # preserve the noise-to-signal ratio: 0.58 * (3.734/4.78)
+                      # ~= 0.4531, rounded to 0.45. If a future checkpoint's
+                      # logit scale drifts again, recheck this the same way
+                      # (real head-logit std via seq_ref.build + IntKVQSequencer
+                      # .step(), not guessed, not the parent IntSequencer class).
 GLBITS = 10          # u resolution = 1/1024; LUT = 1024 x 32b = one BRAM tile
 FRAC = 25            # logits are Q6.25
 VOCAB = 193
