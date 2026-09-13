@@ -153,7 +153,7 @@ footer.endnote{ margin-top:56px; padding-top:20px; border-top:1px solid var(--bo
       published 19M-parameter FP reference trained on the same TinyStories-style corpus. Every draw, not a
       curated subset.</p>
     <div class="provenance">
-      <span><b>Detector</b> model.filter_synth_corpus.is_degenerate, min_bigram_recurrence=3</span>
+      <span><b>Detector</b> model.filter_synth_corpus.is_degenerate, min_bigram_recurrence=6</span>
       <span><b>Draws</b> 5 &times; 5 prompts, 25 total each side</span>
       <span><b>Hardware config</b> on-chip Gumbel-max, TEMP=0.45, MAX_GEN_LEN=124/STORY_SENTENCES=20 (benchmark
         override, see runbook)</span>
@@ -172,13 +172,17 @@ footer.endnote{ margin-top:56px; padding-top:20px; border-top:1px solid var(--bo
     like at the length it's actually built to produce.
   </div>
   <div class="caveat">
-    <b>The bigram-recurrence detector saturates at this length for both sides</b> &mdash; already documented
-    in this directory's own <code>quality_sweep_C_vs_reference.py</code> ("detector saturates here per the
-    original investigation" for its own 250-token Sweep 2). At ~128-150 words, enough function-word bigrams
-    recur by ordinary chance that most samples on both sides trip <code>min_bigram_recurrence=3</code> even
-    when the prose reads fine. Flagged-rate is shown below for completeness but isn't the load-bearing metric
-    here &mdash; read the samples, and see the fixation-term counts (kev-gpt-specific non-sequitur words this
-    project has tracked since the fixation-word investigation) for a more targeted signal.
+    <b>Threshold raised from 3 to 6 for this length.</b> The bigram-recurrence detector's usual
+    <code>min_bigram_recurrence=3</code> (calibrated for ~60-word samples elsewhere in this directory)
+    saturates at ~110-150 words &mdash; already documented in <code>quality_sweep_C_vs_reference.py</code>
+    ("detector saturates here per the original investigation" for its own 250-token Sweep 2). At threshold=3
+    this benchmark's first pass flagged 14/25 hardware and a full 25/25 reference samples, most on ordinary
+    function-word reuse ("the girl" 3&times;, "it was" 3&times;), not real loops. 6 was picked by inspecting
+    this benchmark's own actual max-bigram-count distribution: hardware samples split cleanly into a 2-4 bulk
+    (incidental reuse) and a 6/8/10/12 tail (genuine repetition, e.g. "the dog" recurring 12&times; in one
+    reply) &mdash; 6 is the natural cut between them, and it brings both sides down to a comparable, no-longer-
+    saturated rate (below). Fixation-term counts (kev-gpt-specific non-sequitur words this project has tracked
+    since the fixation-word investigation) remain the more targeted signal regardless of threshold.
   </div>
 
   <div class="stats-grid" id="stats-grid"></div>

@@ -14,7 +14,7 @@
     "real_seed": "0xe03348ad",
     "prompt": "the sun was",
     "text": "the sun was shining brightly and the birds were singing together. they were having so much fun that they didn't notice all the other animals in the forest were very tired. but then the little girl noticed something special. the little bird was very big and had big eyes that was all around. the two animals were so surprised by the bird's happy size and they flew away. the two friends decided to have some more fun. they all laughed and hugged, then they flew off to play with the animals they saw. they all enjoyed the beautiful sight. the little birds and birds were very happy to be together and have fun together. they were not",
-    "reason": "bigram recurred 3x: ('the', 'little')",
+    "reason": null,
     "elapsed_s": 2.476,
     "rate_tok_s": 46.0,
     "word_count": 117
@@ -44,7 +44,7 @@
     "real_seed": "0xb3b3815e",
     "prompt": "she found a",
     "text": "she found a big, shiny rock. she picked it up and showed it to her mom.\" look, mom!\" she said, pointing at a shiny thing.\" wow, that's a pretty rock!\" her dad said.\" can i see it?\" lily nodded and took the rock. she reached for the shiny thing. it was a big and round. she saw a shiny thing on the ground. she thought it looked pretty.\" mom, what is this?\" lily asked, holding the rock.\" it is a gift from my grandma. it has a name. it has four name,\" mom said",
-    "reason": "bigram recurred 3x: ('shiny', 'thing')",
+    "reason": null,
     "elapsed_s": 2.427,
     "rate_tok_s": 37.5,
     "word_count": 94
@@ -64,7 +64,7 @@
     "real_seed": "0xc8fe62db",
     "prompt": "the sun was",
     "text": "the sun was getting hot and the sun was shining. the little girl was so excited to go and play. she ran around the garden, hopping and jumping on the soft grass. she laughed and laughed as she rolled around. the sun shone down on her face and she was feeling so happy. she had the best day ever! she couldn't wait to come back and explore the park! she was sure she would come to play! she jumped up and down, and ran off to explore her new home. the end, she would never forget the fun she ever had. the day of the time she had to leave the garden and play",
-    "reason": "bigram recurred 3x: ('the', 'sun')",
+    "reason": null,
     "elapsed_s": 2.573,
     "rate_tok_s": 43.1,
     "word_count": 114
@@ -94,7 +94,7 @@
     "real_seed": "0x22f3c272",
     "prompt": "she found a",
     "text": "she found a big box with a lock. she was curious and wanted to see what was inside. she opened the box and saw a toy car. it was a car with wheels and a horn. lily was so happy and excited. she took it to her mom and dad. they smiled and hugged her. they said they were very kind and kind. they thanked her for the toy and the toys. they went home and played with the toys. they had a lot of fun. they learned that toys are not toys. they learned to be happy with what they have. they were happy to have new friends. they learned to share",
-    "reason": "bigram recurred 3x: ('they', 'learned')",
+    "reason": null,
     "elapsed_s": 2.428,
     "rate_tok_s": 45.3,
     "word_count": 113
@@ -124,7 +124,7 @@
     "real_seed": "0xce788d8e",
     "prompt": "the dog ran",
     "text": "the dog ran away, running, and the owner was safe. the dog was very glad and he stopped running. the dog wagged his tail and licked his face. from then on, the owner always made sure to keep the little dog safe. the end on the day, he never forgot to be alone again. the moral of the story is that it's important to listen to your friends and be safe. it's also important that you can always have fun and have a good home to have. the moral value: it is important that we should always be careful and listen for what we have and not to do. we can still have a",
-    "reason": "bigram recurred 3x: ('the', 'dog')",
+    "reason": null,
     "elapsed_s": 2.605,
     "rate_tok_s": 42.6,
     "word_count": 114
@@ -164,7 +164,7 @@
     "real_seed": "0x92da5eb9",
     "prompt": "the sun was",
     "text": "the sun was getting hot and the birds were singing. the little girl was so excited to go on the fun. she ran to the kitchen to get some vegetables and vegetables. she started to eat her lunch and then she heard a voice.\" hello there, my little boy!\" it said,\" i'm a little bird. i'm so hungry and i want to help you.\" the girl said yes and they went to get food. the girl took a big bite of the food and said\" this is for you!\" she was happy to see the bird. the girl was very happy and thanked the little girl. she ate",
-    "reason": "bigram recurred 3x: ('the', 'girl')",
+    "reason": null,
     "elapsed_s": 2.443,
     "rate_tok_s": 43.0,
     "word_count": 108
@@ -174,7 +174,7 @@
     "real_seed": "0xf35e2a3c",
     "prompt": "the dog ran",
     "text": "the dog ran away, never to find his owner. the end, the little boy never found his ball again. he was so happy that he gave the dog a big hug and a kiss. the moral of the story is that you will never be so independent again. you always try to be a good boy.\" the little boy's mom smiled and said,\" that's a great idea!\" and with that, they continued to play together until the sun went down. the end and the end. the moral value of this story: if you think, you can do anything if you're not too hard and you will have to do what",
-    "reason": "bigram recurred 3x: ('the', 'end')",
+    "reason": null,
     "elapsed_s": 2.603,
     "rate_tok_s": 41.1,
     "word_count": 110
@@ -184,7 +184,7 @@
     "real_seed": "0x3ced5297",
     "prompt": "a little girl",
     "text": "a little girl who loved to play. one day, she saw a big, scary dog in the park. she was scared and didn't know what to do. she asked her mom,\" mom and dad, why is the dog so scary?\" her dad smiled and said, but he was still scared. he said to her, he knew just what the big dog was. so, the little girl and her mom went to the park. they played on the slide and the swings. the little girl's dad noticed that the big, furry dog had a funny idea. he asked the dog to help him. the little girl's mom smiled",
-    "reason": "bigram recurred 3x: ('the', 'little')",
+    "reason": null,
     "elapsed_s": 2.525,
     "rate_tok_s": 41.2,
     "word_count": 107

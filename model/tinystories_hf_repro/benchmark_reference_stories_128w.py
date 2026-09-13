@@ -28,12 +28,17 @@ MODEL_ID = "SauravP97/tiny-stories-19M"
 PROMPTS = ["Once upon a time", "The sun was", "The dog ran", "A little girl", "She found a"]
 SEEDS = [1, 2, 3, 4, 5]
 MAX_NEW_TOKENS = 180  # generous headroom above a ~128-word target
+MIN_BIGRAM_RECURRENCE = 6  # see benchmark_hw_stories_128w.py's docstring --
+                            # the detector saturates at this length under the
+                            # usual threshold of 3; 6 was picked from this
+                            # benchmark's own actual bigram-count distribution
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
+    ap.add_argument("--min-bigram-recurrence", type=int, default=MIN_BIGRAM_RECURRENCE)
     a = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,7 +59,7 @@ def main():
             )
             text = tok.decode(out[0], skip_special_tokens=True).replace("\n", " ").strip()
             n_words = len(text.split())
-            reason = is_degenerate(text, min_bigram_recurrence=3)
+            reason = is_degenerate(text, min_bigram_recurrence=a.min_bigram_recurrence)
 
             sample = {"seed": seed, "prompt": prompt, "text": text,
                       "reason": reason, "word_count": n_words}

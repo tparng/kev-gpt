@@ -49,6 +49,17 @@ Methodology matches this directory's own established convention
 = 25 samples, normal on-chip Gumbel-max sampling (no seed control --
 each turn's real captured seed is recorded), objective detector
 model.filter_synth_corpus.is_degenerate.
+
+min_bigram_recurrence defaults to 6, not the 3 used for ~60-word
+samples elsewhere in this directory -- the bigram-recurrence detector
+saturates at ~2x the length (more tokens = more chances for ANY
+bigram, even an ordinary one, to recur 3+ times by chance, independent
+of real degeneracy). 6 was picked by inspecting this benchmark's own
+actual max-bigram-count distribution: hardware samples cleanly split
+into a 2-4 bulk (incidental reuse) and a 6/8/10/12 tail (genuine
+repetition loops) -- 6 is the natural cut between them. See
+build_benchmark_128w_report.py's own caveat text for the full
+rationale and the reference-model distribution that confirms it.
 """
 import argparse
 import json
@@ -73,7 +84,7 @@ PROMPTS = [
 SEED_RE = re.compile(r"KEVGPT_DEBUG_SEED,(0x[0-9a-f]+),cyc=0x[0-9a-f]+\n?")
 
 
-def capture(port, repeats, quiet_secs, timeout):
+def capture(port, repeats, quiet_secs, timeout, min_bigram_recurrence=6):
     results = []
     with serial.Serial(port, BAUD, timeout=0.3) as ser:
         for rep in range(1, repeats + 1):
@@ -98,7 +109,7 @@ def capture(port, repeats, quiet_secs, timeout):
                 n_words = len(full_text.split())
                 gen_words = max(n_words - len(prompt.split()), 0)
                 rate = round(gen_words / elapsed, 1) if elapsed > 0 else 0.0
-                reason = is_degenerate(full_text, min_bigram_recurrence=3)
+                reason = is_degenerate(full_text, min_bigram_recurrence=min_bigram_recurrence)
 
                 sample = {
                     "seed": rep, "real_seed": real_seed, "prompt": prompt,
@@ -122,10 +133,13 @@ def main():
                      help="longer than the default chat_over_uart 3.0s -- "
                           "~124-token replies take longer to finish streaming")
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--min-bigram-recurrence", type=int, default=6,
+                     help="see module docstring for why this isn't the 3 used "
+                          "for shorter (~60-word) samples elsewhere")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    results = capture(a.port, a.repeats, a.quiet_secs, a.timeout)
+    results = capture(a.port, a.repeats, a.quiet_secs, a.timeout, a.min_bigram_recurrence)
     with open(a.out, "w") as f:
         json.dump(results, f, indent=2)
 
