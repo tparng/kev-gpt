@@ -1,0 +1,252 @@
+[
+  {
+    "seed": 1,
+    "real_seed": "0x32eb227c",
+    "prompt": "once upon a time",
+    "text": "once upon a time, there was a little girl named lily. she loved to play outside in the sunshine. one day, she went to the park with her mommy. they played on the swings and the slide. suddenly, lily saw a big bird flying high up in a tree. she asked her mom,\" mommy, what is that?\" her mommy replied, pointing at the bird.\" it's a bird,\" lily said.\" it is a bird's nest.\"\" i wonder what it does, sweetie.\"\" maybe it will be a nest, but not a baby bird.\"\" no, i do not know",
+    "reason": "exact doubling: '\"' '\"'",
+    "elapsed_s": 2.403,
+    "rate_tok_s": 38.3,
+    "word_count": 96
+  },
+  {
+    "seed": 1,
+    "real_seed": "0xe03348ad",
+    "prompt": "the sun was",
+    "text": "the sun was shining brightly and the birds were singing together. they were having so much fun that they didn't notice all the other animals in the forest were very tired. but then the little girl noticed something special. the little bird was very big and had big eyes that was all around. the two animals were so surprised by the bird's happy size and they flew away. the two friends decided to have some more fun. they all laughed and hugged, then they flew off to play with the animals they saw. they all enjoyed the beautiful sight. the little birds and birds were very happy to be together and have fun together. they were not",
+    "reason": "bigram recurred 3x: ('the', 'little')",
+    "elapsed_s": 2.476,
+    "rate_tok_s": 46.0,
+    "word_count": 117
+  },
+  {
+    "seed": 1,
+    "real_seed": "0x26e9c0d0",
+    "prompt": "the dog ran",
+    "text": "the dog ran to them and tried to catch them. but the dog was too fast. he caught them with his mouth and ran away. the owner was very sad and angry. he shouted at the kids and told them to go away. he said they had to leave the park and leave it behind. he told lily and sam that he was a bad dog. he told lily to stay away from the park. he told lily and ben that they would not be friends again. he told lily that the big dog did not like children. he told her he liked them very much. he told them he liked their home and his dog",
+    "reason": "bigram recurred 6x: ('he', 'told')",
+    "elapsed_s": 2.554,
+    "rate_tok_s": 44.2,
+    "word_count": 116
+  },
+  {
+    "seed": 1,
+    "real_seed": "0x2d7acf1a",
+    "prompt": "a little girl",
+    "text": "a little girl named lily who loved to play outside. one day, she found a shiny penny on the ground. she picked it up and showed it to her mom.\" look, mommy! i found this penny!\" she said,\" wow, that's great!\" her mommy smiled and said\" yes, it is a new penny. it must be a special penny.\" lily was so happy and thanked her mom. from that day on, lily loved her new new new new new magnet. she knew that it's important to think of something, so she went to the store to buy some new ones. she brought the shiny",
+    "reason": "exact doubling: 'new' 'new'",
+    "elapsed_s": 2.38,
+    "rate_tok_s": 42.0,
+    "word_count": 103
+  },
+  {
+    "seed": 1,
+    "real_seed": "0xb3b3815e",
+    "prompt": "she found a",
+    "text": "she found a big, shiny rock. she picked it up and showed it to her mom.\" look, mom!\" she said, pointing at a shiny thing.\" wow, that's a pretty rock!\" her dad said.\" can i see it?\" lily nodded and took the rock. she reached for the shiny thing. it was a big and round. she saw a shiny thing on the ground. she thought it looked pretty.\" mom, what is this?\" lily asked, holding the rock.\" it is a gift from my grandma. it has a name. it has four name,\" mom said",
+    "reason": "bigram recurred 3x: ('shiny', 'thing')",
+    "elapsed_s": 2.427,
+    "rate_tok_s": 37.5,
+    "word_count": 94
+  },
+  {
+    "seed": 2,
+    "real_seed": "0x844fa4d5",
+    "prompt": "once upon a time",
+    "text": "once upon a time, there was a little girl named lily. she loved to play outside in the park. one day, she found a shiny coin on the ground. she picked it up and showed it to her friend, timmy.\" look, i found this coin!\" she said to timmy.\" wow, that's a pretty coin!\" timmy replied with a smile.\" thank you,\" said lily.\" i wish i could keep it forever.\" from that day on, lily always remembered to give the coin to her friends and they all lived happily ever after. the end, the two friends sat down and enjoyed their",
+    "reason": null,
+    "elapsed_s": 2.348,
+    "rate_tok_s": 41.3,
+    "word_count": 101
+  },
+  {
+    "seed": 2,
+    "real_seed": "0xc8fe62db",
+    "prompt": "the sun was",
+    "text": "the sun was getting hot and the sun was shining. the little girl was so excited to go and play. she ran around the garden, hopping and jumping on the soft grass. she laughed and laughed as she rolled around. the sun shone down on her face and she was feeling so happy. she had the best day ever! she couldn't wait to come back and explore the park! she was sure she would come to play! she jumped up and down, and ran off to explore her new home. the end, she would never forget the fun she ever had. the day of the time she had to leave the garden and play",
+    "reason": "bigram recurred 3x: ('the', 'sun')",
+    "elapsed_s": 2.573,
+    "rate_tok_s": 43.1,
+    "word_count": 114
+  },
+  {
+    "seed": 2,
+    "real_seed": "0x742a6885",
+    "prompt": "the dog ran",
+    "text": "the dog ran away, but the dog was too fast. the owner of the cat saw the cat and tried to help, so the owner called the cat. the dog ran away and the owner was never seen again. the end on the day of their day, the cat was very sad. the next day the owner went to the park to find the dog. the cat looked around and found the cat. the dog saw that the cat's tail was gone. the cat felt bad and knew that he had been wrong. the next time, it was back to its owner, and that the dog had gone. the cat felt very sorry",
+    "reason": "bigram recurred 8x: ('the', 'cat')",
+    "elapsed_s": 2.669,
+    "rate_tok_s": 41.2,
+    "word_count": 113
+  },
+  {
+    "seed": 2,
+    "real_seed": "0x3d3212dc",
+    "prompt": "a little girl",
+    "text": "a little girl named lily who loved to play outside. one day, she saw a big, shiny ball in the ground. she wanted to pick it up, but it was too high up. lily asked her friend, timmy, to help her.\" i want to get the ball,\" timmy said. lily tried to reach the big ball with her hands, and it went up into the sky. she was so happy to see the sky. but then, a loud noise came and thunder came to the park. it made the park dark clouds and the trees and rain. lily and her friends were scared and ran away. but",
+    "reason": null,
+    "elapsed_s": 2.397,
+    "rate_tok_s": 43.4,
+    "word_count": 107
+  },
+  {
+    "seed": 2,
+    "real_seed": "0x22f3c272",
+    "prompt": "she found a",
+    "text": "she found a big box with a lock. she was curious and wanted to see what was inside. she opened the box and saw a toy car. it was a car with wheels and a horn. lily was so happy and excited. she took it to her mom and dad. they smiled and hugged her. they said they were very kind and kind. they thanked her for the toy and the toys. they went home and played with the toys. they had a lot of fun. they learned that toys are not toys. they learned to be happy with what they have. they were happy to have new friends. they learned to share",
+    "reason": "bigram recurred 3x: ('they', 'learned')",
+    "elapsed_s": 2.428,
+    "rate_tok_s": 45.3,
+    "word_count": 113
+  },
+  {
+    "seed": 3,
+    "real_seed": "0x1f616122",
+    "prompt": "once upon a time",
+    "text": "once upon a time, there was a little girl named lily. she loved to play outside with her friends. one day, they decided to go on an adventure. they packed their bags and went on their trip. as they were walking, lily saw a butterfly flying in the sky. she wanted to catch it, but it flew away. she tried to fly it but she couldn't. suddenly, the butterfly flew out of her hands and landed on a branch. lily was so happy and excited that she was able to fly with the pretty butterfly. she thanked the fairy and flew off to show off her adventure. from that day on, she",
+    "reason": null,
+    "elapsed_s": 2.38,
+    "rate_tok_s": 45.4,
+    "word_count": 112
+  },
+  {
+    "seed": 3,
+    "real_seed": "0x1d6c3cee",
+    "prompt": "the sun was",
+    "text": "the sun was shining and the birds were singing. lily was so excited to go outside and play. she ran around the park, laughing and having fun. suddenly, she heard a loud noise. she looked up and saw a big bird flying towards her. it was a bird, and it had a long beak. lily thought it looked like a butterfly. she picked it up, but it flew away. she felt sad and scared. she didn't know what to do. suddenly she remembered the bird she had seen. it had its own beak and was stuck in a tree. she tried to pull it out, and but she could not",
+    "reason": null,
+    "elapsed_s": 2.397,
+    "rate_tok_s": 44.6,
+    "word_count": 110
+  },
+  {
+    "seed": 3,
+    "real_seed": "0xce788d8e",
+    "prompt": "the dog ran",
+    "text": "the dog ran away, running, and the owner was safe. the dog was very glad and he stopped running. the dog wagged his tail and licked his face. from then on, the owner always made sure to keep the little dog safe. the end on the day, he never forgot to be alone again. the moral of the story is that it's important to listen to your friends and be safe. it's also important that you can always have fun and have a good home to have. the moral value: it is important that we should always be careful and listen for what we have and not to do. we can still have a",
+    "reason": "bigram recurred 3x: ('the', 'dog')",
+    "elapsed_s": 2.605,
+    "rate_tok_s": 42.6,
+    "word_count": 114
+  },
+  {
+    "seed": 3,
+    "real_seed": "0x93d8e560",
+    "prompt": "a little girl",
+    "text": "a little girl named lily who loved to play in the park. one day, she saw a big, pretty butterfly flying in a butterfly. she wanted to catch it, but it flew away. lily asked her mom,\" mommy, can we catch the butterfly?\" her mother smiled and said, but said no. lily was sad, so her mom said they could just catch it. lily felt bad for not giving up. she went back to her room and found a shiny coin. she picked it up and took it home. she was so happy and hugged it tightly. from that day on, lily always remembered to be careful",
+    "reason": null,
+    "elapsed_s": 2.38,
+    "rate_tok_s": 43.7,
+    "word_count": 107
+  },
+  {
+    "seed": 3,
+    "real_seed": "0x903c8a35",
+    "prompt": "she found a",
+    "text": "she found a big, scary cat. the cat was scared and ran away. lily was very sad and didn't know what to do. she went back to her mom and said,\" mommy, i know a scary dog!\" her mother smiled and hugged her. she said it was okay, but they were not scared of the dog. they continued to play together and had a good time. lily learned that sometimes it's better to be brave and listen to the scary scary scary scary scary scary scary scary scary scary scary. from that day on, lily always remembered to always be careful around the dark cat. she learned to always ask before",
+    "reason": "exact doubling: 'scary' 'scary'",
+    "elapsed_s": 2.555,
+    "rate_tok_s": 42.3,
+    "word_count": 111
+  },
+  {
+    "seed": 4,
+    "real_seed": "0x2dca4be0",
+    "prompt": "once upon a time",
+    "text": "once upon a time, there was a little girl named lily. she loved to play with her toys and eat cookies. one day, lily's mom asked her to help with the laundry. lily didn't want to clean because she wanted to keep playing.\" mommy, can you help me clean up?\" asked lily, as she was surprised to see a big, shiny thing that could make her mom smile.\" yes, i can help you,\" said her dad.\" but i don't want the clothes to be happy.\" lily was sad, but she knew that her dad had a special tool to make lily feel better. she went",
+    "reason": null,
+    "elapsed_s": 2.348,
+    "rate_tok_s": 43.0,
+    "word_count": 105
+  },
+  {
+    "seed": 4,
+    "real_seed": "0x92da5eb9",
+    "prompt": "the sun was",
+    "text": "the sun was getting hot and the birds were singing. the little girl was so excited to go on the fun. she ran to the kitchen to get some vegetables and vegetables. she started to eat her lunch and then she heard a voice.\" hello there, my little boy!\" it said,\" i'm a little bird. i'm so hungry and i want to help you.\" the girl said yes and they went to get food. the girl took a big bite of the food and said\" this is for you!\" she was happy to see the bird. the girl was very happy and thanked the little girl. she ate",
+    "reason": "bigram recurred 3x: ('the', 'girl')",
+    "elapsed_s": 2.443,
+    "rate_tok_s": 43.0,
+    "word_count": 108
+  },
+  {
+    "seed": 4,
+    "real_seed": "0xf35e2a3c",
+    "prompt": "the dog ran",
+    "text": "the dog ran away, never to find his owner. the end, the little boy never found his ball again. he was so happy that he gave the dog a big hug and a kiss. the moral of the story is that you will never be so independent again. you always try to be a good boy.\" the little boy's mom smiled and said,\" that's a great idea!\" and with that, they continued to play together until the sun went down. the end and the end. the moral value of this story: if you think, you can do anything if you're not too hard and you will have to do what",
+    "reason": "bigram recurred 3x: ('the', 'end')",
+    "elapsed_s": 2.603,
+    "rate_tok_s": 41.1,
+    "word_count": 110
+  },
+  {
+    "seed": 4,
+    "real_seed": "0x3ced5297",
+    "prompt": "a little girl",
+    "text": "a little girl who loved to play. one day, she saw a big, scary dog in the park. she was scared and didn't know what to do. she asked her mom,\" mom and dad, why is the dog so scary?\" her dad smiled and said, but he was still scared. he said to her, he knew just what the big dog was. so, the little girl and her mom went to the park. they played on the slide and the swings. the little girl's dad noticed that the big, furry dog had a funny idea. he asked the dog to help him. the little girl's mom smiled",
+    "reason": "bigram recurred 3x: ('the', 'little')",
+    "elapsed_s": 2.525,
+    "rate_tok_s": 41.2,
+    "word_count": 107
+  },
+  {
+    "seed": 4,
+    "real_seed": "0xf4291df1",
+    "prompt": "she found a",
+    "text": "she found a big, beautiful butterfly with a beautiful flower in the sky. she was so happy and wanted to show it to her friends. her friend smiled and said,\" i can show you my butterfly.\" lily was happy to see her butterfly and they all played together. from that day on, lily and her friend played with the butterfly all day. they learned that even when things are tough, they can always be strong and strong. and lily learned to be careful and not to lose her butterfly. the end, they lived happily ever after. the moral of the story is that sometimes, it's important to listen to your friends",
+    "reason": null,
+    "elapsed_s": 2.412,
+    "rate_tok_s": 44.8,
+    "word_count": 111
+  },
+  {
+    "seed": 5,
+    "real_seed": "0xf0f62097",
+    "prompt": "once upon a time",
+    "text": "once upon a time, there was a little girl named lily. she loved to play outside in the park. one day, she found a shiny rock on the ground. she picked it up and showed it to her mommy. her mom said,\" look, lily! that rock is so shiny!\" lily said with a smile. she showed her new rock. her mom smiled and said it was very pretty. later that day of the day of her party came. lily was so excited to see all the pretty things she saw. she ran to the sidewalk and found lots of pretty flowers. she was very happy to have such a wonderful",
+    "reason": null,
+    "elapsed_s": 2.396,
+    "rate_tok_s": 44.2,
+    "word_count": 110
+  },
+  {
+    "seed": 5,
+    "real_seed": "0xb8a397f7",
+    "prompt": "the sun was",
+    "text": "the sun was going to the park. the little girl was so excited to play on the swings. she ran to her mom and said,\" mommy, look! i made a big puddle!\" her mommy smiled and replied, then she said it was time for bed. she gave her little brother a hug and kissed her cheek. the next morning, the mommy and her daddy went to bed, feeling much better and more excited. they sat down and enjoyed their day playing in the garden. the little girl's mommy said to the daddy, and he said they were very good. they all lived happily ever after. the end, they",
+    "reason": null,
+    "elapsed_s": 2.491,
+    "rate_tok_s": 42.1,
+    "word_count": 108
+  },
+  {
+    "seed": 5,
+    "real_seed": "0xa26347e4",
+    "prompt": "the dog ran",
+    "text": "the dog ran away, but the dog was too fast. the owner of the cat saw what happened and got scared. the owner was very scared and ran away. the dog never came back. the dog got out of his big, lost cat. the dog ran after the dog, and the owner called for help. the dog came out and saw the cat. the owner came to the rescue. the dog barked and barked at the cat. the dog barked at them and chased the dog. the dog chased them around the house, barking and running. the dog chased the owner, the cat, the cat and even the cat.",
+    "reason": "bigram recurred 12x: ('the', 'dog')",
+    "elapsed_s": 2.763,
+    "rate_tok_s": 38.4,
+    "word_count": 109
+  },
+  {
+    "seed": 5,
+    "real_seed": "0x0f68231c",
+    "prompt": "a little girl",
+    "text": "a little girl named lily who loved to play in the park. one day, she saw a big, scary dog running towards her. she was scared and didn't know what to do. suddenly, a kind old lady saw her and said,\" i can help you.\" the little girl was happy and thanked the old man. the lady smiled and thanked lily for helping her. from that day on, lily and the little dog became good friends and they always made each other laugh. the end from the day on they would have a great time together. the moral of the story is that if you work hard, you can do anything",
+    "reason": null,
+    "elapsed_s": 2.397,
+    "rate_tok_s": 45.1,
+    "word_count": 111
+  },
+  {
+    "seed": 5,
+    "real_seed": "0xf07bb13c",
+    "prompt": "she found a",
+    "text": "she found a shiny rock on the ground. she picked it up and put it in her pocket. she was so happy, she wanted to show her friends her new rock. but when she got home, her mom said,\" lily, it's time to go to the park. you can't have it.\" but lily didn't listen. she said goodbye to her friend and started to play with her toys. she even threw a big rock into the street. she went around the playground and saw her favorite toy car. she ran over to it and said\" hi, toy\". her friend was very happy and hugged her. they played",
+    "reason": null,
+    "elapsed_s": 2.38,
+    "rate_tok_s": 43.7,
+    "word_count": 107
+  }
+]
