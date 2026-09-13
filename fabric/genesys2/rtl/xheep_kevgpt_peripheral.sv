@@ -17,6 +17,12 @@
 //  0x00 CTRL (b0 go, b1 wl_rst, b2 soft_reset, b4:3 dbg_stop)
 //  0x04 STATUS (b0 done, b1 busy, b2 wld_done -- see below)
 //  0x08 TOK_ID   0x0C POS    0x10 W_DATA (wl_we) 0x14 RD_SEL  0x18 RD_ADDR
+//       (RD_ADDR is RDADDRW bits, not a fixed 11 -- see its own reg
+//       declaration/comment below: widened Sec8 item 13 to correctly
+//       address every rd_sel bank up to VOCAB elements, e.g. head_logits
+//       at VOCAB=16384; writes beyond RDADDRW bits are truncated same as
+//       any other register here, just no longer silently wrapping at a
+//       stale 2048-element ceiling for a 16384-element bank.)
 //  0x1C RD_DATA_LO   0x20 RD_DATA_HI   0x24 TOK_OUT   0x28 CYCLES   0x2C IDCODE
 //  0x30 SEED (write-only): nonzero => load xorshift state + enable on-chip
 //       Gumbel-max sampling (persists across GOs); 0/never-written => greedy
@@ -260,6 +266,15 @@ module xheep_kevgpt_peripheral #(
     // generated id>511 truncated on readback. Matches sequencer_vec.sv's
     // own VIDXW=$clog2(VOCAB) fix.
     localparam integer VIDXW = $clog2(VOCAB);
+    // FIXATION-WORD-CDC-INVESTIGATION.md Sec8 item 13: rd_addr's own
+    // register was hardcoded [10:0] (11 bits, max 2047) -- silently wraps
+    // for any rd_sel bank needing more (head_logits at VOCAB=16384 needs
+    // up to 16383). Mirrors sequencer_vec.sv's own RDADDRW fix exactly
+    // (same MAXDIM-of-D3/D_MLP/VOCAB logic, floored at 11 for byte-
+    // identical behavior on every existing smaller-VOCAB shape).
+    localparam integer RDADDRW_MAXDIM = (D3 > D_MLP) ? ((D3 > VOCAB) ? D3 : VOCAB)
+                                                       : ((D_MLP > VOCAB) ? D_MLP : VOCAB);
+    localparam integer RDADDRW = ($clog2(RDADDRW_MAXDIM) > 11) ? $clog2(RDADDRW_MAXDIM) : 11;
 
     reg          go_pulse, wl_rst, soft_reset, wl_we;
     reg [1:0]    dbg_stop;
@@ -268,7 +283,7 @@ module xheep_kevgpt_peripheral #(
     reg [VIDXW-1:0] tok_id;
     reg [8:0]    pos;
     reg [3:0]    rd_sel;
-    reg [10:0]   rd_addr;
+    reg [RDADDRW-1:0] rd_addr;
     reg [31:0]   seed;
     reg          seed_we;
     reg          wld_ld_start_r;
@@ -296,7 +311,7 @@ module xheep_kevgpt_peripheral #(
                 6'h3: pos     <= reg_req_i.wdata[8:0];
                 6'h4: begin wl_we<=1; wl_data<=reg_req_i.wdata; end
                 6'h5: rd_sel  <= reg_req_i.wdata[3:0];
-                6'h6: rd_addr <= reg_req_i.wdata[10:0];
+                6'h6: rd_addr <= reg_req_i.wdata[RDADDRW-1:0];
                 6'hC: begin seed <= reg_req_i.wdata; seed_we <= 1'b1; end   // 0x30 SEED
                 6'hD: wld_ld_ddr_addr_r <= reg_req_i.wdata[28:0];          // 0x34 WLD_ADDR
                 6'hE: wld_ld_words_r    <= reg_req_i.wdata;                // 0x38 WLD_WORDS

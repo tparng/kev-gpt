@@ -139,7 +139,25 @@ module sequencer_vec #(
     // weights()'s existing staging point (ddr_addr=0 in the boot-time
     // kevgpt_wld_load() call this mode replaces), not a new staging
     // location.
-    parameter integer       WEIGHTS_DDR_BASE = 0
+    parameter integer       WEIGHTS_DDR_BASE = 0,
+    // FIXATION-WORD-CDC-INVESTIGATION.md Sec8 item 13: rd_addr's own port
+    // was hardcoded [10:0] (11 bits) -- the EXACT same bug class BUSW
+    // (below, in the module body) already exists to fix for g_m/g_k, just
+    // never applied here. 11 bits addresses at most 2048 flat elements
+    // (rbr's row portion gets only 8 bits after removing LSH=$clog2(P)=3
+    // lane bits: 2^8*8=2048), silently wrapping (`wdata[10:0]`, a bare
+    // truncation, no error) for any rd_sel bank needing more --
+    // head_logits (rd_sel=8) needs VOCAB=16384 elements. Found via
+    // real-hardware readback: index 2213 ("care") returned the exact same
+    // value as index 165 (2213-2048=165), because writing RD_ADDR=2213
+    // silently stored 165. RDADDRW mirrors BUSW's own MAXDIM logic
+    // (max of D3/D_MLP/VOCAB, floored at 11 for byte-identical behavior
+    // on every existing smaller-VOCAB shape) but is computed here, in the
+    // parameter list itself, since BUSW's own definition (module body)
+    // isn't in scope yet for the rd_addr port declaration below.
+    localparam integer RDADDRW_MAXDIM = (D3 > D_MLP) ? ((D3 > VOCAB) ? D3 : VOCAB)
+                                                       : ((D_MLP > VOCAB) ? D_MLP : VOCAB),
+    localparam integer RDADDRW = ($clog2(RDADDRW_MAXDIM) > 11) ? $clog2(RDADDRW_MAXDIM) : 11
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -159,7 +177,7 @@ module sequencer_vec #(
     // readback: rd_sel picks the bank, rd_addr the element (2-cyc registered). 64-bit so
     // the Q.22 LN/gelu values fit; 32-bit values are sign-extended in their bank.
     input  wire [3:0]  rd_sel,
-    input  wire [10:0] rd_addr,
+    input  wire [RDADDRW-1:0] rd_addr,
     output reg signed [63:0] rd_data,
     // runtime weight load (stream the whole transposed image once)
     input  wire        wl_rst,

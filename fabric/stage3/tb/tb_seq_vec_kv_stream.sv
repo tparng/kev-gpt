@@ -94,7 +94,7 @@ module tb;
     reg [1:0] dbg_stop_r;
     reg [3:0] dbg_stop_block_r;
     reg [3:0]  rsel;
-    reg [10:0] raddr;
+    reg [15:0] raddr;  // widened Sec8 item 13 (was 11 bits, silently wrapped rd_sel=8 head-logit reads past index 2047)
     wire done;
     wire [VIDXWP-1:0] tok_out;
     wire signed [63:0] rdata;
@@ -376,6 +376,41 @@ module tb;
                 $display("ACT1_END");
             end
             dbg_stop_r = 2'd0; dbg_stop_block_r = 4'd0;  // restore normal operation
+        end
+
+        // ---- Sec8 item 13: verify the rd_addr width fix -- a real
+        // hardware capture found index 2213 ("care") silently aliased to
+        // index 165 (2213-2048=165) through the old 11-bit rd_addr
+        // register. Full normal (non-truncated) step through all 12
+        // layers + LN_f + head, then spot-check head_logits (rsel=8)
+        // across and beyond the old 2048-element wrap boundary.
+        if (VOCABP > 14452) begin : rdaddr_width_check
+            integer k;
+            reg [31:0] probe_idx [0:7];
+            reg [63:0] got_logit [0:7];
+            probe_idx[0]=0; probe_idx[1]=165; probe_idx[2]=2047; probe_idx[3]=2048;
+            probe_idx[4]=2213; probe_idx[5]=4095; probe_idx[6]=4096; probe_idx[7]=16383;
+
+            rst <= 1'b1; @(posedge clk); #1; rst <= 1'b0; @(posedge clk); #1;
+            tok = 6915; pos = 9'd0; go = 1'b1; @(posedge clk); #1; go = 1'b0;
+            wait (done == 1'b1); @(posedge clk); #1;
+            tok = 14452; pos = 9'd1; go = 1'b1; @(posedge clk); #1; go = 1'b0;
+            wait (done == 1'b1); @(posedge clk); #1;
+            tok = 5384; pos = 9'd2; go = 1'b1; @(posedge clk); #1; go = 1'b0;
+            wait (done == 1'b1); @(posedge clk); #1;
+
+            rsel = 4'd8;
+            for (k = 0; k < 8; k = k + 1) begin
+                raddr = probe_idx[k][15:0];
+                @(posedge clk); @(posedge clk); #1;  // 2-cycle rd_sel/rd_addr->rd_data pipe
+                got_logit[k] = rdata;
+                $display("RDADDR_WIDTH_CHECK,idx=%0d,got=%0d", probe_idx[k], $signed(got_logit[k]));
+            end
+            // idx=165 and idx=2213 must now differ (the old bug made them
+            // identical); anything else is the real diagnostic's job to
+            // compare against golden.
+            $display("RDADDR_WIDTH_CHECK_VERDICT,idx165_ne_idx2213=%0d",
+                      ($signed(got_logit[1]) !== $signed(got_logit[4])));
         end
 
         $display("TB_DONE");
