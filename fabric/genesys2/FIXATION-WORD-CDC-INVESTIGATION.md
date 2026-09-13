@@ -1663,6 +1663,27 @@ original order below since item 4 was already next regardless.
     recognized afterward, via this item, to have also been the real
     production bug all along.
 
+    **Multi-seed confirmation sweep, post-fix.** Reran the *exact* same
+    12-prompt × 8-repeat set (`ila_prompt_test_big.py`'s own prompt list)
+    that item 5/6's owner-FIFO stress run used when it recorded the
+    fixation symptom firing pervasively — "cardinal" 90×, "chug" 56×,
+    across 96 generations — a direct, apples-to-apples baseline
+    comparison, not just a fresh absence check. Normal interactive
+    sampling mode (`chat_turn()` derives a fresh seed from live cycle
+    counts every turn, so 96 generations is inherently a 96-seed sweep,
+    no special seed plumbing needed). Objective detector: word-boundary
+    scan of every reply for every fixation word this investigation has
+    ever recorded by name (care, cardinal, chug, carefree), plus a
+    generic immediate-triple-repeat check as an independent secondary
+    signal. **Result: 0/96 generations contained any fixation word**
+    (`FIXATION_WORD_COUNTS,{'care': 0, 'cardinal': 0, 'chug': 0,
+    'carefree': 0}`) — a complete reversal from the pre-fix baseline's
+    90+56+ occurrences on the identical prompt/repeat set. 3/96
+    generations hit the separate, already-documented ordinary
+    sampling-repetition pattern (unrelated to this defect, the
+    repetition guards' own known residual behavior), not the fixation
+    symptom. `SWEEP_VERDICT,PASS`.
+
 ## 9. Evidence trail / artifacts
 
 - `model/SCALE-UP-LOG.md` — full chronological narrative, every command run,

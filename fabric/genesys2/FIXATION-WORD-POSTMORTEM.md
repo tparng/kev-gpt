@@ -392,8 +392,12 @@ isn't a timing or ordering bug.
    Confirmed live: "in the forest" through the real chat path on the
    post-fix bitstream now replies starting with "," (id 163) — the
    genuine correct masked-argmax answer for this prompt, never "care".
-   **Investigation closed.** Full account in
-   `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items 8-14.
+   **Investigation closed.** Confirmed with a multi-seed sweep: the
+   exact same 12-prompt × 8-repeat set that previously produced "care"/
+   "cardinal"/"chug" pervasively (90×/56× on this same set, item 5/6's
+   own baseline) now produces **zero** fixation-word occurrences across
+   all 96 post-fix generations (96 different cycle-derived seeds).
+   Full account in `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items 8-14.
 2. **Isolate §2a's firmware-timing sensitivity on its own terms.** The one
    still-unexplained build-dependent result (a diagnostic-only firmware
    change shifting which wrong token wins, same bitstream) was folded into
