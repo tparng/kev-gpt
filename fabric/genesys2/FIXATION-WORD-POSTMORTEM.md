@@ -326,9 +326,13 @@ isn't a timing or ordering bug.
    nine phases (embed through the final residual) against the Python
    golden reference, for the exact real prompt/KV-state that produces
    "care." **All nine matched exactly.** Layer 0 is now fully ruled out,
-   weights and computation both — the defect must be in a later layer
-   (1-11) or the final head activation stage. Full account in
-   `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items 8-10.
+   weights and computation both. Extended once more: added a new
+   register so the same debug halt applies to any block, checked layer
+   1 the same way — **all eight phases matched exactly again.** Two
+   layers now fully confirmed correct; the defect must be in one of
+   layers 2-11 (now checkable with firmware changes alone) or the final
+   head activation stage. Full account in
+   `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items 8-11.
 2. **Isolate §2a's firmware-timing sensitivity on its own terms.** The one
    still-unexplained build-dependent result (a diagnostic-only firmware
    change shifting which wrong token wins, same bitstream) was folded into

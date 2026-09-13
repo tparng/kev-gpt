@@ -20,9 +20,16 @@ Then went past the weights entirely: item 10 checked layer 0's own
 phases) against the Python golden reference, real hardware vs. real
 KV-cache state, for the exact "in the forest" forward pass that picks
 "care." **All nine matched exactly.** Layer 0 — weights and computation
-both — is now fully ruled out. The defect must be in one of layers 1-11
-(not reachable without new RTL, `dbg_stop`'s halts are hardcoded to
-block 0) or in the final `LN_f`/head activation computation.
+both — is now fully ruled out.
+
+Extended further still: added a new `DBG_STOP_BLOCK` register so
+`dbg_stop`'s halts apply to any block, not just block 0 (verified in
+simulation first, one real bug caught and fixed in the new test code
+along the way — not a hardware finding). Checked layer 1 the same way:
+**all eight phases matched exactly on real hardware too.** Two layers
+now fully confirmed correct end to end. The defect must be in one of
+layers 2-11 (now checkable with firmware changes alone, no further
+resynthesis needed) or in the final `LN_f`/head activation computation.
 
 Status as of 2026-09-12: **open, not root-caused. The CDC timing-constraint
 gap (§6) has now been fully investigated, fixed, rebuilt from scratch, and
@@ -1369,6 +1376,54 @@ original order below since item 4 was already next regardless.
     correct, but the *activation* feeding into it, post-layer-11, has
     not been checked this way). Diff: `main.c` only (soc repo) — no RTL
     changed, reusing an already-deployed, already-proven readback port.
+
+11. **"Extend dbg_stop to check layer 1"** — done, and layer 1 is now
+    fully confirmed correct too. `dbg_stop`'s two block-scoped halt
+    points (`dbg_stop==2`/`3`) were hardcoded to `blk==4'd0`; added a new
+    4-bit `dbg_stop_block` port/register (`0x74 DBG_STOP_BLOCK`, held not
+    pulsed, default 0 reproducing every prior use exactly) selecting
+    which block they apply to instead. Added as a new register rather
+    than widening CTRL's own `dbg_stop` field, keeping this file's own
+    documented KV260-AXI-shell CTRL parity intact.
+
+    Verified in simulation first: a new check in
+    `tb_seq_vec_kv_stream.sv` replays the same real "in the forest"
+    prompt, halts after block 1 (`dbg_stop_block=1`), and reads back all
+    eight of block 1's own phase signals against
+    `IntKVQSequencer._attn_step`/`_mlp_step` called directly with `bi=1`
+    (no changes to the golden reference itself needed — those methods
+    already take a block index). Caught and fixed a real bug in the new
+    testbench code along the way: `rd_sel`/`rd_addr` to `rd_data` is a
+    genuine 2-cycle pipe (`rd_lane` registers from `rd_addr` on cycle 1,
+    `rd_data` registers from `rd_lane` on cycle 2), not the 1-cycle
+    latency the earlier `wbdiag_addr`/`wbdiag_pair` checks used — the
+    real firmware's own `kevgpt_read_bank()` already handled this
+    correctly (an explicit dummy read, pre-existing code, unrelated to
+    this session), so item 10's real-hardware result was never at risk;
+    only this new, more direct testbench access needed the fix. All 8
+    phases matched after fixing it.
+
+    Full clean rebuild (~50 min) to deploy the new register — WNS
+    -4.50ns / WHS 0.051ns, matching the already-understood baseline
+    exactly (the known CPU-core FPU/APU setup gap; the KV-cache hold
+    margin already fixed by item 8's own recalibration). Skipped a fresh
+    targeted `kevgpt_seq`-hierarchy audit this time — the new logic is a
+    single 4-bit register plus one equality comparison feeding two
+    existing FSM conditions, nothing touching any CDC crossing or wide
+    datapath, and the timing signature matched the known-good baseline
+    exactly.
+
+    Generalized `KEVGPT_DIAG_ACTDIAG` into a new `KEVGPT_DIAG_ACTDIAG_BLOCK`
+    parameter (writes `DBG_STOP_BLOCK` before the `dbg_stop=3` halt, skips
+    the block-0-only `dbg_stop=1` x_in capture since a later block's own
+    x_in is simply the previous block's x_out). **Real-hardware result:
+    all 8 of 8 layer-1 phases matched the golden reference exactly.**
+
+    Two layers now fully confirmed correct end to end — weights and
+    computation both, real hardware vs. golden, for the exact divergent
+    case. The RTL work is done; checking further layers (2-11) from here
+    is firmware-only (write `DBG_STOP_BLOCK`, rerun) — no more
+    resynthesis needed for this specific line of investigation.
 
 ## 9. Evidence trail / artifacts
 
