@@ -3446,6 +3446,25 @@ vs. reference this time).
 
 ## Fixation-word root cause, closed: a real-silicon-only numerical near-tie, not a fixable bug
 
+**2026-09-13 correction: this heading's conclusion was wrong, and the
+sections below already show it being progressively overturned.** The
+"near-tie"/"real-silicon-only" framing came from a single sampled-mode
+example; "Chasing 'make FPGA and software produce the same stories'"
+right after this section found a *gross* (not near-tie) greedy-mode
+divergence and a fully deterministic fault (not probabilistic silicon
+noise), and the investigation continued for weeks past this point (see
+`fabric/genesys2/FIXATION-WORD-CDC-INVESTIGATION.md`, this section's
+own "full writeup"). The actual root cause — found and fixed
+2026-09-13 — was a firmware masked-argmax fallback
+(`remask_pick_excluding()`) reading through a silently-truncating
+11-bit `rd_addr` register, aliasing vocab id 2213 ("care") to id 165's
+own logit (the array's global max). Fully deterministic, nothing to do
+with silicon margin or CDC timing. See the investigation doc's own §10
+"Resolution" for the complete closure. Left as-written below for the
+historical record of how this conclusion was reached and why it felt
+justified at the time — not deleted, corrected in place matching this
+log's own convention (e.g. the DDR3-DMA-collision entries above).
+
 Continuing the investigation above. Every simulation-reachable mechanism
 checked out clean — which turned out to be the actual finding, not a
 dead end:
@@ -3801,3 +3820,25 @@ this CDC path, but a lower sampling temperature makes the model pick
 its own high-confidence token more often, giving this corruption
 fewer chances to actually become the winning candidate — reducing the
 symptom without touching the underlying defect.
+
+## Fixation-word investigation: closed (2026-09-13)
+
+This log's own narrative stops at the CDC-timing-constraint-gap
+hypothesis being formed (previous section). The rest of the
+investigation — chasing that hypothesis to a real, fixed-but-unrelated
+CDC margin bug, ruling it out, then finding and fixing the actual root
+cause — happened entirely in the dedicated companion doc,
+`fabric/genesys2/FIXATION-WORD-CDC-INVESTIGATION.md` (§8 items 1-14, §10
+"Resolution"), with a synthesized narrative in
+`fabric/genesys2/FIXATION-WORD-POSTMORTEM.md`.
+
+**Bottom line**: not silicon, not CDC, not the forward pass — a
+silently-truncating 11-bit `rd_addr` register (needed 14 bits for
+`VOCAB=16384`) shared between a diagnostic readback port and a
+production firmware fallback (`remask_pick_excluding()`'s masked-argmax
+scan), aliasing vocab id 2213 ("care") to id 165's own logit (the
+array's true global max, masked out for being a stop token) during that
+scan. Fixed (`RDADDRW`, widening `rd_addr` to `$clog2(VOCAB)`),
+deployed, and confirmed with a multi-seed real-hardware sweep: 0/96
+fixation-word occurrences on the exact 12-prompt × 8-repeat set that
+previously produced "cardinal" 90×/"chug" 56× pervasively.

@@ -1802,3 +1802,52 @@ original order below since item 4 was already next regardless.
   the forest" → `[2213, 5368, 607, 2213, 165, 9689, ...]`, byte-for-byte
   the same id 2213 = "care" at position 0, matching every earlier capture
   of this prompt in this document).
+
+## 10. Resolution (closed 2026-09-13)
+
+**Root cause**: a silently-truncating 11-bit `rd_addr` register (needed
+14 bits for `VOCAB=16384`, both in `xheep_kevgpt_peripheral.sv` and
+`sequencer_vec.sv`'s own port) — not the CDC path, not the DDR3
+streaming datapath, not the checkpoint, not the forward-pass
+computation, not the RTL argmax logic. The full forward pass, `LN_f`,
+the head GEMV (all 16,384 logits), and `tok_out` itself are all proven
+bit-exact correct on real hardware for the exact scenario that produces
+the fixation word (§8 items 8-13).
+
+The truncated register is shared by two consumers: a diagnostic
+head-logit readback port, and `remask_pick_excluding()` — a production
+firmware fallback in `kevgpt_interactive/main.c` that masked-argmax
+scans all 16,384 head logits whenever the repetition guards need to
+replace a stop token picked too early. Before the fix, that scan's read
+of vocab id 2213 ("care") silently aliased to id 165's own logit (the
+single highest value in the whole array, since "." is this exact
+prompt's true top pick, masked out everywhere else for being a stop
+token) — so "care" won the fallback by inheriting a value that
+belonged to a different, filtered-out index. Fully deterministic (no
+CDC/timing/electrical mechanism at all, contrary to every hypothesis
+chased in §§4-7), and specific to this checkpoint's own trained weights
+(`2213 mod 2048 == 165` is a coincidence of this vocabulary, not a
+hardware property). Full derivation: §8 item 14.
+
+**Fix**: `RDADDRW`, a new localparam widening `rd_addr` to
+`max(11, $clog2(VOCAB))`, mirroring the pre-existing `BUSW`'s own
+`MAXDIM` pattern (§8 item 13). Deployed for an unrelated diagnostic
+reason — it transparently repairs `remask_pick_excluding()` too, since
+both consumers share the same register. No firmware change was needed.
+
+**Confirmed**: a multi-seed real-hardware sweep (96 generations, 12
+prompts × 8 repeats — the *exact* set that previously produced "care"/
+"cardinal"/"chug" pervasively, 90×/56× on this same set, per §8 item
+5/6's own baseline) now produces **zero** fixation-word occurrences.
+`SWEEP_VERDICT,PASS`.
+
+**Every hypothesis chased in §§4-7 (CDC timing-constraint gap,
+owner-FIFO backpressure race) is retired as a red herring for this bug**
+— both were real, previously-invisible issues worth having fixed
+regardless (a missing `clk_200mhz_p` constraint, an under-constrained
+CDC exception, a stale-testbench-clock gate), but neither was the
+fixation-word mechanism. The actual defect was a two-layer interaction
+— a firmware masked-argmax fallback plus a hardware register width —
+that no RTL-only simulation gate could ever exercise (RTL testbenches
+don't run firmware) and that only a handful of real, targeted dynamic
+checks against real hardware (§8 items 8-14) was able to isolate.
