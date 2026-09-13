@@ -332,11 +332,24 @@ isn't a timing or ordering bug.
    remaining ten layers into one boot sequence and checked all of them
    too. **All 12 transformer layers are now fully confirmed correct on
    real hardware** — every layer's weights and entire computation,
-   bit-exact against golden, for the exact divergent case. The whole
-   per-layer transformer body is ruled out; what's left is the final
-   `LN_f` layernorm, the head GEMV's own computation, or the
-   argmax/sampling/token-selection logic downstream of the head logits.
-   Full account in `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items 8-12.
+   bit-exact against golden, for the exact divergent case.
+
+   Then the breakthrough: checked the final `LN_f` layernorm and the
+   full head GEMV the same way — all 16,384 head logits. Found and fixed
+   a real `rd_addr` register-width bug along the way (11 bits, silently
+   aliasing any index ≥2048 — index 2213 was reading back index 165's
+   value instead). With that fixed, **all 16,384 logits match the Python
+   golden reference exactly**, including index 2213 ("care"): a
+   correctly-computed −79,079,941, golden rank 2551 — nowhere close to
+   the true answer's 400,546,602. Real hardware computes the right
+   answer correctly and still reports the wrong one. **The entire
+   forward pass — weights, transport, and arithmetic, every layer, the
+   final layernorm, the full head GEMV — is now proven bit-exact correct
+   on real hardware for the exact scenario that produces the fixation
+   word.** The defect has to be in the argmax comparison/selection logic
+   itself, the one part of this design never verified dynamically until
+   now. Full account in `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items
+   8-13.
 2. **Isolate §2a's firmware-timing sensitivity on its own terms.** The one
    still-unexplained build-dependent result (a diagnostic-only firmware
    change shifting which wrong token wins, same bitstream) was folded into

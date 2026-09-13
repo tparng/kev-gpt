@@ -1,48 +1,39 @@
 # Fixation-word investigation: real-hardware-only text corruption in the multi-master DDR read path
 
-Status as of 2026-09-13: **open, not root-caused, but one more concrete
-possibility ruled out.** A new direct readback tap (§8 item 8, from
-`FIXATION-WORD-POSTMORTEM.md`'s own reassessment) confirmed that
-"care"'s (vocab id 2213) real DMA-streamed head-weight data is
-bit-exact correct at the exact moment real hardware produced "care" as
-the fixation word — the wrong weights are not the mechanism, at least
-for this specific implicated row. Extended to all four per-block matrix
-types (QKV/PROJ/FC/MP): all match their known-correct source exactly,
-zero differences, using the design's own never-before-exercised
-`dbg_stop` debug halt (no new RTL/bitstream needed). See §8 items 8-9
-for the full account, including a newly-surfaced setup-timing violation
-on the KV-cache read-return path (unrelated to either weight-check
-tap) that was chased and resolved as a benign verification-bound
-recalibration, not a hardware bug.
+Status as of 2026-09-13: **the computation is proven correct, end to end
+— the bug is in argmax/token-selection, not the forward pass.** §8 item
+13 is the breakthrough: every stage of the forward pass has now been
+checked directly against the Python golden reference on real hardware,
+for the exact "in the forest" scenario that makes real hardware produce
+"care" as the wrong token — the head weight and all four per-block
+weight matrices (items 8-9), all 12 transformer layers' entire
+activation computation (items 10-12), the final `LN_f` layernorm, and
+now (item 13) **all 16,384 head logits**. Every single one matches
+exactly. `head_q25[2213]` ("care") is a correctly-computed
+−79,079,941 — golden rank 2551, nowhere close to competitive;
+`head_q25[165]` (the true, correct answer) is 400,546,602, an
+overwhelming, unambiguous margin. Real hardware has the *right answer
+sitting right there in a register it computed correctly* and still
+reports the wrong one. **The defect cannot be in any part of the
+computation this investigation has checked — weights, transport, or
+arithmetic. It has to be in the argmax comparison/selection logic
+itself**, the one part of this design that has only ever been read
+statically (§3's own "no truncation found on static read"), never
+verified dynamically against real hardware the way every other stage
+now has been. See §8 item 13 for the full account, including a real
+`rd_addr` register-width bug (11 bits, silently aliasing any index
+≥2048) found and fixed along the way — not the fixation-word bug
+itself, but what made the first attempt at this exact check initially
+look like a divergence before the real result underneath it was clear.
 
-Then went past the weights entirely: item 10 checked layer 0's own
-*computation* (embed/LN1/QKV/attention/LN2/GELU/MLP/residual — all nine
-phases) against the Python golden reference, real hardware vs. real
-KV-cache state, for the exact "in the forest" forward pass that picks
-"care." **All nine matched exactly.** Layer 0 — weights and computation
-both — is now fully ruled out.
-
-Extended further still: added a new `DBG_STOP_BLOCK` register so
-`dbg_stop`'s halts apply to any block, not just block 0 (verified in
-simulation first, one real bug caught and fixed in the new test code
-along the way — not a hardware finding). Checked layer 1 the same way:
-**all eight phases matched exactly on real hardware too.** Then batched
-the remaining ten layers into one boot sequence (one weight reload,
-looping `DBG_STOP_BLOCK=2..11` — checking each layer separately would
-have meant ten more ~15-minute reload cycles) and checked all of them
-the same way.
-
-**Result: all 12 transformer layers are now fully confirmed correct on
-real hardware — every layer's weights and entire activation computation,
-bit-exact against the Python golden reference, for the exact "in the
-forest" forward pass that picks "care."** The whole per-layer
-transformer body is ruled out. What's left, by elimination: the final
-`LN_f` layernorm, the head GEMV's own computation (its weight data is
-already confirmed correct, but not whether the GEMV correctly combines
-it with `LN_f`'s output), or the argmax/sampling/token-selection logic
-downstream of the head logits — none reachable with the current
-`dbg_stop` mechanism, which only covers the block loop. See §8 items
-8-12 for the full account.
+Everything below (§8 items 1-12) is the trail that got here: the head
+weight and all four per-block weight matrices confirmed correct via a
+direct DMA-path readback tap (items 8-9); all 12 transformer layers'
+entire activation computation confirmed correct via a generalized
+`dbg_stop`/`DBG_STOP_BLOCK` debug-halt mechanism (items 10-12); and,
+earlier still, the CDC timing-constraint gap and the owner-FIFO
+backpressure gap both investigated at length and ruled out (§§4-7,
+retained below as the historical record).
 
 Status as of 2026-09-12: **open, not root-caused. The CDC timing-constraint
 gap (§6) has now been fully investigated, fixed, rebuilt from scratch, and
@@ -1476,6 +1467,74 @@ original order below since item 4 was already next regardless.
     argmax/sampling/token-selection logic downstream of the head logits
     — none reachable with the current `dbg_stop`/`DBG_STOP_BLOCK`
     mechanism, which only covers the block loop, not what comes after it.
+
+13. **"Check the final LN_f and head GEMV computation next" — the
+    breakthrough of this investigation.** `lnf_q22` (`rd_sel=0`, holds
+    `LN_f`'s own output after a completed step — `lnout1_bank` is
+    documented as "LN1 / LN_f out," reused across the whole forward pass,
+    and nothing writes it again after `LN_f`) and `head_q25` (`rd_sel=8`,
+    already an existing, previously-proven-safe readback — reading state
+    after a step returns can't affect that step's own already-decided
+    value) are both reachable after a *normal*, non-`dbg_stop`-truncated
+    step, so this needed no new RTL to attempt.
+
+    **First real-hardware attempt found a real bug, not the fixation-word
+    one.** `lnf_q22` matched golden exactly, but `head_q25` diverged
+    starting at *exactly* index 2048 — and `head_q25[2213]` ("care")
+    returned the identical value as `head_q25[165]` (2213−2048=165).
+    Traced to `rd_addr` being hardcoded `[10:0]` (11 bits, max 2047) in
+    both `sequencer_vec.sv`'s own port and
+    `xheep_kevgpt_peripheral.sv`'s register — `rd_addr <=
+    reg_req_i.wdata[10:0]` is a bare truncation, no error, so writing
+    `RD_ADDR=2213` silently stored `165`. This is the exact same bug
+    class `BUSW` (in `sequencer_vec.sv`'s own body) already exists to fix
+    for `g_m`/`g_k` — 11 bits was enough for every *other* `rd_sel` bank
+    (largest need: `D_MLP=512`), but `head_logits` needs the full
+    `VOCAB=16384`, and had apparently never been read back at that range
+    before. Fixed with a new `RDADDRW` localparam (added to
+    `sequencer_vec.sv`'s own parameter list, since `BUSW`'s definition
+    lives in the module body and isn't in scope yet for a port
+    declaration) mirroring `BUSW`'s own `MAXDIM`-of-`D3`/`D_MLP`/`VOCAB`
+    logic, floored at 11 for byte-identical behavior on every existing
+    smaller-`VOCAB` shape.
+
+    Verified in simulation before touching real hardware again: 8 sample
+    indices spanning and crossing the old 2048-element wrap boundary (0,
+    165, 2047, 2048, 2213, 4095, 4096, 16383) all matched the Python
+    golden reference exactly post-fix — including index 2213 itself, now
+    correctly returning "care"'s true logit (−79,079,941, golden rank
+    2551) instead of index 165's aliased value. Full clean rebuild (WNS
+    −4.27ns / WHS 0.056ns, matching the known baseline — a simple
+    register-width change, no new datapath or CDC, no fresh targeted
+    audit needed) and redeployed.
+
+    **Real-hardware result, with the fix: all 16,384 head logits match
+    the Python golden reference exactly.** `head_q25[2213]` ("care") =
+    −79,079,941 (rank 2551, dramatically not competitive);
+    `head_q25[165]` (golden's own argmax winner) = 400,546,602 — an
+    overwhelming margin, no near-tie. This is under the exact same
+    real-captured-KV-state, forced-greedy (no sampling noise) conditions
+    this investigation's own earlier real-hardware capture (§2a) used
+    when it recorded real hardware *actually picking* "care" for this
+    exact prompt.
+
+    **This is the decisive result of the whole investigation so far: the
+    entire forward pass — every layer's weights and computation, `LN_f`,
+    and now the full head GEMV — is proven bit-exact correct on real
+    hardware, for the exact scenario that produces the fixation word. The
+    computed logits are unambiguously correct and unambiguously favor the
+    right answer. Yet real hardware's own generation, under identical
+    conditions, reported "care" as the winner anyway.** The defect cannot
+    be in *any* part of the computation checked by this investigation —
+    weights, transport, or arithmetic. It must be in the argmax
+    comparison/selection logic itself (the pairwise-compare tree that
+    finds the maximum over `head_q25`, or how the winning index gets
+    latched into `tok_out`) — a part of this design no prior item in this
+    investigation has directly instrumented. §3's own "Gumbel-max argmax
+    comparison tree... correctly parameterized for VOCAB=16384, no
+    truncation found on static read" was a *static* read of the RTL,
+    never verified dynamically against real hardware the way every other
+    stage now has been.
 
 ## 9. Evidence trail / artifacts
 
