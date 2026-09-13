@@ -26,10 +26,23 @@ Extended further still: added a new `DBG_STOP_BLOCK` register so
 `dbg_stop`'s halts apply to any block, not just block 0 (verified in
 simulation first, one real bug caught and fixed in the new test code
 along the way — not a hardware finding). Checked layer 1 the same way:
-**all eight phases matched exactly on real hardware too.** Two layers
-now fully confirmed correct end to end. The defect must be in one of
-layers 2-11 (now checkable with firmware changes alone, no further
-resynthesis needed) or in the final `LN_f`/head activation computation.
+**all eight phases matched exactly on real hardware too.** Then batched
+the remaining ten layers into one boot sequence (one weight reload,
+looping `DBG_STOP_BLOCK=2..11` — checking each layer separately would
+have meant ten more ~15-minute reload cycles) and checked all of them
+the same way.
+
+**Result: all 12 transformer layers are now fully confirmed correct on
+real hardware — every layer's weights and entire activation computation,
+bit-exact against the Python golden reference, for the exact "in the
+forest" forward pass that picks "care."** The whole per-layer
+transformer body is ruled out. What's left, by elimination: the final
+`LN_f` layernorm, the head GEMV's own computation (its weight data is
+already confirmed correct, but not whether the GEMV correctly combines
+it with `LN_f`'s output), or the argmax/sampling/token-selection logic
+downstream of the head logits — none reachable with the current
+`dbg_stop` mechanism, which only covers the block loop. See §8 items
+8-12 for the full account.
 
 Status as of 2026-09-12: **open, not root-caused. The CDC timing-constraint
 gap (§6) has now been fully investigated, fixed, rebuilt from scratch, and
@@ -1424,6 +1437,45 @@ original order below since item 4 was already next regardless.
     case. The RTL work is done; checking further layers (2-11) from here
     is firmware-only (write `DBG_STOP_BLOCK`, rerun) — no more
     resynthesis needed for this specific line of investigation.
+
+12. **"Continue checking layers 2-11 systematically."** Batched into a
+    single boot sequence rather than one real-hardware reload per layer
+    (each reload's own ~15-minute UART weight transfer dominates real
+    time, not the actual per-layer check) — one weight load, then a loop
+    over `DBG_STOP_BLOCK=2..11` inside the same boot, each iteration
+    replaying "in"+"the" fresh, halting at the target block, dumping its
+    8 phase banks with a `KEVGPT_ACTDIAG_LAYER,block=N` marker between
+    layers, then `soft_reset` before the next. Golden reference
+    generalized the same way: one sequential pass through all 12 blocks
+    (`IntKVQSequencer._attn_step`/`_mlp_step`, `bi=0..11`), capturing
+    each layer's own phase-signal dict as it goes.
+
+    First capture attempt: layers 3-11 matched immediately; layer 2 was
+    entirely missing from the log. Traced to a real bug in the capture
+    wrapper script (not a hardware issue): leftover bytes `_send_blob`
+    reads past its own `TOK_DONE_MARKER` search get carried forward
+    (correctly) for a subsequent marker search, but the script never
+    actually *printed* them to the log — and since layer 2's output is
+    the very first thing the board prints after the transfer completes,
+    it landed in exactly those unprinted leftover bytes. Fixed by
+    flushing the leftover buffer to the log before starting the capture
+    loop, reran (one more full weight-reload cycle) — layer 2 present
+    and clean this time.
+
+    **Real-hardware result: all 8 phases matched exactly for every one
+    of layers 2 through 11.** Combined with layers 0 and 1 (items 10-11),
+    **all 12 transformer layers are now fully confirmed correct on real
+    hardware** — every layer's entire computation, weights and
+    activations both, bit-exact against the Python golden reference, for
+    the exact "in the forest" forward pass that picks "care." This
+    closes out the entire per-layer transformer body as a candidate.
+    What's left, by elimination: the final `LN_f` layernorm (after layer
+    11, before the head), the head GEMV's own *computation* (its
+    *weight data* was already confirmed correct in item 8, but not
+    whether the GEMV correctly combines it with `LN_f`'s output), or the
+    argmax/sampling/token-selection logic downstream of the head logits
+    — none reachable with the current `dbg_stop`/`DBG_STOP_BLOCK`
+    mechanism, which only covers the block loop, not what comes after it.
 
 ## 9. Evidence trail / artifacts
 

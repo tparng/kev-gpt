@@ -328,11 +328,15 @@ isn't a timing or ordering bug.
    "care." **All nine matched exactly.** Layer 0 is now fully ruled out,
    weights and computation both. Extended once more: added a new
    register so the same debug halt applies to any block, checked layer
-   1 the same way — **all eight phases matched exactly again.** Two
-   layers now fully confirmed correct; the defect must be in one of
-   layers 2-11 (now checkable with firmware changes alone) or the final
-   head activation stage. Full account in
-   `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items 8-11.
+   1 the same way (all eight phases matched), then batched the
+   remaining ten layers into one boot sequence and checked all of them
+   too. **All 12 transformer layers are now fully confirmed correct on
+   real hardware** — every layer's weights and entire computation,
+   bit-exact against golden, for the exact divergent case. The whole
+   per-layer transformer body is ruled out; what's left is the final
+   `LN_f` layernorm, the head GEMV's own computation, or the
+   argmax/sampling/token-selection logic downstream of the head logits.
+   Full account in `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items 8-12.
 2. **Isolate §2a's firmware-timing sensitivity on its own terms.** The one
    still-unexplained build-dependent result (a diagnostic-only firmware
    change shifting which wrong token wins, same bitstream) was folded into
