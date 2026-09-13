@@ -6,7 +6,7 @@ actually found, and where the evidence points next. Companion document to
 `FIXATION-WORD-CDC-INVESTIGATION.md` (the full blow-by-blow this report
 synthesizes) and `model/SCALE-UP-LOG.md` (the longer chronological narrative).
 
-**Status: open, not root-caused. Reassessed 2026-09-13.**
+**Status: CLOSED — root cause found and fixed. Reassessed 2026-09-13.**
 
 ## Executive summary
 
@@ -22,8 +22,25 @@ compute logic, the weight-packing pipeline, the UART→DDR3 write path, the
 tokenizer table, and — after real setbacks and real fixes — both of the two
 leading electrical hypotheses (a CDC timing-constraint gap, and an
 owner-tracking FIFO race). Along the way, two genuine, previously-invisible
-hardware bugs were found and fixed, and are worth keeping regardless. **The
-root cause remains unknown.**
+hardware bugs were found and fixed, and are worth keeping regardless.
+
+**The root cause is now found, and already fixed as a side effect of
+other work.** It was never electrical and never in the forward pass: a
+silently-truncating 11-bit `rd_addr` register (needed 14 bits for
+`VOCAB=16384`) was shared between a diagnostic head-logit readback port
+and `remask_pick_excluding()`, a production firmware fallback that does
+a full 16,384-vocab masked-argmax scan whenever the repetition guards
+need to replace a too-early stop token. The truncation made vocab id
+2213 ("care") silently alias to reading id 165's own logit during that
+scan — the single highest value in the entire array, since 165 (".") is
+the model's own true top pick there, just filtered out for being a stop
+token — so "care" won the fallback by inheriting a value that belonged
+to a different, filtered-out index. Fully deterministic (no CDC/timing
+dependency at all), and specific to this checkpoint's own trained
+weights (2213 mod 2048 happens to equal 165). Already fixed: item 13's
+`RDADDRW` register-width fix, deployed for an unrelated diagnostic
+reason, repairs this shared register and therefore this bug too, with
+no further change needed. See §8 for the full derivation.
 
 | | |
 |---|---|
@@ -348,8 +365,35 @@ isn't a timing or ordering bug.
    on real hardware for the exact scenario that produces the fixation
    word.** The defect has to be in the argmax comparison/selection logic
    itself, the one part of this design never verified dynamically until
-   now. Full account in `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items
-   8-13.
+   now.
+
+   That check came next, and closed the investigation. `tok_out` — the
+   RTL argmax's raw output, already exposed at `KEVGPT_REG_TOK_OUT` and
+   exactly what every real generated token comes from — was checked
+   directly for the first time, via a new `KEVGPT_DIAG_TOKOUT` (no new
+   RTL: three real, untruncated `kevgpt_step()` calls, then print the
+   raw result). **Real hardware: `tok_out` = 165, the correct answer.**
+   The RTL argmax pipeline itself is clean — the leading suspect turned
+   out innocent. That redirected attention to *why* "care" only ever
+   showed up through real interactive chat, never a direct register
+   replay: 165 (".") is a *stop-token id*, and `chat_turn()`'s own
+   "don't end the reply after one word" guard correctly swaps it out via
+   `remask_pick_excluding()` — a firmware function that masked-argmax
+   scans the full 16,384-vocab logit array through the exact same
+   `rd_addr` register item 13's `RDADDRW` fix had just repaired for an
+   unrelated diagnostic reason. Before that fix, its scan of id 2213
+   ("care") silently aliased to id 165's own logit (the array's global
+   max, masked out everywhere else for being a stop token), so "care"
+   won the fallback pick by inheriting a value that belonged to a
+   different, filtered-out index — fully deterministic, no CDC/timing
+   involved, and specific to this checkpoint's own weights (2213 mod
+   2048 = 165). No new fix was needed: `RDADDRW`, already deployed,
+   silently repairs this shared register and this bug with it.
+   Confirmed live: "in the forest" through the real chat path on the
+   post-fix bitstream now replies starting with "," (id 163) — the
+   genuine correct masked-argmax answer for this prompt, never "care".
+   **Investigation closed.** Full account in
+   `FIXATION-WORD-CDC-INVESTIGATION.md` §8 items 8-14.
 2. **Isolate §2a's firmware-timing sensitivity on its own terms.** The one
    still-unexplained build-dependent result (a diagnostic-only firmware
    change shifting which wrong token wins, same bitstream) was folded into

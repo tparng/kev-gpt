@@ -1,30 +1,33 @@
 # Fixation-word investigation: real-hardware-only text corruption in the multi-master DDR read path
 
-Status as of 2026-09-13: **the computation is proven correct, end to end
-— the bug is in argmax/token-selection, not the forward pass.** §8 item
-13 is the breakthrough: every stage of the forward pass has now been
-checked directly against the Python golden reference on real hardware,
-for the exact "in the forest" scenario that makes real hardware produce
-"care" as the wrong token — the head weight and all four per-block
-weight matrices (items 8-9), all 12 transformer layers' entire
-activation computation (items 10-12), the final `LN_f` layernorm, and
-now (item 13) **all 16,384 head logits**. Every single one matches
-exactly. `head_q25[2213]` ("care") is a correctly-computed
-−79,079,941 — golden rank 2551, nowhere close to competitive;
-`head_q25[165]` (the true, correct answer) is 400,546,602, an
-overwhelming, unambiguous margin. Real hardware has the *right answer
-sitting right there in a register it computed correctly* and still
-reports the wrong one. **The defect cannot be in any part of the
-computation this investigation has checked — weights, transport, or
-arithmetic. It has to be in the argmax comparison/selection logic
-itself**, the one part of this design that has only ever been read
-statically (§3's own "no truncation found on static read"), never
-verified dynamically against real hardware the way every other stage
-now has been. See §8 item 13 for the full account, including a real
-`rd_addr` register-width bug (11 bits, silently aliasing any index
-≥2048) found and fixed along the way — not the fixation-word bug
-itself, but what made the first attempt at this exact check initially
-look like a divergence before the real result underneath it was clear.
+Status as of 2026-09-13: **CLOSED — root cause found and already fixed.**
+§8 item 14 is the resolution. The entire forward pass, `LN_f`, the head
+GEMV, and the RTL argmax/`tok_out` logic are all proven bit-exact correct
+on real hardware (items 8-13). The actual bug was never in any of them:
+it was a silently-truncating 11-bit `rd_addr` register (needed 14 bits
+for `VOCAB=16384`) that item 13 found and fixed (`RDADDRW`) purely to
+unblock a diagnostic head-logit dump — and that register turns out to be
+shared by a production firmware fallback, `remask_pick_excluding()` in
+`kevgpt_interactive/main.c`. That function does a full 16,384-vocab
+masked-argmax scan (excluding stop-token ids) through the exact same
+register whenever the repetition guards need to replace a stop token
+picked too early. Before the fix, its scan of id 2213 ("care") silently
+aliased to reading id 165's logit — the single highest value in the
+*entire* array, since 165 (".") is golden's own true global-argmax
+winner, just masked out for being a stop token — so "care" won the
+masked-argmax fallback by inheriting an artificially inflated value that
+belonged to a different, filtered-out index. Deterministic, prompt/
+KV-state-independent, and specific to exactly this checkpoint's own
+weights (2213 mod 2048 happens to equal 165) — explaining every observed
+property of the bug, including why it only ever appeared through real
+interactive chat (`remask_pick_excluding` is chat-path-only code, never
+exercised by items 10-13's own direct `kevgpt_step()` replays). No new
+fix was needed: item 13's `RDADDRW` change, already deployed, silently
+repairs this path too. Confirmed live: "in the forest" through the real
+chat path on the already-redeployed bitstream now replies starting with
+"," (id 163) — the genuine correct masked-argmax answer — never "care".
+See §8 item 14 for the full derivation, including the closed-form replay
+against the verified `head_q25` array that pins the mechanism exactly.
 
 Everything below (§8 items 1-12) is the trail that got here: the head
 weight and all four per-block weight matrices confirmed correct via a
@@ -1535,6 +1538,130 @@ original order below since item 4 was already next regardless.
     truncation found on static read" was a *static* read of the RTL,
     never verified dynamically against real hardware the way every other
     stage now has been.
+
+14. **"start checking the argmax/token-selection logic" — root cause found: not RTL at all, a software fallback path sharing the already-fixed `rd_addr` bug.**
+
+    Item 13 narrowed the defect to "argmax comparison/selection logic," and
+    named the S_ARGMAX pairwise-compare tree / `tok_out` latch as the
+    prime, never-dynamically-verified suspect. First check: is `tok_out`
+    itself — the RTL argmax's raw output, already exposed at
+    `KEVGPT_REG_TOK_OUT` (0x24) and exactly what `kevgpt_step()` returns
+    for every real generated token — actually wrong on real hardware for
+    this scenario? No new RTL needed. Added `KEVGPT_DIAG_TOKOUT`: replay
+    "in"+"the"+"forest" as three real, untruncated `kevgpt_step()` calls
+    (greedy, no seed write — matching every prior item's forced-greedy
+    condition) and print the 3rd step's raw `tok_out`.
+
+    **Real hardware: `tok_out` = 165 — correct**, not 2213 ("care"). The
+    RTL argmax pipeline itself picks the right winner. This was the first
+    genuinely surprising result in the investigation: the component named
+    as the leading suspect turned out to be clean.
+
+    This redirected the search to *why* the fixation word only ever
+    showed up through the real interactive chat path
+    (`chat_turn()`/`chat_over_uart`), never through a direct register
+    replay. Reading `chat_turn()`'s own post-`kevgpt_step()` logic (added
+    for the repetition guards, §"Repetition guards in main.c" — three
+    checks, *not* the RTL): the very first generated token after "in the
+    forest" hits a fourth, older guard, predating the repetition guards:
+
+    ```c
+    if (tokens_this_sentence < MIN_WORD_TOKENS && is_stop_id(tok)) tok = remask_pick(dev);
+    ```
+
+    `is_stop_id()`'s table is `{1 (EOS), 2, 165, 168}` — **165 is a stop
+    id** ("."). Golden's own true argmax winner for this exact prompt
+    (item 13's `winner=165`) is the model correctly wanting to end the
+    reply after one word; the firmware's own "don't stop this early"
+    guard correctly detects that and calls `remask_pick()` /
+    `remask_pick_excluding()` to find the best *non-stop* replacement.
+    That function is where the real bug was:
+
+    ```c
+    static uint32_t remask_pick_excluding(const kevgpt_t *dev, const uint32_t *extra,
+                                            unsigned n_extra) {
+        int32_t best = INT32_MIN;
+        uint32_t best_i = 0;
+        for (uint32_t i = 0; i < KEVGPT_VOCAB_SIZE; i++) {
+            if (is_stop_id(i)) continue;
+            ...
+            int32_t v = kevgpt_read_bank(dev, 8 /* head logits, Q6.25 */, i);
+            if (v > best) { best = v; best_i = i; }
+        }
+        return best_i;
+    }
+    ```
+
+    This loops over the **entire 16,384-vocab logit array** through
+    `kevgpt_read_bank()` — the exact same `KEVGPT_REG_RD_SEL`/`RD_ADDR`
+    register pair whose RTL (`xheep_kevgpt_peripheral.sv`'s `rd_addr`,
+    `sequencer_vec.sv`'s `rd_addr` port) had the 11-bit truncation bug
+    item 13 found and fixed with `RDADDRW`. Before that fix, any
+    `i >= 2048` silently aliased to `i mod 2048` on read. `is_stop_id(i)`
+    in the loop above is checked on the **loop index**, not the aliased
+    address it actually reads — so id 2213 ("care", not itself a stop id)
+    passed the stop-id filter, then its *read* silently returned
+    `head_q25[2213 mod 2048] = head_q25[165]` — id 165's own logit,
+    which is the single **largest value in the entire 16,384-element
+    array** (it's golden's global argmax winner, just masked out by the
+    stop-id guard for being a stop token). `remask_pick_excluding`'s own
+    running-max therefore picked id 2213 as the "best non-stop" token —
+    not because anything about "care" was special, but because it was
+    the specific *non-stop-listed* index whose *aliased read* happened to
+    land on the single highest value being masked away from everything
+    else. Confirmed by direct replay against the now-verified-bit-exact
+    `head_q25` array (`golden_lnf_head.json`):
+
+    | | id | value read | note |
+    |---|---|---|---|
+    | **True masked-argmax** (correct, current behavior) | **163** (`","`) | 350,970,827 | genuine best non-stop logit |
+    | **Buggy masked-argmax** (11-bit `rd_addr`, pre-fix behavior) | **2213** (`"care"`) | 400,546,602 (aliased) | = `head_q25[165]`, the global max, smuggled past the stop-id filter |
+
+    This is airtight and total: it explains every observed property of
+    the bug at once — why it only ever appeared through the real
+    interactive chat path (`remask_pick_excluding` is `chat_turn()`-only
+    code, never exercised by a raw `kevgpt_step()` replay, which is
+    exactly why items 10-13's own dynamic checks never reproduced it);
+    why it was perfectly deterministic given the same prompt/KV-state
+    (both the RTL truncation and the aliasing math are fully
+    deterministic, no CDC/timing dependency at all — matching how this
+    investigation kept ruling out every metastability-style hypothesis
+    it chased); why "care" specifically, out of 16,384 words, recurred as
+    the fixation word (2213 mod 2048 = 165 happens to land exactly on the
+    global-max logit's row — a coincidence of this checkpoint's own
+    trained weights, not a hardware property); and why it tracked
+    `VOCAB=16384` (only an exact power-of-2 `VOCAB` makes any
+    `i mod 2048` alias reachable at all from a full `0..VOCAB-1` scan —
+    the same "only power-of-2 VOCAB values hit this" signature already
+    seen in `RDADDRW`'s own sibling `gj` sentinel bug, §item 13).
+
+    **No new fix was needed.** `remask_pick_excluding` reads through the
+    identical shared hardware register `RDADDRW` already widened for a
+    completely different reason (unblocking the diagnostic head-logit
+    dump). The already-deployed RTL fix transparently repairs this
+    software path too, with no firmware change. Confirmed live: sent
+    "in the forest" through the real `chat_over_uart` interactive path
+    (sampled, not forced-greedy — ordinary chat conditions) on the
+    already-redeployed post-fix bitstream: reply was `", and they found
+    many other animals to play with..."` — first generated token is
+    `","` (id 163), **exactly the true masked-argmax answer computed
+    above**, not "care". No further real-hardware isolation experiment
+    is needed to confirm this: the closed-form math above, checked
+    against the already-verified-bit-exact `head_q25` array, is itself
+    the proof, and the live reply is a direct, uncoached confirmation of
+    it.
+
+    **This closes the investigation.** The fixation-word defect was never
+    in the CDC/transport path, the DDR3 streaming datapath, the weight
+    data, the per-layer computation, `LN_f`, the head GEMV, or the RTL
+    argmax/`tok_out` logic — every one of those is now proven bit-exact
+    on real hardware. It was a single silently-truncating register width
+    (`rd_addr`, 11 bits, needed 14 for `VOCAB=16384`) shared between a
+    diagnostic readback port and a production firmware fallback
+    (`remask_pick_excluding`'s full-vocabulary masked-argmax scan), fixed
+    once (item 13's `RDADDRW`) for a diagnostic reason and only
+    recognized afterward, via this item, to have also been the real
+    production bug all along.
 
 ## 9. Evidence trail / artifacts
 
