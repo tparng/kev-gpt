@@ -6533,3 +6533,93 @@ simulation, 111 ILA-watched real generations, and 96 more monitor-watched
 real generations. Hypothesis B is about as thoroughly ruled out as this
 investigation's tooling can currently manage. The fixation-word root
 cause remains open; nothing in items 1-7 has found it yet.
+## Guard-substitution repetition bug: a fix manufacturing the exact bug it prevents
+
+Found via `model/tinystories_hf_repro/`'s Long-Form Fidelity benchmark
+(~128-word real-hardware samples vs. the published reference), not a
+targeted investigation -- one captured sample, prompt "a little girl",
+real_seed `0x2d7acf1a`, read: "...lily loved her **new new new new
+new** magnet..." -- five consecutive identical tokens, despite
+`chat_turn()`'s own immediate-exact-doubling guard (`tok == last_tok`
+-> `remask_pick_excluding`) existing specifically to prevent runs like
+this (see this document's own earlier "Repetition guards in main.c"
+history, `d4770d2`).
+
+**First attempt: reproduce in RTL simulation.** Built a from-scratch
+`tb_seq_vec_kv_stream.sv` compile (file list, `-D` overrides, and a
+`` `define SYNTHESIS `` shim for `mig_read_engine`/`sync_fifo`'s
+`disable iff` assertions Icarus can't parse, all reconstructed from
+`run_vec_kv.py`'s own fully-resident equivalent plus the testbench's own
+header comments -- no `run_vec_kv_stream.py` driver exists yet, despite
+`model/SCALE-UP-LOG.md` flagging this as a "not yet done" gap weeks
+earlier). Turned out much slower than expected in practice --
+38m40s for a 17-pass calibration run, extrapolating to 3+ hours for the
+~99 passes needed to reach the repeat region -- and a second, trimmed-
+testbench attempt (stripping unrelated trailing item-13-era verification
+blocks to cut wasted simulation time) still came back all-`X`: a missed
+`-DWWORDSVAL=32768` override left the testbench's own stale small-shape
+default (3072) in place, silently truncating `g_wbase`/`emb_addr_w` per
+`sequencer_vec`'s own runtime warning. 30 more minutes lost to a config
+mistake, not a real finding -- flagged honestly, not glossed over.
+
+**Second attempt: a firmware trace, decisively faster.** RTL simulation
+was never going to explain this anyway -- the repetition guards are
+pure C in `main.c`, never touch RTL, so no RTL-only gate can see them
+by construction (the same structural argument that closed the earlier
+fixation-word investigation, `FIXATION-WORD-CDC-INVESTIGATION.md`
+§10). Added two small, off-by-default firmware toggles instead:
+`KEVGPT_FORCE_SEED` (replay one exact real `real_seed` deterministically
+instead of the usual cycle-derived one) and `KEVGPT_DIAG_GUARD_TRACE`
+(print every generated position's raw argmax+Gumbel pick, which guard if
+any fired, what it substituted, and the final accepted token). One
+real-hardware capture (needed a longer client-side timeout + an explicit
+port-drain before sending, since the earlier truncated-by-timeout first
+attempt left the board still streaming when the naive retry raced it)
+and the trace was immediately conclusive:
+
+```
+pos=94 raw_tok=new(9412)    last_tok=her        -> accepted: new
+pos=95 raw_tok=penny(10224) last_tok=new(9412)   fired=bigram_recur sub_tok=new(9412)
+pos=96 raw_tok=penny(10224) last_tok=new(9412)   fired=bigram_recur sub_tok=new(9412)
+pos=97 raw_tok=penny(10224) last_tok=new(9412)   fired=bigram_recur sub_tok=new(9412)
+pos=98 raw_tok=penny(10224) last_tok=new(9412)   fired=bigram_recur sub_tok=new(9412)
+pos=99 raw_tok=penny(10224) last_tok=new(9412)   fired=bigram_recur sub_tok=magnet(8398)
+```
+
+The model's own raw stream never actually repeats "new" -- it keeps
+trying to say "penny" (a real earlier bigram, "...it is a new
+penny..."), and the bigram-recurrence guard correctly fires every
+single time. The bug is in the remedy: `remask_pick_excluding()`
+excluded only the literal colliding word ("penny"), never `last_tok`
+("new") itself, so its own unconstrained "best remaining word" search
+kept landing right back on "new" -- manufacturing, four times in a row,
+the exact immediate doubling the OTHER guard exists to prevent, because
+nothing re-validated the substitute against it afterward.
+
+**Fix, `57ce25a`, two parts**: (1) `remask_pick_excluding()` now always
+excludes `last_tok` too, unconditionally, on top of whatever the caller
+passed -- closes this off at the source for every caller, not just the
+bigram guard. (2) The four guard checks (the stop-token MIN_WORD_TOKENS
+remask plus the three named guards) now run in a bounded 4-pass
+re-validation loop instead of one straight-line pass, so any
+substitution -- not just this specific bigram-into-doubling case -- gets
+checked against every other guard before being accepted.
+
+**Verified on real hardware**: replayed the identical prompt + real
+seed with the fix in place. Reply now reads "...lily loved her new
+magnet and her mommy's love..." -- single, natural occurrence. The
+trace also directly confirms the new re-validation loop is genuinely
+exercised, not just theoretically present: pos=84 in the post-fix
+capture shows `bigram_recur` firing twice within the same position
+(a substitute that itself collided, caught and re-resolved by the
+second pass) -- exactly the class of case the loop exists for.
+Confirmed clean afterward on a full 96-generation/96-seed real-hardware
+sweep (the same 12-prompt x 8-repeat set used throughout this document):
+0/96 triple-repeats, and the sweep's one incidental "care" hit read as
+ordinary grammatical usage ("...take care of our things...") on
+inspection, not the unrelated, already-closed fixation-word substitution
+bug.
+
+Both `KEVGPT_FORCE_SEED` and `KEVGPT_DIAG_GUARD_TRACE` are left in the
+tree, off by default, for any future real-hardware repetition capture
+that needs replaying and tracing this same way.

@@ -164,6 +164,19 @@ footer.endnote{ margin-top:56px; padding-top:20px; border-top:1px solid var(--bo
   </header>
 
   <div class="caveat">
+    <b>This dataset caught a real bug, now fixed (2026-09-15).</b> The hardware sample for prompt "a little
+    girl", real_seed <code>0x2d7acf1a</code>, originally read "...lily loved her <b>new new new new new</b>
+    magnet..." &mdash; five consecutive identical tokens, despite a repetition guard existing specifically to
+    prevent this. Root-caused via a real-hardware guard trace (not RTL simulation, which structurally can't
+    see this: the guards are pure firmware, never touch RTL): the bigram-recurrence guard correctly detected
+    a recurring phrase and tried to substitute a different word, but its own substitution logic never excluded
+    <code>last_tok</code> &mdash; so it kept landing right back on "new", four times in a row, manufacturing
+    the exact doubling a DIFFERENT guard exists to prevent. Fixed in
+    <code>kevgpt-genesys2-soc</code> commit <code>57ce25a</code> and verified on real hardware (same prompt +
+    seed now replies "...lily loved her new magnet..."); the sample embedded below still shows the original,
+    pre-fix capture as a permanent record of what this benchmark actually found, not silently touched up.
+  </div>
+  <div class="caveat">
     <b>Not an apples-to-apples parameter comparison.</b> kev-gpt is a 2-4M-parameter model that lives entirely
     in FPGA on-chip memory by design (README's own "compression is the joke and the optimization"); the
     reference is a conventional 19M-parameter FP model with no such constraint. This benchmark measures how
