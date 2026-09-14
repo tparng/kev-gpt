@@ -6623,3 +6623,68 @@ bug.
 Both `KEVGPT_FORCE_SEED` and `KEVGPT_DIAG_GUARD_TRACE` are left in the
 tree, off by default, for any future real-hardware repetition capture
 that needs replaying and tracing this same way.
+
+## Guard-substitution repeat, round two: the re-validation loop's own retry logic could oscillate
+
+Continuing directly from the previous entry. A second flagged sample
+(user-provided, from the same Long-Form Fidelity dataset) surfaced
+almost immediately after that fix was deployed: prompt "the dog ran",
+real_seed `0x4361ec7e`, produced a 113-word story about a dog/cat/owner
+triangle in which "the dog" recurred **10 times**, despite the
+just-fixed 4-pass guard re-validation loop already being in place.
+
+Replayed with the same `KEVGPT_FORCE_SEED`/`KEVGPT_DIAG_GUARD_TRACE`
+toggles (still in the tree from the previous item), and the trace was
+immediately clear -- the loop wasn't failing to fire, it was
+**oscillating**:
+
+```
+pos=19  raw_tok=dog   last_tok=the
+        fired=bigram_recur  sub_tok=cat    (exclude {dog}, best remaining = cat)
+        fired=bigram_recur  sub_tok=dog    (exclude {cat}, best remaining = dog again!)
+        fired=bigram_recur  sub_tok=cat
+        fired=bigram_recur  sub_tok=dog
+        final_tok=dog                       (4-pass cap reached, landed on dog)
+```
+
+The story genuinely revolves around three recurring nouns ("dog",
+"cat", "owner" -- all real bigram-partners of "the" earlier in the same
+reply), so `remask_pick_excluding()`'s own unconstrained "best
+remaining word" search, when told to exclude only the SINGLE most
+recent offender, kept landing back on whichever of the other two it had
+just rejected on the PREVIOUS pass -- each pass forgot what earlier
+passes at the same position had already tried. The fixed 4-pass cap
+(an even number) then just happened to land back on the ORIGINAL
+colliding word by parity, every single time this pattern occurred in
+the story (6 of the 10 "the dog" occurrences show this exact
+oscillate-then-land-on-cap shape in the raw trace).
+
+**Fix, `4c3a398`**: accumulate every candidate rejected so far at the
+CURRENT position (`tried[]`, 8 slots -- comfortably above the 4-pass
+loop's own worst case) across all passes, and pass the whole
+accumulated set to `remask_pick_excluding()` on every call within that
+position's resolution, not just the single most recent offender. A
+word rejected once can never be re-offered later in the same position's
+own resolution, so each pass is now guaranteed to make real forward
+progress (or hit the true fixed point where no guard fires) instead of
+being able to cycle between a small set of already-tried candidates.
+
+**Verified on real hardware**: replayed the identical prompt + real
+seed. New trace shows genuine forward progress at the same position
+(`dog -> cat -> a new word`, no loop back), and at a couple of other
+positions in the story, chains of 3-4 DISTINCT rejections before
+settling. The regenerated story is clean at every
+`min_bigram_recurrence` threshold this project uses (`is_degenerate`
+returns `None` at both 3 and 6), where the pre-fix version flagged
+"bigram recurred 10x: ('the', 'dog')".
+
+**Lesson, worth keeping for next time this class of bug shows up**:
+a bounded retry/re-validation loop is not sufficient on its own to
+guarantee forward progress -- it also needs each pass's exclusion set
+to be cumulative, not just the current pass's own single collision.
+Two consecutive real bugs were found in this exact guard-substitution
+logic within the same session (see the previous entry too), both from
+the same underlying class of mistake: reasoning about ONE substitution
+in isolation instead of the whole position's resolution as a stateful
+process. `KEVGPT_FORCE_SEED`/`KEVGPT_DIAG_GUARD_TRACE` remain in the
+tree, off by default, for whatever comes next.
