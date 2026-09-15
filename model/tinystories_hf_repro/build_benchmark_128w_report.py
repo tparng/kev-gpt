@@ -164,19 +164,22 @@ footer.endnote{ margin-top:56px; padding-top:20px; border-top:1px solid var(--bo
   </header>
 
   <div class="caveat">
-    <b>This dataset caught a real bug, now fixed and reflected below (2026-09-15).</b> An earlier capture of
-    this benchmark (prompt "a little girl", real_seed <code>0x2d7acf1a</code>) originally read "...lily loved
-    her <b>new new new new new</b> magnet..." &mdash; five consecutive identical tokens, despite a repetition
-    guard existing specifically to prevent this. Root-caused via a real-hardware guard trace (not RTL
-    simulation, which structurally can't see this: the guards are pure firmware, never touch RTL): the
-    bigram-recurrence guard correctly detected a recurring phrase and tried to substitute a different word,
-    but its own substitution logic never excluded <code>last_tok</code> &mdash; so it kept landing right back
-    on "new", four times in a row, manufacturing the exact doubling a DIFFERENT guard exists to prevent. Fixed
-    in <code>kevgpt-genesys2-soc</code> commit <code>57ce25a</code>. The hardware panels below are a
-    <b>fresh, post-fix recapture</b> (same 5&times;5 methodology, rerun after the fix) &mdash; the original
-    pre-fix "new new new new new" sample is preserved permanently in
-    <code>fabric/genesys2/PORT-NOTES.md</code>'s own write-up and in this repo's git history, not silently
-    dropped.
+    <b>This dataset caught two consecutive real bugs, both now fixed (2026-09-15).</b> An earlier capture
+    (prompt "a little girl", real_seed <code>0x2d7acf1a</code>) read "...lily loved her <b>new new new new
+    new</b> magnet..." &mdash; a repetition guard's own substitution logic never excluded <code>last_tok</code>,
+    so it kept landing right back on the word it was trying to avoid. Fixed in <code>57ce25a</code> &mdash; but
+    a second capture (prompt "the dog ran", real_seed <code>0x4361ec7e</code>) immediately surfaced a subtler
+    version of the same class of bug: "the dog" recurring 10&times; because the FIRST fix's own re-validation
+    loop could <b>oscillate</b> between two already-rejected candidates ("dog" &#8596; "cat") in stories with
+    multiple genuinely recurring nouns, landing back on the original word by pass-count parity. Fixed in
+    <code>4c3a398</code> by accumulating every rejected candidate across passes, not just the single most
+    recent one. Both root-caused via a real-hardware guard trace (not RTL simulation, which structurally
+    can't see this: the guards are pure firmware, never touch RTL) &mdash; full write-ups in
+    <code>fabric/genesys2/PORT-NOTES.md</code>. The hardware panels below are a
+    <b>fresh recapture after both fixes</b> (same 5&times;5 methodology): <b>0/25 flagged</b> at any
+    <code>min_bigram_recurrence</code> threshold, down from 4-6/25 on the same methodology before this second
+    fix. The original pre-fix samples remain preserved in <code>PORT-NOTES.md</code> and git history, not
+    silently dropped.
   </div>
   <div class="caveat">
     <b>Not an apples-to-apples parameter comparison.</b> kev-gpt is a 2-4M-parameter model that lives entirely
