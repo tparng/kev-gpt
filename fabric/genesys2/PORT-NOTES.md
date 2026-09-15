@@ -6689,3 +6689,33 @@ the same underlying class of mistake: reasoning about ONE substitution
 in isolation instead of the whole position's resolution as a stateful
 process. `KEVGPT_FORCE_SEED`/`KEVGPT_DIAG_GUARD_TRACE` remain in the
 tree, off by default, for whatever comes next.
+
+## Clarification: guard substitution is inline generation, not post-processing
+
+Worth stating explicitly, since it's easy to assume the guards run as a
+cleanup pass over a finished reply: they don't. `chat_turn()`'s
+generation loop is strictly per-token -- get one token from the
+accelerator, check it against the guards, substitute via
+`remask_pick_excluding()` if one fires, THEN append the (possibly
+substituted) token to `hist[]` and feed it back as `last_tok` for the
+next token's own generation. The correction happens before the model
+ever conditions on that position, not after the whole story exists.
+
+This is directly visible in the matched-seed replay pairs built for
+`model/tinystories_hf_repro/guard_fix_diff_report.html` (the "Same
+Seed, Different Guard" artifact): if substitution were a post-process
+splice, the before/after texts would differ only at the swapped word,
+with everything else identical. Instead they're identical only up to
+the first position a guard behaves differently, then diverge into two
+completely different continuations from there (e.g. the bigram-guard
+pair: same first 17 words, then two unrelated 90-word endings). That
+shape only makes sense if the corrected token becomes real context the
+model conditions on afterward -- autoregressive decoding means one
+changed token reshapes every token generated after it, which a
+post-hoc edit of the finished string could never produce. It also
+explains why a divergence can start earlier than the position the
+named bug is usually attributed to: an unrelated earlier guard firing
+(e.g. the `MIN_WORD_TOKENS` stop-token remask) that behaves differently
+under the same code change quietly changes what the model conditions
+on for the rest of the reply, well before the specific documented bug
+would have fired.
