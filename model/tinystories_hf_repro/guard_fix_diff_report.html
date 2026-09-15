@@ -197,6 +197,23 @@ footer.endnote a{ color:var(--accent-after); }
       grammatical role. Below, the actual substitutions are other concrete nouns ("penny" &rarr; "magnet"),
       not pronouns.
     </p>
+    <p>
+      <b>Where the candidates in each event chain actually come from.</b> Every forward pass genuinely computes
+      a score for all 16,384 vocab ids, not just the winner &mdash; that's inherent to how the model's output
+      layer works. But kev-gpt's accelerator normally exposes only ONE of those: its fast path runs a
+      single-pass Gumbel-max tournament in hardware and returns just the winning token, by design (no sort
+      primitive, no per-token host visibility into the full ranking). When a guard fires,
+      <code>remask_pick_excluding()</code> does not trigger a new forward pass or ask the model a fresh
+      question &mdash; it uses a separate, slower diagnostic readback port
+      (<code>kevgpt_read_bank(dev, 8, i)</code>) to pull the raw logit for each of the 16,384 ids, one at a
+      time, from that SAME already-computed distribution for that exact token position, then does a masked
+      argmax over it in software, skipping whatever's already in the exclusion set. So every "raw pick
+      &rarr; rejected &rarr; rejected &rarr; final" chain in the event grids below is firmware replaying a
+      masked version of one static, already-finished hardware computation &mdash; not the model being asked
+      again and again. It's also why guard firings cost real cycles without costing a new inference: the
+      O(16,384) rescan is comparatively slow firmware work layered on top of a computation the accelerator
+      already did once.
+    </p>
   </div>
 
   <div id="diffcards"></div>
