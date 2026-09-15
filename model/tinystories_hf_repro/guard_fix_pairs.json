@@ -1,0 +1,38 @@
+{
+  "pair1": {
+    "title": "Bug 1 -- last_tok not excluded (\"new new new new new\")",
+    "fix_commit": "57ce25a",
+    "prompt": "a little girl",
+    "real_seed": "0x2d7acf1a",
+    "before": {
+      "text": "a little girl named lily who loved to play outside. one day, she found a shiny penny on the ground. she picked it up and showed it to her mom.\" look, mommy! i found this penny!\" she said,\" wow, that's great!\" her mommy smiled and said\" yes, it is a new penny. it must be a special penny.\" lily was so happy and thanked her mom. from that day on, lily loved her new new new new new magnet. she knew that it's important to think of something, so she went to the store to buy some new ones. she brought the shiny",
+      "word_count": 103,
+      "rate_tok_s": 42.0,
+      "build": "pre-any-fix"
+    },
+    "after": {
+      "text": "a little girl named lily who loved to play outside. one day, she found a shiny penny on the ground. she picked it up and showed it to her mom.\" look, mommy! i found this penny!\" she said,\" wow, that's great!\" her mommy smiled and said\" yes, it is a new penny. it must be a special penny.\" lily was so happy and thanked her mommy. from that day on, lily loved her new magnet and her mommy's love. the end, they continued to the park together every day. the moral of the story is to always be kind to others and to",
+      "word_count": 103,
+      "rate_tok_s": null,
+      "build": "post-fix-1 (KEVGPT_FORCE_SEED replay)"
+    }
+  },
+  "pair2": {
+    "title": "Bug 2 -- retry loop oscillation (\"the dog\" x10)",
+    "fix_commit": "4c3a398",
+    "prompt": "the dog ran",
+    "real_seed": "0x4361ec7e",
+    "before": {
+      "text": "the dog ran away, but the dog was too fast. the owner of the cat saw the dog and tried to comfort him. the owner came back and took the dog away. the dog felt sorry for the dog, so he ran away. the owner was happy to help and gave the dog a big hug. the dog wagged his tail and licked his face. the owner gave him a hug and a treat. the dog was so happy! he thanked the owner for helping the dog. from that day on, the owner always made sure to be careful and never let him go too far. the end, and the owner would never",
+      "word_count": 113,
+      "rate_tok_s": 34.8,
+      "build": "post-fix-1-only"
+    },
+    "after": {
+      "text": "the dog ran away, but the dog was too fast. the owner of the cat saw the dog's collar and thought it was a toy. he picked it up and put it in his mouth. he was happy to be free. the next day, the teacher came back and saw what happened. she was very angry. she said,\" you are a bad dog. you did not mean to scare the ball. you have to go to the hospital.\" the lady was surprised and scared. she did as the dog's owner said\" yes, please. i am not a dog. i do not know how to play.\" she",
+      "word_count": 106,
+      "rate_tok_s": null,
+      "build": "post-both-fixes (KEVGPT_FORCE_SEED replay)"
+    }
+  }
+}
