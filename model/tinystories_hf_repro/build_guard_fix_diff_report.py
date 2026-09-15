@@ -367,8 +367,7 @@ function cardHtml(sample){
   const flagged = !!sample.reason;
   const badge = flagged ? `<span class="flagpill flagged">flagged</span>` : `<span class="flagpill clean">clean</span>`;
   const reasonHtml = flagged ? `<div class="reason">${escapeHtml(sample.reason)}</div>` : '';
-  const hide = (flaggedOnly && !flagged) ? ' hidden' : '';
-  return `<div class="card${hide}">
+  return `<div class="card">
     <div class="card-head">
       <span class="seedtag">${escapeHtml(sample.real_seed)}</span>
       ${badge}
@@ -395,7 +394,7 @@ function renderArchive(){
         <h3>${escapeHtml(meta.label)}</h3>
         <span class="stage-sub">${escapeHtml(meta.desc)} &middot; <code>${escapeHtml(meta.commit)}</code></span>
       </div>
-      <div class="cardgrid">${samples.map(s => cardHtml(s)).join('')}</div>
+      <div class="cardgrid">${shown.map(s => cardHtml(s)).join('')}</div>
     </div>`;
   });
   container.innerHTML = html;
