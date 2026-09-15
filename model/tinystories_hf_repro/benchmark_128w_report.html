@@ -274,6 +274,19 @@ riscv32-corev-elf-gdb -batch -ex "target remote :3333" \
       rejected candidate across passes, not just the most recent one, closing an oscillation bug the first
       fix, <code>57ce25a</code>, had itself introduced).
     </p>
+    <p style="font-size:14px;line-height:1.6;color:var(--ink-muted);margin:0 0 14px;max-width:80ch;">
+      <b style="color:var(--ink);">Not pronoun-aware, or part-of-speech-aware at all.</b> It's easy to read
+      the "dog"/"cat"/"owner" example below as the guard deliberately swapping a repeated noun for a pronoun
+      or a topically-sensible alternative &mdash; it isn't. <code>remask_pick_excluding()</code> is a plain
+      masked-argmax over the SAME full 16,384-logit distribution the hardware already computed for that
+      position: whatever scores highest among the ids not yet excluded wins, with no notion of grammatical
+      role or narrative coherence. In the traces captured for both bugs above, the actual substitutions were
+      other concrete nouns, not pronouns &mdash; "penny" &rarr; "magnet" in the first case, and "dog"
+      &harr; "cat" (cycling between two other cast members) in the second, before either fix. When that
+      second-best logit happens to be topically sensible, the output reads as a deliberate edit; when it
+      isn't, the guard has no way to tell &mdash; it's picking a runner-up from the model's own distribution,
+      not exercising editorial judgment.
+    </p>
     <p style="font-size:14px;line-height:1.6;color:var(--ink-muted);margin:0;max-width:80ch;">
       <b style="color:var(--ink);">Cost model: only paid on an actual collision.</b> An unconditional
       full-vocab rescan on every token would dominate the cycle budget, so each guard does nothing on the
