@@ -129,8 +129,26 @@ h3.sub{ font-family:'Fraunces',serif; font-size:17px; font-weight:600; margin:0 
 .story mark.before{ background:var(--before-mark-bg); color:var(--before-mark-fg); padding:0 1px; border-radius:2px; font-weight:600; }
 .story mark.after{ background:var(--after-mark-bg); color:var(--after-mark-fg); padding:0 1px; border-radius:2px; font-weight:600; }
 .diffpanel-foot{ margin-top:12px; padding-top:10px; border-top:1px solid var(--border-soft); font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--ink-faint); display:flex; justify-content:space-between; flex-wrap:wrap; gap:6px; }
-.trace{ margin:0 24px 22px; background:var(--surface-2); border:1px solid var(--border-soft); border-radius:8px; padding:12px 14px; overflow-x:auto; font-family:'IBM Plex Mono',monospace; font-size:11.5px; line-height:1.6; color:var(--ink-muted); }
-.trace .lbl{ color:var(--ink-faint); }
+.note{ margin:0 24px 24px; background:var(--surface-2); border:1px solid var(--border-soft); border-radius:10px; padding:18px 20px; }
+.note-head{ font-family:'IBM Plex Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:0.08em; color:var(--ink-faint); margin-bottom:10px; }
+.note p{ font-size:13.5px; line-height:1.6; color:var(--ink-muted); margin:0 0 12px; }
+.note p:last-child{ margin-bottom:0; }
+.note b{ color:var(--ink); }
+.note code{ font-family:'IBM Plex Mono',monospace; font-size:0.92em; background:var(--surface); border:1px solid var(--border-soft); padding:1px 5px; border-radius:4px; }
+.eventgrid{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px; }
+@media (max-width:640px){ .eventgrid{ grid-template-columns:1fr; } }
+.eventcol{ background:var(--surface); border:1px solid var(--border-soft); border-radius:8px; padding:12px 14px; }
+.eventcol .evlabel{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:8px; }
+.eventcol.before .evlabel{ color:var(--accent-before); }
+.eventcol.after .evlabel{ color:var(--accent-after); }
+.evchain{ font-family:'IBM Plex Mono',monospace; font-size:12px; line-height:1.9; color:var(--ink-muted); }
+.evchain .arrow{ color:var(--ink-faint); margin:0 4px; }
+.evchain .raw{ color:var(--ink-muted); }
+.evchain .rej{ color:var(--before-mark-fg); text-decoration:line-through; text-decoration-color:var(--before-mark-fg); opacity:0.75; }
+.evchain .final{ font-weight:700; }
+.eventcol.before .evchain .final{ color:var(--accent-before); }
+.eventcol.after .evchain .final{ color:var(--accent-after); }
+.evsource{ font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:var(--ink-faint); margin-top:8px; }
 
 .stats-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:12px; overflow:hidden; margin-bottom:44px; box-shadow:var(--shadow); }
 @media (max-width:820px){ .stats-grid{ grid-template-columns:1fr; } }
@@ -304,14 +322,50 @@ function diffPanelHtml(sample, cls, label){
   </div>`;
 }
 
-const TRACE_HTML = {
-  pair1: `<span class="lbl">pos=95-99</span>  raw_tok=penny  last_tok=new  <span class="lbl">fired=bigram_recur</span>  sub_tok=new,new,new,new,<b>magnet</b> (post-fix)
-<span class="lbl">before fix:</span> every retry excluded only "penny", never "new" itself -&gt; landed back on "new" four times
-<span class="lbl">after fix:</span>  "new" (last_tok) always excluded too -&gt; first retry finds "magnet" and stops`,
-  pair2: `<span class="lbl">pos=19</span>  raw_tok=dog  last_tok=the  <span class="lbl">fired=bigram_recur</span> (pre-2nd-fix)
-  sub_tok=cat -&gt; sub_tok=dog -&gt; sub_tok=cat -&gt; sub_tok=dog -&gt; <span class="lbl">final_tok=dog (4-pass cap, oscillated back)</span>
-<span class="lbl">after fix:</span> tried[] accumulates every rejection across passes -&gt; dog -&gt; cat -&gt; genuinely new word, no oscillation`,
-};
+function chainHtml(ev){
+  const parts = [`<span class="raw">raw pick: <b>${escapeHtml(ev.raw_word)}</b> (${ev.raw_tok})</span>`];
+  ev.fired.forEach((f, i) => {
+    const isLast = i === ev.fired.length - 1;
+    const cls = (f.sub_tok === ev.final_tok && isLast) ? 'final' : 'rej';
+    parts.push(`<span class="arrow">&rarr;</span><span class="${cls}">${escapeHtml(f.sub_word)} (${f.sub_tok})</span>`);
+  });
+  if (ev.fired.length === 0){
+    // guard never fired at this position in this build; raw pick was accepted as-is
+  }
+  return parts.join('');
+}
+
+function noteHtml(p){
+  const m = p.mechanism;
+  const wi = m.divergence_word_index;
+  const beforeChain = chainHtml(m.before_event);
+  const afterChain = chainHtml(m.after_event);
+  const samePick = m.before_event.raw_tok === m.after_event.raw_tok;
+  return `<div class="note">
+    <div class="note-head">First token that changes &mdash; word ${wi + 1} of the reply</div>
+    <p>
+      Both builds' models make the <b>identical raw pick</b> at this exact position (word ${wi + 1}):
+      &ldquo;<b>${escapeHtml(m.before_event.raw_word)}</b>&rdquo; (token ${m.before_event.raw_tok}). Everything up to
+      here is byte-identical between builds because the accelerator draws the same Gumbel sample either way &mdash;
+      only what the firmware does with a colliding pick differs. Here, that candidate collides with the
+      bigram-recurrence guard (it already appeared in this exact position relative to the word before it, earlier
+      in the same reply), so both builds intervene. What happens next is where they diverge:
+    </p>
+    <div class="eventgrid">
+      <div class="eventcol before">
+        <div class="evlabel">before fix</div>
+        <div class="evchain">${beforeChain}</div>
+        <div class="evsource">${escapeHtml(m.before_source)}, pos=${m.before_event.pos}</div>
+      </div>
+      <div class="eventcol after">
+        <div class="evlabel">after fix</div>
+        <div class="evchain">${afterChain}</div>
+        <div class="evsource">${escapeHtml(m.after_source)}, pos=${m.after_event.pos}</div>
+      </div>
+    </div>
+    <p>${p.note}</p>
+  </div>`;
+}
 
 function renderDiffCards(){
   const container = document.getElementById('diffcards');
@@ -332,7 +386,7 @@ function renderDiffCards(){
         ${diffPanelHtml(p.before, 'before', 'before fix')}
         ${diffPanelHtml(p.after, 'after', 'after fix')}
       </div>
-      <div class="trace">${TRACE_HTML[key]}</div>
+      ${noteHtml(p)}
     </div>`;
   });
   container.innerHTML = html;
