@@ -182,6 +182,24 @@ footer.endnote{ margin-top:56px; padding-top:20px; border-top:1px solid var(--bo
     silently dropped.
   </div>
   <div class="caveat">
+    <b>The 0/25-vs-5/25 gap is not a capability win.</b> It does not mean kev-gpt's 2-4M-parameter model is
+    more fluent than the 19M-parameter reference. Three things stack in kev-gpt's favor here, and none of
+    them speak to underlying model quality: (1) kev-gpt's output is actively repaired at inference time by
+    three firmware repetition guards (mechanism and cost in the panel below) &mdash; the reference's output
+    is raw, unedited HF <code>generate()</code> sampling with no equivalent correction; the fair comparison
+    would be guards-on vs. guards-on, and the reference has no guards to turn on. (2) Length isn't matched
+    (hw averages 108.6 words, reference 145.8 &mdash; more words means more chances for the detector to
+    trip). (3) <code>min_bigram_recurrence=6</code> was calibrated by inspecting THIS benchmark's own
+    hardware distribution (see the threshold caveat below), not chosen independently for both sides. A
+    held-out check backs this up directly: this project's own earlier 5&times;5 sweep on ~60-word samples
+    found the guarded firmware and an UNGUARDED baseline build statistically tied (7/25 vs 8/25 flagged)
+    &mdash; the guards eliminate the specific narrow patterns they target, but do not change kev-gpt's
+    underlying tendency to loop, which two separate follow-up attempts (60,000-iteration extended training,
+    distillation from an 8.7&times;-larger D=384 teacher) also failed to close. Full record in
+    <code>PORT-NOTES.md</code>'s "Repetition guards" section and this project's
+    <code>project-kevgpt-word-vocab-quality-ceiling</code> history.
+  </div>
+  <div class="caveat">
     <b>Not an apples-to-apples parameter comparison.</b> kev-gpt is a 2-4M-parameter model that lives entirely
     in FPGA on-chip memory by design (README's own "compression is the joke and the optimization"); the
     reference is a conventional 19M-parameter FP model with no such constraint. This benchmark measures how
@@ -256,6 +274,42 @@ riscv32-corev-elf-gdb -batch -ex "target remote :3333" \
         to <code>60u</code>/<code>8u</code> in <code>main.c</code>, then repeat step 1 (rebuild) and step 2
         (reload) to put the board back in its normal-chat configuration before real interactive use.</li>
     </ol>
+  </div>
+
+  <div class="runbook">
+    <h2 class="sec">How the repetition guards work, and what they cost</h2>
+    <p style="font-size:14px;line-height:1.6;color:var(--ink-muted);margin:0 0 14px;max-width:80ch;">
+      kev-gpt's accelerator generates each token with a single-pass on-chip Gumbel-max tournament over all
+      16,384 vocab logits &mdash; a fixed-function hardware primitive with no sort, no top-k/top-p, and no
+      per-token host visibility into the full distribution by design (the same bandwidth-wall constraint
+      that keeps weights resident in on-chip memory in the first place). Firmware can't re-rank or resample
+      the distribution the way typical decoding tricks (repetition penalty, no-repeat-ngram) assume. What it
+      CAN do, reusing a mechanism that already existed for a different purpose (a stop-token remask), is
+      detect a collision after the token comes back and ask the hardware for a fresh answer with the
+      offending candidate excluded.
+    </p>
+    <p style="font-size:14px;line-height:1.6;color:var(--ink-muted);margin:0 0 14px;max-width:80ch;">
+      Three guards run in <code>chat_turn()</code>'s generation loop, checked in order after each token
+      comes back: exact doubling (<code>tok == last_tok</code>), near-duplicate word stems
+      (<code>is_stem_repeat()</code>), and delayed bigram recurrence (checked against the full history of
+      the reply so far). On a hit, <code>remask_pick_excluding()</code> reruns a full linear scan over all
+      16,384 head logits (<code>kevgpt_read_bank(dev, 8, i)</code>, Q6.25 fixed-point) to find the
+      best-scoring token NOT in the exclusion set, then re-checks the result against every other guard again
+      &mdash; a bounded 4-pass re-validation loop (fixed in commit <code>4c3a398</code> to accumulate every
+      rejected candidate across passes, not just the most recent one, closing an oscillation bug the first
+      fix, <code>57ce25a</code>, had itself introduced).
+    </p>
+    <p style="font-size:14px;line-height:1.6;color:var(--ink-muted);margin:0;max-width:80ch;">
+      <b style="color:var(--ink);">Cost model: only paid on an actual collision.</b> An unconditional
+      full-vocab rescan on every token would dominate the cycle budget, so each guard does nothing on the
+      common case and only triggers the extra scan when it actually fires. That shows up directly in this
+      benchmark's own token rates: <b style="color:var(--ink);">41.8 tok/s average, ranging 36.9-46.1 tok/s
+      (a 23% spread) across otherwise-identical prompts and settings.</b> The slowest prompt group, "the dog
+      ran" (39.9 tok/s avg) &mdash; the same prompt family behind both bugs fixed above, whose stories tend
+      to revolve around a small set of recurring nouns ("dog"/"cat"/"owner") that trip the bigram guard
+      repeatedly &mdash; runs about 8% slower than the fastest group, "she found a" (43.2 tok/s avg),
+      consistent with more guard firings on that prompt, not a hardware slowdown.
+    </p>
   </div>
 
   <div class="controls">
