@@ -6536,8 +6536,9 @@ cause remains open; nothing in items 1-7 has found it yet.
 ## Guard-substitution repetition bug: a fix manufacturing the exact bug it prevents
 
 Found via `model/tinystories_hf_repro/`'s Long-Form Fidelity benchmark
-(~128-word real-hardware samples vs. the published reference), not a
-targeted investigation -- one captured sample, prompt "a little girl",
+(~128-word real-hardware samples vs. the published reference; published
+artifact: https://claude.ai/code/artifact/b1997b8c-0994-4bc6-8b93-12514f6e120e),
+not a targeted investigation -- one captured sample, prompt "a little girl",
 real_seed `0x2d7acf1a`, read: "...lily loved her **new new new new
 new** magnet..." -- five consecutive identical tokens, despite
 `chat_turn()`'s own immediate-exact-doubling guard (`tok == last_tok`
