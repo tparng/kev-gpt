@@ -7004,3 +7004,63 @@ op boundary. Not yet ported: the 6-layer *decoder* (cross-attention +
 greedy token generation) and the vocabulary/detokenization step --
 those remain the next real milestone toward an actual transcription
 output on this hardware.
+
+## The full transcription pipeline: decoder C port, native 18/18, exact token ids
+
+Extended the C port past the encoder to the complete Moonshine-tiny
+**decoder**: 6 decoder layers (causal self-attention + RoPE, cross-
+attention to the encoder output with no RoPE and no mask, SwiGLU MLP --
+not the encoder's plain GELU-MLP) + the final decoder-stack `norm` +
+the tied embedding/lm_head projection (`tie_word_embeddings=True`,
+confirmed via `AutoConfig` -- one 32768x288 table serves both roles,
+not two), driving a real 4-step greedy generation loop. No KV-cache yet
+-- each step recomputes self- and cross-attention over the whole
+(short) sequence from scratch; a cache is a speed optimization for
+later, matching this project's own `_fixed` before `_kv` staging
+convention on the fabric side.
+
+Architecture facts pinned down against the real `transformers`
+modeling source (not assumed): cross-attention applies RoPE to neither
+Q nor K (`apply_rotary_pos_emb` only runs when `key_value_states is
+None`, i.e. self-attention only); the decoder MLP's `fc1` produces
+`2*intermediate_size` columns split via `.chunk(2, dim=-1)` where the
+**first** half is the value and the **second** half is the SiLU'd gate;
+`pad_head_dim_to_multiple_of=8` zero-pads head_dim 36->40 before
+attention and strips it after -- a no-op mathematically (a zero-padded
+dot product changes nothing), so, as with the encoder's own already
+real-hardware-verified attention, this port skips the padding.
+
+**Native build: 18/18 checks pass**, including per-layer output at
+step 0 and every step's full 32768-wide logits vector, against a golden
+reference (`export_c_port_data_decoder.py`) that calls the real
+`MoonshineDecoderLayer` modules directly -- same "call the real
+submodule for ground truth" convention the encoder's own export script
+used. The predicted token ids match the reference **bit-for-bit** at
+every one of the 4 steps: `[1, 6439, 29892, 9360, 29892]` (decoded
+host-side to `'Oh, oh,'` -- meaningless text, synthetic tone input, but
+proof the mechanism works end to end).
+
+**Where this leaves the ASR port**: this fork can now take a waveform
+through conv front-end -> 6-layer encoder -> 6-layer decoder -> greedy
+token decode and land on the *exact* tokens the real HuggingFace model
+would, in portable C, bit-honestly gated at (almost) every op boundary.
+That is the software transcription pipeline, working.
+
+**What isn't done, stated plainly (honest-first)**: real-hardware
+bring-up of the decoder. The full decoder's weights plus the tied
+embed/lm_head table are **~75 MB even with weight tying** (embed/
+lm_head alone: 32768 x 288 x 4B = 37.75 MB; six decoder layers: ~39.8
+MB) -- well over the 64 MiB `cpu_ddr_bridge` window this port has used
+for everything so far. Unlike the encoder (which fit one layer, then
+all six, in-window), the decoder's vocabulary is what breaks the
+"stage everything via GDB `restore`, then run" approach used until now.
+Real hardware options, not yet chosen between: (a) a smaller test
+slice -- decoder layer 0 alone plus the embed/lm_head table (~44 MB,
+fits) mirroring the encoder's own layer-0-first bring-up order; (b)
+real INT4 quantization of the embed/lm_head table specifically (~4x
+smaller, ~9.4 MB), which this project's `qgpt.py`/Brevitas precedent on
+the kev-gpt side already establishes a pattern for; (c) a genuinely
+different, streaming-weights firmware architecture that pulls layer
+weights from a larger backing store during execution instead of
+pre-staging the whole window -- the biggest lift of the three, but the
+only one that scales to the full model without a footprint compromise.
