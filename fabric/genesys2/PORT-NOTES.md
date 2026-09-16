@@ -7064,3 +7064,51 @@ different, streaming-weights firmware architecture that pulls layer
 weights from a larger backing store during execution instead of
 pre-staging the whole window -- the biggest lift of the three, but the
 only one that scales to the full model without a footprint compromise.
+
+## Decoder layer 0, real hardware: clean pass, first attempt
+
+Built `asr_decoder_layer0_hw` (self-attn causal+RoPE, cross-attention
+to the fixed encoder output with no RoPE/no mask, SwiGLU MLP, plus the
+embedding lookup and RoPE table stages that feed it) -- the layer-0-
+first real-hardware bring-up path chosen over quantizing the vocab
+table or a streaming-weights redesign, mirroring the encoder's own
+`asr_encoderlayer0_hw` before `asr_encoder_full_hw` order. Builds at
+`ram0` 93.4% (much roomier than the encoder apps -- `cur_len=1` for
+this single decode step keeps every per-token scratch buffer tiny).
+
+DDR3 footprint: 42.51 MiB (the ~37.75 MiB tied embed/lm_head table plus
+layer 0's own ~6.65 MiB of weights, 21 GDB `restore` commands) --
+restore took ~14.5 minutes real time (05:23:58-05:38:31), consistent
+with this session's other restores' ~52 KB/s effective rate.
+
+**Result: clean pass, first attempt, no hang** --
+
+```
+ASR_STAGE,embed_step0,...,max_abs_x1e6=0,max_rel_x1e6=0,elem_fails=0,PASS
+ASR_STAGE,rope_cos_step0,...,max_abs_x1e6=0,max_rel_x1e6=0,elem_fails=0,PASS
+ASR_STAGE,rope_sin_step0,...,max_abs_x1e6=0,max_rel_x1e6=0,elem_fails=0,PASS
+ASR_CYC,tot_ddr,00000000187dc64b
+ASR_STAGE,layer0_out_step0,...,max_abs_x1e6=4,max_rel_x1e6=113,elem_fails=0,PASS
+ASR_RESULT,passed=4,total=4
+ASR_PASS,dec_layer0_hw
+```
+
+The embedding lookup and RoPE table are **bit-exact** (max_abs=0) --
+expected, both are pure memory reads/trig, no float accumulation to
+drift. `tot_ddr` = 410,895,947 cycles = 8.22s, notably cheaper than the
+encoder's own ~40s/layer average despite layer 0's weights being ~1.67x
+larger (6.65MB vs ~3.99MB) -- because `cur_len=1` for this single decode
+step means the self-attention Q/K/V/O and MLP fc1/fc2 linear() calls
+each walk their weight matrix only once (not 40 times, as the encoder's
+own per-token loop does); only the cross-attention K/V projections
+(reading the T2=40-row encoder output) pay the encoder-scale cost.
+
+**Where this leaves the ASR port**: every architectural piece of
+Moonshine-tiny's decoder -- causal self-attention with RoPE,
+cross-attention with neither, the SwiGLU gate-order, the embedding
+table -- is now real-hardware-verified in addition to natively
+verified. What's real-hardware-*unverified* is layers 1-5 (same
+incremental step the encoder already completed once) and the final
+`dec.norm()` + lm_head projection (needs the full stack to mean
+anything, and the ~75MB full-decoder footprint problem noted above
+still applies to getting there in one shot).
