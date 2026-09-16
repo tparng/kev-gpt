@@ -6819,8 +6819,8 @@ Same signature as hang 1 -- identical `$pc` across real elapsed seconds,
 not slow progress -- but a COMPLETELY DIFFERENT function, in a different
 app, with no code in common with hang 1's `expf` call chain other than
 both being reached only after several minutes of continuous execution.
-Reset to a safe state; not yet retried on this one (unlike hang 1) to
-see if it's similarly non-reproducible.
+Reset to a safe state; retried fresh (see "Hang 2 retried" section below) --
+also non-reproducible, matching hang 1's pattern.
 
 ### What's ruled out, and what isn't
 
@@ -6865,3 +6865,77 @@ for several minutes, not `hello_world`'s own quick correctness sweep)
 to see if a hang reproduces on a known-good, already-verified access
 pattern -- which would point at duration/thermal/timing generically
 rather than anything specific to this C port's own code.
+
+### Hang 2 retried fresh -- also non-reproducible, and a complete real
+### cycle-count breakdown of the entire conv front-end
+
+Rebuilt `asr_convfrontend_hw` clean (ram0 75.2%), started the UART
+listener before triggering (not after -- see the harness note above),
+and reset/loaded/resumed fresh. Full run completed cleanly:
+`ASR_RESULT,passed=8,total=8`, `ASR_PASS,convfrontend_hw`. Hang 2 did
+not reproduce, matching hang 1's own retry outcome exactly. The first
+three stages' cycle counts (`conv1_ddr`, `tanh`, `groupnorm`) matched
+the earlier, hung run's own first-three-stage timings almost exactly,
+confirming those specific stages are deterministic run-to-run in cost --
+the earlier hang was not a slow-drift-into-failure inside `conv1`/`tanh`/
+`groupnorm`, it was a discrete stall that started later, during `conv2`.
+
+This run carried the `rdcycle()` DDR-cost instrumentation added earlier
+this session, giving -- for the first time -- a complete, real,
+quantified timing breakdown of the whole conv front-end at
+`CPU_CLK_HZ=50_000_000`:
+
+| stage         | cycles          | time     |
+|---------------|----------------:|---------:|
+| `conv1_ddr`   |     461,746,418 |   9.24 s |
+| `tanh`        |     234,229,744 |   4.69 s |
+| `groupnorm`   |       6,324,445 |   0.13 s |
+| `conv2_ddr`   |   4,972,301,108 |  99.45 s |
+| `gelu2`       |     147,072,821 |   2.94 s |
+| `conv3_ddr`   |   1,105,382,149 |  22.11 s |
+| `gelu3`       |      51,640,415 |   1.03 s |
+| **total**     |                 | **139.6 s** |
+
+(`total_conv_ddr` -- the firmware's own sum of the three `conv*_ddr`
+counters -- came back as 6,539,429,675 cycles = 130.79 s, matching
+`conv1_ddr + conv2_ddr + conv3_ddr` exactly: 461,746,418 + 4,972,301,108
++ 1,105,382,149 = 6,539,429,675.)
+
+Two things this resolves:
+
+1. **The DDR3-cost hypothesis is confirmed, and cleanly.** The three
+   DDR-bound `conv*_ddr` calls account for 130.8 s of the 139.6 s total
+   (93.7%); the four transcendental/compute-only elementwise stages
+   (`tanh`, `groupnorm`, `gelu2`, `gelu3`) together cost only 8.8 s
+   (6.3%). And the DDR cost scales close to linearly with MAC count,
+   not worse: `conv2` has 10.3x `conv1`'s MACs and took 10.8x as long
+   (99.45 s vs 9.24 s); `conv3` has 2.2x `conv1`'s MACs and took 2.4x as
+   long (22.11 s vs 9.24 s). Both are within ~10% of pure linear
+   scaling -- no evidence of the super-linear blowup that seemed
+   possible before this data existed.
+
+2. **This reframes the hangs.** Steady-state, hang-free execution of
+   the whole conv front-end is ~2.3 minutes, not the tens-of-minutes-
+   to-hours seen in some earlier, non-instrumented runs -- meaning
+   those earlier very-long observations were themselves most likely
+   hang-affected (or JTAG-hiccup-recovery-affected) runs, not a
+   representative "normal" cost of this access pattern. The two hangs
+   are best understood as a genuinely separate, intermittent phenomenon
+   layered on top of an otherwise well-behaved, linearly-scaling DDR
+   access pattern -- not a symptom of DDR3 access being inherently slow
+   or unpredictable in the steady state.
+
+**Where this leaves root cause**: still open. Both hangs remain
+non-reproducible on retry (2/2 for hang 1's class, 1/1 so far for hang
+2's class, i.e. every retry attempted has succeeded). Given (a)
+`hello_world`'s DDR3 correctness sweep passes cleanly (734/734), (b)
+steady-state DDR cost now measured as well-behaved and linear, and (c)
+both hangs recovered cleanly with no bitstream corruption, the leading
+candidate is transient real-hardware flakiness under sustained
+multi-minute continuous access (thermal or marginal-timing) rather than
+a deterministic bug in the C port or a structural DDR3/CDC issue --
+but this is still inference from absence of a reproduction, not a
+confirmed mechanism. A dedicated long-duration DDR3 stress test (as
+floated above) remains the next step that could actually distinguish
+"real hardware flakiness" from "this port's specific access pattern"
+if a definitive root cause is wanted later.
