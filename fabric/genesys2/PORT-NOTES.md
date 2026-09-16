@@ -6719,3 +6719,149 @@ named bug is usually attributed to: an unrelated earlier guard firing
 under the same code change quietly changes what the model conditions
 on for the rest of the reply, well before the specific documented bug
 would have fired.
+
+## Two real hangs during ASR C-port bring-up on real hardware -- open, not yet root-caused
+
+New context for anyone reading this cold: `~/RVchatbot/asr-genesys2-soc`
+is a git-clone fork of `kevgpt-genesys2-soc` (same `word-vocab` branch,
+forked at commit `4c3a398`), started to explore replacing kevgpt's own
+"story engine" (`sequencer_vec.sv`/`xheep_kevgpt_peripheral.sv`) with an
+ASR engine -- same X-HEEP+cv32e40px+FPnew+DDR3+Genesys2 chassis, no RTL
+changes so far. The plan settled on: bring up a real ASR model (Moonshine-
+tiny) as a golden-reference-verified C port running on the bare CPU
+first, profile it, THEN decide what to accelerate in hardware -- not
+skip straight to RTL. `model/c_port/`'s `ops.c`/`ops_conv.c`/`ops_attn.c`
+(conv1d/groupnorm/layernorm/linear/gelu/RoPE/self-attention, portable
+C99) is that port, verified bit-exact-to-float32-tolerance natively
+against `UsefulSensors/moonshine-tiny`'s real weights
+(`model/export_c_port_data.py`), then cross-compiled into two firmware
+images (`sw/applications/asr_convfrontend_hw/`,
+`asr_encoderlayer0_hw/` -- split because `ram0` is only 32KB and one
+combined image didn't fit) and run for real on this same board. Both
+have now independently PASSED on real hardware at least once --
+`asr_convfrontend_hw`: `ASR_RESULT,passed=8,total=8`;
+`asr_encoderlayer0_hw`: `ASR_RESULT,passed=2,total=2`, `elem_fails=0` on
+`layer0_out`. This section is about two real hangs hit ALONG THE WAY,
+not about the port's correctness, which is separately established.
+
+### Hang 1: `asr_encoderlayer0_hw`, stuck inside `expf`'s software implementation
+
+Real-hardware run, `asr_encoderlayer0_hw` (pre-`cycles.h` revision,
+plain `ASR_MARK,<name>` progress markers only). A run that should have
+been well past the RoPE table check sat silent for two full 900s UART
+capture windows (1800s total) with no further output. Halted (not
+reset) via GDB and checked `$pc` five times, ~2s apart:
+
+```
+$1 = 0x7328   (x5, identical every time)
+#0  __clzsi2 (x=4) at .../gcc/libgcc/libgcc2.c:690
+#1  0x00007220 in __floatsisf (i=<optimized out>) at .../soft-fp/floatsisf.c:40
+#2  0x000045b8 in __ieee754_expf ()
+```
+
+An identical `$pc` across 10 real seconds (hundreds of millions of
+real cycles at 50MHz) is not "very slow", it's stopped -- confirmed via
+the earlier established playbook (`feedback-hang-diagnosis`: halt and
+read state directly, don't wait longer). `g_checks=1` at the time of
+the halt (only the RoPE table's own check had incremented it), `g_failures=0`,
+`mcause=0` (no trap). This is deep inside `self_attention`'s softmax
+(`expf(scores[t2] - maxv)`) or `gelu_`'s `erff` (which itself calls into
+`expf`-family code) -- both are pure software libm on this zfinx-only
+(hardware single-precision float, no transcendentals) target, reached
+only after `q`/`k`/`v`/`o` projections and RoPE application had already
+completed correctly (their own DDR3-heavy work, not this hang's
+location).
+
+**Not reproducible on immediate retry.** Reset, rebuilt with per-step
+`ASR_MARK` progress prints added (to localize any future hang without
+needing a live GDB halt), reflashed, reran with the SAME weights/
+reference data already staged in DDR3 (no re-restore). That run
+completed cleanly end to end -- every marker printed in order,
+`ASR_RESULT,passed=2,total=2`, `ASR_PASS,encoderlayer0_hw`, `elem_fails=0`
+-- after an elapsed time somewhere between ~900s and 3600s (lost to a
+UART-capture-window gap, not reproduced exactly). Same firmware image,
+same DDR3 contents, same seed-free deterministic computation (this is
+pure feedforward inference, no RNG) -- genuinely non-deterministic
+real-hardware behavior, not a retry-with-different-inputs situation.
+
+### Hang 2: `asr_convfrontend_hw`, stuck inside `conv1d`'s innermost MAC loop, mid-`conv2`
+
+Different app, different session moment, different code path. This run
+had `cycles.h`'s wraparound-safe `rdcycle()` instrumentation freshly
+added (see this repo's own commit for the full mechanism -- per-output-
+channel/element sampling into a `uint64_t` accumulator, specifically
+because a naive before/after `mcycle` delta would silently alias for
+any single call exceeding 85.9s, which this session had already proven
+happens). First three stages of the conv front-end completed with real,
+now-quantified numbers:
+
+```
+ASR_CYC,conv1_ddr,000000001b85afa4   -> 461,746,084 cycles ~= 9.2s
+ASR_CYC,tanh,000000000df60ffb        -> 234,229,755 cycles ~= 4.7s
+ASR_CYC,groupnorm,00000000006080fb   ->   6,324,475 cycles ~= 0.13s
+```
+
+(`ASR_STAGE,raw_conv1/post_tanh/post_groupnorm` all `PASS`,
+`elem_fails=0` each -- the computation up to this point is both correct
+AND not catastrophically slow.) `conv2` (`conv1d` with `in_ch=288,
+out_ch=576, kernel=7` -- 94M MACs, ~10.3x `conv1`'s 9.1M) then produced
+no output for over 13 minutes (two capture windows, 180s + 600s) with
+the UART otherwise silent. Halted twice, 5s apart:
+
+```
+$1 = 0x8fc (both times, identical)
+#0  conv1d (in_ch=288, out_ch=576, kernel=7, w=0xf0023b80 [w_conv2], ...)
+    at .../asr_convfrontend_hw/ops_conv.c:25
+    "                for (int k = 0; k < kernel; k++) {"
+```
+
+Same signature as hang 1 -- identical `$pc` across real elapsed seconds,
+not slow progress -- but a COMPLETELY DIFFERENT function, in a different
+app, with no code in common with hang 1's `expf` call chain other than
+both being reached only after several minutes of continuous execution.
+Reset to a safe state; not yet retried on this one (unlike hang 1) to
+see if it's similarly non-reproducible.
+
+### What's ruled out, and what isn't
+
+Ran `hello_world`'s own DDR3 test suite immediately after (copied to
+`sw/applications/hello_world/` from the vendored
+`hw/vendor/esl_epfl_x_heep/` copy so it builds via this project's own
+`make app` convention -- unmodified otherwise): **`AI_PASS,
+ddr_bridge_test,checks=734`, 0 failures**, all 11 sub-tests (single-word,
+pattern-sweep, byte-enable, neighbor-isolation, isolated-lanes,
+addr-sweep, bitwalk, hammer, PRBS) -- exactly matching this document's
+own §6.10 baseline ("checks=734, 0 failures" after the DDR3-frequency
+root-cause fix). **This rules out basic DDR3 read/write correctness** --
+individual writes and reads, across a wide variety of address patterns
+and bit patterns, are provably fine on this exact board/bitstream right
+now. It does NOT rule out something specific to SUSTAINED access:
+`hello_world`'s whole suite completes in well under 120s, nothing like
+the multi-minute continuous scalar-read runs both hangs occurred during.
+
+**Two things both hangs share**: (1) reached only after several minutes
+of continuous real execution, never near the start of a run; (2)
+recovered cleanly via `monitor reset halt` -- neither corrupted the
+board into a state needing a bitstream reprogram (unlike this session's
+earlier, unrelated "JTAG scan chain interrogation failed: all ones"
+finding, which WAS a lost-bitstream situation, ruled out here since
+`riscv.cpu tap/device found` succeeded immediately both times, no
+reprogram needed to recover).
+
+**What this is NOT yet**: a root cause. Candidate explanations not yet
+distinguished: a genuine marginal DDR3/CDC timing condition specific to
+sustained access duration (this document's own §6 spent a very long
+investigation on a related-sounding but ultimately different DDR3-
+frequency issue, already fixed); a thermal effect under sustained load;
+a watchdog/timeout interaction somewhere in the debug or memory path;
+or something specific to this exact scalar, non-burst, CPU-driven
+access pattern (`cpu_ddr_bridge` is single-outstanding, per
+`llama2c_bringup/main.c`'s own header -- worth remembering, not yet
+shown to be the actual mechanism here). Next step under discussion:
+either retry hang 2 fresh (hang 1's own retry completed cleanly, so this
+may just be more non-deterministic real-hardware flakiness) or write a
+dedicated long-duration DDR3 stress test (sustained sequential reads
+for several minutes, not `hello_world`'s own quick correctness sweep)
+to see if a hang reproduces on a known-good, already-verified access
+pattern -- which would point at duration/thermal/timing generically
+rather than anything specific to this C port's own code.
