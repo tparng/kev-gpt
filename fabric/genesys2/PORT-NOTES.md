@@ -6939,3 +6939,68 @@ confirmed mechanism. A dedicated long-duration DDR3 stress test (as
 floated above) remains the next step that could actually distinguish
 "real hardware flakiness" from "this port's specific access pattern"
 if a definitive root cause is wanted later.
+
+## The full 6-layer Moonshine encoder, ported and real-hardware-verified
+
+Extended the C port from encoder layer 0 only to the complete Moonshine-
+tiny encoder: 6 encoder layers + the final post-encoder-stack
+`layer_norm`. Same "bit-honest before fast" discipline as the rest of
+this port -- every stage gated against the real `UsefulSensors/
+moonshine-tiny` checkpoint's own forward pass, not a synthetic expected
+value.
+
+**Native (portable C) build: 16/16 checks pass**, including all 6
+layers and the final LN, against real weights.
+
+**Real hardware**: a new `asr_encoder_full_hw` app loops the same
+per-layer sequence `asr_encoderlayer0_hw` already validated (LN ->
+QKV -> RoPE -> self-attn -> O-proj -> residual -> LN -> MLP ->
+residual) across all 6 layers, rather than unrolling six copies of it.
+First attempt at this used a `static const` lookup table of each
+layer's DDR3 offsets (one struct per layer) -- its own ~288 bytes of
+`.rodata` alone overflowed `ram0`'s already-tight 32KB budget by 192
+bytes. Fixed by replacing the table with **derived stride arithmetic**:
+`gen_ddr_layout.py` confirms (not assumes) that layers 1-5's per-layer
+tensor blocks sit at a constant byte stride from each other, emits that
+stride as a single `#define`, and the firmware computes each layer's
+DDR3 offsets as `base_L1 + (layer_idx - 1) * stride` instead of storing
+them. That alone wasn't quite enough (8 bytes over) -- also merged two
+near-duplicate `iprintf` format strings in `check()` into one shared
+one, building the per-layer stage label ("layer3_out" etc.) by mutating
+one digit of a small stack buffer instead of a second literal. Final
+build: **`ram0` 99.2%, `ram1` 55.2%** -- fits.
+
+**Real-hardware run, first attempt, clean pass**: DDR3 footprint for
+this app is 33.18 MiB (86 GDB `restore` commands, vs. the single-layer
+app's ~13.6 MiB/29) -- the restore itself took **~10.6 minutes**
+(04:35:48-04:46:24), matching the ~50 KB/s effective rate this
+project's own `restore` mechanism has shown before. Firmware execution
+after `resume` completed well inside 5 minutes: **all 6 layers plus the
+final `layer_norm` passed** --
+
+```
+ASR_STAGE,layer0_out,...,elem_fails=0,PASS
+ASR_STAGE,layer1_out,...,elem_fails=0,PASS
+ASR_STAGE,layer2_out,...,elem_fails=0,PASS
+ASR_STAGE,layer3_out,...,elem_fails=0,PASS
+ASR_STAGE,layer4_out,...,elem_fails=0,PASS
+ASR_STAGE,layer5_out,...,elem_fails=0,PASS
+ASR_CYC,tot_ddr,00000002cfcd5dfe
+ASR_STAGE,encoder_out,...,elem_fails=0,PASS
+ASR_RESULT,passed=7,total=7
+ASR_PASS,enc_full_hw
+```
+
+`tot_ddr` (the summed DDR-read cost of all 36 `linear()` calls -- 6
+layers x 6 Q/K/V/O/FC1/FC2 each) = 12,076,277,246 cycles = **241.5s**
+at `CPU_CLK_HZ=50MHz`. No hang, first try -- consistent with this
+session's other finding that both earlier hangs were non-reproducible
+on retry, not a deterministic property of sustained DDR3 access.
+
+**Where this leaves the ASR port**: the complete Moonshine-tiny
+*encoder* (conv front-end through the final post-encoder LN) is now
+real-hardware-verified end to end, real weights, bit-honest at every
+op boundary. Not yet ported: the 6-layer *decoder* (cross-attention +
+greedy token generation) and the vocabulary/detokenization step --
+those remain the next real milestone toward an actual transcription
+output on this hardware.
