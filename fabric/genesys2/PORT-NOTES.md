@@ -7354,3 +7354,53 @@ once actually running -- the flakiness seen throughout this session has
 consistently been in the bring-up/capture path (JTAG re-enumeration,
 UART byte loss, the reset-without-load boot-path gotcha), not in the
 computation itself.
+
+## Real audio, real hardware: "He hoped." -- the first actual transcription
+
+Every run so far in this port used a deterministic synthetic tone (fixed
+seed, sum of a few sine waves + noise) -- reproducible for correctness
+grading, but meaningless as speech. Swapped in real audio: a 1.0-second
+clip trimmed from `Narsil/asr_dummy`'s real LibriSpeech test sample (the
+classic "He hoped there would be stew for dinner, turnips and carrots
+and bruised potatoes..." passage), fetched via the HF Hub. The real
+model's own greedy decode of just the first 1.0s: **"He hoped."** --
+real, coherent English.
+
+Added `--wav` to every export/verification script (matching
+`moonshine_reference.py`'s own existing interface) and re-ran the full
+gate chain: native encoder (16/16), native decoder (18/18), the INT8
+quantization gate at both step-0 and the full 4-step multi-step check,
+and the native full-generation C-kernel test -- all pass, token ids
+exactly `[1, 940, 24936, 29889, 2]` matching the real model. (Caught two
+stale-text bugs along the way -- a hardcoded "meaningless -- synthetic
+input" label that didn't check `--wav`, and a stale filename reference
+left over from the `verify_int4_full_generation.py` -> `verify_int8_
+full_generation.py` rename -- both fixed.)
+
+**Real hardware**: realized only `ref_dec_encoder_out` (46KB) actually
+depends on the audio input -- every decoder layer weight and the INT8
+vocab table are model-derived, unchanged regardless of what's being
+transcribed, and were already correctly staged in DDR3 from the
+previous session's runs. A single targeted GDB `restore` of just that
+one tensor (plus the usual fresh `load`) took ~1 second, versus the
+~16 minutes a full 94-command restore would have needed. **Clean pass,
+first attempt, no hang, no corruption**:
+
+```
+ASR_PHASE,generate_hw
+ASR_STEP,step=0,predicted=940,ref=940,PASS
+ASR_STEP,step=1,predicted=24936,ref=24936,PASS
+ASR_STEP,step=2,predicted=29889,ref=29889,PASS
+ASR_STEP,step=3,predicted=2,ref=2,PASS
+ASR_CYC,tot_ddr,000000035fcc2aee
+ASR_RESULT,passed=4,total=4
+ASR_PASS,generate_hw
+```
+
+`tot_ddr` = 289.84s, matching every prior run's timing almost exactly
+(as expected -- compute cost depends on tensor shapes, not data
+values). **This is the first time this project's real hardware has
+transcribed actual speech into actual, correct, human-legible text**:
+the board took 1.0 second of a real person's real recorded voice and
+produced "He hoped." -- exactly what the real, unquantized, full-size
+HuggingFace model itself predicts from the same clip.
