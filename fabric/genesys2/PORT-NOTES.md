@@ -7587,3 +7587,39 @@ C itself quantizes) -- untried so far, since this session's
 investigation focused on the vocab table specifically. Real next step
 if further BRAM headroom is needed: quantize those instead of
 revisiting the vocab table.
+
+## ASR compute op sequence worked out for a dedicated accelerator
+
+Full writeup: `~/gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md` (gen2asr is now
+where this line of work happens, per its own README). Summary: every op
+in Moonshine-tiny's conv front-end, 6-layer encoder, and 6-layer KV-cached
+decoder was read directly from the real C port (`ops.h`, `test_encoder0.c`,
+`test_generate_kv.c`) and classified against `kevgpt_seq`'s existing RTL --
+REUSE (LayerNorm, GELU, the LLM's own causal-KV-cache attention pattern,
+reused directly for the decoder's self-attention) vs. NEW (the conv
+front-end, GroupNorm, RoPE with partial rotary width, a new "static
+full-attend" primitive that covers BOTH the encoder's bidirectional
+self-attention and every decoder layer's cross-attention as one shape,
+SiLU/SwiGLU for the decoder MLP).
+
+Two findings worth keeping independent of the full document:
+
+1. **`gen2gpt/README.md` had a real factual error**, caught while doing
+   this comparison: it described `sequencer_vec.sv`'s op sequence as
+   "RMSNorm -> RoPE -> SwiGLU". Checked against `model/gpt.py` directly:
+   the LLM actually uses real LayerNorm (mean-subtracted, no bias, not
+   RMS-only), no RoPE anywhere (position comes from a learned `pos_emb`
+   added once at the input), and a plain 2-layer GELU MLP (no gating, no
+   SwiGLU). Fixed in `gen2gpt/README.md`'s own RTL-reusability table.
+   Ironically this means the LLM's block is CLOSER to Moonshine's
+   *encoder* layer than the wrong description suggested.
+2. **The INT4-storage-proven-reusable result doesn't extend to compute.**
+   `gemv_banked_resident_vec.sv`'s own header: "one wide URAM word = LANES
+   nibbles/cycle" -- the MAC core's weight datapath is 4 bits/element by
+   construction, not a parameter. None of ASR's per-layer weights are
+   quantized at all today (FP32 throughout, except the vocab table's own
+   already-decided INT8), so every "reusable" GEMV in the op-sequence map
+   is shape-compatible with the existing core, not format-compatible as
+   found. Real next decision, not resolved here: generalize the MAC core
+   to also support INT8, or QAT-quantize the transformer weights to INT4
+   (untested territory, distinct from the vocab table's own answer).
