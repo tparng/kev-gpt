@@ -7179,3 +7179,65 @@ lm_head logits projection, and multi-step (>1 token) real-hardware
 generation -- all of which need the ~37.75MB vocab table simultaneously
 with the rest of the state, the same footprint question flagged
 earlier, still open.
+
+## The vocabulary table, real hardware: embedding lookup + lm_head, clean pass
+
+Built `asr_decoder_vocab_hw` to close the one remaining real-hardware
+gap: the ~37.75MB tied embed/lm_head table itself, at both ends it's
+used for. `asr_decoder_layer0_hw` had only spot-checked embedding
+lookup for `decoder_start_token_id` (row 1, right near the table's
+start); this app checks 4 DISTINCT token ids the real greedy decode
+actually produced, spread from row 1 (0%) to row 29892 (91.2% through
+the 32768-row table) -- real coverage of the DDR address range, not
+just the front. It also computes the final lm_head logits projection
+(`last_hidden @ embed_tokens^T`, tied weights, 32768-wide output) on
+the real decoder's own final hidden state (`ref_dec_norm_out_step0`,
+itself already real-hardware-verified by `asr_decoder_full_hw`) and
+argmaxes it to a predicted token -- the one op in the whole pipeline no
+prior hardware app had touched.
+
+No decoder layer weights needed (the fixed, already-verified hidden
+state is used directly, same convention as the other `_full_hw` apps),
+so despite needing the full vocab table this fits in 36.26 MiB, only 7
+GDB `restore` commands. Builds at `ram0` 35.5% -- by far the roomiest
+of any hardware app in this port (no attention/RoPE/MLP code at all,
+just `linear()` and `embed_lookup()`).
+
+**Result: clean pass, first attempt, 6/6 checks** --
+
+```
+ASR_STAGE,embed_tok0,...,max_abs_x1e6=0,max_rel_x1e6=0,elem_fails=0,PASS
+ASR_STAGE,embed_tok1,...,max_abs_x1e6=0,max_rel_x1e6=0,elem_fails=0,PASS
+ASR_STAGE,embed_tok2,...,max_abs_x1e6=0,max_rel_x1e6=0,elem_fails=0,PASS
+ASR_STAGE,embed_tok3,...,max_abs_x1e6=0,max_rel_x1e6=0,elem_fails=0,PASS
+ASR_CYC,lmhead_ddr,000000001c6d1241
+ASR_STAGE,logits,n=32768,max_abs_x1e6=15,max_rel_x1e6=204,elem_fails=0,PASS
+ASR_TOKEN,predicted=6439,ref=6439,PASS
+ASR_RESULT,passed=6,total=6
+ASR_PASS,dec_vocab_hw
+```
+
+All four embedding lookups are bit-exact (max_abs=0) regardless of
+table position -- expected, a lookup is a pure memory read. The real
+finding: `lmhead_ddr` = 476,910,145 cycles = **9.54s** for a single
+sequential pass over the full 37.75MB table (`rows=1`, 32768 output
+elements, each a contiguous 288-float weight-row dot product). That is
+roughly **85x faster per MB than `conv1d`'s own DDR cost** measured
+earlier this session (conv2: 4.6MB in 99.45s => ~46.7KB/s vs. here:
+37.75MB in 9.54s => ~3.96MB/s) -- `linear()`'s access pattern (one
+long contiguous read per output element) is far more DDR3-row-buffer-
+friendly than `conv1d`'s own strided, overlapping-window reads. Worth
+remembering for any future speed work: the *op*, not just the byte
+count, determines real DDR cost on this bridge.
+
+And the real payoff: **the real hardware's own argmax over a real
+32768-wide logits vector predicts token id 6439 -- exactly matching
+what the real HuggingFace model predicts next.** Combined with the
+rest of this port's real-hardware coverage (full encoder stack, full
+decoder stack, now the vocabulary table's own two use sites), every
+architectural piece of Moonshine-tiny that a single decode step
+touches has now run correctly on this exact board. What remains is
+only stitching these already-separately-verified pieces into one
+continuous multi-step real-hardware generation loop (currently proven
+piecewise, not yet as one running program) -- a firmware-integration
+step, not an open correctness question.
