@@ -7325,3 +7325,32 @@ and cross-attention, SwiGLU MLP, RoPE, the tied embedding/lm_head
 table -- now runs correctly on this exact board, in one program, real
 weights (INT8 only where necessary to fit, gated at every step before
 trusting it).
+
+## Reproducibility check: 4/4 clean, deterministic real-hardware passes
+
+Reran `asr_generate_hw` three more times (no fresh DDR3 restore needed
+-- confirmed DDR3 contents persist across a soft reset, only a fresh
+`load` of the ~31KB ELF is required each time, seconds not minutes) to
+confirm the continuous multi-step run isn't a one-off. All three, plus
+the first clean run, passed identically --
+
+```
+                        tot_ddr cycles     tot_ddr seconds
+retry2 (first clean)    14,492,131,015     289.843s
+run3                    14,492,100,996     289.842s
+run4                    14,492,119,393     289.842s
+run5                    14,492,106,258     289.842s
+```
+
+Spread across all 4 runs: 30,019 cycles = **0.6ms** on a ~290s
+workload (~0.0002% variation) -- as tight and deterministic as this
+port's real-hardware timing gets, and every run predicted the exact
+same token sequence, `[1, 6439, 29892, 9360, 29892]`. Combined with the
+two earlier hangs (conv front-end, encoder layer 0) both turning out to
+be non-reproducible on retry, and this run's own first attempt turning
+out to be a UART capture issue rather than a real hang, the emerging
+picture is that this port's real hardware is solid and deterministic
+once actually running -- the flakiness seen throughout this session has
+consistently been in the bring-up/capture path (JTAG re-enumeration,
+UART byte loss, the reset-without-load boot-path gotcha), not in the
+computation itself.
