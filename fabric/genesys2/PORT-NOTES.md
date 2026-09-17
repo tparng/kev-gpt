@@ -7472,3 +7472,56 @@ inference this way, not an algorithmic redundancy like the cross-K/V
 one was) -- fully eliminating that would mean keeping per-layer
 weights resident across steps in a faster on-chip store, a different
 kind of optimization than what KV-caching addresses.
+
+## ASR + checkpoint C's real RTL: reusing weight_loader_ddr/weight_bank_tdp, PASS
+
+Resuming the ASR-acceleration thread with the corrected reference
+architecture: not `ai_accel` (confirmed unfinished -- only generic
+infrastructure exists, no workload-specific RTL for anything, including
+Moonshine), but `kevgpt_seq` -- the real, hardware-verified RTL
+checkpoint C actually runs on the board via per-layer DDR3 weight
+streaming (`weight_loader_ddr.sv` DMAs a weight window from DDR3 into
+the on-chip `weight_bank_tdp` once per layer, compute runs against the
+resident bank, next layer streams in).
+
+First concrete step: prove the reused plumbing moves REAL ASR data
+correctly, before touching any compute RTL. Built a minimal iverilog
+testbench (`asr-genesys2-soc/fabric/rtl_reuse/`) instantiating
+`weight_loader_ddr.sv` + `weight_bank_tdp.sv` **unmodified**, copied
+verbatim from `hw/ip/kevgpt_seq/rtl/`, plus a deliberately
+single-outstanding behavioral DDR3 model (matching this project's own
+documented real `cpu_ddr_bridge` property -- not simplified to make the
+test easier than reality). Streamed `model/c_port/data/w_dsq_l0.f32`
+(the ASR decoder's real layer-0 self-attention Q-projection, 288x288
+fp32, 82,944 values, already bit-exact-verified against the real
+Moonshine-tiny checkpoint earlier this session) through it at
+checkpoint C's own real deployed geometry (`LANES=64`, `WWORDS=32768`
+-- not a made-up test config):
+
+```
+WEIGHT_STREAM_ASR_LOAD_DONE,cycles=93314
+WEIGHT_STREAM_ASR_CHECKED,82944
+WEIGHT_STREAM_ASR_ERRORS,0
+WEIGHT_STREAM_ASR_VERDICT,PASS
+```
+
+**82,944/82,944 values bit-exact, zero errors, first attempt.** One
+finding worth remembering: `weight_bank_tdp`'s addressable depth
+(`WWORDS`) counts *wide rows* (`WBITS`=`LANES`*4=256 bits = 8 packed
+32-bit sub-words each at `LANES=64`), not raw 32-bit values -- a
+288x288 fp32 matrix needs only 10,368 rows, comfortably under the
+32768-row budget (~32%) with no quantization needed for a single
+per-layer weight matrix at this size. That headroom won't survive
+contact with ASR's much larger tensors unquantized (the 32768-row,
+288-wide vocab/lm_head table alone is bigger than this whole matrix by
+~118x) -- quantizing those to fit the real BRAM budget, matching
+checkpoint C's own INT4 precedent, is a real next step, not solved by
+this result.
+
+**Scope, stated plainly**: this proves data movement only -- raw fp32
+bits, no quantization, no compute datapath (`gemv_banked_resident_vec.sv`
+etc.) touched. It does not yet prove the full weight image fits
+alongside everything else that needs to be resident, and it says
+nothing about compute correctness. It's the first rung, not the whole
+ladder -- but it's a real, bit-exact, first-attempt PASS on the exact
+RTL a real board already runs, not a synthetic sanity check.
