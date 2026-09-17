@@ -7525,3 +7525,65 @@ alongside everything else that needs to be resident, and it says
 nothing about compute correctness. It's the first rung, not the whole
 ladder -- but it's a real, bit-exact, first-attempt PASS on the exact
 RTL a real board already runs, not a synthetic sanity check.
+
+## Vocab table INT4: investigated, decided against (kept INT8)
+
+Follow-up to the section above: with the weight-streaming plumbing
+proven, the natural next question was whether the 32768x288 vocab/
+lm_head table (the tensor whose unquantized size dwarfs the BRAM
+budget, per the note above) could match checkpoint C's own INT4 scheme
+rather than staying on the already-proven INT8 path
+(`quantize_decoder_embed_int8.py` / `w_dec_embed_i8*.bin` in the
+`asr-genesys2-soc` fork).
+
+First checked the exact formula: checkpoint C's `Int4WeightPerChannel`
+(`model/qgpt.py`, Brevitas `NarrowIntQuant` + `MaxStatsScaling` +
+`PerChannelFloatScaling8bit`) is per-output-channel (per-row) symmetric
+narrow-range ([-7,7]) INT4 with max-abs scaling -- structurally identical
+to the ad-hoc scheme an earlier attempt this project already tried and
+that reportedly failed the 4-step generation gate (matched step 0,
+flipped by step 2). So the formula wasn't the suspect.
+
+Re-ran that exact per-row INT4 scheme through a fresh 6-input sweep
+(the real `model/samples/real_speech_1s.wav` clip + 5 synthetic-tone
+seeds, each graded against its OWN freshly-computed FP32 reference,
+not a stored manifest value -- re-deriving this caught a real bug in
+the first draft of the re-test script: defaulting to `synth_waveform()`
+silently compares against the wrong reference, since
+`manifest_decoder.json`'s `ref_full_token_ids` was captured from the
+real wav clip specifically. Exactly the bug class
+`verify_int8_full_generation.py`'s own docstring warns about -- worth
+a second read of that warning before writing any new gate script
+against this manifest). Per-row INT4 passed only 1 of 6 inputs -- not
+robust, confirming the earlier finding rather than overturning it.
+
+Tried per-GROUP INT4 (finer scale granularity than per-row, standard
+GPTQ/AWQ-style PTQ technique, no retraining) at several group sizes.
+`group_size=8` (36 groups/row) was the smallest that passed all 6/6.
+But the storage math kills the appeal: with ordinary fp32 scales, that
+config is 98.6% of the size of the INT8 scheme already in production
+use here -- a new, more complex datapath (per-group scale lookup) for
+essentially zero benefit. Compressing scales to fp16 gets it to ~74%
+of INT8's footprint (~26% real saving) -- verified that fp16-scale
+rounding doesn't itself break the 6/6 match -- but fp16 dequant isn't
+a datapath used anywhere else in this project (checkpoint C's real
+RTL, and this project's own INT8 vocab path, both use plain fp32-scaled
+per-row/per-tensor math); introducing it would be new RTL surface for
+a ~26% win on one tensor.
+
+**Decision (explicit, this session): keep INT8 for the vocab table, do
+not pursue INT4 further here.** The working INT4 configuration no
+longer resembles checkpoint C's actual per-row scheme (it needs
+per-group scales plus fp16 compression to be worth anything), and the
+already-shipped INT8 path is simpler, proven through the full
+generation gate, and only ~26% larger than the best INT4 alternative
+found. Scratch investigation script:
+`asr-genesys2-soc/model/try_int4_group_quantize.py` (kept for
+reference/future revisit, not wired into the C port).
+
+Checkpoint C's INT4 scheme *is* still a good match for the smaller
+transformer weight matrices (qkv/proj/mlp, the same shapes checkpoint
+C itself quantizes) -- untried so far, since this session's
+investigation focused on the vocab table specifically. Real next step
+if further BRAM headroom is needed: quantize those instead of
+revisiting the vocab table.
