@@ -7404,3 +7404,71 @@ transcribed actual speech into actual, correct, human-legible text**:
 the board took 1.0 second of a real person's real recorded voice and
 produced "He hoped." -- exactly what the real, unquantized, full-size
 HuggingFace model itself predicts from the same clip.
+
+## KV-cache: 2.53x real-hardware speedup, exact same output
+
+Built `asr_generate_kv_hw` -- the "_kv" speed stage after
+`asr_generate_hw`'s own "_fixed" (full-recompute) baseline, matching
+this project's own `goformer_*.py` staging convention. Structural
+change: instead of re-embedding every token and recomputing self- and
+cross-attention over the whole grown sequence every step, exactly one
+new token flows through the stack per step. Each layer keeps a growing
+self-attention K/V cache (the new token's own K/V, RoPE'd at its
+absolute position, appended after computing it) and a cross-attention
+K/V cache computed **once**, before the step loop even starts -- it
+depends only on the fixed encoder output, never the decode step, so
+`asr_generate_hw`'s own per-step recomputation of it was pure redundant
+work. No new attention primitive needed: a lone new query attending to
+an all-past-or-present cache needs no causal mask by construction, so
+the existing general `mha()` covers it with `causal=0`. One new op,
+`rope_table_at()` -- `rope_table`'s math for a single absolute position
+rather than a from-0 table.
+
+Gated natively first (`test_generate_kv.c`): **exact match** against
+the full-recompute baseline and the real model -- KV-caching
+reassociates the same math, it doesn't approximate it, so this was a
+correctness bar, not a tolerance one, and it passed as one.
+
+Real hardware: the weight/vocab/encoder-output DDR addresses turned out
+**byte-identical** between the two apps' layouts (same tensor order,
+same sizes) -- confirmed by diffing the two generated headers before
+assuming it, not guessed. That meant the ~47MB of decoder weights and
+the INT8 vocab table, already staged in DDR3 from the previous
+real-audio run, didn't need restoring again -- just a fresh `load` (the
+~31KB ELF) and resume. **Clean pass, first attempt, no hang**, same
+prediction as every other run this session, `[1, 940, 24936, 29889, 2]`
+= "He hoped.":
+
+```
+ASR_PHASE,generate_kv_hw
+ASR_CYC,cross_kv_ddr,0000000077f0ee29
+ASR_STEP,step=0,predicted=940,ref=940,PASS
+ASR_STEP,step=1,predicted=24936,ref=24936,PASS
+ASR_STEP,step=2,predicted=29889,ref=29889,PASS
+ASR_STEP,step=3,predicted=2,ref=2,PASS
+ASR_CYC,step_ddr,00000000ddec96d2
+ASR_CYC,total_ddr,0000000155dd84fb
+ASR_RESULT,passed=4,total=4
+ASR_PASS,generate_kv_hw
+```
+
+**`total_ddr` = 114.71s vs. `asr_generate_hw`'s own 289.84s on the same
+real-speech input -- a 2.53x speedup, 175s saved.** `cross_kv_ddr`
+(the once-only precompute) = 40.25s; `step_ddr` (everything else,
+all 4 steps) = 74.47s. Reproducibility confirmed with a second run:
+`total_ddr` spread 16,716 cycles = 0.33ms (that run's own UART capture
+lost some bytes mid-stream again -- the same benign capture-side issue
+documented earlier, not a compute problem; `ASR_RESULT`/`ASR_PASS`
+both came through intact).
+
+**Where this leaves the ASR port**: the KV-cache speed stage is done
+and real-hardware-verified, exactly matching the "_fixed" baseline's
+output while running 2.53x faster. The remaining redundant cost is
+`step_ddr` itself -- every step still re-reads each layer's self-
+attention Q/K/V/O and MLP fc1/fc2 weight matrices from DDR3 fresh
+(the weights don't change, only the activations do, so this is a
+genuine DDR3-bandwidth-bound cost inherent to running weight-resident
+inference this way, not an algorithmic redundancy like the cross-K/V
+one was) -- fully eliminating that would mean keeping per-layer
+weights resident across steps in a faster on-chip store, a different
+kind of optimization than what KV-caching addresses.
