@@ -7623,3 +7623,44 @@ Two findings worth keeping independent of the full document:
    found. Real next decision, not resolved here: generalize the MAC core
    to also support INT8, or QAT-quantize the transformer weights to INT4
    (untested territory, distinct from the vocab table's own answer).
+
+## gemv_banked_resident_vec generalized to INT8 (WBW parameter), gated bit-exact
+
+Resolves the precondition flagged in the ASR op-sequence doc's "INT4-specific
+compute, not just storage" finding: `gemv_banked_resident_vec.sv` (`fabric/
+stage3/rtl/`) took a new `WBW` parameter (weight bit-width per lane), default
+4 -- every existing checkpoint-C-style build (no WBW override) is byte-for-
+byte unchanged. `WBW=8` generalizes the same MAC core to INT8 weight x INT8
+activation: `WBITS=LANES*WBW` (was hardcoded `LANES*4`), the MAC's per-lane
+slice widened `[L*4 +: 4]` -> `[L*WBW +: WBW]`, addend width `ADW` re-derived
+as `WBW+10` (reproduces the old hardcoded `14` exactly at WBW=4 -- a real
+derivation, not a guess: signed WBW-bit weight x signed INT8 act max
+magnitude 2^(WBW+6), K2 doubles that to 2^(WBW+7), representing that exactly
+needs WBW+8 bits, +2 margin matching the original choice = WBW+10), and
+`weight_bank_tdp`'s own `WBITS` now passed explicitly (its own default of
+`LANES*4` only matched by coincidence at WBW=4 -- omitting this would have
+been a real, silent width mismatch at WBW=8).
+
+No standalone gate existed for this module before (only ever exercised
+indirectly via the full sequencer integration tests) -- built one:
+`fabric/stage3/run_resident_banked_vec.py` + `pack_banked_resident_vec.py`,
+multi-layer/multi-offset, bit-exact against a numpy golden, mirroring
+`run_resident_banked.py`'s own discipline for the P=1 predecessor core.
+Verified clean:
+
+- WBW=4 regression (K2=0 and K2=1) -- bit-exact, unchanged from before.
+- WBW=8 new capability: multiple shapes, K2=0/1, a non-LANES/P-aligned M
+  (exercises the P-wide readback's padding/trim path), a deliberate
+  extreme-value worst case (every weight at the most-negative WBW-bit
+  value, every activation at -128, K2=1 -- the exact scenario ADW=WBW+10
+  is sized for), and real ASR layer shapes (288x288 QKV/O, 2304x288
+  decoder fc1, 288x1152 encoder fc1) -- all bit-exact.
+
+Synced to `gen2asr`'s and `gen2gpt`'s own copies of this file (default-
+compatible, no bitstream impact for gen2gpt's already-built `.bit`).
+
+Still open, not decided here: WHICH ASR weights actually get quantized to
+INT8 (or INT4, now that both are hardware-supported) for a real accelerator
+build, and at what accuracy cost -- this session resolved the hardware
+CAPABILITY question, not the quantization SCHEME question. See gen2asr's
+`ASR-ACCELERATOR-OP-SEQUENCE.md` for the full writeup.
