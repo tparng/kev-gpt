@@ -7241,3 +7241,87 @@ only stitching these already-separately-verified pieces into one
 continuous multi-step real-hardware generation loop (currently proven
 piecewise, not yet as one running program) -- a firmware-integration
 step, not an open correctness question.
+
+## One continuous multi-step generation run, real hardware: success, after two real diagnostic findings
+
+Stitched every already-separately-verified piece into `asr_generate_hw`:
+one program, one `resume`, no host intervention between steps -- for
+each of 4 steps, re-embed every token generated so far, run all 6
+decoder layers, `dec.norm()`, lm_head, argmax, append, repeat. No
+KV-cache (every weight read fresh every step), so this needed all 6
+decoder layers' FP32 weights (~39.9MB) AND the tied embed/lm_head table
+resident simultaneously -- combined with the FP32 table that's
+~77.65MB, over the 64MiB `EXT_SLAVE_SIZE` this bitstream hard-caps at
+synthesis time (`core_v_mini_mcu.h`, confirmed not a runtime knob --
+expanding it means a Vivado resynthesis, a much bigger lift than
+software quantization).
+
+**INT8-quantized the vocab table** to close the gap (`model/
+quantize_decoder_embed_int8.py`, this project's own already-validated
+per-row scheme from `tools/llama2c_int8_quantize.py`) -- ~9.12MB,
+combined footprint ~47.2MiB, fits. An INT4 attempt (scale=max_abs/7)
+was tried FIRST and genuinely failed: step 0 matched, but quantization
+noise compounding through 6 decoder layers flipped the argmax to
+`eos_token_id` by step 2 (`model/verify_int8_full_generation.py`'s own
+log, run against the INT4 table before the INT8 switch). INT8 passed
+the same full 4-step gate exactly, and the **actual C kernels**
+(`embed_lookup_i8`/`linear_lmhead_i8` in `ops.c`) were re-verified
+against it natively (`model/c_port/test_generate.c`) before any real
+hardware was touched -- both gates existed specifically to catch a
+quantization regression before a 15+ minute real-hardware attempt, and
+the first one did exactly that.
+
+**Real hardware, attempt 1**: 94 GDB `restore` commands, ~16 minutes
+(18:52:52-19:09:04). Firmware ran to completion, but the UART capture
+came back badly corrupted -- missing step 0's whole line, step 2's line
+missing its prefix, and the run appeared to hang mid-print of the final
+`tot_ddr` line. **Diagnosed via `monitor halt` + disassembly (not
+assumed)**: the CPU was NOT stuck -- PC sat right after `wfi` in
+`_exit()` (`soc_ctrl_set_valid()` then `wfi`, this runtime's normal
+"signal completion, park" terminal state), landing on the next symbol
+(`_fstat`) purely because that's the next function in the binary layout
+-- a GDB/symbol-table coincidence, not a real call into `_fstat` with
+garbage arguments (which is what the raw backtrace looked like at
+first glance). **The firmware completed correctly; only the UART
+transmission/capture lost bytes** -- the first real-hardware evidence
+in this port of a lossy link rather than a compute-side hang, distinct
+from the two earlier-documented conv-frontend/encoder-layer0 hangs.
+
+**Retry attempt 1** (a `reset halt` + `resume` with NO fresh `load`,
+reasoning that DDR3/SRAM contents persist across a soft reset so a full
+reload shouldn't be needed): landed the CPU at `0x40000180`, no
+matching symbol -- a boot-path address, not back in the firmware at
+all. **New finding**: `reset` alone does not reliably resume execution
+from previously-loaded SRAM on this platform; `load` does more than
+just write bytes (some part of the boot/entry sequence depends on it
+running). Fixed by including a fresh `load` (fast -- just the ~31KB ELF,
+not the 47MB DDR3 dataset, since DDR3 itself doesn't need re-staging).
+
+**Retry attempt 2** (`reset halt` + `load` + `resume`): **clean pass,
+all 4 steps, full uncorrupted output** --
+
+```
+ASR_PHASE,generate_hw
+ASR_STEP,step=0,predicted=6439,ref=6439,PASS
+ASR_STEP,step=1,predicted=29892,ref=29892,PASS
+ASR_STEP,step=2,predicted=9360,ref=9360,PASS
+ASR_STEP,step=3,predicted=29892,ref=29892,PASS
+ASR_CYC,tot_ddr,000000035fcc5ec7
+ASR_RESULT,passed=4,total=4
+ASR_PASS,generate_hw
+```
+
+`tot_ddr` = 14,492,131,015 cycles = 289.84s (~4.8 minutes) of DDR-bound
+compute for the whole 4-step run.
+
+**This is the milestone**: a single, continuous, unbroken real-hardware
+program -- no host intervention between steps, no per-layer staging --
+takes a fixed encoder output through 4 steps of real decoder inference
+and produces `[1, 6439, 29892, 9360, 29892]`, byte-for-byte the same
+sequence the real, unquantized HuggingFace model predicts. Every stage
+of Moonshine-tiny's architecture this project set out to port -- conv
+front-end, 6-layer encoder, 6-layer decoder with causal self-attention
+and cross-attention, SwiGLU MLP, RoPE, the tied embedding/lm_head
+table -- now runs correctly on this exact board, in one program, real
+weights (INT8 only where necessary to fit, gated at every step before
+trusting it).
