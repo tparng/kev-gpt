@@ -7112,3 +7112,70 @@ incremental step the encoder already completed once) and the final
 `dec.norm()` + lm_head projection (needs the full stack to mean
 anything, and the ~75MB full-decoder footprint problem noted above
 still applies to getting there in one shot).
+
+## All 6 decoder layers + final dec.norm(), real hardware: clean pass, first attempt
+
+Extended `asr_decoder_layer0_hw` into `asr_decoder_full_hw` the same way
+the encoder went from `asr_encoderlayer0_hw` to `asr_encoder_full_hw` --
+looping the same per-layer sequence across all 6 decoder layers via
+stride arithmetic from layer 0's own base DDR offset (applied from the
+start this time, given the encoder side's own lesson about a lookup
+table overflowing `ram0`'s `.rodata` budget). Unlike the encoder, the
+decoder's own weight export never special-cased layer 0's naming, so
+every layer here (0 through 5) uses the identical `base + i*stride`
+formula -- no layer-0-is-different branch needed.
+
+Deliberately excludes the ~37.75MB tied embed/lm_head table: it's only
+needed for the initial embedding lookup (already captured as a fixed
+starting input, `ref_dec_embed_step0`) and the final logits projection
+(out of scope for this app, same as `asr_decoder_layer0_hw`). Without
+it, all 6 layers' own weights (6 x ~6.65MB) plus refs/scratch fit in
+**38.23 MiB** -- comfortably inside the 64MiB window, no budget wall.
+This is the resolution to the "~75MB, doesn't fit" concern raised
+after the native decoder milestone: that number was for embedding
+table + all 6 layers + logits simultaneously (the from-scratch full
+generation step), not for verifying the 6 layers' own forward
+correctness, which never needed the vocab table at all. Builds at
+`ram0` 93.4% -- identical to the single-layer app's own footprint,
+confirming the loop adds no real code-size cost (same instructions,
+run 6 times, not 6 copies).
+
+**Result: clean pass, first attempt, no hang, all 7 checks** --
+
+```
+ASR_STAGE,layer0_out,...,elem_fails=0,PASS
+ASR_STAGE,layer1_out,...,elem_fails=0,PASS
+ASR_STAGE,layer2_out,...,elem_fails=0,PASS
+ASR_STAGE,layer3_out,...,elem_fails=0,PASS
+ASR_STAGE,layer4_out,...,elem_fails=0,PASS
+ASR_STAGE,layer5_out,...,elem_fails=0,PASS
+ASR_CYC,tot_ddr,0000000092f7bb0f
+ASR_STAGE,norm_out,...,elem_fails=0,PASS
+ASR_RESULT,passed=7,total=7
+ASR_PASS,dec_full_hw
+```
+
+DDR3 footprint: 38.23 MiB, 100 GDB `restore` commands, restore took
+~13 minutes (05:15:57-05:29:11 real time), consistent with this
+session's other restores. `tot_ddr` = 2,465,708,815 cycles = 49.31s,
+which divided evenly across 6 layers (8.22s/layer) matches
+`asr_decoder_layer0_hw`'s own isolated 8.22s almost exactly -- a clean,
+self-consistent scaling result (no per-layer surprises, no super-linear
+cost growth, same finding shape the encoder's own full-stack timing
+showed).
+
+**Where this leaves the ASR port**: the entire Moonshine-tiny decoder
+stack -- causal self-attention with RoPE, cross-attention to the
+encoder output with neither, SwiGLU MLP, all 6 layers, and the final
+`dec.norm()` -- is now real-hardware-verified, matching the encoder
+side's own completeness. Combined with the encoder's full-stack
+real-hardware verification and the native (software) full
+transcription pipeline's exact token-id match, every architectural
+piece of this model has now run correctly on this exact board. What
+remains real-hardware-unverified is only the vocabulary-dependent
+edges: the embedding lookup for tokens beyond `decoder_start_token_id`
+(spot-checked on `asr_decoder_layer0_hw`, not exhaustively), the final
+lm_head logits projection, and multi-step (>1 token) real-hardware
+generation -- all of which need the ~37.75MB vocab table simultaneously
+with the rest of the state, the same footprint question flagged
+earlier, still open.
