@@ -7832,11 +7832,11 @@ into one decoder self-attention block, gated against real
 test_generate_kv_i8.c intermediate values -- proving the pieces actually
 assemble, not just that each is individually correct.
 
-## Decoder self-attention block gate: built, PARTIAL pass, one open finding
+## Decoder self-attention block gate: built, bit-exact, root cause found + fixed
 
 Follow-up to rope_apply_vec.sv: built fabric/asr_seq/pack_decoder_self_attn.py
 + tb_decoder_self_attn.sv, chaining rope_apply_vec.sv + kv_bank.sv (real,
-unmodified) + vec_attn_w.sv (real, unmodified) for real ASR Q/K/V, checked
+checkpoint-C RTL) + vec_attn_w.sv (real, unmodified) for real ASR Q/K/V, checked
 against a Python reference reusing this project's own proven fixed-point
 functions (seq_ref.rsh_round/sat, run_softmax.int_softmax_q/exp_table,
 goformer_kvq.quant_head_asym/dequant_head).
@@ -7845,13 +7845,32 @@ Real finding: P=8 (checkpoint C's own convention) doesn't work for
 HEAD_DIM=36 -- kv_bank.sv/vec_attn_w.sv need HEAD_DIM%P==0, P=4 does
 (HR=9). Not "zero changes" as an earlier note optimistically claimed.
 
-Status: T=1 (step 0, all 8 heads) bit-exact, 288/288. T>=2 mismatches,
-288/576. Extensive debugging this session (RoPE verified bit-exact at
-every step; every write/read address direct-monitored via hierarchical
-reference into kv_bank's own FSM state, confirmed correct; standalone
-isolated testbenches matching the real data and increasingly exact
-operation sequence could NOT reproduce the corruption at all) did not
-find root cause. Recorded honestly as open, not smoothed over -- the
-failure to reproduce in isolation is itself informative and worth
-keeping. Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's
-"Decoder self-attention block gate" section.
+Root cause of the T>=2 mismatch (previously recorded here as an unresolved
+open finding): kv_bank.sv's `wq_head`/`rd_head`/`rd2_head` ports were
+hardcoded `[1:0]` (2 bits) -- correct for checkpoint C's own NHEAD<=4 but a
+silent overflow for the ASR decoder's NHEAD=8. Head indices 4-7 truncated
+via bit-slicing (`head_i[1:0]`) onto heads 0-3, so writing head 4's K/V
+silently ALIASED onto and overwrote head 0's own cache slot at the same
+position. T=1 passed because each head's own single write+read completed
+before any other head could alias over it; T>=2 failed because, by the time
+head 0 re-read its own position-0 K at step 1, head 4's step-0 write (which
+ran after head 0's step-0 read) had already clobbered it. Isolated repro
+built by exactly replicating the real op order -- write+read K/V for all 8
+heads at step 0 before ever touching step 1 -- reproduced the corruption
+with kv_bank.sv alone (no vec_attn_w, no RoPE): reading head 0's position-0
+K after that sequence returned head 4's stored K vector verbatim.
+
+Fix: widened `wq_head`/`rd_head`/`rd2_head` (and the internal `w_head` debug
+reg) to `$clog2(NHEAD)-1:0` in kv_bank.sv, and dropped the now-redundant
+explicit zero-pad concatenation in the three pbase address computations
+(Verilog zero-extends unsigned operands in arithmetic context regardless of
+width, so the padding was never load-bearing at any head count). Backward
+compatible: for checkpoint C's own NHEAD=4 usage, `$clog2(4)=2`, bit-for-bit
+identical to the old hardcoded width -- confirmed via run_softmax/run_banked/
+run_rope gates still bit-exact after the change, and run_vec_seq's pre-existing
+(unrelated, pre-dates this change) missing-module build failure reproduced
+identically on a stash of the fix.
+
+Status: bit-exact, 864/864 (T=1, T=2, T=3, all 8 heads). Full writeup:
+gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Decoder self-attention block gate"
+section.

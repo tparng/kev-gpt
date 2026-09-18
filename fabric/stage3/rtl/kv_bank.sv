@@ -46,7 +46,7 @@ module kv_bank #(
     input  wire        wq_start,            // pulse; selectors sampled here
     input  wire [3:0]  wq_layer,
     input  wire        wq_kv,               // 0 = K, 1 = V
-    input  wire [1:0]  wq_head,
+    input  wire [$clog2(NHEAD)-1:0]  wq_head,
     input  wire [8:0]  wq_pos,
     input  wire        wq_valid,            // HR beats of P Q.16 lanes follow
     input  wire [P*32-1:0] wq_data,
@@ -56,7 +56,7 @@ module kv_bank #(
     input  wire        rd_start,            // pulse; selectors sampled here
     input  wire [3:0]  rd_layer,
     input  wire        rd_kv,
-    input  wire [1:0]  rd_head,
+    input  wire [$clog2(NHEAD)-1:0]  rd_head,
     input  wire [8:0]  rd_tcount,           // positions to stream (1..TMAX)
     output reg         rd_valid,            // a dequantised wide row is on rd_data
     output reg  [HEAD_DIM*32-1:0] rd_data,  // ONE POSITION's head row, dequantised
@@ -66,7 +66,7 @@ module kv_bank #(
     input  wire        rd2_start,
     input  wire [3:0]  rd2_layer,
     input  wire        rd2_kv,
-    input  wire [1:0]  rd2_head,
+    input  wire [$clog2(NHEAD)-1:0]  rd2_head,
     input  wire [8:0]  rd2_tcount,
     output reg         rd2_valid,
     output reg  [HEAD_DIM*32-1:0] rd2_data,
@@ -98,7 +98,7 @@ module kv_bank #(
     wire [47:0]               hdr_rd,  hdr_rd2;
 
     // ---- write-side state ------------------------------------------------------
-    reg [3:0]  w_layer; reg w_kv; reg [1:0] w_head; reg [8:0] w_pos;
+    reg [3:0]  w_layer; reg w_kv; reg [$clog2(NHEAD)-1:0] w_head; reg [8:0] w_pos;
     reg [HEAD_DIM*32-1:0] vecbuf;            // plain reg: the head vector, collected
     reg signed [31:0] minv, maxv;
     reg [$clog2(HR+1)-1:0] w_vi;             // collect beat counter
@@ -333,7 +333,7 @@ module kv_bank #(
             case (wst)
                 W_IDLE: if (wq_start) begin
                     w_layer <= wq_layer; w_kv <= wq_kv; w_head <= wq_head; w_pos <= wq_pos;
-                    w_pbase <= ((wq_layer*2 + {3'b0,wq_kv})*NHEAD + {2'b0,wq_head})*TMAX
+                    w_pbase <= ((wq_layer*2 + {3'b0,wq_kv})*NHEAD + wq_head)*TMAX
                                 + {3'b0,wq_pos};
                     minv <= 32'sh7FFFFFFF; maxv <= 32'sh80000000;
                     qm_v <= 1'b0;
@@ -415,7 +415,7 @@ module kv_bank #(
                     r_ecnt  <= 0;
                     r_v0    <= 1'b0;
                     r_pbase <= ((rd_layer*2 + {3'b0,rd_kv})*NHEAD
-                                 + {2'b0,rd_head})*TMAX;
+                                 + rd_head)*TMAX;
                     rst_st <= R_RUN;
                 end
                 R_RUN: begin
@@ -445,7 +445,7 @@ module kv_bank #(
                     r2_ecnt  <= 0;
                     r2_v0    <= 1'b0;
                     r2_pbase <= ((rd2_layer*2 + {3'b0,rd2_kv})*NHEAD
-                                  + {2'b0,rd2_head})*TMAX;
+                                  + rd2_head)*TMAX;
                     rst2_st <= R_RUN;
                 end
                 R_RUN: begin

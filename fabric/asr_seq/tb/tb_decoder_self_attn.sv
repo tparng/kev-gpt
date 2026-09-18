@@ -23,21 +23,14 @@
 // array task arguments.
 //
 // STATUS, stated plainly (see ASR-ACCELERATOR-OP-SEQUENCE.md for the full
-// writeup): T=1 (step 0, every head) passes BIT-EXACT. T>=2 (steps 1-2)
-// currently MISMATCHES -- root cause not yet found despite extensive
-// isolated debugging this session (RoPE's own output verified bit-exact at
-// every step via a direct dump; write-commit and read addresses verified
-// correct via direct hierarchical monitoring of kv_bank's own internal FSM
-// state; and -- the most telling result -- standalone testbenches
-// replicating kv_bank.sv + vec_attn_w.sv + rope_apply_vec.sv with the SAME
-// real data and an increasingly exact copy of this TB's own operation
-// sequence, interleaving, and per-head attention calls, could NOT reproduce
-// the corruption at all). That last result is worth taking seriously: it
-// suggests either a genuine but narrow interaction this TB's own longer,
-// 3-step/8-head sequence triggers and shorter isolation attempts don't, or
-// a bug in THIS file's own bookkeeping that hasn't been found yet either --
-// not assumed to be one or the other. Not declared fixed; a real, open
-// finding, not smoothed over.
+// writeup): BIT-EXACT, 864/864 (T=1,2,3, all 8 heads). The T>=2 mismatch this
+// header used to describe as an open, unresolved finding was root-caused to
+// kv_bank.sv's wq_head/rd_head/rd2_head ports being hardcoded [1:0] (2 bits,
+// correct only for checkpoint C's own NHEAD<=4) -- a silent overflow for
+// this decoder's NHEAD=8: head 4 truncated onto head 0's own cache slot and
+// clobbered it after head 0's own step-0 read but before its step-1 reread.
+// Fixed by widening those ports to $clog2(NHEAD)-1:0 in kv_bank.sv (backward
+// compatible: $clog2(4)=2, unchanged for checkpoint C's own NHEAD=4 usage).
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
 
@@ -73,13 +66,13 @@ module tb_decoder_self_attn;
     reg         kb_wstart, kb_wvalid, kb_rstart;
     reg  [3:0]  kb_wlayer;
     reg         kb_wkv;
-    reg  [1:0]  kb_whead;
+    reg  [$clog2(NHEAD)-1:0]  kb_whead;
     reg  [8:0]  kb_wpos;
     reg  [P*32-1:0] kb_wdata;
     wire        kb_wdone;
     reg  [3:0]  kb_rlayer;
     reg         kb_rkv;
-    reg  [1:0]  kb_rhead;
+    reg  [$clog2(NHEAD)-1:0]  kb_rhead;
     reg  [8:0]  kb_rtcount;
     wire        kb_rvalid, kb_rdone;
     wire [HEAD_DIM*32-1:0] kb_rdata;
@@ -142,7 +135,7 @@ module tb_decoder_self_attn;
                       input reg [HEAD_DIM*32-1:0] vec);
         integer b, l;
         begin
-            kb_wlayer = 4'd0; kb_wkv = kv[0]; kb_whead = head_i[1:0]; kb_wpos = pos[8:0];
+            kb_wlayer = 4'd0; kb_wkv = kv[0]; kb_whead = head_i[$clog2(NHEAD)-1:0]; kb_wpos = pos[8:0];
             kb_wstart = 1'b1;
             @(posedge clk); #1;
             kb_wstart = 1'b0;
@@ -176,7 +169,7 @@ module tb_decoder_self_attn;
             at_qvalid = 1'b0;
 
             // start kv_bank's K read; its own valid/data feed vec_attn_w directly
-            kb_rlayer = 4'd0; kb_rkv = 1'b0; kb_rhead = head_i[1:0]; kb_rtcount = tcount[8:0];
+            kb_rlayer = 4'd0; kb_rkv = 1'b0; kb_rhead = head_i[$clog2(NHEAD)-1:0]; kb_rtcount = tcount[8:0];
             kb_rstart = 1'b1;
             @(posedge clk); #1;
             kb_rstart = 1'b0;
@@ -184,7 +177,7 @@ module tb_decoder_self_attn;
             while (!at_kdone) @(posedge clk);
 
             // now stream V the same way
-            kb_rlayer = 4'd0; kb_rkv = 1'b1; kb_rhead = head_i[1:0]; kb_rtcount = tcount[8:0];
+            kb_rlayer = 4'd0; kb_rkv = 1'b1; kb_rhead = head_i[$clog2(NHEAD)-1:0]; kb_rtcount = tcount[8:0];
             kb_rstart = 1'b1;
             @(posedge clk); #1;
             kb_rstart = 1'b0;
