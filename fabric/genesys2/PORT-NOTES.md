@@ -7934,3 +7934,54 @@ widths and either widen a port to `$clog2(param)` (constraint 3) or drop
 the manual concatenation and let Verilog's own context-determined
 arithmetic handle it (constraint 2) -- both fully backward compatible
 with checkpoint C's own NHEAD=4 shape.
+
+## Encoder self-attention block gate: built, bit-exact, zero new storage RTL
+
+Follow-up to the decoder self-attention gate: tests the OTHER attention
+access pattern -- "static full-attend" (a fixed K/V set written once,
+every query row attends the whole set, bidirectional, no causal masking)
+-- the encoder's own self-attention.
+
+`gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md`'s "Two attention shapes, one
+primitive" section originally concluded this needs NEW storage RTL (a
+`weight_bank_tdp.sv`-style static bank), reasoning `kv_bank.sv`'s design
+is built for a cache that grows. A cheap isolated probe first (write
+`T=4` positions once into `kv_bank.sv` alone, no `vec_attn_w`/RoPE
+involved, then call the read port 3 separate times with the SAME fixed
+`tcount=4`) showed every read returns bit-identical data -- the read FSM
+has no incremental dependency baked into a single `rd_start` call;
+"growing" is purely how the decoder happens to call it (varying `tcount`
+step by step), not RTL-enforced. Real gate built to confirm this with
+actual model weights, not just the probe extrapolated:
+`fabric/asr_seq/tb/tb_encoder_self_attn.sv` + `pack_encoder_self_attn.py`,
+chaining `rope_apply_vec.sv` + `kv_bank.sv` (real, UNMODIFIED, same file
+as the decoder gate) + `vec_attn_w.sv` (real, unmodified), against real
+encoder layer-0 weights applied to the model's own real conv front-end
+(`conv1->tanh->groupnorm->conv2->gelu->conv3->gelu->permute`, real
+conv/groupnorm weights, unmodified) on a short fixed-seed waveform
+(`torch.manual_seed(0)`, `L=3000`, chosen to land on a small `T2=6` for
+a fast gate -- not an end-to-end transcription claim).
+
+Gate structure, deliberately different from the decoder gate: writes ALL
+`T2*NHEAD` K (RoPE'd) and V (raw) rows FIRST with zero reads interleaved
+(the actual precondition the pattern needs), THEN loops every one of the
+6 query positions over all 8 heads, each `do_attn` call reading the
+complete, unchanging `T2`-row set with a FIXED `tcount=T2` (never
+growing). Checked against `pack_encoder_self_attn.py`'s own golden
+`ctx_q25`, reusing this project's proven fixed-point references verbatim
+(`seq_ref.rsh_round`/`sat`, `run_softmax.int_softmax_q`/`exp_table`,
+`goformer_kvq.quant_head_asym`/`dequant_head`, `pack_rope.rope_apply_ref`
++ the same `POST_SCALE_Q16=75674` correction as the decoder gate).
+
+Status: bit-exact, first attempt, no debugging needed -- `TB_DONE,
+checked=1728, mismatches=0` / `ENCODER_SELF_ATTN_VERDICT,bitexact=1`.
+6 query positions x 8 heads x 36 dims, every one exact. Zero new RTL
+beyond `rope_apply_vec.sv` (already built, reused unmodified) --
+`kv_bank.sv`/`vec_attn_w.sv` needed no changes and no new wrapper
+control path.
+
+Not covered: cross-attention (decoder-side, Stage 3a) is the *simpler*
+case of the same pattern (RoPE-free), NOT separately gated -- a strong
+inference from this result, not independently verified. Full writeup:
+`gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md`'s "Encoder self-attention block
+gate" section.
