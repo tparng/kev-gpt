@@ -8030,3 +8030,44 @@ shapes, one primitive" section's original `weight_bank_tdp.sv`-style
 storage proposal: neither op it flagged as needing new storage RTL
 actually does. Full writeup: `gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md`'s
 "Decoder cross-attention block gate" section.
+
+## Decoder-block top-level FSM: sized, elaborates clean, not yet gated
+
+Turned gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's informal "Sketch: a
+top-level FSM extension (not implemented, not sized)" section's
+decode-step-loop sketch into a real, sized state machine:
+`fabric/asr_seq/rtl/decoder_block_seq.sv`, extending sequencer_vec.sv's
+own conventions -- a `localparam [5:0]` state list (38 states) plus ONE
+shared GEMV dispatcher (`G_XFEED`/`G_WAIT`/`G_DRAIN`) and ONE shared
+LayerNorm dispatcher (`L_FEED`/`L_WAIT`), reused across all 8 linear
+layers / 3 LayerNorms per decoder layer via `g_ret`/`l_ret` return-state
+fields -- same idiom as sequencer_vec.sv's own G_AQ/G_WAIT/G_RB + L_COLL.
+
+Two real bugs found while wiring this, both fixed:
+
+1. `layernorm_vec.sv` is WRONG for ASR's D=288 (this doc's own Stage 2
+   table called it "exact... already parametric" -- checked directly and
+   it isn't: `sum >>> $clog2(D)` only divides exactly by D when D is a
+   power of 2, and 288 isn't). Fixed as `layernorm_vec_gendiv.sv` (exact
+   floor-divide, not a shift -- see the file's own header). Gated both
+   ways: D=256 regression matches the original reference exactly, D=288
+   is bit-exact against a new generalized reference.
+2. SiLU (SwiGLU's gate activation) had no RTL anywhere. Built
+   `silu_lut.sv` + `vec_silu.sv` (same shape as `gelu_lut.sv`/
+   `vec_gelu.sv`, activation swapped). Gated bit-exact.
+
+`decoder_block_seq.sv` itself wires every state to its REAL, already-
+gated sub-module interface (`kv_bank.sv` x2, `vec_attn_w.sv` shared
+across self+cross attention, `layernorm_vec_gendiv.sv`,
+`gemv_banked_resident_vec.sv` WBW=8, `rope_apply_vec.sv`, `vec_silu.sv`)
+-- confirmed by actually compiling it with iverilog against all of them:
+clean elaboration, exit 0, no errors, only pre-existing benign warnings.
+NOT yet a functional gate -- real, flagged (`// TODO` in the RTL itself)
+open items remain: the weight/gamma image layout and GEMV dequant scheme
+(both explicitly undecided per the op-sequence doc), per-head lane
+gather/scatter between the GEMV P=8 boundary and attention's own
+HEAD_DIM=36/ATTN_P=4 boundary, and SwiGLU's gate-multiply math (currently
+a literal passthrough placeholder). Full writeup, including the exact
+open-item list: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "The
+decoder-block FSM sketch, turned into a real, sized state machine"
+section.
