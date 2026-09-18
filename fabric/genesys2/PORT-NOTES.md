@@ -7664,3 +7664,37 @@ INT8 (or INT4, now that both are hardware-supported) for a real accelerator
 build, and at what accuracy cost -- this session resolved the hardware
 CAPABILITY question, not the quantization SCHEME question. See gen2asr's
 `ASR-ACCELERATOR-OP-SEQUENCE.md` for the full writeup.
+
+## ASR transformer weight quantization: INT8 for everything, decided empirically
+
+Follow-up to the gemv_banked_resident_vec INT8 generalization above: with
+the hardware capable of either INT4 or INT8, decided WHICH ASR weights to
+actually quantize and at what precision. All 90 GEMV weight matrices
+(encoder self-attn+MLP x6, decoder self-attn+cross-attn+MLP x6 -- conv
+kernels and the vocab table excluded, handled separately) run FP32 today,
+with no QAT (unlike checkpoint C) -- a pure PTQ robustness question,
+decided via `gen2asr/model/quantize_transformer_weights_sweep.py` against
+the same 6-input seeded sweep (real clip + 5 synthetic seeds, each graded
+on whether the FULL pipeline still produces the FP32 reference's exact
+token sequence) the vocab table's own INT4-vs-INT8 decision used.
+
+Result: INT8 for every group is the ONLY fully robust config (6/6). Every
+INT4 combination tried -- full INT4, attention-only INT4, MLP-only INT4,
+single-MLP-group INT4, encoder-only INT4, decoder-only INT4 -- failed
+outright or failed the real clip specifically (attention-INT8/MLP-INT4
+reached 5/6, but the one failure was the real clip, treated as
+disqualifying, not a rounding error). Attention weights are clearly the
+more sensitive of the two (matches common quantization-literature
+findings: softmax amplifies logit noise more than an MLP's roughly-
+additive error). One genuinely surprising, reproducible finding kept
+rather than smoothed over: quantizing BOTH MLP groups to INT4 together
+did better (5/6) than quantizing EITHER ONE ALONE (0/6 each) -- a real
+PTQ cross-layer error-interaction effect, verified not to be a test bug
+(each config restores exact original weights before the next runs).
+
+Real storage win: 15,925,248 total weight parameters, 63.70 MB FP32 ->
+~16.15 MB INT8 (25.3%, ~3.9x). Full writeup + the decision table:
+gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Quantization scheme" section.
+QAT to INT4 (real training, not more PTQ search) remains the real next
+step if a smaller footprint is needed later -- attention's demonstrated
+sensitivity says watch it first.
