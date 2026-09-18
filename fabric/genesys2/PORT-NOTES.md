@@ -7669,7 +7669,7 @@ CAPABILITY question, not the quantization SCHEME question. See gen2asr's
 
 Follow-up to the gemv_banked_resident_vec INT8 generalization above: with
 the hardware capable of either INT4 or INT8, decided WHICH ASR weights to
-actually quantize and at what precision. All 90 GEMV weight matrices
+actually quantize and at what precision. All 96 GEMV weight matrices
 (encoder self-attn+MLP x6, decoder self-attn+cross-attn+MLP x6 -- conv
 kernels and the vocab table excluded, handled separately) run FP32 today,
 with no QAT (unlike checkpoint C) -- a pure PTQ robustness question,
@@ -7698,3 +7698,28 @@ gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Quantization scheme" section.
 QAT to INT4 (real training, not more PTQ search) remains the real next
 step if a smaller footprint is needed later -- attention's demonstrated
 sensitivity says watch it first.
+
+## ASR transformer weights re-exported at INT8, gated bit-honestly
+
+Follow-up to the quantization decision above: `gen2asr/model/
+quantize_transformer_weights_int8.py` re-applies it for real, writing
+`<name>_i8.bin` + `<name>_i8_scales.f32` for all 96 GEMV matrices into
+`model/c_port/data/` (same convention `quantize_decoder_embed_int8.py`
+already used for the vocab table). 63.70 MB FP32 -> 16.10 MB INT8+scales.
+
+New `linear_i8()` C kernel (dequantize-on-use, matching `embed_lookup_i8`/
+`linear_lmhead_i8`'s existing pattern) plus two new gates:
+`test_encoder0_i8.c` (diagnostic per-layer tolerance check) and
+`test_generate_kv_i8.c` (the definitive one -- conv front-end -> INT8
+encoder -> INT8 KV-cached decoder -> the already-INT8 vocab table,
+checked against the real reference token sequence). PASS, first attempt,
+after each test's OWN first run caught a real bug immediately (a
+filename-ordering mistake in the encoder loader -- clean file-not-found,
+not silently wrong data -- and a scale-vector-length bug specific to
+w_dfc2, whose shape is D x FFN so count/D gives FFN, not the real out_dim
+D). Exact token match: [1, 940, 24936, 29889, 2] = "He hoped.", same as
+every other real-hardware and native-C run of this clip.
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Re-exported at
+INT8" section. Deploying these files to real hardware is the natural next
+step, not done here.
