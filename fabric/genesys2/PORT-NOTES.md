@@ -7874,3 +7874,54 @@ identically on a stash of the fix.
 Status: bit-exact, 864/864 (T=1, T=2, T=3, all 8 heads). Full writeup:
 gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Decoder self-attention block gate"
 section.
+
+### Checkpoint-C RTL reuse at ASR's shape: three sizing constraints, consolidated
+
+Reusing `kv_bank.sv`/`vec_attn_w.sv` unmodified at ASR's own shape (NHEAD=8,
+HEAD_DIM=36 -- neither matches checkpoint C's own NHEAD=4, HEAD_DIM=64)
+surfaced three real, load-bearing sizing constraints baked into these
+modules as hardcoded assumptions rather than exposed as parameters. All
+three were found by hitting them (an elaboration error or a silent
+correctness bug), not by reading the RTL cover-to-cover first -- worth
+checking explicitly, not just re-deriving from the parameter list, before
+reusing either module (or any other checkpoint-C block) at a shape it
+was never run at:
+
+1. **`HEAD_DIM % P == 0`.** `kv_bank.sv`/`vec_attn_w.sv` compute
+   `HR`/`NGRP = HEAD_DIM/P` and stream that many P-wide beats per
+   position -- a non-divisible `HEAD_DIM` silently produces a wrong beat
+   count. Checkpoint C's own `P=8` doesn't divide ASR's `HEAD_DIM=36`;
+   `P=4` does (`HR=NGRP=9`). Not a checkpoint-C-RTL change -- purely a
+   parameter choice at the instantiation site.
+
+2. **`$clog2(HROWS) >= 9`, i.e. `NLAYER*2*NHEAD*TMAX >= 512`.**
+   `kv_bank.sv`'s `wq_pos`/`rd_tcount`/`rd2_tcount` ports are hardcoded
+   9 bits wide (`input wire [8:0]`), independent of any parameter --
+   `pos_ra`/`kva_a`'s address arithmetic assumes that width. Below the
+   floor, iverilog fails elaboration outright (`Concatenation repeat may
+   not be negative`), so this one fails loud, not silent. Hit twice
+   during this work: once at `TMAX=4` (checkpoint C's own tiny-test
+   convention), fixed by `TMAX=32` (`NLAYER=1,NHEAD=8` -> exactly
+   `HROWS=512`); once again building an isolated single-head repro at
+   `NHEAD=1,TMAX=32` (`HROWS=64`), fixed by `TMAX=256` for that one test.
+   **Not fixed in the RTL** (unlike constraint 3 below) -- still a real
+   floor on any future `kv_bank.sv` instantiation with a small
+   `NLAYER*NHEAD*TMAX` product; widening `wq_pos`/`rd_tcount`/`rd2_tcount`
+   to `$clog2(HROWS)` would remove it the same way constraint 3 was
+   removed, not attempted here since every actual use so far clears 512
+   comfortably.
+
+3. **Head-select ports width, `NHEAD <= 4` -- FIXED.** Covered in full
+   above: `wq_head`/`rd_head`/`rd2_head` were hardcoded `[1:0]`, silently
+   aliasing heads 4-7 onto heads 0-3 at ASR's `NHEAD=8`. Fixed by
+   widening to `$clog2(NHEAD)-1:0`, backward compatible with checkpoint
+   C's own `NHEAD=4` (`$clog2(4)=2`, unchanged).
+
+None of the three are `TMAX`/`NHEAD`/`P` themselves being *parameters* in
+name only -- each module genuinely takes them as Verilog `parameter`s and
+most of the address math scales correctly. The gotcha in every case was a
+hardcoded port *width* (constraint 2 and 3) or an implicit divisibility
+assumption in the streaming shape (constraint 1) that the parameter alone
+doesn't protect against -- exactly the kind of thing `$clog2(param)` port
+widths (constraint 3's fix) are supposed to prevent, and constraint 2 is
+the one remaining place in `kv_bank.sv` that doesn't yet do that.
