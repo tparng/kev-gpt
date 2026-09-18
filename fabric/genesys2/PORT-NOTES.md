@@ -7831,3 +7831,27 @@ vec_attn_w.sv + layernorm_vec.sv + gemv_banked_resident_vec.sv (WBW=8)
 into one decoder self-attention block, gated against real
 test_generate_kv_i8.c intermediate values -- proving the pieces actually
 assemble, not just that each is individually correct.
+
+## Decoder self-attention block gate: built, PARTIAL pass, one open finding
+
+Follow-up to rope_apply_vec.sv: built fabric/asr_seq/pack_decoder_self_attn.py
++ tb_decoder_self_attn.sv, chaining rope_apply_vec.sv + kv_bank.sv (real,
+unmodified) + vec_attn_w.sv (real, unmodified) for real ASR Q/K/V, checked
+against a Python reference reusing this project's own proven fixed-point
+functions (seq_ref.rsh_round/sat, run_softmax.int_softmax_q/exp_table,
+goformer_kvq.quant_head_asym/dequant_head).
+
+Real finding: P=8 (checkpoint C's own convention) doesn't work for
+HEAD_DIM=36 -- kv_bank.sv/vec_attn_w.sv need HEAD_DIM%P==0, P=4 does
+(HR=9). Not "zero changes" as an earlier note optimistically claimed.
+
+Status: T=1 (step 0, all 8 heads) bit-exact, 288/288. T>=2 mismatches,
+288/576. Extensive debugging this session (RoPE verified bit-exact at
+every step; every write/read address direct-monitored via hierarchical
+reference into kv_bank's own FSM state, confirmed correct; standalone
+isolated testbenches matching the real data and increasingly exact
+operation sequence could NOT reproduce the corruption at all) did not
+find root cause. Recorded honestly as open, not smoothed over -- the
+failure to reproduce in isolation is itself informative and worth
+keeping. Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's
+"Decoder self-attention block gate" section.

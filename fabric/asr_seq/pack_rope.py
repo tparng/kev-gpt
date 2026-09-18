@@ -65,16 +65,25 @@ def build_cos_sin_rom():
     return cos_rom, sin_rom
 
 
-def rope_apply_ref(head_q16: np.ndarray, position: int, cos_rom, sin_rom) -> np.ndarray:
+def rope_apply_ref(head_q16: np.ndarray, position: int, cos_rom, sin_rom,
+                    post_scale_q16: int = 65536) -> np.ndarray:
     """Integer-exact reference for what the RTL computes -- same Q.16 x
-    Q1.15 -> rsh_round(.., 15) -> Q.16 pipeline, element by element."""
-    out = head_q16.copy()
+    Q1.15 -> rsh_round(.., 15) -> Q.16 pipeline, element by element, then
+    POST_SCALE_Q16 applied uniformly to every lane (default 65536 = 1.0,
+    a true no-op -- see rope_apply_vec.sv's own header for why this
+    exists: compensating vec_attn_w.sv's HEAD_DIM=64-specific SCORE_SH,
+    not part of RoPE's own math)."""
+    out = np.zeros_like(head_q16)
     for i in range(ROT_PAIRS):
         x1, x2 = int(head_q16[2 * i]), int(head_q16[2 * i + 1])
         c, s = int(cos_rom[position, i]), int(sin_rom[position, i])
-        out[2 * i] = rsh_round(x1 * c - x2 * s, 15)
-        out[2 * i + 1] = rsh_round(x2 * c + x1 * s, 15)
-    return out  # dims [ROT_DIM:HEAD_DIM) already copied through unchanged
+        r1 = rsh_round(x1 * c - x2 * s, 15)
+        r2 = rsh_round(x2 * c + x1 * s, 15)
+        out[2 * i] = rsh_round(r1 * post_scale_q16, 16)
+        out[2 * i + 1] = rsh_round(r2 * post_scale_q16, 16)
+    for i in range(ROT_DIM, HEAD_DIM):
+        out[i] = rsh_round(int(head_q16[i]) * post_scale_q16, 16)
+    return out
 
 
 def to_u32_hex(v: int) -> str:
