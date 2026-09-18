@@ -254,8 +254,14 @@ module kv_bank #(
     // PORT DISCIPLINE: the quant-write (W_CWR) is FOLDED INTO port A — it commits
     // only when stream A is idle (W_CWR stalls on rst_st, see the write FSM), so
     // each memory is exactly write-else-read on A plus read on B = two ports.
-    wire [$clog2(HROWS)-1:0] pos_ra  = r_pbase  + {{($clog2(HROWS)-9){1'b0}}, r_rowi};
-    wire [$clog2(HROWS)-1:0] pos_ra2 = r2_pbase + {{($clog2(HROWS)-9){1'b0}}, r2_rowi};
+    // r_rowi/r2_rowi are unsigned regs; Verilog's context-determined
+    // arithmetic zero-extends (or, for a small HROWS, correctly truncates a
+    // provably-in-range sum) them to pos_ra/pos_ra2's own width automatically
+    // -- no manual pad-width computation needed, and none that can go negative
+    // when $clog2(HROWS) is SMALLER than r_rowi's own declared width (small
+    // NLAYER*NHEAD*TMAX products; this used to require $clog2(HROWS)>=9).
+    wire [$clog2(HROWS)-1:0] pos_ra  = r_pbase  + r_rowi;
+    wire [$clog2(HROWS)-1:0] pos_ra2 = r2_pbase + r2_rowi;
     wire cwr_fire = (wst == W_CWR) && (rst_st == R_IDLE);
     // ONE ADDRESS NET PER PORT (the URAM contract): write and read share port A's
     // muxed address; port B is the second read stream.
@@ -334,7 +340,7 @@ module kv_bank #(
                 W_IDLE: if (wq_start) begin
                     w_layer <= wq_layer; w_kv <= wq_kv; w_head <= wq_head; w_pos <= wq_pos;
                     w_pbase <= ((wq_layer*2 + {3'b0,wq_kv})*NHEAD + wq_head)*TMAX
-                                + {3'b0,wq_pos};
+                                + wq_pos;
                     minv <= 32'sh7FFFFFFF; maxv <= 32'sh80000000;
                     qm_v <= 1'b0;
                     w_vi <= 0; wst <= W_COLL;

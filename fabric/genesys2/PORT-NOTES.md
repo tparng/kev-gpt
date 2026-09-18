@@ -7894,22 +7894,28 @@ was never run at:
    `P=4` does (`HR=NGRP=9`). Not a checkpoint-C-RTL change -- purely a
    parameter choice at the instantiation site.
 
-2. **`$clog2(HROWS) >= 9`, i.e. `NLAYER*2*NHEAD*TMAX >= 512`.**
-   `kv_bank.sv`'s `wq_pos`/`rd_tcount`/`rd2_tcount` ports are hardcoded
-   9 bits wide (`input wire [8:0]`), independent of any parameter --
-   `pos_ra`/`kva_a`'s address arithmetic assumes that width. Below the
-   floor, iverilog fails elaboration outright (`Concatenation repeat may
-   not be negative`), so this one fails loud, not silent. Hit twice
+2. **`$clog2(HROWS) >= 9`, i.e. `NLAYER*2*NHEAD*TMAX >= 512` -- FIXED.**
+   `kv_bank.sv`'s `pos_ra`/`pos_ra2`/`w_pbase` address arithmetic used to
+   explicitly zero-pad `r_rowi`/`r2_rowi`/`wq_pos` with a HARDCODED
+   `$clog2(HROWS)-9`-wide concatenation, assuming `wq_pos`/`rd_tcount`/
+   `rd2_tcount`'s own 9-bit port width was always the SMALLER operand.
+   Below the floor (small `NLAYER*NHEAD*TMAX`), that pad width goes
+   negative and iverilog fails elaboration outright (`Concatenation
+   repeat may not be negative`) -- fails loud, not silent. Hit twice
    during this work: once at `TMAX=4` (checkpoint C's own tiny-test
-   convention), fixed by `TMAX=32` (`NLAYER=1,NHEAD=8` -> exactly
+   convention), worked around by `TMAX=32` (`NLAYER=1,NHEAD=8` -> exactly
    `HROWS=512`); once again building an isolated single-head repro at
-   `NHEAD=1,TMAX=32` (`HROWS=64`), fixed by `TMAX=256` for that one test.
-   **Not fixed in the RTL** (unlike constraint 3 below) -- still a real
-   floor on any future `kv_bank.sv` instantiation with a small
-   `NLAYER*NHEAD*TMAX` product; widening `wq_pos`/`rd_tcount`/`rd2_tcount`
-   to `$clog2(HROWS)` would remove it the same way constraint 3 was
-   removed, not attempted here since every actual use so far clears 512
-   comfortably.
+   `NHEAD=1,TMAX=32` (`HROWS=64`), worked around by `TMAX=256` for that
+   one test. Fixed properly by DELETING the manual zero-pad concatenation
+   entirely (`pos_ra = r_pbase + r_rowi;`, plain `+ wq_pos` in `w_pbase`)
+   and letting Verilog's own context-determined arithmetic zero-extend
+   (or, for a small `HROWS`, correctly truncate a provably-in-range sum)
+   automatically -- the port widths themselves are UNCHANGED (still
+   9 bits), so this is fully backward compatible and removes the floor
+   for any `NLAYER*NHEAD*TMAX` product, not just ones above 512.
+   Confirmed by rebuilding the original crashing shape directly
+   (`NHEAD=1,NLAYER=1,TMAX=4`, `HROWS=8`, `$clog2(HROWS)=3`): compiles
+   clean now, and a 3-position write+read round-trips the data correctly.
 
 3. **Head-select ports width, `NHEAD <= 4` -- FIXED.** Covered in full
    above: `wq_head`/`rd_head`/`rd2_head` were hardcoded `[1:0]`, silently
@@ -7920,8 +7926,11 @@ was never run at:
 None of the three are `TMAX`/`NHEAD`/`P` themselves being *parameters* in
 name only -- each module genuinely takes them as Verilog `parameter`s and
 most of the address math scales correctly. The gotcha in every case was a
-hardcoded port *width* (constraint 2 and 3) or an implicit divisibility
-assumption in the streaming shape (constraint 1) that the parameter alone
-doesn't protect against -- exactly the kind of thing `$clog2(param)` port
-widths (constraint 3's fix) are supposed to prevent, and constraint 2 is
-the one remaining place in `kv_bank.sv` that doesn't yet do that.
+hardcoded, manually-computed bit width (constraints 2 and 3) or an
+implicit divisibility assumption in the streaming shape (constraint 1)
+that the parameter alone doesn't protect against. Constraints 2 and 3 are
+now both fixed the same way: stop manually computing extension/padding
+widths and either widen a port to `$clog2(param)` (constraint 3) or drop
+the manual concatenation and let Verilog's own context-determined
+arithmetic handle it (constraint 2) -- both fully backward compatible
+with checkpoint C's own NHEAD=4 shape.

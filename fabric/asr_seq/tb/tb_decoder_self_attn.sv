@@ -12,10 +12,11 @@
 // golden ctx_q25 output.
 //
 // P=4 for kv_bank/vec_attn_w (NOT checkpoint C's own P=8 convention): HEAD_DIM=36
-// is not divisible by 8, but is by 4 (HR=NGRP=9). TMAX=32 (not a tiny 4):
-// kv_bank.sv's own pos_ra logic assumes $clog2(HROWS)>=9 (HROWS=NLAYER*2*
-// NHEAD*TMAX) -- a real sizing floor this TB's own first attempt (TMAX=4)
-// tripped, not a checkpoint-C-shape-specific constant.
+// is not divisible by 8, but is by 4 (HR=NGRP=9). TMAX=32 here is just this
+// TB's own choice, not a floor: kv_bank.sv's pos_ra/pos_ra2/w_pbase logic
+// used to hardcode a $clog2(HROWS)>=9 assumption (this TB's own first
+// attempt at TMAX=4 tripped it, a real elaboration crash), now removed --
+// see kv_bank.sv's pos_ra/pos_ra2 comment for the fix.
 //
 // iverilog-2012 note: subroutine ports with unpacked dimensions aren't
 // supported -- tasks below take/return PACKED HEAD_DIM*32-bit buses, with
