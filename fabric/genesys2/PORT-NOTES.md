@@ -7985,3 +7985,48 @@ case of the same pattern (RoPE-free), NOT separately gated -- a strong
 inference from this result, not independently verified. Full writeup:
 `gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md`'s "Encoder self-attention block
 gate" section.
+
+## Decoder cross-attention block gate: built, bit-exact, no RoPE needed at all
+
+Closes the honest gap the encoder self-attention gate left open: cross-
+attention is the RoPE-free, simpler case of the identical static-full-
+attend access pattern -- this gate proves it directly instead of leaving
+it as an inference from the encoder gate.
+
+Per `MoonshineAttention.forward`'s own `if not is_cross_attention:`
+guard, RoPE is skipped ENTIRELY for cross-attention (neither Q nor K gets
+rotated). So `fabric/asr_seq/tb/tb_decoder_cross_attn.sv` has no
+`rope_apply_vec.sv` instance at all -- just `kv_bank.sv` + `vec_attn_w.sv`,
+both real and unmodified, the simplest RTL chain of all three attention
+gates built so far. `vec_attn_w.sv`'s `SCORE_SH=27` mismatch (still a
+function of `HEAD_DIM=36`, not of RoPE) is compensated by applying the
+same `POST_SCALE_Q16=75674` correction directly in Python
+(`pack_decoder_cross_attn.py`, using `rope_apply_vec.sv`'s own
+pass-through-lane formula) and feeding the already-scaled Q.16 values
+straight into the RTL testbench -- Q/K generation, including this
+upstream scale, is out of scope for this gate, same as LayerNorm/GEMV in
+both prior gates.
+
+Data: cross K/V from the SAME real conv-front-end output as the encoder
+self-attention gate (`T2=6`), through the encoder's own real final
+`layer_norm` then decoder layer 0's real `encoder_attn.k_proj`/`v_proj`
+-- the actual Stage 3a op, computed once. Query: the SAME real decoder
+token embeddings/`TOKEN_IDS` as the decoder self-attention gate, through
+`post_attention_layernorm` + `encoder_attn.q_proj`, one query row per
+decode step (3 steps), each attending the SAME fixed `T2=6`-row cross
+K/V set (`tcount=T2` always, never growing).
+
+Structure: writes ALL `T2*NHEAD` cross K/V rows once, up front, THEN
+loops 3 decode steps x 8 heads, each `do_attn` call reading the same
+fixed set. Checked against `pack_decoder_cross_attn.py`'s own golden
+`ctx_q25`.
+
+Status: bit-exact, first attempt, no debugging needed -- `TB_DONE,
+checked=864, mismatches=0` / `DECODER_CROSS_ATTN_VERDICT,bitexact=1`.
+Zero new RTL at all -- not even `rope_apply_vec.sv` -- the simplest of
+the three attention gates built in this project. Together with the
+encoder self-attention gate, this fully retires the "Two attention
+shapes, one primitive" section's original `weight_bank_tdp.sv`-style
+storage proposal: neither op it flagged as needing new storage RTL
+actually does. Full writeup: `gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md`'s
+"Decoder cross-attention block gate" section.
