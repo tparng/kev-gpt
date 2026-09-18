@@ -7723,3 +7723,55 @@ every other real-hardware and native-C run of this clip.
 Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Re-exported at
 INT8" section. Deploying these files to real hardware is the natural next
 step, not done here.
+
+## asr_generate_kv_i8_hw: INT8 decoder weights, real hardware, PASS first attempt
+
+Follow-up to the INT8 re-export above: wired the new *_i8.bin/*_i8_scales.f32
+files + linear_i8() into a real firmware app and staged it on the actual
+board. Scope matched deliberately to this project's own established
+convention (no app anywhere in this family has ever chained one stage's
+live on-device computation into the next's DDR-staged input): same
+precomputed real ref_dec_encoder_out.f32 (FP32) as asr_generate_kv_hw's
+own, all 10 decoder GEMV weight matrices per layer now INT8. New
+gen_ddr_layout_generate_kv_i8.py laid out a 19.59 MiB DDR3 image (vs. the
+FP32 app's own 47.95 MiB). Built clean via X-HEEP's make app (ram0 95.5%).
+
+Real board bring-up hit one stale-state issue before anything else: an
+openocd instance left running from earlier in this session had gone
+LIBUSB_ERROR_NO_DEVICE (a dead USB handle, not a config problem) -- killed
+and restarted fresh, JTAG tap found cleanly, hart examined, GDB
+connectivity confirmed (halt + read PC + detach) before touching DDR3.
+Matches this project's own "Hang diagnosis" lesson: don't trust old
+process state, restart and verify fresh.
+
+Staged via the generated restore_generate_kv_i8.gdb (154 restore
+commands) + load + monitor resume, UART listener armed BEFORE triggering
+resume (per this project's own "confirm listener before triggering"
+lesson). Clean pass, first attempt:
+
+```
+ASR_STEP,step=0,predicted=940,ref=940,PASS
+ASR_STEP,step=1,predicted=24936,ref=24936,PASS
+ASR_STEP,step=2,predicted=29889,ref=29889,PASS
+ASR_STEP,step=3,predicted=2,ref=2,PASS
+ASR_RESULT,passed=4,total=4
+ASR_PASS,generate_kv_i8_hw
+```
+
+Same tokens as every other run of this clip: [1, 940, 24936, 29889, 2] =
+"He hoped."
+
+**Real finding, not the expected one**: INT8 bought essentially ZERO speed
+improvement -- cross_kv_ddr=40.33s, step_ddr=74.54s, total_ddr=114.87s,
+vs. the FP32 app's own 40.25s/74.47s/114.71s (within noise). This board's
+cpu_ddr_bridge is genuinely single-outstanding and transaction-latency-
+bound, not bandwidth-bound, for linear_i8()'s one-element-at-a-time DDR3
+read pattern -- reading a smaller value per element doesn't reduce
+transaction COUNT, which is what actually costs time here. INT8 buys real
+DDR3/BRAM footprint (19.59 vs 47.95 MiB), not throughput, on this specific
+access pattern -- a real distinction for planning a future dedicated
+accelerator (a wide-burst GEMV compute core, unlike this CPU-firmware
+reference, might see a different answer -- untested, flagged not assumed).
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Staged on real
+hardware" section.
