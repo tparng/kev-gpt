@@ -7800,3 +7800,34 @@ DMA would only have sped up the READ, not the scalar MAC compute itself,
 which is the bigger gap next to gemv_banked_resident_vec.sv's parallel
 MAC array. gen2asr/rtl/firmware/asr_dma_bench_hw kept as the real,
 documented negative result, not deleted.
+
+## ASR accelerator: first new RTL piece built -- rope_apply_vec.sv, bit-exact
+
+Direction settled (also independently raised by the user): reuse
+checkpoint C's real compute+streaming RTL for ASR, not CPU-firmware
+tuning (the DMA hang above closed that path anyway). New home:
+fabric/asr_seq/ (mirrors fabric/stage3/'s own layout).
+
+First piece: rope_apply_vec.sv -- the one genuinely new primitive needed
+before checkpoint C's already-proven causal-attention RTL (kv_bank.sv +
+vec_attn_w.sv, both already HEAD_DIM-parametric, so directly usable at
+ASR's HEAD_DIM=36 with zero changes) can be reused for ASR's decoder
+self-attention. Precomputed Q1.15 cos/sin ROM (position x frequency,
+small and synthesis-time-known -- no sin/cos engine needed), Q.16
+head-lane I/O matching vec_attn_w.sv/kv_bank.sv's own internal format,
+rsh_round copied verbatim from vec_attn_w.sv/sequencer_fast.sv's own
+function of the same name (this project's established rounding
+convention).
+
+Gated bit-exact (fabric/asr_seq/run_rope.py): 8 real positions (0-127),
+288 elements, 0 mismatches, first attempt after fixing one Verilog
+syntax error (function-call-result part-select isn't valid, needed a
+temp variable). Cross-checked separately against the true float
+rotation: within one Q1.15 ULP -- confirms the ROM itself is correct,
+not just internally self-consistent with its own derivation.
+
+Real next slice, not built yet: chain rope_apply_vec.sv + kv_bank.sv +
+vec_attn_w.sv + layernorm_vec.sv + gemv_banked_resident_vec.sv (WBW=8)
+into one decoder self-attention block, gated against real
+test_generate_kv_i8.c intermediate values -- proving the pieces actually
+assemble, not just that each is individually correct.
