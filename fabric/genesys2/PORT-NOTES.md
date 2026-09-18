@@ -7775,3 +7775,28 @@ reference, might see a different answer -- untested, flagged not assumed).
 
 Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Staged on real
 hardware" section.
+
+## ASR firmware DDR3 speed: X-HEEP's generic DMA hangs on EXT_SLAVE, closing this path
+
+Follow-up to the "essentially zero speed win" finding above: tried X-HEEP's
+own generic dma_copy() (no new RTL, no new bitstream -- the pragmatic
+alternative to checkpoint C's real weight_loader_ddr, which is hardwired
+to WBW=4 in the currently-deployed bitstream and can't be resynthesized
+for WBW=8 without Vivado, unavailable in this environment) to bulk-copy a
+DDR3 chunk into on-chip SRAM before compute.
+
+Real result: dma_copy() from EXT_SLAVE_START_ADDRESS HANGS indefinitely,
+stuck inside DMA_WAIT (confirmed via GDB halt + backtrace, not assumed --
+"don't wait longer, halt and read state directly"). X-HEEP's generic DMA
+master apparently isn't wired to reach the DDR3 EXT_SLAVE region in this
+SoC's crossbar config at all. Closes this path cleanly -- no further time
+spent chasing a software-only DDR3-speed fix.
+
+This settles the real direction (also independently raised by the user):
+the actual speed/efficiency story for ASR has to come from reusing
+checkpoint C's real compute+streaming RTL (sequencer_vec.sv's building
+blocks), not from CPU-firmware access-pattern tricks -- even a working
+DMA would only have sped up the READ, not the scalar MAC compute itself,
+which is the bigger gap next to gemv_banked_resident_vec.sv's parallel
+MAC array. gen2asr/rtl/firmware/asr_dma_bench_hw kept as the real,
+documented negative result, not deleted.
