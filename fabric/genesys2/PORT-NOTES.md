@@ -8094,9 +8094,25 @@ actually an option); `tb_decoder_block_seq.sv` loops `go` across all 3
 steps, re-writing a fresh per-step `xres0` each time. First attempt:
 `DECODER_BLOCK_SEQ_VERDICT,bitexact=1,mismatches=0,checked=864,nsteps=3`
 -- real causal self-attention over `Tc=2`/`Tc=3` (not just the `Tc=1`
-case the first gate exercised) worked correctly untested. Layer-looping
-(`blk=1..5`) is still open: `WB_Q`/`WB_K`/.../`WB_FC2` are still
-compile-time parameters, not runtime-selectable per layer.
+case the first gate exercised) worked correctly untested.
+
+**Third update: real layer-looping, all 6 decoder layers, bit-exact.**
+Chains every real decoder layer across all 3 decode steps (layer L's own
+residual output becomes layer L+1's own input, same step). Needed two RTL
+changes on `decoder_block_seq.sv`: `WB_*` (anticipated) AND `GF_*` (not --
+`g_frac` bakes in `WSHIFT`, genuinely per-layer) both converted from
+compile-time parameters to runtime ports. `ACT_*` stayed fixed -- clips
+nowhere across the full (layer x step) grid. A real, separate bug also
+turned up: `u_cross_kv` was sized `NLAYER=1` with `wq_layer`/`rd_layer`
+hardwired to `4'd0` (fine for one layer, silently wrong for 6 -- every
+layer's cross-K/V preload landed in the same slot, only the last
+survived). Fixed by sizing/wiring it like `u_self_kv` already was. A
+fourth issue was in the Python reference, not the RTL: `xres_bank` is
+32 bits/lane and the RTL truncates on every store, but real layer-0
+weights push the accumulated residual past `INT32_MAX` by layer 1 --
+`pack_decoder_block.py` needed an explicit `wrap32()` after every xres
+update to match. Result, first attempt after all four fixes:
+`DECODER_BLOCK_SEQ_VERDICT,bitexact=1,mismatches=0,checked=5184,nsteps=3,nlayer=6`.
 
 Full writeup, including the per-bug detail: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's
 "The decoder-block FSM sketch, turned into a real, sized state machine"

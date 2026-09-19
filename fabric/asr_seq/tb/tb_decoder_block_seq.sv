@@ -1,12 +1,14 @@
-// tb_decoder_block_seq -- the MULTI-STEP functional gate for
-// decoder_block_seq.sv: loads real moonshine-tiny layer-0 weights
-// (INT8-quantized per pack_decoder_block.py's own documented scheme),
-// gamma, bias, and cross-attention K/V (T2=6) ONCE, then for each of
-// N_STEPS real decode steps: writes that step's own real decoder token
-// embedding as the initial residual, pulses `go` for one full
-// decoder-layer forward pass (step advancing each time, growing the
-// self-attn KV cache causally), and checks the final residual stream
-// against pack_decoder_block.py's own per-step golden xres3 -- bit-exact.
+// tb_decoder_block_seq -- the MULTI-LAYER, MULTI-STEP functional gate for
+// decoder_block_seq.sv: loads the real moonshine-tiny resident weight
+// image (ALL NLAYER decoder layers' 8 GEMVs each, INT8-quantized per
+// pack_decoder_block.py's own documented scheme) and per-layer cross-attn
+// K/V (T2=6) ONCE, then for each of NSTEPS real decode steps, chains
+// through all NLAYER layers in order (layer L's own RES3 output sitting
+// in xres_bank becomes layer L+1's own LN1 input -- the SAME physical
+// memory across `go` pulses, no explicit hand-off needed): reloads that
+// layer's own gamma/bias tables and wb_*/gf_* runtime constants, pulses
+// `go`, and checks that layer's own residual output against
+// pack_decoder_block.py's own per-(step,layer) golden xres3 -- bit-exact.
 //
 // Weight-load protocol: identical to fabric/stage3/run_resident_banked_vec.py's
 // own established gemv_banked_resident_vec.sv gate -- one-time resident load,
@@ -18,6 +20,9 @@
 `endif
 `ifndef NSTEPS
  `define NSTEPS 3
+`endif
+`ifndef NLAYER
+ `define NLAYER 6
 `endif
 
 module tb;
@@ -37,6 +42,8 @@ module tb;
     localparam integer SUBW     = WBITS/32;
     localparam integer NWORDS   = `NWORDS;
     localparam integer NSTEPS   = `NSTEPS;
+    localparam integer NLAYER   = `NLAYER;
+    localparam integer NCALL    = 8;   // q,k,v,o,cq,oc,fc1,fc2 -- CALL_NAMES order
 
     reg clk = 1'b0;
     always #5 clk = ~clk;
@@ -46,29 +53,32 @@ module tb;
     reg xres_wr; reg [$clog2(D/P)-1:0] xres_waddr; reg [P*32-1:0] xres_wdata;
     wire [P*32-1:0] xres_rdata_dbg;
 
+    reg [19:0] wb_q, wb_k, wb_v, wb_o, wb_cq, wb_co, wb_fc1, wb_fc2;
+    reg signed [7:0] gf_q, gf_k, gf_v, gf_o, gf_cq, gf_co, gf_fc1, gf_fc2;
+
     reg gv_ld_rst, gv_ld_we; reg [31:0] gv_ld_data;
     reg gam_we; reg [1:0] gam_sel; reg [$clog2(D/P)-1:0] gam_waddr; reg [P*32-1:0] gam_wdata;
     reg bias_we, bias_sel; reg [$clog2(DFFN2/P)-1:0] bias_waddr; reg [P*32-1:0] bias_wdata;
     reg xkv_wstart, xkv_wkv; reg [$clog2(NHEAD)-1:0] xkv_whead; reg [8:0] xkv_wpos;
     reg xkv_wvalid; reg [ATTN_P*32-1:0] xkv_wdata; wire xkv_wdone;
 
-    // ACT_*/GF_* are decoder_block_seq.sv's own compile-time quantization
-    // constants -- FIXED for the whole simulation, chosen by
-    // pack_decoder_block.py's own two-pass profiling to safely cover every
-    // one of NSTEPS decode steps (not just step 0's own magnitude; see that
-    // file's header for why a per-step choice isn't an option here).
+    // ACT_* stay compile-time parameters -- ONE fixed value per call site,
+    // profiled by pack_decoder_block.py across ALL NLAYER layers x NSTEPS
+    // steps (verified to clip nowhere). wb_*/gf_* are runtime ports (see
+    // decoder_block_seq.sv's own header for why GF_* specifically needed
+    // converting: WSHIFT, baked into g_frac, is genuinely per-layer).
     decoder_block_seq #(
         .P(P), .D(D), .FFN(FFN), .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .ATTN_P(ATTN_P),
         .ATTN_TMAX(8), .T2(T2),
         .POST_SCALE_Q16(75674),
-        .ACT_Q(17), .ACT_K(17), .ACT_V(17), .ACT_O(18),
-        .ACT_CQ(19), .ACT_OC(20), .ACT_FC1(17), .ACT_FC2(11),
-        .GF_Q(-4), .GF_K(-4), .GF_V(-2), .GF_O(-12),
-        .GF_CQ(-6), .GF_OC(-14), .GF_FC1(-1), .GF_FC2(-18),
-        .WB_Q(0), .WB_K(864), .WB_V(1728), .WB_O(2592),
-        .WB_CQ(3456), .WB_CO(4320), .WB_FC1(5184), .WB_FC2(10368)
+        .ACT_Q(18), .ACT_K(18), .ACT_V(18), .ACT_O(21),
+        .ACT_CQ(19), .ACT_OC(23), .ACT_FC1(17), .ACT_FC2(12)
     ) dut (
         .clk(clk), .rst(rst), .go(go), .blk(blk), .step(step), .done(done),
+        .wb_q(wb_q), .wb_k(wb_k), .wb_v(wb_v), .wb_o(wb_o),
+        .wb_cq(wb_cq), .wb_co(wb_co), .wb_fc1(wb_fc1), .wb_fc2(wb_fc2),
+        .gf_q(gf_q), .gf_k(gf_k), .gf_v(gf_v), .gf_o(gf_o),
+        .gf_cq(gf_cq), .gf_co(gf_co), .gf_fc1(gf_fc1), .gf_fc2(gf_fc2),
         .xres_wr(xres_wr), .xres_waddr(xres_waddr), .xres_wdata(xres_wdata),
         .xres_rdata_dbg(xres_rdata_dbg),
         .gv_ld_rst(gv_ld_rst), .gv_ld_we(gv_ld_we), .gv_ld_data(gv_ld_data),
@@ -79,17 +89,19 @@ module tb;
     );
 
     // ---- test vectors ----
-    reg [WBITS-1:0] wload [0:NWORDS-1];
-    reg [31:0] gamma1 [0:ROWS_D*P-1];
-    reg [31:0] gamma2 [0:ROWS_D*P-1];
-    reg [31:0] gamma3 [0:ROWS_D*P-1];
-    reg [31:0] biasfc1 [0:ROWS_FFN2*P-1];
-    reg [31:0] biasfc2 [0:ROWS_D*P-1];
-    reg [31:0] xkvin [0:T2*NHEAD*HEAD_DIM*2-1];
+    reg [WBITS-1:0] wload [0:NWORDS-1];   // NWORDS is the TOTAL across all NLAYER layers, from the manifest
+    reg [31:0] gamma1 [0:NLAYER*ROWS_D*P-1];
+    reg [31:0] gamma2 [0:NLAYER*ROWS_D*P-1];
+    reg [31:0] gamma3 [0:NLAYER*ROWS_D*P-1];
+    reg [31:0] biasfc1 [0:NLAYER*ROWS_FFN2*P-1];
+    reg [31:0] biasfc2 [0:NLAYER*ROWS_D*P-1];
+    reg [31:0] xkvin [0:NLAYER*T2*NHEAD*HEAD_DIM*2-1];
     reg [31:0] xres0steps [0:NSTEPS*ROWS_D*P-1];
-    reg [31:0] xres3refsteps [0:NSTEPS*D-1];
+    reg [31:0] xres3refsteps [0:NSTEPS*NLAYER*D-1];
+    reg [19:0] wboff [0:NLAYER*NCALL-1];
+    reg [7:0]  gfsh  [0:NLAYER*NCALL-1];
 
-    integer i, s, hcnt, pos, head, b, l, mism, checked, st_i, mism_step;
+    integer i, s, hcnt, pos, head, b, l, mism, checked, st_i, ly_i, mism_ly;
     reg [HEAD_DIM*32-1:0] kvec, vvec;
     reg [WBITS-1:0] word_tmp;
     reg [P*32-1:0] rowbuf;
@@ -108,28 +120,47 @@ module tb;
         end
     end
 
+    task set_wb_gf(input integer li);
+        reg [19:0] base;
+        begin
+            base = li * NCALL;
+            wb_q = wboff[base+0]; wb_k = wboff[base+1]; wb_v = wboff[base+2]; wb_o = wboff[base+3];
+            wb_cq = wboff[base+4]; wb_co = wboff[base+5]; wb_fc1 = wboff[base+6]; wb_fc2 = wboff[base+7];
+            gf_q = $signed(gfsh[base+0]); gf_k = $signed(gfsh[base+1]);
+            gf_v = $signed(gfsh[base+2]); gf_o = $signed(gfsh[base+3]);
+            gf_cq = $signed(gfsh[base+4]); gf_co = $signed(gfsh[base+5]);
+            gf_fc1 = $signed(gfsh[base+6]); gf_fc2 = $signed(gfsh[base+7]);
+        end
+    endtask
+
     initial begin
         $readmemh("w.mem", wload);
-        $readmemh("gamma_ln1.mem", gamma1);
-        $readmemh("gamma_ln2.mem", gamma2);
-        $readmemh("gamma_ln3.mem", gamma3);
-        $readmemh("bias_fc1.mem", biasfc1);
-        $readmemh("bias_fc2.mem", biasfc2);
-        $readmemh("xkv_in.mem", xkvin);
+        $readmemh("gamma_ln1_all.mem", gamma1);
+        $readmemh("gamma_ln2_all.mem", gamma2);
+        $readmemh("gamma_ln3_all.mem", gamma3);
+        $readmemh("bias_fc1_all.mem", biasfc1);
+        $readmemh("bias_fc2_all.mem", biasfc2);
+        $readmemh("xkv_in_all.mem", xkvin);
         $readmemh("xres0_steps.mem", xres0steps);
         $readmemh("xres3_ref_steps.mem", xres3refsteps);
+        $readmemh("wb_offsets.mem", wboff);
+        $readmemh("gf_shifts.mem", gfsh);
 
         go=0; blk=0; step=0; xres_wr=0; xres_waddr=0; xres_wdata=0;
         gv_ld_rst=0; gv_ld_we=0; gv_ld_data=0;
         gam_we=0; gam_sel=0; gam_waddr=0; gam_wdata=0;
         bias_we=0; bias_sel=0; bias_waddr=0; bias_wdata=0;
         xkv_wstart=0; xkv_wkv=0; xkv_whead=0; xkv_wpos=0; xkv_wvalid=0; xkv_wdata=0;
+        wb_q=0; wb_k=0; wb_v=0; wb_o=0; wb_cq=0; wb_co=0; wb_fc1=0; wb_fc2=0;
+        gf_q=0; gf_k=0; gf_v=0; gf_o=0; gf_cq=0; gf_co=0; gf_fc1=0; gf_fc2=0;
 
         @(posedge clk); #1;
         rst = 0;
         @(posedge clk); #1;
 
-        // ---- 1. load GEMV resident weight image (once, step-invariant) ----
+        // ---- 1. load GEMV resident weight image: ALL NLAYER layers' own
+        // 8 GEMVs each, one combined resident image, loaded ONCE (never
+        // reloaded between layers). ----
         gv_ld_rst = 1; @(posedge clk); #1; gv_ld_rst = 0;
         for (i = 0; i < NWORDS; i = i + 1) begin
             word_tmp = wload[i];
@@ -140,81 +171,57 @@ module tb;
         gv_ld_we = 0;
         $display("TB_WEIGHTS_LOADED,nwords=%0d", NWORDS);
 
-        // ---- 2. load LN gamma tables (once, step-invariant) ----
-        for (i = 0; i < ROWS_D; i = i + 1) begin
-            for (l = 0; l < P; l = l + 1) rowbuf[l*32 +: 32] = gamma1[i*P+l];
-            gam_sel = 0; gam_waddr = i[$clog2(D/P)-1:0]; gam_wdata = rowbuf; gam_we = 1;
-            @(posedge clk); #1;
-        end
-        for (i = 0; i < ROWS_D; i = i + 1) begin
-            for (l = 0; l < P; l = l + 1) rowbuf[l*32 +: 32] = gamma2[i*P+l];
-            gam_sel = 1; gam_waddr = i[$clog2(D/P)-1:0]; gam_wdata = rowbuf; gam_we = 1;
-            @(posedge clk); #1;
-        end
-        for (i = 0; i < ROWS_D; i = i + 1) begin
-            for (l = 0; l < P; l = l + 1) rowbuf[l*32 +: 32] = gamma3[i*P+l];
-            gam_sel = 2; gam_waddr = i[$clog2(D/P)-1:0]; gam_wdata = rowbuf; gam_we = 1;
-            @(posedge clk); #1;
-        end
-        gam_we = 0;
-        $display("TB_GAMMA_LOADED");
-
-        // ---- 3. load bias tables (once, step-invariant) ----
-        for (i = 0; i < ROWS_FFN2; i = i + 1) begin
-            for (l = 0; l < P; l = l + 1) rowbuf[l*32 +: 32] = biasfc1[i*P+l];
-            bias_sel = 0; bias_waddr = i[$clog2(DFFN2/P)-1:0]; bias_wdata = rowbuf; bias_we = 1;
-            @(posedge clk); #1;
-        end
-        for (i = 0; i < ROWS_D; i = i + 1) begin
-            for (l = 0; l < P; l = l + 1) rowbuf[l*32 +: 32] = biasfc2[i*P+l];
-            bias_sel = 1; bias_waddr = i[$clog2(DFFN2/P)-1:0]; bias_wdata = rowbuf; bias_we = 1;
-            @(posedge clk); #1;
-        end
-        bias_we = 0;
-        $display("TB_BIAS_LOADED");
-
-        // ---- 4. preload cross-attn K/V (once, step-invariant -- same
-        // protocol as tb_decoder_cross_attn.sv's do_kv_write task) ----
-        for (pos = 0; pos < T2; pos = pos + 1) begin
-            for (head = 0; head < NHEAD; head = head + 1) begin
-                hcnt = (pos * NHEAD + head) * HEAD_DIM * 2;
-                for (i = 0; i < HEAD_DIM; i = i + 1) begin
-                    kvec[i*32 +: 32] = xkvin[hcnt + i];
-                    vvec[i*32 +: 32] = xkvin[hcnt + HEAD_DIM + i];
+        // ---- 2. preload cross-attn K/V for EVERY layer (once each --
+        // kv_bank.sv's own storage is layer-indexed internally via `blk`,
+        // so all NLAYER layers' cross K/V persist simultaneously). ----
+        for (ly_i = 0; ly_i < NLAYER; ly_i = ly_i + 1) begin
+            blk = ly_i[3:0];
+            for (pos = 0; pos < T2; pos = pos + 1) begin
+                for (head = 0; head < NHEAD; head = head + 1) begin
+                    hcnt = ((ly_i*T2 + pos) * NHEAD + head) * HEAD_DIM * 2;
+                    for (i = 0; i < HEAD_DIM; i = i + 1) begin
+                        kvec[i*32 +: 32] = xkvin[hcnt + i];
+                        vvec[i*32 +: 32] = xkvin[hcnt + HEAD_DIM + i];
+                    end
+                    // write K
+                    xkv_wkv = 1'b0; xkv_whead = head[$clog2(NHEAD)-1:0]; xkv_wpos = pos[8:0];
+                    xkv_wstart = 1'b1; @(posedge clk); #1; xkv_wstart = 1'b0;
+                    for (b = 0; b < HEAD_DIM/ATTN_P; b = b + 1) begin
+                        for (l = 0; l < ATTN_P; l = l + 1)
+                            xkv_wdata[l*32 +: 32] = kvec[(b*ATTN_P+l)*32 +: 32];
+                        xkv_wvalid = 1'b1; @(posedge clk); #1;
+                    end
+                    xkv_wvalid = 1'b0;
+                    while (!xkv_wdone) @(posedge clk); #1;
+                    // write V
+                    xkv_wkv = 1'b1; xkv_whead = head[$clog2(NHEAD)-1:0]; xkv_wpos = pos[8:0];
+                    xkv_wstart = 1'b1; @(posedge clk); #1; xkv_wstart = 1'b0;
+                    for (b = 0; b < HEAD_DIM/ATTN_P; b = b + 1) begin
+                        for (l = 0; l < ATTN_P; l = l + 1)
+                            xkv_wdata[l*32 +: 32] = vvec[(b*ATTN_P+l)*32 +: 32];
+                        xkv_wvalid = 1'b1; @(posedge clk); #1;
+                    end
+                    xkv_wvalid = 1'b0;
+                    while (!xkv_wdone) @(posedge clk); #1;
                 end
-                // write K
-                xkv_wkv = 1'b0; xkv_whead = head[$clog2(NHEAD)-1:0]; xkv_wpos = pos[8:0];
-                xkv_wstart = 1'b1; @(posedge clk); #1; xkv_wstart = 1'b0;
-                for (b = 0; b < HEAD_DIM/ATTN_P; b = b + 1) begin
-                    for (l = 0; l < ATTN_P; l = l + 1) xkv_wdata[l*32 +: 32] = kvec[(b*ATTN_P+l)*32 +: 32];
-                    xkv_wvalid = 1'b1; @(posedge clk); #1;
-                end
-                xkv_wvalid = 1'b0;
-                while (!xkv_wdone) @(posedge clk); #1;
-                // write V
-                xkv_wkv = 1'b1; xkv_whead = head[$clog2(NHEAD)-1:0]; xkv_wpos = pos[8:0];
-                xkv_wstart = 1'b1; @(posedge clk); #1; xkv_wstart = 1'b0;
-                for (b = 0; b < HEAD_DIM/ATTN_P; b = b + 1) begin
-                    for (l = 0; l < ATTN_P; l = l + 1) xkv_wdata[l*32 +: 32] = vvec[(b*ATTN_P+l)*32 +: 32];
-                    xkv_wvalid = 1'b1; @(posedge clk); #1;
-                end
-                xkv_wvalid = 1'b0;
-                while (!xkv_wdone) @(posedge clk); #1;
             end
         end
-        $display("TB_CROSS_KV_LOADED,t2=%0d,nhead=%0d", T2, NHEAD);
+        $display("TB_CROSS_KV_LOADED,t2=%0d,nhead=%0d,nlayer=%0d", T2, NHEAD, NLAYER);
 
-        // ---- 5. run NSTEPS decode steps on layer 0, checking each one's
-        // own residual output against that step's own golden xres3. Each
-        // step writes a FRESH xres0 (that step's own real token embedding,
-        // NOT chained from the previous step's xres3 -- real decode-step
-        // semantics, see pack_decoder_block.py's header), advances `step`
-        // (growing the self-attn KV cache causally via decoder_block_seq.sv's
-        // own kv_bank writes), and re-pulses `go`. Weights/gamma/bias/cross
-        // K/V stay loaded from steps 1-4 above, unchanged. ----
-        blk = 0;
+        // ---- 3. run NSTEPS decode steps, chaining through all NLAYER
+        // layers each step. Step is the OUTER loop, layer the INNER loop
+        // (real decode semantics: layer L's own step-t input needs layer
+        // L-1's own step-t output, and layer L's own step-(t+1) self-attn
+        // needs layer L's own step-t KV cache -- both directions require
+        // this exact nesting). Only step 0's layer-0 gets a fresh xres0
+        // write (the real per-token embedding); every other (step,layer)
+        // reads the residual xres_bank ALREADY sitting there from the
+        // previous `go` pulse -- layer chaining and step chaining are both
+        // "free" this way, no explicit re-write needed except the very
+        // first token embedding per step. ----
         mism = 0; checked = 0;
         for (st_i = 0; st_i < NSTEPS; st_i = st_i + 1) begin
+            // fresh per-step token embedding -> layer 0's own xres0
             for (i = 0; i < ROWS_D; i = i + 1) begin
                 for (l = 0; l < P; l = l + 1)
                     rowbuf[l*32 +: 32] = xres0steps[st_i*ROWS_D*P + i*P + l];
@@ -224,35 +231,77 @@ module tb;
             xres_wr = 0;
             $display("TB_XRES0_LOADED,step=%0d", st_i);
 
-            step = st_i[8:0];
-            dbg_armed = 1'b1;
-            go = 1; @(posedge clk); #1; go = 0;
-            while (!done) @(posedge clk); #1;
-            dbg_armed = 1'b0;
-            $display("TB_LAYER_DONE,step=%0d", st_i);
+            for (ly_i = 0; ly_i < NLAYER; ly_i = ly_i + 1) begin
+                // reload this layer's own gamma/bias (RTL banks are sized
+                // for one layer, reused sequentially -- real access
+                // pattern never revisits a layer within a step).
+                for (i = 0; i < ROWS_D; i = i + 1) begin
+                    for (l = 0; l < P; l = l + 1)
+                        rowbuf[l*32 +: 32] = gamma1[ly_i*ROWS_D*P + i*P + l];
+                    gam_sel = 0; gam_waddr = i[$clog2(D/P)-1:0]; gam_wdata = rowbuf; gam_we = 1;
+                    @(posedge clk); #1;
+                end
+                for (i = 0; i < ROWS_D; i = i + 1) begin
+                    for (l = 0; l < P; l = l + 1)
+                        rowbuf[l*32 +: 32] = gamma2[ly_i*ROWS_D*P + i*P + l];
+                    gam_sel = 1; gam_waddr = i[$clog2(D/P)-1:0]; gam_wdata = rowbuf; gam_we = 1;
+                    @(posedge clk); #1;
+                end
+                for (i = 0; i < ROWS_D; i = i + 1) begin
+                    for (l = 0; l < P; l = l + 1)
+                        rowbuf[l*32 +: 32] = gamma3[ly_i*ROWS_D*P + i*P + l];
+                    gam_sel = 2; gam_waddr = i[$clog2(D/P)-1:0]; gam_wdata = rowbuf; gam_we = 1;
+                    @(posedge clk); #1;
+                end
+                gam_we = 0;
 
-            mism_step = 0;
-            for (i = 0; i < ROWS_D; i = i + 1) begin
-                xres_waddr = i[$clog2(D/P)-1:0];
-                #1;
-                for (l = 0; l < P; l = l + 1) begin
-                    checked = checked + 1;
-                    if (xres_rdata_dbg[l*32 +: 32] !== xres3refsteps[st_i*D + i*P + l]) begin
-                        mism = mism + 1;
-                        mism_step = mism_step + 1;
-                        if (mism <= 10)
-                            $display("MISMATCH,step=%0d,row=%0d,lane=%0d,got=%0d,ref=%0d",
-                                      st_i, i, l, $signed(xres_rdata_dbg[l*32 +: 32]),
-                                      $signed(xres3refsteps[st_i*D + i*P + l]));
+                for (i = 0; i < ROWS_FFN2; i = i + 1) begin
+                    for (l = 0; l < P; l = l + 1)
+                        rowbuf[l*32 +: 32] = biasfc1[ly_i*ROWS_FFN2*P + i*P + l];
+                    bias_sel = 0; bias_waddr = i[$clog2(DFFN2/P)-1:0]; bias_wdata = rowbuf; bias_we = 1;
+                    @(posedge clk); #1;
+                end
+                for (i = 0; i < ROWS_D; i = i + 1) begin
+                    for (l = 0; l < P; l = l + 1)
+                        rowbuf[l*32 +: 32] = biasfc2[ly_i*ROWS_D*P + i*P + l];
+                    bias_sel = 1; bias_waddr = i[$clog2(DFFN2/P)-1:0]; bias_wdata = rowbuf; bias_we = 1;
+                    @(posedge clk); #1;
+                end
+                bias_we = 0;
+
+                set_wb_gf(ly_i);
+                blk = ly_i[3:0];
+                step = st_i[8:0];
+                dbg_armed = 1'b1;
+                go = 1; @(posedge clk); #1; go = 0;
+                while (!done) @(posedge clk); #1;
+                dbg_armed = 1'b0;
+                $display("TB_LAYER_DONE,step=%0d,layer=%0d", st_i, ly_i);
+
+                mism_ly = 0;
+                for (i = 0; i < ROWS_D; i = i + 1) begin
+                    xres_waddr = i[$clog2(D/P)-1:0];
+                    #1;
+                    for (l = 0; l < P; l = l + 1) begin
+                        checked = checked + 1;
+                        if (xres_rdata_dbg[l*32 +: 32] !==
+                            xres3refsteps[(st_i*NLAYER + ly_i)*D + i*P + l]) begin
+                            mism = mism + 1;
+                            mism_ly = mism_ly + 1;
+                            if (mism <= 10)
+                                $display("MISMATCH,step=%0d,layer=%0d,row=%0d,lane=%0d,got=%0d,ref=%0d",
+                                          st_i, ly_i, i, l, $signed(xres_rdata_dbg[l*32 +: 32]),
+                                          $signed(xres3refsteps[(st_i*NLAYER + ly_i)*D + i*P + l]));
+                        end
                     end
                 end
+                $display("TB_LAYER_CHECK,step=%0d,layer=%0d,mismatches=%0d", st_i, ly_i, mism_ly);
             end
-            $display("TB_STEP_DONE,step=%0d,mismatches=%0d", st_i, mism_step);
         end
 
         $display("TB_DONE,checked=%0d,mismatches=%0d", checked, mism);
-        $display("DECODER_BLOCK_SEQ_VERDICT,bitexact=%0d,mismatches=%0d,checked=%0d,nsteps=%0d",
-                  (mism == 0), mism, checked, NSTEPS);
+        $display("DECODER_BLOCK_SEQ_VERDICT,bitexact=%0d,mismatches=%0d,checked=%0d,nsteps=%0d,nlayer=%0d",
+                  (mism == 0), mism, checked, NSTEPS, NLAYER);
         $finish;
     end
 

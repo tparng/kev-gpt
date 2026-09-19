@@ -20,9 +20,27 @@
 // this, not new; only the gate itself (+ its own fixed, all-steps-profiled
 // ACT_*/GF_* quantization constants) needed building. See that gate's own
 // verdict line for the current status. Layer-looping (blk=1..5, chaining
-// multiple decoder layers) is still NOT covered -- WB_Q/WB_K/.../WB_FC2
-// below are still compile-time parameters, not runtime-selectable per
-// layer; that needs its own follow-up.
+// multiple decoder layers) needed two real RTL changes, both the same
+// shape: wb_q/wb_k/.../wb_fc2 (weight-image offsets) AND gf_q/gf_k/.../
+// gf_fc2 (dequant shifts) were compile-time WB_*/GF_* parameters in the
+// single-layer gate -- both converted to runtime ports here so the caller
+// can drive each layer's own values before its own `go` pulse, the same
+// way gam_wdata/bias_wdata/xkv_wdata are already caller-driven per layer.
+// GF_* needed converting (WSHIFT, baked into g_frac, is genuinely
+// per-layer -- each layer's own weight matrix gets its own optimal
+// scale); ACT_* did NOT (one profiled ACT_RSHIFT per call site, verified
+// to clip nowhere across all 6 layers x 3 steps -- LayerNorm keeps the
+// activation side's scale comparable across layers even though the
+// weight side isn't). Per-layer gamma/bias reload (through the existing
+// gam_we/bias_we ports) and self-attn's own per-layer kv_bank storage
+// (u_self_kv, via `blk`) were already correct. u_cross_kv was NOT: it was
+// sized NLAYER=1 with wq_layer/rd_layer hardwired to 4'd0 (fine for the
+// single-layer gate, silently wrong for real multi-layer use -- every
+// layer's own cross-K/V preload landed in the SAME storage slot, so only
+// the LAST layer's own data survived once more than one layer was loaded;
+// found as every layer's own decode pass mismatching, even layer 0's, the
+// moment a real 6-layer gate first exercised this). Fixed by sizing/wiring
+// u_cross_kv exactly like u_self_kv already was.
 //
 // GEMV QUANTIZATION SCHEME (a real, explicit, documented simplification --
 // the production INT8 export/quantization scheme is still genuinely
@@ -39,8 +57,9 @@
 //     WSHIFT - FRAC_OUT, computed offline, one combined shift per call)
 // ACT_RSHIFT/g_frac are real, DATA-PROFILED constants (see
 // pack_decoder_block.py's choose_act_rshift(), which also asserts no
-// clipping occurs) -- localparams ACT_Q/ACT_K/.../GF_Q/GF_K/... below,
-// specific to THIS gate's real layer-0 weights/data, not a general formula.
+// clipping occurs) -- ACT_Q/ACT_K/... below are compile-time parameters
+// (one value covers every real layer's own weights); gf_q/gf_k/... are
+// runtime ports instead (see the multi-layer update above for why).
 //
 // PER-HEAD BANK LAYOUT (fixes the first draft's real indexing-overflow bug):
 // q_bank/k_bank/v_bank/q_rope_bank/k_rope_bank/ctx_bank are stored at
@@ -69,15 +88,14 @@ module decoder_block_seq #(
     parameter integer ROPE_TMAX = 128,
     // ---- real, data-profiled quantization constants (pack_decoder_block.py) --
     parameter integer POST_SCALE_Q16 = 75674,
+    // ACT_* stay compile-time parameters (unlike GF_*, below) -- one fixed
+    // ACT_RSHIFT per call site, profiled to safely cover every layer AND
+    // every step, verified to clip nowhere (LayerNorm re-normalizes the
+    // residual stream's scale at each layer boundary, so the activation
+    // side genuinely doesn't need a per-layer value; see
+    // pack_decoder_block.py's own header).
     parameter signed [6:0] ACT_Q=17,  ACT_K=17,  ACT_V=17,  ACT_O=15,
-                           ACT_CQ=19, ACT_OC=20, ACT_FC1=17, ACT_FC2=11,
-    parameter signed [7:0] GF_Q=-4,   GF_K=-4,   GF_V=-2,   GF_O=-9,
-                           GF_CQ=-6,  GF_OC=-14, GF_FC1=-1, GF_FC2=-18,
-    // real word offsets into the resident weight image (pack_banked_
-    // resident_vec.build_resident()'s own layer_meta[i]["w_base"] --
-    // depends on each matrix's (M,K) shape, NOT a simple 0..7 layer index)
-    parameter integer WB_Q=0, WB_K=0, WB_V=0, WB_O=0,
-                      WB_CQ=0, WB_CO=0, WB_FC1=0, WB_FC2=0
+                           ACT_CQ=19, ACT_OC=20, ACT_FC1=17, ACT_FC2=11
 ) (
     input  wire clk,
     input  wire rst,
@@ -86,6 +104,33 @@ module decoder_block_seq #(
     input  wire [3:0]  blk,            // self kv_bank's layer index
     input  wire [8:0]  step,           // decode step (self-attn tcount=step+1)
     output reg         done,
+
+    // real word offsets into the resident weight image (pack_banked_
+    // resident_vec.build_resident()'s own layer_meta[i]["w_base"] --
+    // depends on each matrix's (M,K) shape, NOT a simple 0..7 layer index).
+    // Runtime ports, NOT compile-time parameters (the first draft's own
+    // choice) -- multi-LAYER decoding needs a DIFFERENT weight offset per
+    // layer for the SAME call site (layer 1's own Q-projection lives at a
+    // different resident-image address than layer 0's), and `blk` alone
+    // can't index into a parameter. The caller is expected to drive these
+    // to the CURRENT layer's own offsets before each `go` pulse, the same
+    // way gam_wdata/bias_wdata/xkv_wdata are already caller-driven per
+    // layer, not baked in.
+    input  wire [19:0] wb_q, wb_k, wb_v, wb_o,
+    input  wire [19:0] wb_cq, wb_co, wb_fc1, wb_fc2,
+
+    // dequant shift per call site -- ALSO runtime ports, not GF_Q/GF_K/...
+    // parameters: g_frac = FRAC_IN - ACT_RSHIFT + WSHIFT - FRAC_OUT, and
+    // WSHIFT is genuinely per-layer (each layer's own weight matrix gets
+    // its own optimal scale, chosen independently so its own INT8 image
+    // doesn't clip) -- unlike ACT_RSHIFT (above), a single compile-time
+    // GF_* could NOT stay fixed across layers without forcing every
+    // layer's weights to share one, more conservative, WSHIFT (a real
+    // precision trade-off this file doesn't take). Found by the two-pass
+    // profiling gate's own g_frac/act_rshift-must-be-fixed assertion
+    // tripping on WSHIFT drift between layer 0 and layer 1, not ACT_RSHIFT.
+    input  wire signed [7:0] gf_q, gf_k, gf_v, gf_o,
+    input  wire signed [7:0] gf_cq, gf_co, gf_fc1, gf_fc2,
 
     // residual stream in/out -- P*32-bit packed rows, D/P rows, Q6.25
     input  wire                   xres_wr,
@@ -211,15 +256,25 @@ module decoder_block_seq #(
     // ---- cross-attn kv_bank (real, unmodified) -- write port exposed via
     // xkv_* passthrough (Stage 3a's own precompute is out of this file's
     // scope; the OUTER testbench/integration drives these). -------------------
+    // NLAYER(1)/wq_layer(4'd0)/rd_layer(4'd0) (the original code here) only
+    // ever worked for the single-layer gate: ALL layers' cross-K/V preload
+    // landed in the SAME layer-0 storage slot, so loading layer 1's cross
+    // K/V silently overwrote layer 0's -- by the time all NLAYER layers'
+    // preload finished, only the LAST layer's own data survived. Sized and
+    // wired to `blk` now, mirroring u_self_kv (above) exactly -- found via
+    // every layer's own decode pass mismatching, even layer 0's, the
+    // moment a real multi-layer gate first exercised more than one layer's
+    // worth of cross-attn K/V.
+    reg  [3:0]  xk_rlayer;
     reg         xk_rstart;  reg xk_rkv;  reg [$clog2(NHEAD)-1:0] xk_rhead;  reg [8:0] xk_rtcount;
     wire        xk_rvalid, xk_rdone;
     wire [HEAD_DIM*32-1:0] xk_rdata;
-    kv_bank #(.P(ATTN_P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(1), .TMAX(T2),
+    kv_bank #(.P(ATTN_P), .HEAD_DIM(HEAD_DIM), .NHEAD(NHEAD), .NLAYER(16), .TMAX(T2),
               .KBITS(8), .MEM_PRIMITIVE("block")) u_cross_kv (
         .clk(clk), .rst(rst),
-        .wq_start(xkv_wstart), .wq_layer(4'd0), .wq_kv(xkv_wkv), .wq_head(xkv_whead),
+        .wq_start(xkv_wstart), .wq_layer(blk), .wq_kv(xkv_wkv), .wq_head(xkv_whead),
         .wq_pos(xkv_wpos), .wq_valid(xkv_wvalid), .wq_data(xkv_wdata), .wq_done(xkv_wdone),
-        .rd_start(xk_rstart), .rd_layer(4'd0), .rd_kv(xk_rkv), .rd_head(xk_rhead),
+        .rd_start(xk_rstart), .rd_layer(xk_rlayer), .rd_kv(xk_rkv), .rd_head(xk_rhead),
         .rd_tcount(xk_rtcount), .rd_valid(xk_rvalid), .rd_data(xk_rdata), .rd_done(xk_rdone),
         .rd2_start(1'b0), .rd2_layer(4'd0), .rd2_kv(1'b0), .rd2_head({$clog2(NHEAD){1'b0}}),
         .rd2_tcount(9'd0), .rd2_valid(), .rd2_data(), .rd2_done()
@@ -564,20 +619,20 @@ module decoder_block_seq #(
 
                 // ---- Q/K/V GEMVs ----
                 S_QSET: begin
-                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=WB_Q[19:0];
-                    g_src<=3'd0; g_dst<=3'd0; g_frac<=GF_Q; g_actshift<=ACT_Q;
+                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=wb_q;
+                    g_src<=3'd0; g_dst<=3'd0; g_frac<=gf_q; g_actshift<=ACT_Q;
                     g_bias_en<=1'b0; g_ret<=S_KSET;
                     ri_g<=0; gi<=0; st<=G_XRESET;
                 end
                 S_KSET: begin
-                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=WB_K[19:0];
-                    g_src<=3'd0; g_dst<=3'd1; g_frac<=GF_K; g_actshift<=ACT_K;
+                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=wb_k;
+                    g_src<=3'd0; g_dst<=3'd1; g_frac<=gf_k; g_actshift<=ACT_K;
                     g_bias_en<=1'b0; g_ret<=S_VSET;
                     ri_g<=0; gi<=0; st<=G_XRESET;
                 end
                 S_VSET: begin
-                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=WB_V[19:0];
-                    g_src<=3'd0; g_dst<=3'd2; g_frac<=GF_V; g_actshift<=ACT_V;
+                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=wb_v;
+                    g_src<=3'd0; g_dst<=3'd2; g_frac<=gf_v; g_actshift<=ACT_V;
                     g_bias_en<=1'b0; g_ret<=S_ROPE_Q0;
                     // CRITICAL: hh is never otherwise reset before this, its
                     // very first use anywhere in the per-layer flow. On the
@@ -755,8 +810,8 @@ module decoder_block_seq #(
 
                 // ---- O ----
                 S_OSET: begin
-                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=WB_O[19:0];
-                    g_src<=3'd1; g_dst<=3'd3; g_frac<=GF_O; g_actshift<=ACT_O;
+                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=wb_o;
+                    g_src<=3'd1; g_dst<=3'd3; g_frac<=gf_o; g_actshift<=ACT_O;
                     g_bias_en<=1'b0; g_ret<=S_RES1;
                     // ri_d must be reset here: S_RES1 reuses it, but it was
                     // last left at ROWS_D-1 by LN1's own L_WAIT drain loop --
@@ -779,8 +834,8 @@ module decoder_block_seq #(
 
                 // ---- cross Q GEMV (no RoPE -- POST_SCALE applied after) ----
                 S_CQSET: begin
-                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=WB_CQ[19:0];
-                    g_src<=3'd0; g_dst<=3'd0; g_frac<=GF_CQ; g_actshift<=ACT_CQ;
+                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=wb_cq;
+                    g_src<=3'd0; g_dst<=3'd0; g_frac<=gf_cq; g_actshift<=ACT_CQ;
                     g_bias_en<=1'b0; g_ret<=S_CQSCALE;
                     // same fix as S_OSET/S_COSET/S_FC2SET -- ri_d was left at
                     // ROWS_D-1=35 by LN2's own L_WAIT drain loop; without this,
@@ -814,13 +869,13 @@ module decoder_block_seq #(
                     at_qdata <= q_bank[hh*HR_ATTN + wi];
                     at_qvalid <= 1'b1;
                     if (wi != HR_ATTN-1) wi <= wi + 1'b1;
-                    else begin wi<=0; xk_rkv<=1'b0; xk_rhead<=hh[$clog2(NHEAD)-1:0];
+                    else begin wi<=0; xk_rlayer<=blk; xk_rkv<=1'b0; xk_rhead<=hh[$clog2(NHEAD)-1:0];
                                xk_rtcount<=T2[8:0]; xk_rstart<=1'b1; st<=S_ACROSS_K0; end
                 end
                 S_ACROSS_K0: begin
                     at_kvvalid <= xk_rvalid; at_kvdata <= xk_rdata;
                     if (at_kdone) begin
-                        xk_rkv<=1'b1; xk_rhead<=hh[$clog2(NHEAD)-1:0];
+                        xk_rlayer<=blk; xk_rkv<=1'b1; xk_rhead<=hh[$clog2(NHEAD)-1:0];
                         xk_rtcount<=T2[8:0]; xk_rstart<=1'b1; st<=S_ACROSS_V0;
                     end
                 end
@@ -840,8 +895,8 @@ module decoder_block_seq #(
                 end
 
                 S_COSET: begin
-                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=WB_CO[19:0];
-                    g_src<=3'd1; g_dst<=3'd3; g_frac<=GF_OC; g_actshift<=ACT_OC;
+                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=wb_co;
+                    g_src<=3'd1; g_dst<=3'd3; g_frac<=gf_co; g_actshift<=ACT_OC;
                     g_bias_en<=1'b0; g_ret<=S_RES2;
                     // same fix as S_OSET -- ri_d was left at ROWS_AD-1 (71) by
                     // S_CQSCALE's own loop, which would make S_RES2 index
@@ -861,8 +916,8 @@ module decoder_block_seq #(
 
                 // ---- FC1: D -> DFFN2, +bias ----
                 S_FC1SET: begin
-                    gv_m<=DFFN2[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=WB_FC1[19:0];
-                    g_src<=3'd0; g_dst<=3'd3; g_frac<=GF_FC1; g_actshift<=ACT_FC1;
+                    gv_m<=DFFN2[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=D[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=wb_fc1;
+                    g_src<=3'd0; g_dst<=3'd3; g_frac<=gf_fc1; g_actshift<=ACT_FC1;
                     g_bias_en<=1'b1; g_bias_sel<=1'b0; g_ret<=S_SILU_INIT;
                     ri_g<=0; gi<=0; st<=G_XRESET;
                 end
@@ -901,8 +956,8 @@ module decoder_block_seq #(
 
                 // ---- FC2: FFN -> D, +bias ----
                 S_FC2SET: begin
-                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=FFN[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=WB_FC2[19:0];
-                    g_src<=3'd2; g_dst<=3'd3; g_frac<=GF_FC2; g_actshift<=ACT_FC2;
+                    gv_m<=D[$clog2(GEMV_MMAX+1)-1:0]; gv_k<=FFN[$clog2(GEMV_KMAX+1)-1:0]; gv_wbase<=wb_fc2;
+                    g_src<=3'd2; g_dst<=3'd3; g_frac<=gf_fc2; g_actshift<=ACT_FC2;
                     g_bias_en<=1'b1; g_bias_sel<=1'b1; g_ret<=S_RES3;
                     // same fix as S_OSET -- ri_d was left at ROWS_D-1 by LN3's
                     // own L_WAIT drain loop.

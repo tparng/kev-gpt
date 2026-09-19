@@ -31,6 +31,7 @@ def run(sim_dir: str) -> bool:
     manifest = pack_decoder_block.main_gen(sim_dir)
     n_words = manifest["n_words_total"]
     n_steps = manifest["n_steps"]
+    n_layer = manifest["n_layer"]
 
     vvp = os.path.join(sim_dir, "sim.vvp")
     sources = [
@@ -47,8 +48,8 @@ def run(sim_dir: str) -> bool:
         TB,
     ]
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
-                          f"-DNWORDS={n_words}", f"-DNSTEPS={n_steps}"] + sources,
-                         cwd=sim_dir, capture_output=True, text=True)
+                          f"-DNWORDS={n_words}", f"-DNSTEPS={n_steps}", f"-DNLAYER={n_layer}"]
+                         + sources, cwd=sim_dir, capture_output=True, text=True)
     if cp.returncode != 0:
         print("IVERILOG_COMPILE_FAIL")
         print(cp.stdout); print(cp.stderr)
