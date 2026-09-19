@@ -8031,19 +8031,20 @@ storage proposal: neither op it flagged as needing new storage RTL
 actually does. Full writeup: `gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md`'s
 "Decoder cross-attention block gate" section.
 
-## Decoder-block top-level FSM: sized, elaborates clean, not yet gated
+## Decoder-block top-level FSM: sized, BIT-EXACT gated
 
 Turned gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's informal "Sketch: a
 top-level FSM extension (not implemented, not sized)" section's
 decode-step-loop sketch into a real, sized state machine:
 `fabric/asr_seq/rtl/decoder_block_seq.sv`, extending sequencer_vec.sv's
-own conventions -- a `localparam [5:0]` state list (38 states) plus ONE
-shared GEMV dispatcher (`G_XFEED`/`G_WAIT`/`G_DRAIN`) and ONE shared
-LayerNorm dispatcher (`L_FEED`/`L_WAIT`), reused across all 8 linear
-layers / 3 LayerNorms per decoder layer via `g_ret`/`l_ret` return-state
-fields -- same idiom as sequencer_vec.sv's own G_AQ/G_WAIT/G_RB + L_COLL.
+own conventions -- a `localparam [5:0]` state list (46 states) plus ONE
+shared GEMV dispatcher (`G_XFEED`/`G_WAIT`/`G_DRAIN`/`G_XSTART`/`G_XRESET`)
+and ONE shared LayerNorm dispatcher (`L_FEED`/`L_WAIT`/`L_START`), reused
+across all 8 linear layers / 3 LayerNorms per decoder layer via
+`g_ret`/`l_ret` return-state fields -- same idiom as sequencer_vec.sv's
+own G_AQ/G_WAIT/G_RB + L_COLL.
 
-Two real bugs found while wiring this, both fixed:
+Two real bugs found while first wiring this (elaborates-clean stage):
 
 1. `layernorm_vec.sv` is WRONG for ASR's D=288 (this doc's own Stage 2
    table called it "exact... already parametric" -- checked directly and
@@ -8059,15 +8060,28 @@ Two real bugs found while wiring this, both fixed:
 `decoder_block_seq.sv` itself wires every state to its REAL, already-
 gated sub-module interface (`kv_bank.sv` x2, `vec_attn_w.sv` shared
 across self+cross attention, `layernorm_vec_gendiv.sv`,
-`gemv_banked_resident_vec.sv` WBW=8, `rope_apply_vec.sv`, `vec_silu.sv`)
--- confirmed by actually compiling it with iverilog against all of them:
-clean elaboration, exit 0, no errors, only pre-existing benign warnings.
-NOT yet a functional gate -- real, flagged (`// TODO` in the RTL itself)
-open items remain: the weight/gamma image layout and GEMV dequant scheme
-(both explicitly undecided per the op-sequence doc), per-head lane
-gather/scatter between the GEMV P=8 boundary and attention's own
-HEAD_DIM=36/ATTN_P=4 boundary, and SwiGLU's gate-multiply math (currently
-a literal passthrough placeholder). Full writeup, including the exact
-open-item list: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "The
-decoder-block FSM sketch, turned into a real, sized state machine"
+`gemv_banked_resident_vec.sv` WBW=8, `rope_apply_vec.sv`, `vec_silu.sv`).
+
+**Update: now a real functional gate, bit-exact.**
+`fabric/asr_seq/pack_decoder_block.py` (a full Python reference chaining
+real moonshine-tiny layer-0 weights through LN1->QKV->RoPE->self-attn
+->O->RES1->LN2->CQ->cross-attn->CO->RES2->LN3->FC1->SwiGLU->FC2->RES3,
+with its own explicit, documented GEMV INT8 quantization scheme) plus
+`tb/tb_decoder_block_seq.sv` now gate the whole module bit-exact:
+`DECODER_BLOCK_SEQ_VERDICT,bitexact=1,mismatches=0,checked=288`
+(`python -m fabric.asr_seq.run_decoder_block`). Getting there past
+elaborates-clean surfaced 6 more real bugs (all in `decoder_block_seq.sv`
+itself -- the sub-modules it chains stayed untouched): three module
+start/valid-data same-cycle overlaps (LN/self-attn/cross-attn dispatch),
+three uninitialized per-call loop counters, `gemv_banked_resident_vec.sv`'s
+shared activation pointer never rewound between the 8 GEMV calls sharing
+one instance, the GEMV drain's own readback address being a registered
+(one-cycle-lagged) `<= gi` instead of combinational `= gi` (X on the very
+first GEMV call, silently wrong on every later one), attention's own
+context write dropping row 0 of every head, two lane-width mismatches
+(a P*64 module output read as P*32, a P*32 bank row read as P*16), and
+flat 256-bit vector `+` used for residual/bias adds instead of 8
+independent 32-bit signed lanes (a real carry-bleed between lanes). Full
+writeup, including the per-bug detail: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's
+"The decoder-block FSM sketch, turned into a real, sized state machine"
 section.
