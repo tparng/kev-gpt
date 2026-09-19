@@ -7982,9 +7982,29 @@ control path.
 
 Not covered: cross-attention (decoder-side, Stage 3a) is the *simpler*
 case of the same pattern (RoPE-free), NOT separately gated -- a strong
-inference from this result, not independently verified. Full writeup:
-`gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md`'s "Encoder self-attention block
-gate" section.
+inference from this result, not independently verified.
+
+**Update: the real encoder-block top-level FSM, multi-layer, bit-exact.**
+Only the self-attention primitive was gated above -- `fabric/asr_seq/rtl/
+encoder_block_seq.sv` now chains the encoder's own full per-layer op
+sequence (`LN1->QKV->RoPE->bidirectional self-attn->O->res->LN2->fc1->
+GELU->fc2->res`), built directly to real multi-layer spec from the start
+(not a single-layer draft extended later), reusing every lesson
+`decoder_block_seq.sv`'s own step-loop/layer-loop gates already
+surfaced: `wb_*`/`gf_*` runtime ports and `u_self_kv` sized `NLAYER`/
+wired to `blk` from day one (the bug decoder's `u_cross_kv` had, avoided
+here by construction), plus `pack_encoder_block.py`'s own two-pass
+profiling and `wrap32()` on every residual add. One real bug found:
+`rope_pos <= pos[$clog2(ROPE_TMAX)-1:0]` read bits beyond the position
+counter's own 3-bit width and returned X (the decoder's own `step` port
+happened to be wide enough already); fixed by assigning `rope_pos <=
+pos;` directly. Result:
+`ENCODER_BLOCK_SEQ_VERDICT,bitexact=1,mismatches=0,checked=10368,
+nlayer=6` -- second attempt, all 6 real layers x all 6 real positions,
+chained layer-to-layer for real.
+
+Full writeup: `gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md`'s "Encoder
+self-attention block gate" section.
 
 ## Decoder cross-attention block gate: built, bit-exact, no RoPE needed at all
 
