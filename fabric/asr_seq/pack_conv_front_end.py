@@ -56,6 +56,32 @@ def widen1312(x_q412):
     return np.asarray(x_q412, dtype=np.int64) << 13
 
 
+def wrap32(x):
+    """Wrap each element to signed 32-bit two's complement -- y_data is
+    `reg [P*32-1:0]` (32b/lane) in the RTL, and widen1312_w's own `<<<13`
+    is self-determined (result width = operand width, IEEE 1364/1800) so
+    it truncates to 32 bits there exactly like this. Same fix decoder/
+    encoder/output_head's own xres_bank needed (see conv_front_end_seq.sv's
+    own header) -- here triggered by gelu_wide_vec.sv's own positive-
+    passthrough fix, which can produce real magnitudes Q6.25's ~+-64
+    representable range doesn't cover."""
+    x = np.asarray(x, dtype=np.int64) & 0xFFFFFFFF
+    return np.where(x >= 0x80000000, x - 0x100000000, x)
+
+
+def gelu_wide_q412(x_wide, lut):
+    """Matches gelu_wide_vec.sv exactly (run_gelu_wide.py's own reference,
+    reused here directly in spirit): gelu_q on the sat16-clipped value for
+    in-domain/very-negative inputs (already correct there), overridden by
+    the WIDE value itself, unclipped, when x > +32767 (real >+8 units) --
+    GELU(x)->x that fast on the positive side, which gelu_lut2.sv's own
+    fixed Q4.12 domain can't represent."""
+    x_wide = np.asarray(x_wide, dtype=np.int64)
+    x_clip = sat16(x_wide)
+    lut_out = gelu_q(x_clip, lut)
+    return np.where(x_wide > 32767, x_wide, lut_out)
+
+
 def choose_rshift_from_max(m: int, target_max: int = 100) -> int:
     """Smallest non-negative right-shift bringing |m| under target_max --
     same as pack_output_head.py's own choose_act_rshift_from_max, reused
@@ -158,14 +184,16 @@ def main_gen(out_dir: str):
     dq2 = ashift2_eff + wshift2 - Q412
     b2_q = np.round(d["b2"] * (1 << Q412)).astype(np.int64)   # bias in Q4.12 (matches conv2's own target)
     c2_out = cr.conv1d_int_ref(x2_int8, w2_int8, KW2, STRIDE2, COUT2, cin2,
-                                bias_q=b2_q, dq_shift=dq2)          # (TOUT2,COUT2) Q4.12
-    c2_sat = sat16(c2_out)
+                                bias_q=b2_q, dq_shift=dq2)          # (TOUT2,COUT2) Q4.12, WIDE (not sat16'd)
     tout2 = c2_out.shape[0]
-    print(f"conv2: wshift={wshift2} dq2={dq2} TOUT2={tout2}", file=sys.stderr)
+    print(f"conv2: wshift={wshift2} dq2={dq2} TOUT2={tout2} max|c2_out|={int(np.max(np.abs(c2_out)))}",
+          file=sys.stderr)
 
-    # ================= gelu1 =================================================
+    # ================= gelu1 (gelu_wide_q412 -- see that function's own
+    # docstring and conv_front_end_seq.sv's own header for the Q4.12
+    # clipping fix this closes) ================================================
     lut_gelu = gelu_table()
-    g1_q412 = gelu_q(c2_sat, lut_gelu)                    # (TOUT2,COUT2) Q4.12
+    g1_q412 = gelu_wide_q412(c2_out, lut_gelu)            # (TOUT2,COUT2) Q4.12, WIDE
 
     # ================= actquant gelu1 -> conv3 input =========================
     ge1_shift = choose_rshift_from_max(int(np.max(np.abs(g1_q412))))
@@ -182,16 +210,20 @@ def main_gen(out_dir: str):
     dq3 = ashift3_eff + wshift3 - Q412
     b3_q = np.round(d["b3"] * (1 << Q412)).astype(np.int64)
     c3_out = cr.conv1d_int_ref(x3_int8, w3_int8, KW3, STRIDE3, COUT3, cin3,
-                                bias_q=b3_q, dq_shift=dq3)          # (TOUT3,COUT3) Q4.12
-    c3_sat = sat16(c3_out)
+                                bias_q=b3_q, dq_shift=dq3)          # (TOUT3,COUT3) Q4.12, WIDE
     tout3 = c3_out.shape[0]
-    print(f"conv3: wshift={wshift3} dq3={dq3} TOUT3={tout3}", file=sys.stderr)
+    print(f"conv3: wshift={wshift3} dq3={dq3} TOUT3={tout3} max|c3_out|={int(np.max(np.abs(c3_out)))}",
+          file=sys.stderr)
 
-    # ================= gelu2 =================================================
-    g2_q412 = gelu_q(c3_sat, lut_gelu)                    # (TOUT3,COUT3) Q4.12
+    # ================= gelu2 (gelu_wide_q412, same fix as gelu1) ============
+    g2_q412 = gelu_wide_q412(c3_out, lut_gelu)            # (TOUT3,COUT3) Q4.12, WIDE
 
     # ================= widen Q4.12 -> Q6.25: FINAL OUTPUT ====================
-    final_out = widen1312(g2_q412)                          # (TOUT3,COUT3) Q6.25
+    # wrap32(): widen1312_w's own RTL shift is self-determined (32-bit,
+    # truncates/wraps) -- match it here, since g2_q412 can now genuinely
+    # exceed Q6.25's own ~+-64 representable range post-widen (the SAME
+    # class of fix decoder/encoder/output_head's own xres_bank needed).
+    final_out = wrap32(widen1312(g2_q412))                  # (TOUT3,COUT3) Q6.25 (wrapped)
 
     # informational-only float check against the real HF model's own conv
     # front-end output

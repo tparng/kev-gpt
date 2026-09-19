@@ -8214,17 +8214,37 @@ bitexact=1, mismatches=0/216` across the whole 7-stage chain, first real
 attempt after fixing two missing-mem-file build issues (`tanh_lut.mem`,
 `gelu_lut2.sv`'s own even/odd `gelu_lut_e.mem`/`gelu_lut_o.mem`).
 
-Honest, not-fixed limitation found gating this: conv3's own raw pre-GELU
-output reaches |.|~1004 in real units on the real-audio test, vastly
-outside Q4.12's fixed +-8 range GELU's own LUT expects (unlike conv1's
-similarly wide range feeding tanh, which saturates before +-8 -- GELU
-does not). Informational cosine vs the real float output is ~0.72 (RTL-
-vs-Python is still bit-exact -- this project's own gate bar). moonshine's
-real firmware sidesteps this by running the conv front-end unquantized;
-no existing precedent exists for INT8-quantizing it. A real fix needs a
-wider GELU input format, out of scope for reusing gelu_lut2.sv unmodified.
+Found gating this, since fixed: conv3's own raw pre-GELU output reaches
+|.|~1004 in real units on the real-audio test, vastly outside Q4.12's
+fixed +-8 range GELU's own LUT expects (unlike conv1's similarly wide
+range feeding tanh, which saturates before +-8 -- GELU does not).
 
 Closes Stage 1 -- real gates now exist for every ASR accelerator stage,
-standalone and (Stage 1) end to end. Full writeup: gen2asr/
-ASR-ACCELERATOR-OP-SEQUENCE.md's "Stage 1 top-level FSM: built, bit-exact
-end to end" section.
+standalone and (Stage 1) end to end.
+
+## Q4.12 GELU precision: fixed -- and what fixing it revealed
+
+`gelu_wide_vec.sv`: a wide (32-bit/lane) wrapper around vec_gelu.sv/
+gelu_lut2.sv (reused unmodified for in-domain values), passing the wide
+input straight through instead of clipping whenever x > +8 real units --
+GELU(x)->x that fast on the positive side. Gated standalone first
+(GELU_WIDE_VERDICT bitexact=1, mismatches=0/2048) before wiring into
+conv_front_end_seq.sv in place of the two direct vec_gelu instances.
+End-to-end stays bit-exact after the fix (CONV_FRONT_END_VERDICT
+bitexact=1, mismatches=0/216).
+
+The fix moved the bottleneck, not removed it: gelu2's own real output
+can now correctly reach magnitude ~1000, which overflows Q6.25's own
+~+-64 representable range at the final widen step, wrapping via ordinary
+32-bit truncation -- the same class of issue decoder/encoder/output_head's
+own xres_bank already established project-wide (wrap32(), matched
+exactly between RTL and Python, not avoided). Informational cosine vs the
+real float output is now ~0.33 (worse than before the fix, ~0.72) since
+the dominant error moved from "clipped to +8" to "wrapped mod 2^32" --
+an honest, expected consequence of fixing one stage inside a chain that
+reuses a fixed Q6.25 format everywhere. A real fix needs a wider final
+output format than Q6.25 project-wide -- a materially bigger change, out
+of scope here.
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Q4.12 GELU
+precision: fixed -- and what fixing it actually revealed" section.

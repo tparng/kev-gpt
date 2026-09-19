@@ -36,6 +36,7 @@ def run(sim_dir: str) -> bool:
         os.path.join(STAGE3_RTL, "weight_bank_tdp.sv"),
         os.path.join(STAGE3_RTL, "vec_gelu.sv"),
         os.path.join(STAGE3_RTL, "gelu_lut2.sv"),
+        os.path.join(RTL_DIR, "gelu_wide_vec.sv"),
         os.path.join(RTL_DIR, "conv1d_seq.sv"),
         os.path.join(RTL_DIR, "tanh_lut.sv"),
         os.path.join(RTL_DIR, "vec_tanh.sv"),

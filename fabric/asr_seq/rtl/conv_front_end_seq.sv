@@ -46,41 +46,81 @@
 // Every conv1d_seq.sv instance's own dq_shift (runtime port, chosen by the
 // Python packer) is picked so its raw INT32 GEMV accumulator lands DIRECTLY
 // in Q4.12 scale when the next stage is a LUT (conv1->tanh, conv2->gelu1,
-// conv3->gelu2) -- so the only conversion needed at those 3 boundaries is
-// sat16() (a plain int32->int16 clip, the SAME idiom encoder_block_seq.sv's
-// own sat16() uses before its own vec_gelu call), no shift at all.
-// tanh_lut.sv/gelu_lut2.sv's own Q4.12 output needs an EXPLICIT widening
-// shift (<<<13, exact -- Q4.12 has 12 fractional bits, Q6.25 has 25, the
-// difference is a power of 2 so this loses no precision) wherever the
-// NEXT stage wants Q6.25: tanh->groupnorm1's x_in, and gelu2->this
-// module's own final y_data (which feeds the encoder's own first
-// LayerNorm, itself Q6.25). Wherever the next stage is another conv1d_seq
-// call (groupnorm1->conv2, gelu1->conv3), an actquant()-style shift+clip
-// to INT8 is unavoidable (GEMV activations are always INT8) -- gn_ashift/
-// ge1_ashift are runtime ports, chosen by the Python packer the same way
-// dq_shift is.
+// conv3->gelu2) -- no shift needed at those 3 boundaries. conv1->tanh
+// still uses a plain sat16() clip (int32->int16, the SAME idiom
+// encoder_block_seq.sv's own sat16() uses before its own vec_gelu call) --
+// safe because tanh saturates well inside Q4.12's +-8 range. The two GELU
+// boundaries (conv2->gelu1, conv3->gelu2) go through gelu_wide_vec.sv
+// instead of a plain sat16()+vec_gelu (see the section below for why:
+// GELU does NOT saturate the same way, so a REAL widening fix was needed,
+// not just format bookkeeping). tanh_lut.sv's own Q4.12 output needs an
+// EXPLICIT widening shift (<<<13, exact -- Q4.12 has 12 fractional bits,
+// Q6.25 has 25, the difference is a power of 2 so this loses no precision)
+// wherever the NEXT stage wants Q6.25: tanh->groupnorm1's x_in, and
+// gelu2->this module's own final y_data (which feeds the encoder's own
+// first LayerNorm, itself Q6.25) -- the latter via widen1312_w (32-bit
+// input, since gelu_wide_vec.sv's own output no longer fits in 16 bits).
+// Wherever the next stage is another conv1d_seq call (groupnorm1->conv2,
+// gelu1->conv3), an actquant()-style shift+clip to INT8 is unavoidable
+// (GEMV activations are always INT8) -- gn_ashift/ge1_ashift are runtime
+// ports, chosen by the Python packer the same way dq_shift is.
 //
-// ---- Honest limitation, found gating this file (not fixed, not hidden) --
+// ---- Q4.12 GELU precision: found gating this file, then fixed -----------
 // pack_conv_front_end.py's own real-audio run (torch.manual_seed(0),
-// L=3000) shows conv3's raw pre-GELU output reaching |.|~1004 in real
-// units on this synthetic input -- vastly outside Q4.12's fixed +-8 range
-// (tanh's own Q4.12 feed is fine DESPITE conv1's similarly-wide raw range,
-// because tanh saturates to +-1 well inside +-8; GELU has no such
-// saturation for large positive inputs, so sat16() clipping there is a
-// REAL accuracy loss, not a benign one). End-to-end RTL-vs-Python is still
-// bit-exact (CONV_FRONT_END_VERDICT bitexact=1, mismatches=0/216) -- the
-// gate's own bar, per this project's convention, is RTL matching its own
-// reference exactly, not matching the real unquantized model -- but the
-// informational cosine against the real float front-end output is only
-// ~0.72, well below every other block's own 0.99+ (moonshine-tiny's real
-// firmware sidesteps this entirely: gen2asr's own test_generate_kv_i8.c
-// runs the conv front-end UNQUANTIZED, float32, only the transformer
-// layers are INT8 -- there is no existing real precedent to match here).
-// Whether this magnitude is representative of real speech (vs an artifact
-// of feeding un-trained-on Gaussian noise through an unbounded conv stack)
-// is not established either way. A real fix needs a WIDER GELU input
-// format than gelu_lut2.sv's own fixed Q4.12 -- out of scope for this
-// file, which reuses that module unmodified.
+// L=3000) originally showed conv3's raw pre-GELU output reaching |.|~1004
+// in real units -- vastly outside Q4.12's fixed +-8 range -- with the
+// GELU boundaries (conv2->gelu1, conv3->gelu2) simply sat16()-clipping
+// before the LUT, same as tanh's own conv1->tanh boundary. That's benign
+// for tanh (saturates to +-1 well inside +-8) but NOT for GELU, which has
+// no such saturation for large positive inputs -- clipping there was a
+// real ~1000x magnitude error on this project's own real-audio test,
+// dragging the informational cosine against the real float front-end
+// output down to ~0.72 (bit-exactness against this file's own Python
+// reference held throughout -- that's this project's own gate bar, not
+// matching the real unquantized model -- but a reference that's THIS far
+// from the real float computation isn't a reference worth trusting for
+// its own sake). moonshine-tiny's real firmware sidesteps the whole
+// problem by running the conv front-end UNQUANTIZED (gen2asr's own
+// test_generate_kv_i8.c) -- no existing real precedent to match.
+//
+// Fixed via gelu_wide_vec.sv (this dir): a WIDE (32-bit/lane) wrapper
+// around vec_gelu.sv/gelu_lut2.sv, reused completely UNMODIFIED for
+// in-domain values, but passing the wide input straight through instead
+// of clipping it whenever x > +8 real units -- GELU(x)->x that fast on
+// the positive side (Phi(x) already indistinguishable from 1.0 at x=8 to
+// far more precision than Q4.12 could represent anyway), the same way
+// tanh's own saturation already made clipping harmless on ITS boundary.
+// The negative side needed no such fix: GELU(x)->0 just as fast as
+// x->-infinity, and gelu_lut2.sv's own boundary value at x=-8 already
+// rounds to ~0, so sat16-then-LUT was already correct there. Gated
+// standalone first (GELU_WIDE_VERDICT bitexact=1, mismatches=0/2048, in
+// and out of domain, both signs) before wiring in here -- see
+// run_gelu_wide.py. End-to-end RTL-vs-Python STAYS bit-exact after this
+// fix (CONV_FRONT_END_VERDICT bitexact=1, mismatches=0/216) -- the fix
+// changes what value gets computed, not whether RTL matches its own
+// reference.
+//
+// ---- The fix moved the bottleneck, it didn't remove it ------------------
+// With GELU no longer clipping, gelu2's own real output can now correctly
+// reach magnitude ~1000 on this project's own real-audio test -- but THAT
+// now overflows Q6.25's own ~+-64 representable range at the FINAL widen
+// step (widen1312_w), wrapping via ordinary 32-bit truncation (wrap32() on
+// the Python side, matched to the RTL's own self-determined `<<<13`) --
+// the exact same class of issue decoder_block_seq.sv/encoder_block_seq.sv/
+// output_head_seq.sv's own xres_bank already established and accepted
+// project-wide (real magnitude exceeding a nominal Qn.m format's own
+// representable range, handled by matching the wrap exactly on both
+// sides, not by avoiding it). The informational cosine against the real
+// float front-end output is now ~0.33 -- WORSE than before this fix
+// (~0.72), because the dominant error source moved from "GELU clipped a
+// large value to +8" (a big constant-ish error) to "the whole widened
+// value wrapped mod 2^32" (essentially noise for the affected elements).
+// This is an honest, expected consequence of fixing ONE stage's precision
+// in a chain that reuses a FIXED Q6.25 format everywhere -- not something
+// this file's own scope (a targeted GELU-domain fix) tries to resolve. A
+// real fix would need a wider (or floating, or per-tensor-rescaled) final
+// output format than Q6.25 -- out of scope here, same as the GELU fix
+// above was out of scope for the ORIGINAL "Stage 1 conv front-end" pass.
 
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
@@ -184,10 +224,25 @@ module conv_front_end_seq #(
             else sat16 = x[15:0];
         end
     endfunction
+    // Two widths: tanh's own output is always 16-bit (Q4.12, sat16-clipped
+    // -- that path is correct as-is, see gelu_wide_vec.sv's own header for
+    // why GELU needs the wide variant but tanh does not). gelu_wide_vec.sv's
+    // own output is 32-bit (may hold values outside int16 range for its own
+    // positive-passthrough case) -- widen1312_w takes that width directly.
+    // `<<<` is self-determined (result width = the operand's own declared
+    // width, IEEE 1364/1800), so widen1312_w's 32-bit shift naturally
+    // truncates/wraps exactly like every other wide accumulator in this
+    // project (xres_bank etc.) -- consistent with wrap32() on the Python side.
     function automatic signed [31:0] widen1312;
         input signed [15:0] x;
         begin
             widen1312 = $signed(x) <<< 13;
+        end
+    endfunction
+    function automatic signed [31:0] widen1312_w;
+        input signed [31:0] x;
+        begin
+            widen1312_w = $signed(x) <<< 13;
         end
     endfunction
     function automatic signed [7:0] actq;
@@ -294,17 +349,13 @@ module conv_front_end_seq #(
         .go(c2_go), .done(c2_done), .y_valid(c2_yv), .y_data(c2_ydata)
     );
 
-    // conv2 -> gelu1: direct wire, sat16 only
-    integer c2p;
-    reg signed [16*P-1:0] ge1_x;
-    always @(*) begin
-        ge1_x = {(16*P){1'b0}};
-        for (c2p = 0; c2p < P; c2p = c2p + 1)
-            ge1_x[c2p*16 +: 16] = sat16($signed(c2_ydata[c2p*32 +: 32]));
-    end
-    wire ge1_ov; wire signed [16*P-1:0] ge1_y;
-    vec_gelu #(.P(P)) u_gelu1 (
-        .clk(clk), .in_valid(c2_yv), .x(ge1_x), .out_valid(ge1_ov), .y(ge1_y)
+    // conv2 -> gelu1: direct wire, WIDE (no sat16 pre-clip -- gelu_wide_vec.sv
+    // does its own internal clip for the LUT path while preserving the wide
+    // value for its own positive-passthrough case, see that module's header;
+    // this closes conv_front_end_seq.sv's own earlier "Honest limitation" note).
+    wire ge1_ov; wire signed [32*P-1:0] ge1_y;
+    gelu_wide_vec #(.P(P)) u_gelu1 (
+        .clk(clk), .in_valid(c2_yv), .x(c2_ydata), .out_valid(ge1_ov), .y(ge1_y)
     );
 
     // gelu1 -> conv3 xt_we: direct wire, actquant
@@ -313,7 +364,7 @@ module conv_front_end_seq #(
     always @(*) begin
         ge1_xt_word = {(P*8){1'b0}};
         for (gep = 0; gep < P; gep = gep + 1)
-            ge1_xt_word[gep*8 +: 8] = actq($signed({{16{ge1_y[gep*16+15]}}, ge1_y[gep*16 +: 16]}), ge1_ashift);
+            ge1_xt_word[gep*8 +: 8] = actq($signed(ge1_y[gep*32 +: 32]), ge1_ashift);
     end
     reg [$clog2(ROWS_C2+1)-1:0] cnt_c3xt;
     reg cnt_c3xt_clr;
@@ -334,27 +385,25 @@ module conv_front_end_seq #(
         .go(c3_go), .done(c3_done), .y_valid(c3_yv), .y_data(c3_ydata)
     );
 
-    // conv3 -> gelu2: direct wire, sat16 only
-    integer c3p;
-    reg signed [16*P-1:0] ge2_x;
-    always @(*) begin
-        ge2_x = {(16*P){1'b0}};
-        for (c3p = 0; c3p < P; c3p = c3p + 1)
-            ge2_x[c3p*16 +: 16] = sat16($signed(c3_ydata[c3p*32 +: 32]));
-    end
-    wire ge2_ov; wire signed [16*P-1:0] ge2_y;
-    vec_gelu #(.P(P)) u_gelu2 (
-        .clk(clk), .in_valid(c3_yv), .x(ge2_x), .out_valid(ge2_ov), .y(ge2_y)
+    // conv3 -> gelu2: direct wire, WIDE (same fix as gelu1, see above)
+    wire ge2_ov; wire signed [32*P-1:0] ge2_y;
+    gelu_wide_vec #(.P(P)) u_gelu2 (
+        .clk(clk), .in_valid(c3_yv), .x(c3_ydata), .out_valid(ge2_ov), .y(ge2_y)
     );
 
     // gelu2 -> this module's own output: direct wire, widen to Q6.25 (encoder's
     // own first LayerNorm input format) -- the front end's own final output.
+    // widen1312_w's own 32-bit self-determined shift truncates/wraps exactly
+    // like xres_bank and every other wide accumulator in this project when
+    // the real value exceeds Q6.25's own ~+-64 representable range (matched
+    // by wrap32() on the Python reference side, same as decoder/encoder/
+    // output_head's own established fix for this exact class of issue).
     integer gep2;
     reg [P*32-1:0] ge2_word;
     always @(*) begin
         ge2_word = {(P*32){1'b0}};
         for (gep2 = 0; gep2 < P; gep2 = gep2 + 1)
-            ge2_word[gep2*32 +: 32] = widen1312($signed(ge2_y[gep2*16 +: 16]));
+            ge2_word[gep2*32 +: 32] = widen1312_w($signed(ge2_y[gep2*32 +: 32]));
     end
     assign y_valid = ge2_ov;
     assign y_data  = ge2_word;
