@@ -58,8 +58,9 @@
 // Q6.25 has 25, the difference is a power of 2 so this loses no precision)
 // wherever the NEXT stage wants Q6.25: tanh->groupnorm1's x_in, and
 // gelu2->this module's own final y_data (which feeds the encoder's own
-// first LayerNorm, itself Q6.25) -- the latter via widen1312_w (32-bit
-// input, since gelu_wide_vec.sv's own output no longer fits in 16 bits).
+// first LayerNorm, itself Q6.25) -- the latter via widen1312_sat (32-bit
+// input, since gelu_wide_vec.sv's own output no longer fits in 16 bits;
+// "_sat" because that boundary needs to SATURATE, not wrap -- see below).
 // Wherever the next stage is another conv1d_seq call (groupnorm1->conv2,
 // gelu1->conv3), an actquant()-style shift+clip to INT8 is unavoidable
 // (GEMV activations are always INT8) -- gn_ashift/ge1_ashift are runtime
@@ -100,27 +101,45 @@
 // changes what value gets computed, not whether RTL matches its own
 // reference.
 //
-// ---- The fix moved the bottleneck, it didn't remove it ------------------
-// With GELU no longer clipping, gelu2's own real output can now correctly
-// reach magnitude ~1000 on this project's own real-audio test -- but THAT
-// now overflows Q6.25's own ~+-64 representable range at the FINAL widen
-// step (widen1312_w), wrapping via ordinary 32-bit truncation (wrap32() on
-// the Python side, matched to the RTL's own self-determined `<<<13`) --
-// the exact same class of issue decoder_block_seq.sv/encoder_block_seq.sv/
-// output_head_seq.sv's own xres_bank already established and accepted
-// project-wide (real magnitude exceeding a nominal Qn.m format's own
-// representable range, handled by matching the wrap exactly on both
-// sides, not by avoiding it). The informational cosine against the real
-// float front-end output is now ~0.33 -- WORSE than before this fix
-// (~0.72), because the dominant error source moved from "GELU clipped a
-// large value to +8" (a big constant-ish error) to "the whole widened
-// value wrapped mod 2^32" (essentially noise for the affected elements).
-// This is an honest, expected consequence of fixing ONE stage's precision
-// in a chain that reuses a FIXED Q6.25 format everywhere -- not something
-// this file's own scope (a targeted GELU-domain fix) tries to resolve. A
-// real fix would need a wider (or floating, or per-tensor-rescaled) final
-// output format than Q6.25 -- out of scope here, same as the GELU fix
-// above was out of scope for the ORIGINAL "Stage 1 conv front-end" pass.
+// ---- Q6.25 final-output range: the GELU fix moved the bottleneck here,
+// then this was fixed too (saturate, not wrap) -- but a real, DEEPER
+// contributor was found underneath and is NOT fixed -----------------------
+// With GELU no longer clipping (the fix above), gelu2's own real output
+// can correctly reach magnitude ~1000 on this project's own real-audio
+// test -- but that overflows Q6.25's own ~+-64 representable range at the
+// FINAL widen step. First tried wrapping (ordinary 32-bit truncation,
+// matching decoder_block_seq.sv/encoder_block_seq.sv/output_head_seq.sv's
+// own xres_bank precedent) -- informational cosine against the real
+// float front-end output actually got WORSE (~0.72 -> ~0.33), since
+// wrapping turns a bounded, constant-ish clipping error into effectively
+// RANDOM noise (a value can wrap to any bit pattern, even flip sign).
+// Switched to widen1312_sat() instead -- SATURATE at
+// Q6.25's own representable ceiling (+-262143 pre-shift, i.e. +-~64 real
+// units) rather than wrap. Chosen deliberately for this NEW boundary
+// (unlike the older xres_bank precedent, which was never revisited, not
+// concluded to be worse): a saturated value is at least bounded and
+// sign-correct, the same "sat" idiom sat16()/act_quantize's own clip-
+// with-WARNING convention already uses elsewhere in this project.
+// Recovered PART of the loss: cosine -> ~0.58 (better than wrapping's
+// ~0.33, still well below every other block's own 0.99+). End-to-end
+// RTL-vs-Python stays bit-exact throughout both attempts (CONV_FRONT_END_
+// VERDICT bitexact=1, mismatches=0/216).
+//
+// The REMAINING gap traces to a genuinely different, deeper cause, found
+// while debugging this: real INT8-quantization noise compounding across
+// THREE cascaded activation-quantization boundaries (audio->conv1,
+// groupnorm1->conv2, gelu1->conv3) before conv3's own small kernel
+// (KW3=3) amplifies it further for some output positions. Confirmed
+// directly: one real element has TRUE conv3-then-gelu value 21.19 (real
+// units), but this file's own quantized pipeline computes 92.97 at that
+// SAME element -- a real ~4.4x error, not a clipping/wrapping artifact
+// (GELU is near-identity there, x>>0, so the error is inherited straight
+// from conv3's own raw dequantized output, not introduced by GELU or the
+// final widen). This is NOT fixed here -- it would need a materially
+// different quantization strategy for the gelu1->conv3 boundary specifically
+// (e.g. per-channel rather than per-matrix weight scales, or retaining
+// more than INT8 precision through that one narrow-kernel stage) -- a
+// bigger, separate investigation than either fix above.
 
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
@@ -226,23 +245,32 @@ module conv_front_end_seq #(
     endfunction
     // Two widths: tanh's own output is always 16-bit (Q4.12, sat16-clipped
     // -- that path is correct as-is, see gelu_wide_vec.sv's own header for
-    // why GELU needs the wide variant but tanh does not). gelu_wide_vec.sv's
-    // own output is 32-bit (may hold values outside int16 range for its own
-    // positive-passthrough case) -- widen1312_w takes that width directly.
-    // `<<<` is self-determined (result width = the operand's own declared
-    // width, IEEE 1364/1800), so widen1312_w's 32-bit shift naturally
-    // truncates/wraps exactly like every other wide accumulator in this
-    // project (xres_bank etc.) -- consistent with wrap32() on the Python side.
+    // why GELU needs the wide variant but tanh does not; tanh's own +-1
+    // output range is ALWAYS well inside Q6.25's own +-64, so a plain
+    // exact <<<13 can never overflow there). gelu_wide_vec.sv's own output
+    // is 32-bit (may hold values outside int16 range for its own
+    // positive-passthrough case) -- widen1312_sat takes that width
+    // directly, and SATURATES instead of wrapping: x > +262143 (real
+    // > ~+64) clips to INT32_MAX, x < -262144 (real < ~-64) clips to
+    // INT32_MIN, otherwise the shift is exact (no overflow possible in
+    // that range). See this file's own "Q6.25 final-output range" section
+    // below for why saturate, not wrap, was chosen for this NEW boundary
+    // (decoder/encoder/output_head's own xres_bank wraps instead -- an
+    // already-shipped, already-gated design decision this file does not
+    // revisit; wrapping was simply never reconsidered there, not concluded
+    // to be better).
     function automatic signed [31:0] widen1312;
         input signed [15:0] x;
         begin
             widen1312 = $signed(x) <<< 13;
         end
     endfunction
-    function automatic signed [31:0] widen1312_w;
+    function automatic signed [31:0] widen1312_sat;
         input signed [31:0] x;
         begin
-            widen1312_w = $signed(x) <<< 13;
+            if (x > 32'sd262143)        widen1312_sat = 32'sh7FFFFFFF;
+            else if (x < -32'sd262144)  widen1312_sat = 32'sh80000000;
+            else                         widen1312_sat = $signed(x) <<< 13;
         end
     endfunction
     function automatic signed [7:0] actq;
@@ -393,17 +421,15 @@ module conv_front_end_seq #(
 
     // gelu2 -> this module's own output: direct wire, widen to Q6.25 (encoder's
     // own first LayerNorm input format) -- the front end's own final output.
-    // widen1312_w's own 32-bit self-determined shift truncates/wraps exactly
-    // like xres_bank and every other wide accumulator in this project when
-    // the real value exceeds Q6.25's own ~+-64 representable range (matched
-    // by wrap32() on the Python reference side, same as decoder/encoder/
-    // output_head's own established fix for this exact class of issue).
+    // widen1312_sat() SATURATES (not wraps) when the real value exceeds
+    // Q6.25's own ~+-64 representable range -- see that function's own
+    // comment and this file's "Q6.25 final-output range" section below.
     integer gep2;
     reg [P*32-1:0] ge2_word;
     always @(*) begin
         ge2_word = {(P*32){1'b0}};
         for (gep2 = 0; gep2 < P; gep2 = gep2 + 1)
-            ge2_word[gep2*32 +: 32] = widen1312_w($signed(ge2_y[gep2*32 +: 32]));
+            ge2_word[gep2*32 +: 32] = widen1312_sat($signed(ge2_y[gep2*32 +: 32]));
     end
     assign y_valid = ge2_ov;
     assign y_data  = ge2_word;

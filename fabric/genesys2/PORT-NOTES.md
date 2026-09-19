@@ -8235,16 +8235,28 @@ bitexact=1, mismatches=0/216).
 
 The fix moved the bottleneck, not removed it: gelu2's own real output
 can now correctly reach magnitude ~1000, which overflows Q6.25's own
-~+-64 representable range at the final widen step, wrapping via ordinary
-32-bit truncation -- the same class of issue decoder/encoder/output_head's
-own xres_bank already established project-wide (wrap32(), matched
-exactly between RTL and Python, not avoided). Informational cosine vs the
-real float output is now ~0.33 (worse than before the fix, ~0.72) since
-the dominant error moved from "clipped to +8" to "wrapped mod 2^32" --
-an honest, expected consequence of fixing one stage inside a chain that
-reuses a fixed Q6.25 format everywhere. A real fix needs a wider final
-output format than Q6.25 project-wide -- a materially bigger change, out
-of scope here.
+~+-64 representable range at the final widen step. Wrapping (matching
+decoder/encoder/output_head's own xres_bank precedent) made cosine
+WORSE (~0.72 -> ~0.33, wrapping turns a bounded clipping error into
+effectively random noise).
 
-Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Q4.12 GELU
-precision: fixed -- and what fixing it actually revealed" section.
+## Q6.25 final-output range: fixed (saturate, not wrap) -- deeper cause found underneath, not fixed
+
+Switched to saturating instead (widen1312_sat, both RTL and Python) --
+clip to Q6.25's own representable ceiling rather than truncate mod 2^32,
+same sat16()/act_quantize-clip idiom already used elsewhere. Recovered
+part of the loss: cosine -> ~0.58. Still bit-exact throughout
+(CONV_FRONT_END_VERDICT bitexact=1, mismatches=0/216).
+
+Remaining gap traces to something genuinely different, found while
+debugging this: real INT8 noise compounding across 3 cascaded
+activation-quantization boundaries, amplified by conv3's own small
+kernel (KW3=3). Confirmed directly: one real element with TRUE value
+21.19 quantizes to 92.97 in this project's own pipeline -- a real ~4.4x
+error, not a clip/wrap artifact. Not fixed here -- needs a different
+quantization strategy for gelu1->conv3 specifically (e.g. per-channel
+weight scales), a bigger, separate investigation.
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Q6.25
+final-output range: fixed (saturate, not wrap) -- and a real, deeper
+cause found underneath, not fixed" section.

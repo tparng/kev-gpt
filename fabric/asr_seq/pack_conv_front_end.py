@@ -56,17 +56,18 @@ def widen1312(x_q412):
     return np.asarray(x_q412, dtype=np.int64) << 13
 
 
-def wrap32(x):
-    """Wrap each element to signed 32-bit two's complement -- y_data is
-    `reg [P*32-1:0]` (32b/lane) in the RTL, and widen1312_w's own `<<<13`
-    is self-determined (result width = operand width, IEEE 1364/1800) so
-    it truncates to 32 bits there exactly like this. Same fix decoder/
-    encoder/output_head's own xres_bank needed (see conv_front_end_seq.sv's
-    own header) -- here triggered by gelu_wide_vec.sv's own positive-
-    passthrough fix, which can produce real magnitudes Q6.25's ~+-64
-    representable range doesn't cover."""
-    x = np.asarray(x, dtype=np.int64) & 0xFFFFFFFF
-    return np.where(x >= 0x80000000, x - 0x100000000, x)
+def widen1312_sat(x_q412_wide):
+    """Matches conv_front_end_seq.sv's own widen1312_sat exactly: x<<<13,
+    SATURATING (not wrapping) whenever that would overflow signed int32 --
+    x > +262143 (real > ~+64, Q6.25's own representable ceiling) clips to
+    INT32_MAX, x < -262144 clips to INT32_MIN, otherwise the shift is
+    exact. Chosen over decoder/encoder/output_head's own xres_bank
+    precedent (which wraps) because this is NEW code with a real choice to
+    make, not an already-shipped, already-gated design being revisited --
+    see conv_front_end_seq.sv's own header for the reasoning."""
+    x = np.asarray(x_q412_wide, dtype=np.int64)
+    return np.where(x > 262143, 0x7FFFFFFF,
+           np.where(x < -262144, -0x80000000, x << 13))
 
 
 def gelu_wide_q412(x_wide, lut):
@@ -218,12 +219,11 @@ def main_gen(out_dir: str):
     # ================= gelu2 (gelu_wide_q412, same fix as gelu1) ============
     g2_q412 = gelu_wide_q412(c3_out, lut_gelu)            # (TOUT3,COUT3) Q4.12, WIDE
 
-    # ================= widen Q4.12 -> Q6.25: FINAL OUTPUT ====================
-    # wrap32(): widen1312_w's own RTL shift is self-determined (32-bit,
-    # truncates/wraps) -- match it here, since g2_q412 can now genuinely
-    # exceed Q6.25's own ~+-64 representable range post-widen (the SAME
-    # class of fix decoder/encoder/output_head's own xres_bank needed).
-    final_out = wrap32(widen1312(g2_q412))                  # (TOUT3,COUT3) Q6.25 (wrapped)
+    # ================= widen Q4.12 -> Q6.25: FINAL OUTPUT (saturating) ======
+    # widen1312_sat: g2_q412 can now genuinely exceed Q6.25's own ~+-64
+    # representable range post-widen -- SATURATE (not wrap), matching
+    # conv_front_end_seq.sv's own widen1312_sat exactly.
+    final_out = widen1312_sat(g2_q412)                       # (TOUT3,COUT3) Q6.25 (saturated)
 
     # informational-only float check against the real HF model's own conv
     # front-end output
