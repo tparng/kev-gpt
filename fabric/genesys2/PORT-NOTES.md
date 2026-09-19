@@ -8203,3 +8203,28 @@ block is proven standalone; nothing end-to-end yet.
 Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Stage 1 conv
 front-end: tanh, groupnorm1, and the conv1d engine, all built + bit-exact"
 section.
+
+## Stage 1 top-level FSM: built, bit-exact end to end -- closes Stage 1
+
+`conv_front_end_seq.sv` chains conv1->tanh->groupnorm1->conv2->gelu->
+conv3->gelu into one `go` pulse, reusing every block exactly as gated
+standalone (no new arithmetic, only sequencing + format glue). Gated
+against real moonshine-tiny weights + real audio: `CONV_FRONT_END_VERDICT
+bitexact=1, mismatches=0/216` across the whole 7-stage chain, first real
+attempt after fixing two missing-mem-file build issues (`tanh_lut.mem`,
+`gelu_lut2.sv`'s own even/odd `gelu_lut_e.mem`/`gelu_lut_o.mem`).
+
+Honest, not-fixed limitation found gating this: conv3's own raw pre-GELU
+output reaches |.|~1004 in real units on the real-audio test, vastly
+outside Q4.12's fixed +-8 range GELU's own LUT expects (unlike conv1's
+similarly wide range feeding tanh, which saturates before +-8 -- GELU
+does not). Informational cosine vs the real float output is ~0.72 (RTL-
+vs-Python is still bit-exact -- this project's own gate bar). moonshine's
+real firmware sidesteps this by running the conv front-end unquantized;
+no existing precedent exists for INT8-quantizing it. A real fix needs a
+wider GELU input format, out of scope for reusing gelu_lut2.sv unmodified.
+
+Closes Stage 1 -- real gates now exist for every ASR accelerator stage,
+standalone and (Stage 1) end to end. Full writeup: gen2asr/
+ASR-ACCELERATOR-OP-SEQUENCE.md's "Stage 1 top-level FSM: built, bit-exact
+end to end" section.

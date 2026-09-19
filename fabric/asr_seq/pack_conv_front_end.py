@@ -1,0 +1,259 @@
+"""Golden reference + RTL test vectors for conv_front_end_seq.sv -- the
+Stage 1 conv front-end's own top-level FSM: conv1 -> tanh_ -> groupnorm1 ->
+conv2 -> gelu -> conv3 -> gelu (permute is free, see that file's header),
+end to end, against real moonshine-tiny weights and real audio
+(torch.manual_seed(0), L=3000, this project's own gate-audio convention).
+
+Reconstructs the SAME integer pipeline conv_front_end_seq.sv's own RTL
+computes, stage by stage, reusing every existing block's own reference
+function (conv1d_ref.conv1d_int_ref, pack_groupnorm1.gn_int, run_tanh.tanh_q,
+run_gelu.gelu_q) -- no new arithmetic here either, only the SAME format-glue
+choices (dq_shift targeting Q4.12 instead of the standalone conv gates' own
+Q6.25, sat16, actquant, widen-by-13) the RTL's own header documents.
+
+    .venv/bin/python -m fabric.asr_seq.pack_conv_front_end gen --dir <sim_dir>
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+GEN2ASR_SW = os.path.expanduser("~/gen2asr/sw_model")
+sys.path.insert(0, GEN2ASR_SW)
+sys.path.insert(0, os.path.join(GEN2ASR_SW, "model"))
+
+from fabric.asr_seq import conv1d_ref as cr  # noqa: E402
+from fabric.asr_seq.run_tanh import tanh_table, tanh_q  # noqa: E402
+from fabric.stage3.run_gelu import gelu_table, gelu_q  # noqa: E402
+from fabric.asr_seq.pack_groupnorm1 import gn_int, BETA_FRAC  # noqa: E402
+from fabric.stage3.run_layernorm import G_FRAC, seed_table  # noqa: E402
+from fabric.stage3.pack_banked_resident_vec import build_resident  # noqa: E402
+
+P = 8
+LANES, WBW = 128, 8
+Q412 = 12
+Q625 = 25
+OUT_FRAC_GN = 22   # groupnorm1_vec.sv's own OUT_FRAC
+AUDIO_SEED = 0
+AUDIO_LEN = 3000
+
+COUT1, KW1, STRIDE1 = 288, 127, 64
+COUT2, KW2, STRIDE2 = 576, 7, 3
+COUT3, KW3, STRIDE3 = 288, 3, 2
+
+
+def sat16(x):
+    return np.clip(np.asarray(x, dtype=np.int64), -32768, 32767)
+
+
+def widen1312(x_q412):
+    return np.asarray(x_q412, dtype=np.int64) << 13
+
+
+def choose_rshift_from_max(m: int, target_max: int = 100) -> int:
+    """Smallest non-negative right-shift bringing |m| under target_max --
+    same as pack_output_head.py's own choose_act_rshift_from_max, reused
+    directly as the actq()/gdequant() RTL 'shift' port value (this file's
+    own gn_ashift/ge1_ashift, dq_shift1/2/3)."""
+    if m <= target_max:
+        return 0
+    shift = 0
+    while (m >> shift) > target_max:
+        shift += 1
+    return shift
+
+
+def load_real():
+    from transformers import MoonshineForConditionalGeneration
+    model = MoonshineForConditionalGeneration.from_pretrained(
+        "UsefulSensors/moonshine-tiny", dtype=torch.float32)
+    model.eval()
+    enc = model.model.encoder
+
+    torch.manual_seed(AUDIO_SEED)
+    audio = torch.randn(1, AUDIO_LEN, dtype=torch.float32)
+    with torch.no_grad():
+        c1 = enc.conv1(audio.unsqueeze(1))          # (1,288,T1)
+        t1 = torch.tanh(c1)
+        gn = enc.groupnorm(t1)                        # (1,288,T1)
+        c2 = enc.conv2(gn)                              # (1,576,T2)
+        g2 = F.gelu(c2)
+        c3 = enc.conv3(g2)                              # (1,288,T3)
+        g3 = F.gelu(c3)
+        front_end_real = g3.permute(0, 2, 1)[0]          # (T3,288), real float reference
+
+    return dict(
+        audio=audio[0].detach().numpy().astype(np.float64),
+        w1=enc.conv1.weight.detach().numpy().astype(np.float64),
+        gn_gamma=enc.groupnorm.weight.detach().numpy().astype(np.float64),
+        gn_beta=enc.groupnorm.bias.detach().numpy().astype(np.float64),
+        w2=enc.conv2.weight.detach().numpy().astype(np.float64),
+        b2=enc.conv2.bias.detach().numpy().astype(np.float64),
+        w3=enc.conv3.weight.detach().numpy().astype(np.float64),
+        b3=enc.conv3.bias.detach().numpy().astype(np.float64),
+        front_end_real=front_end_real.detach().numpy().astype(np.float64),
+    )
+
+
+def _wmem(path, vals, nib):
+    mask = (1 << (4 * nib)) - 1
+    with open(path, "w") as f:
+        f.write("\n".join(f"{int(v) & mask:0{nib}x}" for v in vals) + "\n")
+
+
+def main_gen(out_dir: str):
+    os.makedirs(out_dir, exist_ok=True)
+    d = load_real()
+    audio = d["audio"][None, :]         # (1, TIN1)
+    tin1 = audio.shape[1]
+
+    # ================= conv1 (dq target = Q4.12, feeds tanh directly) =====
+    x1_pad = cr.pad_cin_input(audio, P)              # (8, TIN1)
+    w1_pad = cr.pad_cin_weight(d["w1"], P)             # (288,8,127)
+    cin1 = x1_pad.shape[0]
+    ashift1 = cr.choose_ashift(audio)
+    x1_int8 = cr.quantize_act(x1_pad, ashift1)
+    w1_flat = cr.transpose_weight(w1_pad)
+    w1_int8, wshift1 = cr.quantize_weight_per_matrix(w1_flat)
+    dq1 = ashift1 + wshift1 - Q412
+    c1_out = cr.conv1d_int_ref(x1_int8, w1_int8, KW1, STRIDE1, COUT1, cin1,
+                                bias_q=None, dq_shift=dq1)          # (TOUT1,COUT1) Q4.12
+    c1_sat = sat16(c1_out)
+    tout1 = c1_out.shape[0]
+    print(f"conv1: ashift={ashift1} wshift={wshift1} dq1={dq1} TOUT1={tout1}", file=sys.stderr)
+
+    # ================= tanh =================================================
+    lut_tanh = tanh_table()
+    t1_q412 = tanh_q(c1_sat, lut_tanh)                  # (TOUT1,COUT1) Q4.12
+
+    # ================= widen Q4.12 -> Q6.25, groupnorm1 =====================
+    gn_x_625 = widen1312(t1_q412)                        # (TOUT1,COUT1) Q6.25
+    c_gn, t_gn = COUT1, tout1
+    gn_x_flat = gn_x_625.reshape(-1)                       # t-major/channel-minor
+    g_gn = np.round(d["gn_gamma"] * (1 << G_FRAC)).astype(np.int64)
+    b_gn = np.round(d["gn_beta"] * (1 << BETA_FRAC)).astype(np.int64)
+    gn_out_list, gn_mean, gn_var, gn_A, gn_Yr = gn_int(
+        list(gn_x_flat.astype(object)), list(g_gn.astype(object)), list(b_gn.astype(object)))
+    gn_out = np.array([int(v) for v in gn_out_list], dtype=np.int64)   # (T*C,) Q.22
+    print(f"groupnorm1: mean={gn_mean} var={gn_var} A={gn_A} Yr={gn_Yr}", file=sys.stderr)
+
+    # ================= actquant groupnorm1 -> conv2 input ===================
+    gn_shift = choose_rshift_from_max(int(np.max(np.abs(gn_out))))
+    gn_int8 = np.clip(gn_out >> gn_shift, -128, 127).astype(np.int64)
+    ashift2_eff = OUT_FRAC_GN - gn_shift
+    print(f"groupnorm1->conv2: gn_shift={gn_shift} ashift2_eff={ashift2_eff}", file=sys.stderr)
+
+    # ================= conv2 (dq target = Q4.12, feeds gelu1) ===============
+    x2_int8 = gn_int8.reshape(t_gn, c_gn).T              # (CIN2=288, TIN2=t_gn)
+    cin2 = x2_int8.shape[0]
+    w2_pad = cr.pad_cin_weight(d["w2"], P)                 # no-op, 288 already /8
+    w2_flat = cr.transpose_weight(w2_pad)
+    w2_int8, wshift2 = cr.quantize_weight_per_matrix(w2_flat)
+    dq2 = ashift2_eff + wshift2 - Q412
+    b2_q = np.round(d["b2"] * (1 << Q412)).astype(np.int64)   # bias in Q4.12 (matches conv2's own target)
+    c2_out = cr.conv1d_int_ref(x2_int8, w2_int8, KW2, STRIDE2, COUT2, cin2,
+                                bias_q=b2_q, dq_shift=dq2)          # (TOUT2,COUT2) Q4.12
+    c2_sat = sat16(c2_out)
+    tout2 = c2_out.shape[0]
+    print(f"conv2: wshift={wshift2} dq2={dq2} TOUT2={tout2}", file=sys.stderr)
+
+    # ================= gelu1 =================================================
+    lut_gelu = gelu_table()
+    g1_q412 = gelu_q(c2_sat, lut_gelu)                    # (TOUT2,COUT2) Q4.12
+
+    # ================= actquant gelu1 -> conv3 input =========================
+    ge1_shift = choose_rshift_from_max(int(np.max(np.abs(g1_q412))))
+    ge1_int8 = np.clip(g1_q412 >> ge1_shift, -128, 127).astype(np.int64)
+    ashift3_eff = Q412 - ge1_shift
+    print(f"gelu1->conv3: ge1_shift={ge1_shift} ashift3_eff={ashift3_eff}", file=sys.stderr)
+
+    # ================= conv3 (dq target = Q4.12, feeds gelu2) ===============
+    x3_int8 = ge1_int8.T                                    # (CIN3=576, TIN3=tout2)
+    cin3 = x3_int8.shape[0]
+    w3_pad = cr.pad_cin_weight(d["w3"], P)                    # no-op, 576 already /8
+    w3_flat = cr.transpose_weight(w3_pad)
+    w3_int8, wshift3 = cr.quantize_weight_per_matrix(w3_flat)
+    dq3 = ashift3_eff + wshift3 - Q412
+    b3_q = np.round(d["b3"] * (1 << Q412)).astype(np.int64)
+    c3_out = cr.conv1d_int_ref(x3_int8, w3_int8, KW3, STRIDE3, COUT3, cin3,
+                                bias_q=b3_q, dq_shift=dq3)          # (TOUT3,COUT3) Q4.12
+    c3_sat = sat16(c3_out)
+    tout3 = c3_out.shape[0]
+    print(f"conv3: wshift={wshift3} dq3={dq3} TOUT3={tout3}", file=sys.stderr)
+
+    # ================= gelu2 =================================================
+    g2_q412 = gelu_q(c3_sat, lut_gelu)                    # (TOUT3,COUT3) Q4.12
+
+    # ================= widen Q4.12 -> Q6.25: FINAL OUTPUT ====================
+    final_out = widen1312(g2_q412)                          # (TOUT3,COUT3) Q6.25
+
+    # informational-only float check against the real HF model's own conv
+    # front-end output
+    y_real_from_int = final_out.astype(np.float64) / (1 << Q625)
+    y_real_ref = d["front_end_real"]
+    cos = float(np.dot(y_real_from_int.reshape(-1), y_real_ref.reshape(-1)) /
+                (np.linalg.norm(y_real_from_int) * np.linalg.norm(y_real_ref) + 1e-30))
+    print(f"cosine(quantized_int_output, real_float_front_end_output)={cos:.6f} (informational only)",
+          file=sys.stderr)
+
+    # ================= RTL vectors ============================================
+    all_w1, meta1 = build_resident([w1_int8], LANES, WBW)
+    all_w2, meta2 = build_resident([w2_int8], LANES, WBW)
+    all_w3, meta3 = build_resident([w3_int8], LANES, WBW)
+    hexw = (LANES * WBW + 3) // 4
+    _wmem(os.path.join(out_dir, "w1.mem"), all_w1, hexw)
+    _wmem(os.path.join(out_dir, "w2.mem"), all_w2, hexw)
+    _wmem(os.path.join(out_dir, "w3.mem"), all_w3, hexw)
+
+    xt1_flat = x1_int8.T.reshape(-1)              # (TIN1,CIN1) -> flat, CGRP1=1
+    _wmem(os.path.join(out_dir, "xt1.mem"), cr.pack_rows_p8(xt1_flat, P), (P * 8) // 4)
+
+    _wmem(os.path.join(out_dir, "g.mem"), cr.pack_rows_p32(g_gn, P), (P * 32) // 4)
+    _wmem(os.path.join(out_dir, "b.mem"), cr.pack_rows_p32(b_gn, P), (P * 32) // 4)
+    _wmem(os.path.join(out_dir, "b2.mem"), cr.pack_rows_p32(b2_q, P), (P * 32) // 4)
+    _wmem(os.path.join(out_dir, "b3.mem"), cr.pack_rows_p32(b3_q, P), (P * 32) // 4)
+    _wmem(os.path.join(out_dir, "seed.mem"), seed_table(), 5)
+
+    with open(os.path.join(out_dir, "tanh_lut.mem"), "w") as f:
+        f.write("\n".join(f"{int(v) & 0xFFFF:04x}" for v in lut_tanh) + "\n")
+    # vec_gelu.sv instantiates gelu_lut2 (BRAM-shared even/odd-banked core),
+    # not gelu_lut directly -- same split pack_encoder_block.py's own export
+    # already documented finding (that file's own header note on this).
+    with open(os.path.join(out_dir, "gelu_lut_e.mem"), "w") as f:
+        f.write("\n".join(f"{int(v) & 0xFFFF:04x}" for v in lut_gelu[0::2]) + "\n")
+    with open(os.path.join(out_dir, "gelu_lut_o.mem"), "w") as f:
+        f.write("\n".join(f"{int(v) & 0xFFFF:04x}" for v in lut_gelu[1::2]) + "\n")
+
+    gold_flat = final_out.reshape(-1)
+    gold_rows = cr.pack_rows_p32(gold_flat, P)
+    gold_masked = [v & 0xFFFFFFFFFFFFFFFF for v in gold_rows]
+
+    return {
+        "TIN1": tin1, "NWORDS1": meta1[0]["n_words"], "NWORDS2": meta2[0]["n_words"],
+        "NWORDS3": meta3[0]["n_words"], "DQ1": dq1, "GNSHIFT": gn_shift, "DQ2": dq2,
+        "GE1SHIFT": ge1_shift, "DQ3": dq3, "TOUT3": tout3, "COUT3": COUT3,
+        "gold_rows": gold_masked,
+    }
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="fabric.asr_seq.pack_conv_front_end")
+    sub = p.add_subparsers(dest="cmd")
+    g = sub.add_parser("gen")
+    g.add_argument("--dir", required=True)
+    a = p.parse_args(argv)
+    if a.cmd == "gen":
+        m = main_gen(a.dir)
+        print(f"TOUT3={m['TOUT3']} COUT3={m['COUT3']}")
+    else:
+        p.print_help()
+
+
+if __name__ == "__main__":
+    main()
