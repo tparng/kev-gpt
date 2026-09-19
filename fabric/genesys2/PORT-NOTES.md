@@ -8137,3 +8137,44 @@ update to match. Result, first attempt after all four fixes:
 Full writeup, including the per-bug detail: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's
 "The decoder-block FSM sketch, turned into a real, sized state machine"
 section.
+
+## Output-head top-level FSM (Stage 4): built, bit-exact
+
+Closes the last stage of the real pipeline: final decoder LayerNorm ->
+tied `lm_head` GEMV (`VOCAB=32768 x D=288`, INT8) -> argmax, once per
+real decode step. `fabric/asr_seq/rtl/output_head_seq.sv` +
+`pack_output_head.py` + `tb_output_head_seq.sv` + `run_output_head.py`.
+
+Real, deliberate dequant-scheme fork decided up front: `decoder_block_
+seq.sv`/`encoder_block_seq.sv` both use a per-matrix single-shift dequant
+simplification. With `VOCAB=32768` very different output rows feeding
+directly into an argmax, one shared shift risks real precision loss that
+could flip which token wins -- this file uses checkpoint C's real,
+already-deployed PER-ROW dequant instead (`vec_dequant.sv`, mantissa x
+2^exponent per row), with the `lm_head` weight matrix quantized per-row
+too (matching `model/c_port/ops.c`'s own `linear_lmhead_i8` convention).
+
+Real decoder hidden states via the real HF model's own forward pass
+(teacher-forced, `decoder.norm` temporarily patched to identity so the
+returned state is pre-final-norm) -- not a reimplementation of 6 layers
+of attention a second time.
+
+Two real bugs, both genuinely new since `VOCAB=32768` is far larger (row
+count and real hidden-state magnitude) than anything gated here before:
+1. `gi` (drain-side counter) needs to count to `ROWS_VOCAB+1`=4097 but
+   was declared `$clog2(GEMV_MMAX/P)` wide (copied from decoder/encoder's
+   own `gi`, fine at their much smaller `GEMV_MMAX`) -- silently wrapped
+   at 4096, drain loop never terminated. Fixed by widening with explicit
+   margin.
+2. The real decoder hidden state's own magnitude (~240 in real units)
+   already exceeds Q6.25's 32-bit range for some elements even before
+   any accumulation -- same class of fix as decoder/encoder's own
+   `wrap32()`, triggered by a fresh real input's own magnitude rather
+   than layer-to-layer growth.
+
+Result: `OUTPUT_HEAD_SEQ_VERDICT,bitexact=1,mismatches=0,checked=3,
+nsteps=3`. Real gates now exist for every pipeline stage except Stage 1
+(the conv front-end).
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Output-head
+top-level FSM (Stage 4): built, bit-exact" section.
