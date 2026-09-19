@@ -8178,3 +8178,28 @@ nsteps=3`. Real gates now exist for every pipeline stage except Stage 1
 
 Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Output-head
 top-level FSM (Stage 4): built, bit-exact" section.
+
+## Stage 1 conv front-end: tanh, groupnorm1, conv1d engine (x3 shapes) -- all bit-exact
+
+Closes the "single biggest new hardware component" line from the
+op-sequence doc's own Stage 1 table. Four new gated modules:
+`tanh_lut.sv`/`vec_tanh.sv` (exact mirror of `silu_lut.sv`/`vec_silu.sv`,
+first attempt), `groupnorm1_vec.sv` (GroupNorm num_groups=1: ONE mean/var
+over all C*T=12960 elements + per-channel affine WITH bias -- built by
+copying `layernorm_vec_gendiv.sv`'s own reduction/rsqrt core verbatim,
+same eps=1e-5, plus a separate gamma/beta preload phase and a 4-hop beta
+pipeline pass-through; first attempt), and `conv1d_seq.sv` (conv1d as a
+sequence of GEMV calls reusing `gemv_banked_resident_vec.sv` unmodified,
+one generic module for all 3 real conv shapes -- conv1's CIN=1 padded to
+P=8 rather than special-cased; all three gated bit-exact on the first
+attempt: `CONV1_VERDICT`/`CONV2_VERDICT`/`CONV3_VERDICT bitexact=1,
+mismatches=0`).
+
+Not yet done: the top-level FSM chaining all of Stage 1 into one `go`
+pulse, the Q6.25<->Q4.12 format glue between blocks, and a single
+end-to-end gate against the real HF conv front-end's own output. Each
+block is proven standalone; nothing end-to-end yet.
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Stage 1 conv
+front-end: tanh, groupnorm1, and the conv1d engine, all built + bit-exact"
+section.
