@@ -41,10 +41,14 @@ def transpose_weight(w_padded):
     return w_padded.transpose(0, 2, 1).reshape(cout, kw * cin)
 
 
-def quantize_weight_per_matrix(w_flat, target_max=100.0):
+def quantize_weight_per_matrix(w_flat):
     """One shift for the whole matrix -- decoder_block_seq.sv/
     encoder_block_seq.sv's own simpler convention (no giant per-row-sensitive
-    argmax downstream like output_head_seq.sv has, so no per-row scheme needed)."""
+    argmax downstream like output_head_seq.sv has, so no per-row scheme needed).
+    Already uses INT8's full +-127 ceiling directly (no target_max headroom
+    -- there never was one here; an earlier `target_max=100.0` default
+    parameter existed but was dead code, never read by this function's own
+    body, which always searched against the true 127.0 ceiling)."""
     m = float(np.max(np.abs(w_flat)))
     if m <= 0:
         return np.zeros_like(w_flat, dtype=np.int64), 0
@@ -57,7 +61,17 @@ def quantize_weight_per_matrix(w_flat, target_max=100.0):
     return w_int8, wshift
 
 
-def choose_ashift(x_real, target_max=100.0):
+def choose_ashift(x_real, target_max=127.0):
+    """Smallest right-shift-equivalent scale keeping |x_real*2^ashift| within
+    target_max. Was defaulted to 100.0 (leaving ~21% of INT8's own +-127
+    range unused, a real, avoidable precision loss compounding across this
+    pipeline's several cascaded INT8 boundaries -- found investigating
+    gelu1->conv3's own quantization noise, see conv_front_end_seq.sv's own
+    header). 127.0 is safe here (not just "close to the edge"): the search
+    below is a floor-style shift count, so `m*2^ashift <= target_max` holds
+    by construction, and round()-ing any individual element (<=m) to the
+    nearest int can't push it past target_max=127 either -- rounding a
+    value already <=127.0 never produces >127."""
     m = float(np.max(np.abs(x_real)))
     if m <= 0:
         return 0

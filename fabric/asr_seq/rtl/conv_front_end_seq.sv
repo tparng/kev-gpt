@@ -125,21 +125,46 @@
 // RTL-vs-Python stays bit-exact throughout both attempts (CONV_FRONT_END_
 // VERDICT bitexact=1, mismatches=0/216).
 //
-// The REMAINING gap traces to a genuinely different, deeper cause, found
+// The REMAINING gap traced to a genuinely different, deeper cause, found
 // while debugging this: real INT8-quantization noise compounding across
 // THREE cascaded activation-quantization boundaries (audio->conv1,
 // groupnorm1->conv2, gelu1->conv3) before conv3's own small kernel
 // (KW3=3) amplifies it further for some output positions. Confirmed
 // directly: one real element has TRUE conv3-then-gelu value 21.19 (real
-// units), but this file's own quantized pipeline computes 92.97 at that
+// units), but this file's own quantized pipeline computed 92.97 at that
 // SAME element -- a real ~4.4x error, not a clipping/wrapping artifact
 // (GELU is near-identity there, x>>0, so the error is inherited straight
 // from conv3's own raw dequantized output, not introduced by GELU or the
-// final widen). This is NOT fixed here -- it would need a materially
-// different quantization strategy for the gelu1->conv3 boundary specifically
-// (e.g. per-channel rather than per-matrix weight scales, or retaining
-// more than INT8 precision through that one narrow-kernel stage) -- a
-// bigger, separate investigation than either fix above.
+// final widen).
+//
+// ---- Partial fix: stop wasting INT8 headroom (conv1d_ref.py's own
+// choose_ashift, pack_conv_front_end.py's own choose_rshift_from_max) ----
+// Both of this pipeline's activation-quantization scale searches
+// defaulted to `target_max=100`, not INT8's real ceiling of 127 -- ~21%
+// of the format's own dynamic range was being left unused at EVERY
+// activation-quantization boundary in this chain, for no reason (the
+// search is a floor-style/round-nearest shift choice that provably can't
+// overshoot 127 even at target_max=127 -- see choose_ashift's own updated
+// docstring). Raising both to 127 recovered a real bit of precision at
+// gelu1->conv3 specifically (`ge1_shift` 12->11) and at conv1's own audio
+// quantization (`ashift` 0->1 in the standalone conv3 gate). The same
+// concrete element above improved from 92.97 to **50.75** (still ~2.4x
+// off the true 21.19, better than 4.4x but not fixed) -- and the whole-
+// chain informational cosine rose from **~0.58 to ~0.83**. All of
+// conv1/conv2/conv3's own standalone gates AND this file's own end-to-end
+// gate stay bit-exact throughout (dq_shift/ge1_ashift/etc. are always
+// runtime ports, computed once and fed identically to RTL and Python --
+// changing WHICH shift gets chosen can't affect bit-exactness by
+// construction, only the resulting precision).
+//
+// This closes part of the gap, not all of it: a real ~2.4x error remains
+// on at least this one element, which needs a materially different
+// quantization strategy for the gelu1->conv3 boundary specifically (e.g.
+// per-channel rather than per-matrix weight scales, which would need
+// conv1d_seq.sv's own dequant step widened from a single runtime shift to
+// a per-row scheme like output_head_seq.sv's own vec_dequant.sv -- a real
+// RTL change to an already-proven, shared module, not attempted here) --
+// a bigger, separate investigation than the precision-headroom fix above.
 
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps

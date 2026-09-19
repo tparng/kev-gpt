@@ -8248,15 +8248,32 @@ same sat16()/act_quantize-clip idiom already used elsewhere. Recovered
 part of the loss: cosine -> ~0.58. Still bit-exact throughout
 (CONV_FRONT_END_VERDICT bitexact=1, mismatches=0/216).
 
-Remaining gap traces to something genuinely different, found while
+Remaining gap traced to something genuinely different, found while
 debugging this: real INT8 noise compounding across 3 cascaded
 activation-quantization boundaries, amplified by conv3's own small
 kernel (KW3=3). Confirmed directly: one real element with TRUE value
-21.19 quantizes to 92.97 in this project's own pipeline -- a real ~4.4x
-error, not a clip/wrap artifact. Not fixed here -- needs a different
-quantization strategy for gelu1->conv3 specifically (e.g. per-channel
-weight scales), a bigger, separate investigation.
+21.19 quantized to 92.97 in this project's own pipeline -- a real ~4.4x
+error, not a clip/wrap artifact.
 
-Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Q6.25
-final-output range: fixed (saturate, not wrap) -- and a real, deeper
-cause found underneath, not fixed" section.
+## gelu1->conv3 quantization noise: partially fixed, real remainder left open
+
+Both quantization-scale searches in this pipeline (choose_ashift,
+choose_rshift_from_max) defaulted to target_max=100, not INT8's real
+ceiling of 127 -- ~21% of the format's own range wasted at EVERY
+activation-quantization boundary, for no reason (both are provably safe
+at target_max=127, see choose_ashift's own updated docstring). Raising
+both to 127 recovered a real bit of precision at gelu1->conv3
+specifically (ge1_shift 12->11). The same element improved 92.97 ->
+50.75 (still ~2.4x off true 21.19, not fixed) -- whole-chain cosine rose
+~0.58 -> ~0.83. Every standalone conv gate and the end-to-end gate stay
+bit-exact throughout.
+
+Not fully fixed: the remaining ~2.4x error needs per-channel (not
+per-matrix) weight scales for gelu1->conv3, which needs conv1d_seq.sv's
+own dequant widened to a per-row scheme like output_head_seq.sv's own
+vec_dequant.sv -- a real RTL change to an already-proven shared module,
+not attempted here.
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "gelu1->conv3
+quantization noise: partially fixed (wasted INT8 headroom), a real
+remainder left open" section.

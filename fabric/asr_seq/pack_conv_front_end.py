@@ -83,11 +83,21 @@ def gelu_wide_q412(x_wide, lut):
     return np.where(x_wide > 32767, x_wide, lut_out)
 
 
-def choose_rshift_from_max(m: int, target_max: int = 100) -> int:
+def choose_rshift_from_max(m: int, target_max: int = 127) -> int:
     """Smallest non-negative right-shift bringing |m| under target_max --
     same as pack_output_head.py's own choose_act_rshift_from_max, reused
-    directly as the actq()/gdequant() RTL 'shift' port value (this file's
-    own gn_ashift/ge1_ashift, dq_shift1/2/3)."""
+    directly as the actq() RTL 'shift' port value for gn_ashift/ge1_ashift
+    (both INT8 activation quantizations, ceiling 127). Was defaulted to
+    100 (~21% of INT8's own range left unused, a real, avoidable precision
+    loss) -- found investigating gelu1->conv3's own quantization noise
+    (ge1_shift alone was landing a full extra bit conservative: gelu1's
+    own real max ~54.65 only needed shift=11 to fit <=127, but target_max
+    =100 pushed it to shift=12, discarding ALL fractional real-unit
+    precision -- see conv_front_end_seq.sv's own header). 127 is safe: the
+    search is a floor-style integer right-shift (`m>>shift`, monotonic,
+    never rounds up), so every OTHER element (<=m in magnitude) also
+    lands <=127 after the same shift -- no new clipping risk from raising
+    this."""
     if m <= target_max:
         return 0
     shift = 0
