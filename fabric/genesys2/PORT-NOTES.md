@@ -8081,7 +8081,23 @@ first GEMV call, silently wrong on every later one), attention's own
 context write dropping row 0 of every head, two lane-width mismatches
 (a P*64 module output read as P*32, a P*32 bank row read as P*16), and
 flat 256-bit vector `+` used for residual/bias adds instead of 8
-independent 32-bit signed lanes (a real carry-bleed between lanes). Full
-writeup, including the per-bug detail: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's
+independent 32-bit signed lanes (a real carry-bleed between lanes).
+
+**Second update: real multi-step decoding, bit-exact, zero RTL changes.**
+`step`/`blk` were already runtime ports -- extending the gate to drive
+real decode steps 0,1,2 (moonshine-tiny's own `TOKEN_IDS`) needed no RTL
+edits, only a bigger gate: `pack_decoder_block.py` now profiles every GEMV
+call site's magnitude across all 3 steps first, then computes the real
+reference with ONE fixed `ACT_RSHIFT`/`g_frac` per site (the module's
+`ACT_*`/`GF_*` are compile-time parameters, so per-step shifts were never
+actually an option); `tb_decoder_block_seq.sv` loops `go` across all 3
+steps, re-writing a fresh per-step `xres0` each time. First attempt:
+`DECODER_BLOCK_SEQ_VERDICT,bitexact=1,mismatches=0,checked=864,nsteps=3`
+-- real causal self-attention over `Tc=2`/`Tc=3` (not just the `Tc=1`
+case the first gate exercised) worked correctly untested. Layer-looping
+(`blk=1..5`) is still open: `WB_Q`/`WB_K`/.../`WB_FC2` are still
+compile-time parameters, not runtime-selectable per layer.
+
+Full writeup, including the per-bug detail: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's
 "The decoder-block FSM sketch, turned into a real, sized state machine"
 section.

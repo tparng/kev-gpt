@@ -1,8 +1,9 @@
-"""Sim gate for decoder_block_seq.sv -- the first FUNCTIONAL gate (not just
-elaboration) for the real, sized decoder-block top-level FSM: real
-moonshine-tiny layer-0 weights, real cross K/V (T2=6), real initial
-residual, one full decoder-layer forward pass (decode step 0), checked
-bit-exact against pack_decoder_block.py's own golden xres3.
+"""Sim gate for decoder_block_seq.sv -- the MULTI-STEP functional gate for
+the real, sized decoder-block top-level FSM: real moonshine-tiny layer-0
+weights, real cross K/V (T2=6), real per-step initial residuals, one full
+decoder-layer forward pass per real decode step (step 0..N_STEPS-1,
+self-attn KV cache growing causally across steps), each checked bit-exact
+against pack_decoder_block.py's own per-step golden xres3.
 
     python -m fabric.asr_seq.run_decoder_block
 
@@ -29,6 +30,7 @@ def run(sim_dir: str) -> bool:
     os.makedirs(sim_dir, exist_ok=True)
     manifest = pack_decoder_block.main_gen(sim_dir)
     n_words = manifest["n_words_total"]
+    n_steps = manifest["n_steps"]
 
     vvp = os.path.join(sim_dir, "sim.vvp")
     sources = [
@@ -44,7 +46,8 @@ def run(sim_dir: str) -> bool:
         os.path.join(RTL_DIR, "decoder_block_seq.sv"),
         TB,
     ]
-    cp = subprocess.run(["iverilog", "-g2012", "-o", vvp, f"-DNWORDS={n_words}"] + sources,
+    cp = subprocess.run(["iverilog", "-g2012", "-o", vvp,
+                          f"-DNWORDS={n_words}", f"-DNSTEPS={n_steps}"] + sources,
                          cwd=sim_dir, capture_output=True, text=True)
     if cp.returncode != 0:
         print("IVERILOG_COMPILE_FAIL")

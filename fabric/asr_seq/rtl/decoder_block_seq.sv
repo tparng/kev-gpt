@@ -11,11 +11,18 @@
 //
 // gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Decoder-block FSM sketch, turned
 // into a real, sized state machine" section documents the design and its
-// real, flagged open items; this revision closes the functional-gate gap
-// that first pass left open (fabric/asr_seq/pack_decoder_block.py +
+// real, flagged open items; a first revision closed the functional-gate gap
+// that pass left open (fabric/asr_seq/pack_decoder_block.py +
 // tb_decoder_block_seq.sv, real moonshine-tiny layer-0 weights, T2=6, decode
-// step 0): BIT-EXACT, see that gate's own verdict line for the current
-// status.
+// step 0): BIT-EXACT. The gate now covers real MULTI-STEP decoding (step
+// 0..N_STEPS-1, self-attn KV cache growing causally across steps, RoPE
+// position advancing) too -- `step`/`blk` were ALREADY runtime ports before
+// this, not new; only the gate itself (+ its own fixed, all-steps-profiled
+// ACT_*/GF_* quantization constants) needed building. See that gate's own
+// verdict line for the current status. Layer-looping (blk=1..5, chaining
+// multiple decoder layers) is still NOT covered -- WB_Q/WB_K/.../WB_FC2
+// below are still compile-time parameters, not runtime-selectable per
+// layer; that needs its own follow-up.
 //
 // GEMV QUANTIZATION SCHEME (a real, explicit, documented simplification --
 // the production INT8 export/quantization scheme is still genuinely

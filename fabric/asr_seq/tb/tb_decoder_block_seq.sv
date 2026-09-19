@@ -1,11 +1,12 @@
-// tb_decoder_block_seq -- the first FUNCTIONAL (not just elaboration) gate
-// for decoder_block_seq.sv: loads real moonshine-tiny layer-0 weights
+// tb_decoder_block_seq -- the MULTI-STEP functional gate for
+// decoder_block_seq.sv: loads real moonshine-tiny layer-0 weights
 // (INT8-quantized per pack_decoder_block.py's own documented scheme),
-// gamma, bias, and cross-attention K/V (T2=6), writes the real initial
-// residual (a real decoder token embedding), pulses `go` for ONE full
-// decoder-layer forward pass (decode step 0), and checks the final
-// residual stream against pack_decoder_block.py's own golden xres3 --
-// bit-exact.
+// gamma, bias, and cross-attention K/V (T2=6) ONCE, then for each of
+// N_STEPS real decode steps: writes that step's own real decoder token
+// embedding as the initial residual, pulses `go` for one full
+// decoder-layer forward pass (step advancing each time, growing the
+// self-attn KV cache causally), and checks the final residual stream
+// against pack_decoder_block.py's own per-step golden xres3 -- bit-exact.
 //
 // Weight-load protocol: identical to fabric/stage3/run_resident_banked_vec.py's
 // own established gemv_banked_resident_vec.sv gate -- one-time resident load,
@@ -14,6 +15,9 @@
 `timescale 1ns / 1ps
 `ifndef NWORDS
  `define NWORDS 13824
+`endif
+`ifndef NSTEPS
+ `define NSTEPS 3
 `endif
 
 module tb;
@@ -32,6 +36,7 @@ module tb;
     localparam integer WBITS    = LANES*WBW;
     localparam integer SUBW     = WBITS/32;
     localparam integer NWORDS   = `NWORDS;
+    localparam integer NSTEPS   = `NSTEPS;
 
     reg clk = 1'b0;
     always #5 clk = ~clk;
@@ -47,13 +52,18 @@ module tb;
     reg xkv_wstart, xkv_wkv; reg [$clog2(NHEAD)-1:0] xkv_whead; reg [8:0] xkv_wpos;
     reg xkv_wvalid; reg [ATTN_P*32-1:0] xkv_wdata; wire xkv_wdone;
 
+    // ACT_*/GF_* are decoder_block_seq.sv's own compile-time quantization
+    // constants -- FIXED for the whole simulation, chosen by
+    // pack_decoder_block.py's own two-pass profiling to safely cover every
+    // one of NSTEPS decode steps (not just step 0's own magnitude; see that
+    // file's header for why a per-step choice isn't an option here).
     decoder_block_seq #(
         .P(P), .D(D), .FFN(FFN), .NHEAD(NHEAD), .HEAD_DIM(HEAD_DIM), .ATTN_P(ATTN_P),
         .ATTN_TMAX(8), .T2(T2),
         .POST_SCALE_Q16(75674),
-        .ACT_Q(17), .ACT_K(17), .ACT_V(17), .ACT_O(15),
+        .ACT_Q(17), .ACT_K(17), .ACT_V(17), .ACT_O(18),
         .ACT_CQ(19), .ACT_OC(20), .ACT_FC1(17), .ACT_FC2(11),
-        .GF_Q(-4), .GF_K(-4), .GF_V(-2), .GF_O(-9),
+        .GF_Q(-4), .GF_K(-4), .GF_V(-2), .GF_O(-12),
         .GF_CQ(-6), .GF_OC(-14), .GF_FC1(-1), .GF_FC2(-18),
         .WB_Q(0), .WB_K(864), .WB_V(1728), .WB_O(2592),
         .WB_CQ(3456), .WB_CO(4320), .WB_FC1(5184), .WB_FC2(10368)
@@ -76,10 +86,10 @@ module tb;
     reg [31:0] biasfc1 [0:ROWS_FFN2*P-1];
     reg [31:0] biasfc2 [0:ROWS_D*P-1];
     reg [31:0] xkvin [0:T2*NHEAD*HEAD_DIM*2-1];
-    reg [31:0] xres0v [0:ROWS_D*P-1];
-    reg [31:0] xres3ref [0:D-1];
+    reg [31:0] xres0steps [0:NSTEPS*ROWS_D*P-1];
+    reg [31:0] xres3refsteps [0:NSTEPS*D-1];
 
-    integer i, s, hcnt, pos, head, b, l, mism, checked;
+    integer i, s, hcnt, pos, head, b, l, mism, checked, st_i, mism_step;
     reg [HEAD_DIM*32-1:0] kvec, vvec;
     reg [WBITS-1:0] word_tmp;
     reg [P*32-1:0] rowbuf;
@@ -106,8 +116,8 @@ module tb;
         $readmemh("bias_fc1.mem", biasfc1);
         $readmemh("bias_fc2.mem", biasfc2);
         $readmemh("xkv_in.mem", xkvin);
-        $readmemh("xres0.mem", xres0v);
-        $readmemh("xres3_ref.mem", xres3ref);
+        $readmemh("xres0_steps.mem", xres0steps);
+        $readmemh("xres3_ref_steps.mem", xres3refsteps);
 
         go=0; blk=0; step=0; xres_wr=0; xres_waddr=0; xres_wdata=0;
         gv_ld_rst=0; gv_ld_we=0; gv_ld_data=0;
@@ -119,7 +129,7 @@ module tb;
         rst = 0;
         @(posedge clk); #1;
 
-        // ---- 1. load GEMV resident weight image ----
+        // ---- 1. load GEMV resident weight image (once, step-invariant) ----
         gv_ld_rst = 1; @(posedge clk); #1; gv_ld_rst = 0;
         for (i = 0; i < NWORDS; i = i + 1) begin
             word_tmp = wload[i];
@@ -130,7 +140,7 @@ module tb;
         gv_ld_we = 0;
         $display("TB_WEIGHTS_LOADED,nwords=%0d", NWORDS);
 
-        // ---- 2. load LN gamma tables ----
+        // ---- 2. load LN gamma tables (once, step-invariant) ----
         for (i = 0; i < ROWS_D; i = i + 1) begin
             for (l = 0; l < P; l = l + 1) rowbuf[l*32 +: 32] = gamma1[i*P+l];
             gam_sel = 0; gam_waddr = i[$clog2(D/P)-1:0]; gam_wdata = rowbuf; gam_we = 1;
@@ -149,7 +159,7 @@ module tb;
         gam_we = 0;
         $display("TB_GAMMA_LOADED");
 
-        // ---- 3. load bias tables ----
+        // ---- 3. load bias tables (once, step-invariant) ----
         for (i = 0; i < ROWS_FFN2; i = i + 1) begin
             for (l = 0; l < P; l = l + 1) rowbuf[l*32 +: 32] = biasfc1[i*P+l];
             bias_sel = 0; bias_waddr = i[$clog2(DFFN2/P)-1:0]; bias_wdata = rowbuf; bias_we = 1;
@@ -163,8 +173,8 @@ module tb;
         bias_we = 0;
         $display("TB_BIAS_LOADED");
 
-        // ---- 4. preload cross-attn K/V (same protocol as
-        // tb_decoder_cross_attn.sv's do_kv_write task) ----
+        // ---- 4. preload cross-attn K/V (once, step-invariant -- same
+        // protocol as tb_decoder_cross_attn.sv's do_kv_write task) ----
         for (pos = 0; pos < T2; pos = pos + 1) begin
             for (head = 0; head < NHEAD; head = head + 1) begin
                 hcnt = (pos * NHEAD + head) * HEAD_DIM * 2;
@@ -194,42 +204,55 @@ module tb;
         end
         $display("TB_CROSS_KV_LOADED,t2=%0d,nhead=%0d", T2, NHEAD);
 
-        // ---- 5. write initial residual (real decoder token embedding) ----
-        for (i = 0; i < ROWS_D; i = i + 1) begin
-            for (l = 0; l < P; l = l + 1) rowbuf[l*32 +: 32] = xres0v[i*P+l];
-            xres_waddr = i[$clog2(D/P)-1:0]; xres_wdata = rowbuf; xres_wr = 1;
-            @(posedge clk); #1;
-        end
-        xres_wr = 0;
-        $display("TB_XRES0_LOADED");
-
-        // ---- 6. run one decoder-layer forward pass, decode step 0 ----
-        blk = 0; step = 0;
-        dbg_armed = 1'b1;
-        go = 1; @(posedge clk); #1; go = 0;
-        while (!done) @(posedge clk); #1;
-        dbg_armed = 1'b0;
-        $display("TB_LAYER_DONE");
-
-        // ---- 7. check final residual vs golden ----
+        // ---- 5. run NSTEPS decode steps on layer 0, checking each one's
+        // own residual output against that step's own golden xres3. Each
+        // step writes a FRESH xres0 (that step's own real token embedding,
+        // NOT chained from the previous step's xres3 -- real decode-step
+        // semantics, see pack_decoder_block.py's header), advances `step`
+        // (growing the self-attn KV cache causally via decoder_block_seq.sv's
+        // own kv_bank writes), and re-pulses `go`. Weights/gamma/bias/cross
+        // K/V stay loaded from steps 1-4 above, unchanged. ----
+        blk = 0;
         mism = 0; checked = 0;
-        for (i = 0; i < ROWS_D; i = i + 1) begin
-            xres_waddr = i[$clog2(D/P)-1:0];
-            #1;
-            for (l = 0; l < P; l = l + 1) begin
-                checked = checked + 1;
-                if (xres_rdata_dbg[l*32 +: 32] !== xres3ref[i*P+l]) begin
-                    mism = mism + 1;
-                    if (mism <= 10)
-                        $display("MISMATCH,row=%0d,lane=%0d,got=%0d,ref=%0d",
-                                  i, l, $signed(xres_rdata_dbg[l*32 +: 32]), $signed(xres3ref[i*P+l]));
+        for (st_i = 0; st_i < NSTEPS; st_i = st_i + 1) begin
+            for (i = 0; i < ROWS_D; i = i + 1) begin
+                for (l = 0; l < P; l = l + 1)
+                    rowbuf[l*32 +: 32] = xres0steps[st_i*ROWS_D*P + i*P + l];
+                xres_waddr = i[$clog2(D/P)-1:0]; xres_wdata = rowbuf; xres_wr = 1;
+                @(posedge clk); #1;
+            end
+            xres_wr = 0;
+            $display("TB_XRES0_LOADED,step=%0d", st_i);
+
+            step = st_i[8:0];
+            dbg_armed = 1'b1;
+            go = 1; @(posedge clk); #1; go = 0;
+            while (!done) @(posedge clk); #1;
+            dbg_armed = 1'b0;
+            $display("TB_LAYER_DONE,step=%0d", st_i);
+
+            mism_step = 0;
+            for (i = 0; i < ROWS_D; i = i + 1) begin
+                xres_waddr = i[$clog2(D/P)-1:0];
+                #1;
+                for (l = 0; l < P; l = l + 1) begin
+                    checked = checked + 1;
+                    if (xres_rdata_dbg[l*32 +: 32] !== xres3refsteps[st_i*D + i*P + l]) begin
+                        mism = mism + 1;
+                        mism_step = mism_step + 1;
+                        if (mism <= 10)
+                            $display("MISMATCH,step=%0d,row=%0d,lane=%0d,got=%0d,ref=%0d",
+                                      st_i, i, l, $signed(xres_rdata_dbg[l*32 +: 32]),
+                                      $signed(xres3refsteps[st_i*D + i*P + l]));
+                    end
                 end
             end
+            $display("TB_STEP_DONE,step=%0d,mismatches=%0d", st_i, mism_step);
         end
 
         $display("TB_DONE,checked=%0d,mismatches=%0d", checked, mism);
-        $display("DECODER_BLOCK_SEQ_VERDICT,bitexact=%0d,mismatches=%0d,checked=%0d",
-                  (mism == 0), mism, checked);
+        $display("DECODER_BLOCK_SEQ_VERDICT,bitexact=%0d,mismatches=%0d,checked=%0d,nsteps=%0d",
+                  (mism == 0), mism, checked, NSTEPS);
         $finish;
     end
 

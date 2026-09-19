@@ -1,28 +1,39 @@
 """Golden reference + RTL test vectors for decoder_block_seq.sv -- the
-first functional (not just elaboration) gate for the real, sized
-decoder-block top-level FSM. One full decoder-layer forward pass (layer 0,
-decode step 0: self-attn tcount=1, cross-attn tcount=T2=6), using REAL
-moonshine-tiny weights throughout: input_layernorm, self_attn.{q,k,v,o}_proj,
-post_attention_layernorm, encoder_attn.{q,k,v,o}_proj (cross), final_layernorm,
-mlp.fc1(+bias)/fc2(+bias). Cross K/V input reuses the SAME real conv-front-end
-output as pack_encoder_self_attn.py/pack_decoder_cross_attn.py (T2=6, same
-fixed-seed waveform). Query input reuses the SAME real decoder token
-embeddings/TOKEN_IDS as pack_decoder_self_attn.py.
+MULTI-STEP functional gate for the real, sized decoder-block top-level FSM.
+Runs decoder layer 0 across ALL of TOKEN_IDS' real decode steps (step=0,1,2),
+using REAL moonshine-tiny weights throughout: input_layernorm,
+self_attn.{q,k,v,o}_proj, post_attention_layernorm, encoder_attn.{q,k,v,o}_proj
+(cross), final_layernorm, mlp.fc1(+bias)/fc2(+bias). Cross K/V input reuses
+the SAME real conv-front-end output as pack_encoder_self_attn.py/
+pack_decoder_cross_attn.py (T2=6, same fixed-seed waveform). Query input
+reuses the SAME real decoder token embeddings/TOKEN_IDS as
+pack_decoder_self_attn.py -- which already established the causal self-attn
+KV-cache-accumulation pattern this file reuses directly (self_k_cache[h]
+grows one row per step, softmax over T=step+1 positions).
 
-GEMV quantization scheme, a real, explicit, DOCUMENTED simplification (this
-project's own "quantization scheme still open" note, unresolved upstream --
-not invented as final here): per-matrix single-scale INT8 weights
-(w_int8 = round(w_real * 2^WSHIFT), WSHIFT chosen so max|w_int8|<=127, no
-clipping) and per-call single-shift INT8 activation quantization
-(x_int8 = sat(x_fixed >>> ACT_RSHIFT, -128, 127), a PLAIN arithmetic-shift
-floor -- matching decoder_block_seq.sv's own G_XFEED stage bit-for-bit, no
-rounding). Dequant is a single combined shift (decoder_block_seq.sv's own
-g_frac / gdequant()):
-    g_frac = FRAC_IN - ACT_RSHIFT + WSHIFT - FRAC_OUT
-This is NOT checkpoint C's own per-channel vec_dequant.sv scheme (that one
-is tied to INT4-QAT weights this project doesn't use for ASR) -- it is a
-real, self-consistent, bit-exactly-reproducible choice for THIS gate,
-profiled against real data below so no value clips.
+Extends the earlier STEP=0-only gate (see git history) to real multi-step
+decoding: self-attention now exercises a genuine causal softmax over T>1
+positions (not just the degenerate T=1 case), and RoPE's position argument
+is the real per-step position, not hardcoded 0. Layer-looping (multiple
+decoder layers chained, blk=1..5) is explicitly OUT of scope here --
+decoder_block_seq.sv's WB_Q/WB_K/.../WB_FC2 weight-offset parameters are
+still compile-time constants, not runtime-selectable per layer; that needs
+its own follow-up before multi-layer gating is possible.
+
+GEMV quantization scheme (unchanged from the single-step gate, see that
+version's own header for the full rationale): per-matrix single-scale INT8
+weights, per-call single-shift INT8 activations, one combined dequant shift.
+The one REAL change multi-step forces: decoder_block_seq.sv's ACT_*/GF_*
+constants are compile-time MODULE PARAMETERS (one value for the whole
+simulation), not a per-call runtime choice -- so a single decode step can no
+longer freely auto-derive its own ACT_RSHIFT from just that step's own
+observed magnitude (the earlier, STEP=0-only gate's approach). This file
+now does two passes: PASS 1 profiles every call site's observed magnitude
+across ALL steps (auto-deriving per step, as before, purely to measure);
+PASS 2 re-runs the whole thing with ONE FIXED ACT_RSHIFT per call site
+(the one that safely covers the worst step), matching what real hardware
+would actually need to do (quantization constants fixed at deploy time, not
+recomputed per token) -- not a workaround, the more realistic design.
 
 Reuses this project's proven fixed-point references directly: rsh_round/sat
 (fabric.stage3.seq_ref), int_softmax_q/exp_table (fabric.stage3.run_softmax),
@@ -84,10 +95,12 @@ POST_SCALE_Q16 = round(math.sqrt(4.0 / 3.0) * Q16)   # 75674
 
 AUDIO_SEED = 0
 AUDIO_LEN = 3000            # -> T2=6, same as pack_encoder_self_attn.py
-TOKEN_IDS = [1, 940, 24936]  # same as pack_decoder_self_attn.py; step 0 uses TOKEN_IDS[0]
+TOKEN_IDS = [1, 940, 24936]  # same as pack_decoder_self_attn.py -- real decode steps 0,1,2
 
-STEP = 0
 RESID_FRAC = 25             # xres_bank's Q6.25
+FRAC_QKV = VFRAC             # 16
+FRAC_FC1 = 12
+CALL_NAMES = ["q", "k", "v", "o", "cq", "oc", "fc1", "fc2"]
 
 
 # ---- LayerNorm (layernorm_vec_gendiv's own exact integer math) --------------
@@ -125,7 +138,8 @@ def to_qfrac(x_real, frac) -> np.ndarray:
 # ---- GEMV quantization --------------------------------------------------------
 def quantize_weight(W: np.ndarray):
     """Returns (W_int8 (M,K) int64, WSHIFT). Single scale per matrix,
-    WSHIFT chosen so max|round(W*2^WSHIFT)| <= 127 -- no clipping."""
+    WSHIFT chosen so max|round(W*2^WSHIFT)| <= 127 -- no clipping. Step-
+    invariant (depends only on the weight matrix), computed once."""
     max_abs = float(np.max(np.abs(W)))
     wshift = int(math.floor(math.log2(127.0 / max_abs)))
     while True:
@@ -136,12 +150,11 @@ def quantize_weight(W: np.ndarray):
     return W_int8, wshift
 
 
-def choose_act_rshift(x_fixed, target_max: int = 100) -> int:
-    """Pick the smallest ACT_RSHIFT (>=0) that brings max|x_fixed >>> shift|
-    at or below target_max -- an automatic, data-driven choice (no manual
-    guessing), profiled fresh for each call site's own observed magnitude
-    rather than shared across calls with different real ranges."""
-    m = int(np.max(np.abs(np.asarray(x_fixed, dtype=np.int64))))
+def choose_act_rshift_from_max(m: int, target_max: int = 100) -> int:
+    """Smallest ACT_RSHIFT (>=0) bringing observed max magnitude m at or
+    below target_max -- the same rule choose_act_rshift used per-call in
+    the single-step gate, now applied to a magnitude already maximized
+    across every decode step (so ONE shift is safe for all of them)."""
     if m <= target_max:
         return 0
     shift = 0
@@ -179,23 +192,6 @@ def gdequant(raw: np.ndarray, g_frac: int) -> np.ndarray:
     return np.asarray([int(v) << (-g_frac) for v in raw], dtype=np.int64)
 
 
-def linear_q(x_fixed, frac_in, W_real, frac_out, bias_fixed=None, target_max=100):
-    """One full GEMV call through the chosen quant scheme: auto-derive
-    ACT_RSHIFT from x_fixed's OWN observed magnitude (no shared/guessed
-    constants), quantize x and W, integer MAC, dequant to frac_out, optional
-    bias add (already in frac_out format). Returns (y_fixed, g_frac, wshift,
-    act_rshift, x_int8, w_int8, raw)."""
-    W_int8, wshift = quantize_weight(W_real)
-    act_rshift = choose_act_rshift(x_fixed, target_max)
-    x_int8 = act_quantize(x_fixed, act_rshift)
-    raw = gemv_int(W_int8, x_int8)
-    g_frac = frac_in - act_rshift + wshift - frac_out
-    y = gdequant(raw, g_frac)
-    if bias_fixed is not None:
-        y = y + np.asarray(bias_fixed, dtype=np.int64)
-    return y, g_frac, wshift, act_rshift, x_int8, W_int8, raw
-
-
 def layernorm_nobias_f(x, gamma, eps):
     mean = x.mean()
     var = ((x - mean) ** 2).mean()
@@ -204,7 +200,7 @@ def layernorm_nobias_f(x, gamma, eps):
 
 # ---- real weight/data loading -------------------------------------------------
 def load_real():
-    from transformers import AutoModel, MoonshineForConditionalGeneration
+    from transformers import MoonshineForConditionalGeneration
 
     model = MoonshineForConditionalGeneration.from_pretrained(
         "UsefulSensors/moonshine-tiny", dtype=torch.float32)
@@ -254,81 +250,74 @@ def head_slice(vec_d, h):
     return vec_d[h * HEAD_DIM:(h + 1) * HEAD_DIM]
 
 
-def main_gen(out_dir: str):
-    os.makedirs(out_dir, exist_ok=True)
-    enc_hidden, w_enc_finalln, w, embed = load_real()
-    t2 = enc_hidden.shape[0]
-    assert t2 == T2, f"expected T2={T2}, got {t2}"
+def one_step(step, tok, w, embed, g_ln1, g_ln2, g_ln3, bias_fc1_fixed, bias_fc2_fixed,
+             W8, wshift, k_cross_deq, v_cross_deq, self_k_cache, self_v_cache,
+             cos_rom, sin_rom, act_rshifts):
+    """One decoder-layer forward pass at `step`. self_k_cache/self_v_cache
+    (lists of NHEAD lists, one entry appended per step so far) are MUTATED
+    in place -- the real causal-KV-cache-accumulation pattern established by
+    pack_decoder_self_attn.py. `act_rshifts`: dict name->shift; when None,
+    auto-derives per call from this step's own magnitude (the profiling
+    pass); when given, uses the FIXED shift (the real pass, matching
+    decoder_block_seq.sv's own compile-time ACT_* parameters).
 
-    cos_rom, sin_rom = build_cos_sin_rom()
+    Returns (result_dict, profile_dict) -- profile_dict maps call name to
+    this step's own observed |x_fixed| max, used by the profiling pass.
+    """
+    profile = {}
 
-    dump = {}
+    def lq(x_fixed, frac_in, name, wshift_local, frac_out, bias_fixed=None):
+        profile[name] = int(np.max(np.abs(np.asarray(x_fixed, dtype=np.int64))))
+        ar = act_rshifts[name] if act_rshifts is not None else choose_act_rshift_from_max(profile[name])
+        x_int8 = act_quantize(x_fixed, ar)
+        raw = gemv_int(W8[name], x_int8)
+        g_frac = frac_in - ar + wshift_local - frac_out
+        y = gdequant(raw, g_frac)
+        if bias_fixed is not None:
+            y = y + np.asarray(bias_fixed, dtype=np.int64)
+        return y, g_frac, ar
 
-    # ================= Stage 3a: cross K/V (once, real weights) =============
-    k_cross_deq = [[None] * NHEAD for _ in range(T2)]
-    v_cross_deq = [[None] * NHEAD for _ in range(T2)]
-    for pos in range(T2):
-        eo = layernorm_nobias_f(enc_hidden[pos], w_enc_finalln, LN_EPS)
-        k16 = to_qfrac(w["ck"] @ eo, VFRAC)
-        v16 = to_qfrac(w["cv"] @ eo, VFRAC)
-        for h in range(NHEAD):
-            k_h = head_slice(k16, h)
-            v_h = head_slice(v16, h)
-            # matches pack_decoder_cross_attn.py's post_scale_q16(): rsh_round(v*POST_SCALE_Q16, VFRAC)
-            k_h_scaled = np.array([rsh_round(int(v) * POST_SCALE_Q16, VFRAC) for v in k_h], dtype=np.int64)
-            k_codes, k_lo, k_scale = quant_head_asym(list(k_h_scaled), KBITS, divfree=True)
-            v_codes, v_lo, v_scale = quant_head_asym(list(v_h), KBITS, divfree=True)
-            k_cross_deq[pos][h] = np.asarray(dequant_head(k_codes, k_lo, k_scale), dtype=np.int64)
-            v_cross_deq[pos][h] = np.asarray(dequant_head(v_codes, v_lo, v_scale), dtype=np.int64)
-
-    # ================= decoder layer 0, decode step 0 =======================
-    tok = TOKEN_IDS[STEP]
-    x_real = embed[tok]                              # (D,) real embedding, treated as Q6.25 input
-    xres0 = to_qfrac(x_real, RESID_FRAC)              # xres_bank initial content
+    x_real = embed[tok]
+    xres0 = to_qfrac(x_real, RESID_FRAC)
 
     # ---- LN1 ----
-    x_q625 = xres0.astype(object)
-    g_ln1 = to_qfrac(w["ln1"], G_FRAC)
-    xn1 = np.asarray(ln_int_gendiv(list(x_q625), list(g_ln1)), dtype=np.int64)   # Q.22
+    xn1 = np.asarray(ln_int_gendiv(list(xres0.astype(object)), list(g_ln1)), dtype=np.int64)
 
-    # ---- Q/K/V GEMVs ---- (ACT_RSHIFT auto-derived per call from xn1's own
-    # observed magnitude -- see choose_act_rshift)
-    FRAC_QKV = VFRAC       # 16
-    q_fixed, gfrac_q, wshift_q, arshift_q, _, wint8_q, _ = linear_q(xn1, OUT_FRAC, w["sq"], FRAC_QKV)
-    k_fixed, gfrac_k, wshift_k, arshift_k, _, wint8_k, _ = linear_q(xn1, OUT_FRAC, w["sk"], FRAC_QKV)
-    v_fixed, gfrac_v, wshift_v, arshift_v, _, wint8_v, _ = linear_q(xn1, OUT_FRAC, w["sv"], FRAC_QKV)
+    # ---- Q/K/V GEMVs ----
+    q_fixed, gfrac_q, ar_q = lq(xn1, OUT_FRAC, "q", wshift["q"], FRAC_QKV)
+    k_fixed, gfrac_k, ar_k = lq(xn1, OUT_FRAC, "k", wshift["k"], FRAC_QKV)
+    v_fixed, gfrac_v, ar_v = lq(xn1, OUT_FRAC, "v", wshift["v"], FRAC_QKV)
 
-    # ---- RoPE (self, WITH the HEAD_DIM=36 SCORE_SH correction) ----
+    # ---- RoPE (self, real position = step) ----
     q_rope = np.zeros(D, dtype=np.int64)
     k_rope = np.zeros(D, dtype=np.int64)
     for h in range(NHEAD):
         q_rope[h * HEAD_DIM:(h + 1) * HEAD_DIM] = rope_apply_ref(
-            head_slice(q_fixed, h), STEP, cos_rom, sin_rom, POST_SCALE_Q16)
+            head_slice(q_fixed, h), step, cos_rom, sin_rom, POST_SCALE_Q16)
         k_rope[h * HEAD_DIM:(h + 1) * HEAD_DIM] = rope_apply_ref(
-            head_slice(k_fixed, h), STEP, cos_rom, sin_rom, POST_SCALE_Q16)
+            head_slice(k_fixed, h), step, cos_rom, sin_rom, POST_SCALE_Q16)
 
-    # ---- self kv_bank write (K RoPE'd, V raw) + quantize-at-write, matching
-    # kv_bank.sv's own scheme exactly (same as the decoder self-attn gate) ----
-    k_self_deq = [None] * NHEAD
-    v_self_deq = [None] * NHEAD
+    # ---- self kv_bank write (K RoPE'd, V raw) + quantize-at-write; append
+    # this step's own row to the running per-head cache (grows by 1/step,
+    # matching kv_bank.sv's own real semantics -- pack_decoder_self_attn.py's
+    # established pattern, not re-derived). ----
+    ctx_self = np.zeros(D, dtype=np.int64)
     for h in range(NHEAD):
         k_h = head_slice(k_rope, h)
         v_h = head_slice(v_fixed, h)
         k_codes, k_lo, k_scale = quant_head_asym(list(k_h), KBITS, divfree=True)
         v_codes, v_lo, v_scale = quant_head_asym(list(v_h), KBITS, divfree=True)
-        k_self_deq[h] = np.asarray(dequant_head(k_codes, k_lo, k_scale), dtype=np.int64)
-        v_self_deq[h] = np.asarray(dequant_head(v_codes, v_lo, v_scale), dtype=np.int64)
+        k_deq = np.asarray(dequant_head(k_codes, k_lo, k_scale), dtype=np.int64)
+        v_deq = np.asarray(dequant_head(v_codes, v_lo, v_scale), dtype=np.int64)
+        self_k_cache[h].append(k_deq)
+        self_v_cache[h].append(v_deq)
 
-    # ---- self-attn (causal, T=step+1=1) ----
-    ctx_self = np.zeros(D, dtype=np.int64)
-    for h in range(NHEAD):
+        # ---- causal self-attn (Tc=step+1, real for step>0) ----
         q_h = head_slice(q_rope, h)
-        Tc = STEP + 1
+        Tc = step + 1
         scores = np.zeros(Tc, dtype=np.int64)
         for j in range(Tc):
-            # Tc=step+1=1 this gate: k_self_deq[h] IS position 0's own K
-            # (the only position written so far), matching j==0 exactly.
-            acc = int(np.dot(q_h.astype(object), k_self_deq[h].astype(object)))
+            acc = int(np.dot(q_h.astype(object), self_k_cache[h][j].astype(object)))
             s_q88 = rsh_round(acc, SCORE_SH)
             scores[j] = sat(s_q88, -32768, 32767)
         prob = int_softmax_q(scores, np.ones(Tc, dtype=bool), exp_table())
@@ -336,27 +325,24 @@ def main_gen(out_dir: str):
         for d in range(HEAD_DIM):
             acc = 0
             for j in range(Tc):
-                acc += int(prob[j]) * int(v_self_deq[h][d])
+                acc += int(prob[j]) * int(self_v_cache[h][j][d])
             ctx_h[d] = rsh_round(acc, CTX_SH)
         ctx_self[h * HEAD_DIM:(h + 1) * HEAD_DIM] = ctx_h
 
-    # ---- O GEMV (self-attn output proj): ctx is already Q.25 (RESID_FRAC,
-    # matching CTX_SH's own output format) -> INT8 -> Q.25 out ----
-    o_fixed, gfrac_o, wshift_o, arshift_o, _, wint8_o, _ = linear_q(ctx_self, RESID_FRAC, w["so"], RESID_FRAC)
-
+    # ---- O GEMV (self-attn output proj) ----
+    o_fixed, gfrac_o, ar_o = lq(ctx_self, RESID_FRAC, "o", wshift["o"], RESID_FRAC)
     xres1 = xres0 + o_fixed   # RES1
 
     # ---- LN2 ----
-    g_ln2 = to_qfrac(w["ln2"], G_FRAC)
     xn2 = np.asarray(ln_int_gendiv(list(xres1.astype(object)), list(g_ln2)), dtype=np.int64)
 
     # ---- cross Q GEMV (no RoPE; POST_SCALE applied directly) ----
-    qc_fixed, gfrac_cq, wshift_cq, arshift_cq, _, wint8_cq, _ = linear_q(xn2, OUT_FRAC, w["cq"], FRAC_QKV)
+    qc_fixed, gfrac_cq, ar_cq = lq(xn2, OUT_FRAC, "cq", wshift["cq"], FRAC_QKV)
     qc_scaled = np.zeros(D, dtype=np.int64)
     for i in range(D):
         qc_scaled[i] = rsh_round(int(qc_fixed[i]) * POST_SCALE_Q16, VFRAC)
 
-    # ---- cross-attn (static full-attend, T2=6) ----
+    # ---- cross-attn (static full-attend, T2=6, step-invariant K/V) ----
     ctx_cross = np.zeros(D, dtype=np.int64)
     for h in range(NHEAD):
         q_h = head_slice(qc_scaled, h)
@@ -375,18 +361,15 @@ def main_gen(out_dir: str):
         ctx_cross[h * HEAD_DIM:(h + 1) * HEAD_DIM] = ctx_h
 
     # ---- Oc GEMV ----
-    oc_fixed, gfrac_oc, wshift_oc, arshift_oc, _, wint8_oc, _ = linear_q(ctx_cross, RESID_FRAC, w["co"], RESID_FRAC)
+    oc_fixed, gfrac_oc, ar_oc = lq(ctx_cross, RESID_FRAC, "oc", wshift["oc"], RESID_FRAC)
     xres2 = xres1 + oc_fixed   # RES2
 
     # ---- LN3 ----
-    g_ln3 = to_qfrac(w["ln3"], G_FRAC)
     xn3 = np.asarray(ln_int_gendiv(list(xres2.astype(object)), list(g_ln3)), dtype=np.int64)
 
     # ---- FC1: D -> DFFN2, +bias, Q.12 out (SiLU-ready) ----
-    FRAC_FC1 = 12
-    bias_fc1_fixed = to_qfrac(w["b_fc1"], FRAC_FC1)
-    h1_fixed, gfrac_fc1, wshift_fc1, arshift_fc1, _, wint8_fc1, _ = linear_q(
-        xn3, OUT_FRAC, w["fc1"], FRAC_FC1, bias_fixed=bias_fc1_fixed)
+    h1_fixed, gfrac_fc1, ar_fc1 = lq(xn3, OUT_FRAC, "fc1", wshift["fc1"], FRAC_FC1,
+                                      bias_fixed=bias_fc1_fixed)
     value = h1_fixed[:FFN]
     gate = h1_fixed[FFN:]
 
@@ -401,31 +384,109 @@ def main_gen(out_dir: str):
         combined[i] = rsh_round(prod, FRAC_FC1)         # -> Q4.12
 
     # ---- FC2: FFN -> D, +bias, Q.25 out ----
-    bias_fc2_fixed = to_qfrac(w["b_fc2"], RESID_FRAC)
-    h2_fixed, gfrac_fc2, wshift_fc2, arshift_fc2, _, wint8_fc2, _ = linear_q(
-        combined, FRAC_FC1, w["fc2"], RESID_FRAC, bias_fixed=bias_fc2_fixed)
+    h2_fixed, gfrac_fc2, ar_fc2 = lq(combined, FRAC_FC1, "fc2", wshift["fc2"], RESID_FRAC,
+                                      bias_fixed=bias_fc2_fixed)
     xres3 = xres2 + h2_fixed   # RES3
+
+    result = {
+        "xres0": xres0, "xres1": xres1, "xres2": xres2, "xres3": xres3,
+        "g_frac": {"q": gfrac_q, "k": gfrac_k, "v": gfrac_v, "o": gfrac_o, "cq": gfrac_cq,
+                   "oc": gfrac_oc, "fc1": gfrac_fc1, "fc2": gfrac_fc2},
+        "act_rshift": {"q": ar_q, "k": ar_k, "v": ar_v, "o": ar_o, "cq": ar_cq,
+                       "oc": ar_oc, "fc1": ar_fc1, "fc2": ar_fc2},
+    }
+    return result, profile
+
+
+def main_gen(out_dir: str):
+    os.makedirs(out_dir, exist_ok=True)
+    enc_hidden, w_enc_finalln, w, embed = load_real()
+    t2 = enc_hidden.shape[0]
+    assert t2 == T2, f"expected T2={T2}, got {t2}"
+
+    cos_rom, sin_rom = build_cos_sin_rom()
+
+    # ================= Stage 3a: cross K/V (once, real weights, step-
+    # invariant -- unchanged across the whole decode-step loop) ==============
+    k_cross_deq = [[None] * NHEAD for _ in range(T2)]
+    v_cross_deq = [[None] * NHEAD for _ in range(T2)]
+    for pos in range(T2):
+        eo = layernorm_nobias_f(enc_hidden[pos], w_enc_finalln, LN_EPS)
+        k16 = to_qfrac(w["ck"] @ eo, VFRAC)
+        v16 = to_qfrac(w["cv"] @ eo, VFRAC)
+        for h in range(NHEAD):
+            k_h = head_slice(k16, h)
+            v_h = head_slice(v16, h)
+            k_h_scaled = np.array([rsh_round(int(v) * POST_SCALE_Q16, VFRAC) for v in k_h], dtype=np.int64)
+            k_codes, k_lo, k_scale = quant_head_asym(list(k_h_scaled), KBITS, divfree=True)
+            v_codes, v_lo, v_scale = quant_head_asym(list(v_h), KBITS, divfree=True)
+            k_cross_deq[pos][h] = np.asarray(dequant_head(k_codes, k_lo, k_scale), dtype=np.int64)
+            v_cross_deq[pos][h] = np.asarray(dequant_head(v_codes, v_lo, v_scale), dtype=np.int64)
+
+    # ---- weight quantization (step-invariant, computed once) ----
+    W8, wshift = {}, {}
+    for name, key in zip(CALL_NAMES, ["sq", "sk", "sv", "so", "cq", "co", "fc1", "fc2"]):
+        W8[name], wshift[name] = quantize_weight(w[key])
+
+    g_ln1 = to_qfrac(w["ln1"], G_FRAC)
+    g_ln2 = to_qfrac(w["ln2"], G_FRAC)
+    g_ln3 = to_qfrac(w["ln3"], G_FRAC)
+    bias_fc1_fixed = to_qfrac(w["b_fc1"], FRAC_FC1)
+    bias_fc2_fixed = to_qfrac(w["b_fc2"], RESID_FRAC)
+
+    step_args = (w, embed, g_ln1, g_ln2, g_ln3, bias_fc1_fixed, bias_fc2_fixed,
+                 W8, wshift, k_cross_deq, v_cross_deq)
+
+    # ================= PASS 1: profile every call site's magnitude across
+    # ALL steps (auto-derive per step, purely to measure) -- decoder_block_
+    # seq.sv's ACT_*/GF_* are compile-time parameters, so ONE fixed shift
+    # per call site must cover every step, not just step 0. ==================
+    profile_max = {name: 0 for name in CALL_NAMES}
+    k_cache_p, v_cache_p = [[] for _ in range(NHEAD)], [[] for _ in range(NHEAD)]
+    for step, tok in enumerate(TOKEN_IDS):
+        _, profile = one_step(step, tok, *step_args, k_cache_p, v_cache_p,
+                               cos_rom, sin_rom, act_rshifts=None)
+        for name, m in profile.items():
+            profile_max[name] = max(profile_max[name], m)
+    fixed_ar = {name: choose_act_rshift_from_max(m) for name, m in profile_max.items()}
+    print("profile (max|x_fixed| across all steps -> fixed ACT_RSHIFT):", file=sys.stderr)
+    for name in CALL_NAMES:
+        print(f"  {name}: max|.|={profile_max[name]} -> act_rshift={fixed_ar[name]}", file=sys.stderr)
+
+    # ================= PASS 2: real run, FIXED shifts (matches decoder_
+    # block_seq.sv's own compile-time ACT_*/GF_* parameters exactly) =========
+    self_k_cache, self_v_cache = [[] for _ in range(NHEAD)], [[] for _ in range(NHEAD)]
+    steps_out = []
+    for step, tok in enumerate(TOKEN_IDS):
+        result, _ = one_step(step, tok, *step_args, self_k_cache, self_v_cache,
+                              cos_rom, sin_rom, act_rshifts=fixed_ar)
+        steps_out.append(result)
+
+    # g_frac/act_rshift are identical across steps by construction (fixed_ar
+    # is the same dict every call) -- take step 0's as THE manifest constants.
+    g_frac = steps_out[0]["g_frac"]
+    act_rshift = steps_out[0]["act_rshift"]
+    for s, res in enumerate(steps_out):
+        assert res["g_frac"] == g_frac and res["act_rshift"] == act_rshift, \
+            f"step {s}: g_frac/act_rshift drifted -- should be fixed across steps"
 
     # ---- profiling report (stderr-visible via print) ------------------------
     def rng(name, arr):
         a = np.asarray(arr, dtype=np.float64)
         print(f"  {name}: max|.|={np.max(np.abs(a)):.0f}", file=sys.stderr)
-    print("profile (fixed-point magnitudes):", file=sys.stderr)
-    rng("xn1(Q22)", xn1); rng("q_fixed(Q16)", q_fixed); rng("ctx_self(Q25)", ctx_self)
-    rng("o_fixed(Q25)", o_fixed); rng("qc_scaled(Q16)", qc_scaled); rng("ctx_cross(Q25)", ctx_cross)
-    rng("xn3(Q22)", xn3); rng("h1_fixed(Q12)", h1_fixed); rng("combined(Q12)", combined)
-    rng("h2_fixed(Q25)", h2_fixed); rng("xres3(Q25)", xres3)
+    print("final (fixed-point magnitudes, last step):", file=sys.stderr)
+    rng("xres3(Q25)", steps_out[-1]["xres3"])
 
     # =========================================================================
     # ---- resident weight image (real gemv_banked_resident_vec.sv loader
     # format, reusing pack_banked_resident_vec.build_resident() -- the
-    # already-proven WBW=8 packing, not re-derived) --------------------------
+    # already-proven WBW=8 packing, not re-derived; weights are step-
+    # invariant, written once) -------------------------------------------------
     from fabric.stage3.pack_banked_resident_vec import build_resident
     LANES, WBW = 128, 8
-    layer_order = [wint8_q, wint8_k, wint8_v, wint8_o, wint8_cq, wint8_oc, wint8_fc1, wint8_fc2]
+    layer_order = [W8[name] for name in CALL_NAMES]
     all_words, wmeta = build_resident(layer_order, LANES, WBW)
-    wb = {name: wmeta[i]["w_base"] for i, name in
-          enumerate(["q", "k", "v", "o", "cq", "co", "fc1", "fc2"])}
+    wb = {name: wmeta[i]["w_base"] for i, name in enumerate(CALL_NAMES)}
 
     wbits = LANES * WBW
     hexw = (wbits + 3) // 4
@@ -473,18 +534,19 @@ def main_gen(out_dir: str):
                 for k in range(8):
                     w32(f, vec[r * 8 + k])
 
-    # ---- LN gamma tables (Q4.20, P=8-wide) ----
+    # ---- LN gamma tables (Q4.20, P=8-wide), step-invariant ----
     write_prow(os.path.join(out_dir, "gamma_ln1.mem"), g_ln1)
     write_prow(os.path.join(out_dir, "gamma_ln2.mem"), g_ln2)
     write_prow(os.path.join(out_dir, "gamma_ln3.mem"), g_ln3)
 
-    # ---- bias tables (fc1: Q.12 DFFN2-wide; fc2: Q.25 D-wide), P=8-wide ----
+    # ---- bias tables (fc1: Q.12 DFFN2-wide; fc2: Q.25 D-wide), P=8-wide,
+    # step-invariant ----
     write_prow(os.path.join(out_dir, "bias_fc1.mem"), bias_fc1_fixed)
     write_prow(os.path.join(out_dir, "bias_fc2.mem"), bias_fc2_fixed)
 
     # ---- cross K/V write vectors (ATTN_P=4-wide, pos-major then head-major:
     # [k(36) v(36)] per head -- same convention as pack_decoder_cross_attn.py's
-    # kv_in.mem, K already POST_SCALE'd, V raw). ------------------------------
+    # kv_in.mem, K already POST_SCALE'd, V raw), step-invariant. ------------------------------
     with open(os.path.join(out_dir, "xkv_in.mem"), "w") as f:
         for pos in range(T2):
             eo = layernorm_nobias_f(enc_hidden[pos], w_enc_finalln, LN_EPS)
@@ -500,37 +562,46 @@ def main_gen(out_dir: str):
                 for v in v_h:
                     w32(f, v)
 
-    # ---- xres0 (initial residual) + xres3 (golden final residual) ----------
-    write_prow(os.path.join(out_dir, "xres0.mem"), xres0)
-    with open(os.path.join(out_dir, "xres3_ref.mem"), "w") as f:
-        for v in xres3:
-            w32(f, v)
+    # ---- per-step xres0 (initial residual) + xres3 (golden final residual),
+    # bundled one after another, N_STEPS*D each -- the testbench loops step
+    # 0..N_STEPS-1, re-loading xres0 fresh each time (real per-token
+    # embedding, NOT chained from the previous step's own xres3 -- matches
+    # test_generate_kv.c's real semantics: each decode step starts from that
+    # step's own known/generated token, not the residual stream). ----
+    n_steps = len(TOKEN_IDS)
+    with open(os.path.join(out_dir, "xres0_steps.mem"), "w") as f:
+        for res in steps_out:
+            for r in range(D // 8):
+                for k in range(8):
+                    w32(f, res["xres0"][r * 8 + k])
+    with open(os.path.join(out_dir, "xres3_ref_steps.mem"), "w") as f:
+        for res in steps_out:
+            for v in res["xres3"]:
+                w32(f, v)
 
     # =========================================================================
     # ---- assemble manifest ---------------------------------------------------
     manifest = {
         "d": D, "ffn": FFN, "dffn2": DFFN2, "nhead": NHEAD, "head_dim": HEAD_DIM, "t2": T2,
-        "step": STEP, "token": tok, "resid_frac": RESID_FRAC, "post_scale_q16": POST_SCALE_Q16,
+        "n_steps": n_steps, "tokens": TOKEN_IDS,
+        "resid_frac": RESID_FRAC, "post_scale_q16": POST_SCALE_Q16,
         "lanes": LANES, "wbw": WBW, "n_words_total": len(all_words),
-        "g_frac": {"q": gfrac_q, "k": gfrac_k, "v": gfrac_v, "o": gfrac_o, "cq": gfrac_cq,
-                   "oc": gfrac_oc, "fc1": gfrac_fc1, "fc2": gfrac_fc2},
-        "wshift": {"q": wshift_q, "k": wshift_k, "v": wshift_v, "o": wshift_o, "cq": wshift_cq,
-                  "oc": wshift_oc, "fc1": wshift_fc1, "fc2": wshift_fc2},
-        "act_rshift": {"q": arshift_q, "k": arshift_k, "v": arshift_v, "o": arshift_o,
-                       "cq": arshift_cq, "oc": arshift_oc, "fc1": arshift_fc1, "fc2": arshift_fc2},
-        "w_base": wb,
+        "g_frac": g_frac, "wshift": wshift, "act_rshift": act_rshift, "w_base": wb,
     }
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
     dump = {
-        "xres0": xres0.tolist(), "xres1": xres1.tolist(), "xres2": xres2.tolist(),
-        "xres3": xres3.tolist(),
+        "n_steps": n_steps,
+        "steps": [{"xres0": res["xres0"].tolist(), "xres1": res["xres1"].tolist(),
+                   "xres2": res["xres2"].tolist(), "xres3": res["xres3"].tolist()}
+                  for res in steps_out],
     }
     with open(os.path.join(out_dir, "golden.json"), "w") as f:
         json.dump(dump, f)
 
-    print(f"GEN dir={out_dir} t2={T2} step={STEP} token={tok} n_words={len(all_words)} w_base={wb}")
+    print(f"GEN dir={out_dir} t2={T2} n_steps={n_steps} tokens={TOKEN_IDS} "
+          f"n_words={len(all_words)} w_base={wb}")
     return manifest
 
 
