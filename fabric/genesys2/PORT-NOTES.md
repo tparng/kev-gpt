@@ -8268,12 +8268,41 @@ specifically (ge1_shift 12->11). The same element improved 92.97 ->
 ~0.58 -> ~0.83. Every standalone conv gate and the end-to-end gate stay
 bit-exact throughout.
 
-Not fully fixed: the remaining ~2.4x error needs per-channel (not
-per-matrix) weight scales for gelu1->conv3, which needs conv1d_seq.sv's
-own dequant widened to a per-row scheme like output_head_seq.sv's own
-vec_dequant.sv -- a real RTL change to an already-proven shared module,
-not attempted here.
+Not fully fixed by that alone: a real ~2.4x error remained, needing
+per-channel (not per-matrix) weight scales.
 
-Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "gelu1->conv3
-quantization noise: partially fixed (wasted INT8 headroom), a real
-remainder left open" section.
+## Per-channel weight scales: real RTL change, real (modest) gain, honest limit found
+
+conv1d_seq.sv's own dequant is now a per-row (mant,exp) table via
+vec_dequant.sv (checkpoint C's real, unmodified per-row dequant --
+output_head_seq.sv's own lm_head GEMV already uses it), replacing the
+single shared dq_shift. New dq_we preload port + drain FSM split into
+input-feed (gi) and output-drain (ro) counters, same idiom
+output_head_seq.sv's own S_LMDRAIN already established for
+vec_dequant.sv's own 3-cycle pipeline lag. quantize_weight_per_row (one
+wshift per output channel) replaces quantize_weight_per_matrix at all 3
+convs. Bit-exact throughout: all 3 standalone conv gates + the
+end-to-end gate.
+
+Result: whole-chain cosine rose ~0.83 -> ~0.85, but the SAME tracked
+element barely moved (50.75 -> 53.996, still not close to true 21.19) --
+an honest, expected outcome: per-row WEIGHT scale can't fix ACTIVATION-
+side noise, and gelu1's own INT8 activation feeding conv3 is still a
+single shared scale across all 576 channels (this project's shared GEMV
+core has no per-channel-activation mechanism). A real fix for the
+remainder needs a different activation-side architecture -- out of scope.
+
+Also found and fixed along the way: the standalone conv3 gate's own
+cosine crashed to ~0.07 on the first per-row attempt -- not a math bug,
+but a pre-existing Q6.25-range overflow (conv3's raw output can reach
+~1004 real units, Q6.25 only holds ~+-64) that the OLD reference had
+been silently hiding by computing its own cosine from an unwrapped value
+while the RTL comparison used a wrapped one. Fixed by truncating to 32
+bits consistently inside conv1d_int_ref now (matching vec_dequant.sv's
+own real hardware truncation) -- documented directly in pack_conv3.py so
+it isn't mistaken for a regression. Doesn't affect the real front-end
+integration (targets Q4.12, far smaller scale, no overflow there).
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Per-channel
+weight scales: a real RTL change, a real (if modest) further gain, and
+the honest limit of what weight-side fixes alone can do" section.

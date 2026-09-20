@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from fabric.stage3.seq_ref import rsh_round
+
 QX = 25   # Q6.25 -- conv1d_seq.sv's own output format (matches layernorm_vec_gendiv.sv/groupnorm1_vec.sv's x_in)
 
 
@@ -61,6 +63,32 @@ def quantize_weight_per_matrix(w_flat):
     return w_int8, wshift
 
 
+def quantize_weight_per_row(w_flat):
+    """PER-ROW (per-output-channel) INT8 quantization -- one wshift per
+    output row instead of quantize_weight_per_matrix's own single shared
+    shift. Needed wherever a single shared weight scale under-serves
+    output channels whose own dynamic range is much smaller than the
+    matrix's own max -- found gating gelu1->conv3 specifically (see
+    conv1d_seq.sv's own header). Shape-generic reproduction of
+    pack_output_head.py's own quantize_weight_per_row (that file's own
+    version is VOCAB-row-specific for the lm_head weight; this one takes
+    any (COUT, K) matrix) -- same floor-shift-search against INT8's real
+    127 ceiling, same per-row re-check-and-shrink fixup for the rare
+    floor-then-round boundary clip."""
+    w_flat = np.asarray(w_flat, dtype=np.float64)
+    max_abs = np.max(np.abs(w_flat), axis=1)                  # (COUT,)
+    max_abs = np.where(max_abs == 0, 1.0, max_abs)
+    wshift = np.floor(np.log2(127.0 / max_abs)).astype(np.int64)
+    w_int8 = np.round(w_flat * (2.0 ** wshift[:, None]))
+    w_int8 = np.clip(w_int8, -128, 127).astype(np.int64)
+    bad = np.max(np.abs(w_int8), axis=1) > 127
+    while np.any(bad):
+        wshift[bad] -= 1
+        w_int8[bad] = np.clip(np.round(w_flat[bad] * (2.0 ** wshift[bad, None])), -128, 127).astype(np.int64)
+        bad = np.max(np.abs(w_int8), axis=1) > 127
+    return w_int8, wshift
+
+
 def choose_ashift(x_real, target_max=127.0):
     """Smallest right-shift-equivalent scale keeping |x_real*2^ashift| within
     target_max. Was defaulted to 100.0 (leaving ~21% of INT8's own +-127
@@ -86,22 +114,39 @@ def quantize_act(x_real, ashift):
     return np.clip(q, -128, 127).astype(np.int64)
 
 
-def conv1d_int_ref(x_int8, w_int8_flat, kw, stride, cout, cin, bias_q=None, dq_shift=0):
+def conv1d_int_ref(x_int8, w_int8_flat, kw, stride, cout, cin, mant, exp, bias_q=None):
     """Exact-integer conv1d matching conv1d_seq.sv's own per-output-position
-    GEMV scheme bit-for-bit. x_int8 (CIN,TIN) int8 (padded), w_int8_flat
-    (COUT, KW*CIN) int8 (see transpose_weight). Returns (TOUT,COUT) int64
-    Q6.25 (gdequant()'d, + optional per-channel bias in the same domain)."""
+    GEMV + per-row vec_dequant.sv dequant scheme bit-for-bit (frac=0, see
+    conv1d_seq.sv's own header for why: mant/exp are chosen to already
+    target the output format directly, Q4.12 for every real call site in
+    this pipeline). x_int8 (CIN,TIN) int8 (padded), w_int8_flat
+    (COUT, KW*CIN) int8 (see transpose_weight), mant/exp (COUT,) --
+    vec_dequant.sv's own per-row table (fabric.stage3.seq_ref.
+    quantize_scale_24's own output, mant unsigned/positive per that
+    module's own convention). Returns (TOUT,COUT) int64, truncated to
+    32 bits per element (matching vec_dequant.sv's own `dq_out[31:0]`
+    write and y_data's own 32-bit storage, bias added AFTER that
+    truncation in the SAME 32-bit domain, exactly like the RTL)."""
     cin_ax, tin = x_int8.shape
     assert cin_ax == cin
     tout = (tin - kw) // stride + 1
     w = w_int8_flat.astype(np.int64)                     # (COUT, KW*CIN)
+    mant = np.asarray(mant, dtype=np.int64)
+    exp = np.asarray(exp, dtype=np.int64)
+    left = exp >= 0
     out = np.zeros((tout, cout), dtype=np.int64)
     for t in range(tout):
         win = x_int8[:, t * stride: t * stride + kw].T.reshape(-1).astype(np.int64)  # e=k*CIN+ci
-        raw = w @ win                                     # (COUT,) exact int64
-        deq = raw >> dq_shift if dq_shift >= 0 else raw << (-dq_shift)
+        raw = w @ win                                     # (COUT,) exact int64 -- gemvy
+        dq_prod = raw.astype(object) * mant.astype(object)
+        dq_val = np.empty(cout, dtype=object)
+        dq_val[left] = [int(p) << int(s) for p, s in zip(dq_prod[left], exp[left])]
+        dq_val[~left] = [rsh_round(int(p), int(-s)) for p, s in zip(dq_prod[~left], exp[~left])]
+        deq = np.array([int(v) & 0xFFFFFFFF for v in dq_val], dtype=np.int64)
+        deq = np.where(deq >= 0x80000000, deq - 0x100000000, deq)
         if bias_q is not None:
-            deq = deq + bias_q
+            deq = (deq + bias_q) & 0xFFFFFFFF
+            deq = np.where(deq >= 0x80000000, deq - 0x100000000, deq)
         out[t] = deq
     return out
 
@@ -130,5 +175,22 @@ def pack_rows_p32(vec, p):
             i = r * p + k
             v = int(vec[i]) if i < n else 0
             val |= (v & 0xFFFFFFFF) << (32 * k)
+        rows.append(val)
+    return rows
+
+
+def pack_rows_pw(vec, p, w):
+    """Flat values -> list of P*w-bit packed rows (lane k = bits [w*k +: w]),
+    masked to w bits each -- generic form of pack_rows_p8/p32, used for
+    vec_dequant.sv's own per-row mant (w=24) / exp (w=8) tables."""
+    mask = (1 << w) - 1
+    rows = []
+    n = len(vec)
+    for r in range((n + p - 1) // p):
+        val = 0
+        for k in range(p):
+            i = r * p + k
+            v = int(vec[i]) if i < n else 0
+            val |= (v & mask) << (w * k)
         rows.append(val)
     return rows

@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(GEN2ASR_SW, "model"))
 
 from fabric.asr_seq import conv1d_ref as cr  # noqa: E402
 from fabric.stage3.pack_banked_resident_vec import build_resident  # noqa: E402
+from fabric.stage3.seq_ref import quantize_scale_24  # noqa: E402
 
 P = 8
 COUT = 576
@@ -73,14 +74,17 @@ def main_gen(out_dir: str):
     x_int8 = cr.quantize_act(x_pad, ashift)
 
     w_flat = cr.transpose_weight(w_pad)              # (COUT, KW*CIN)
-    w_int8, wshift = cr.quantize_weight_per_matrix(w_flat)
+    w_int8, wshift = cr.quantize_weight_per_row(w_flat)   # (COUT,) per-output-channel shift
 
-    dq_shift = ashift + wshift - cr.QX
+    scale = np.exp2((cr.QX - ashift - wshift).astype(np.float64))   # (COUT,)
+    mant, expo = quantize_scale_24(scale)
+    mant = np.asarray(mant, dtype=np.int64)
+    expo = np.asarray(expo, dtype=np.int64)
     bias_q = np.round(b_real * (1 << cr.QX)).astype(np.int64)   # Q6.25, added post-dequant
-    print(f"ashift={ashift} wshift={wshift} dq_shift={dq_shift}", file=sys.stderr)
+    print(f"ashift={ashift} wshift range=[{wshift.min()},{wshift.max()}]", file=sys.stderr)
 
     gold_tc = cr.conv1d_int_ref(x_int8, w_int8, KW, STRIDE, COUT, cin,
-                                 bias_q=bias_q, dq_shift=dq_shift)   # (TOUT,COUT)
+                                 mant, expo, bias_q=bias_q)   # (TOUT,COUT)
     tout = gold_tc.shape[0]
 
     y_real_from_int = gold_tc.astype(np.float64) / (1 << cr.QX)
@@ -108,13 +112,20 @@ def main_gen(out_dir: str):
         nib = (P * 32) // 4
         f.write("\n".join(f"{v & ((1 << (P*32)) - 1):0{nib}x}" for v in b_rows) + "\n")
 
+    mant_rows = cr.pack_rows_pw(mant, P, 24)
+    exp_rows = cr.pack_rows_pw(expo, P, 8)
+    with open(os.path.join(out_dir, "dq_mant.mem"), "w") as f:
+        f.write("\n".join(f"{v & ((1 << (P*24)) - 1):0{(P*24)//4}x}" for v in mant_rows) + "\n")
+    with open(os.path.join(out_dir, "dq_exp.mem"), "w") as f:
+        f.write("\n".join(f"{v & ((1 << (P*8)) - 1):0{(P*8)//4}x}" for v in exp_rows) + "\n")
+
     gold_flat = gold_tc.reshape(-1)
     gold_rows = cr.pack_rows_p32(gold_flat, P)
     gold_masked = [v & 0xFFFFFFFFFFFFFFFF for v in gold_rows]
 
     return {"P": P, "CIN": cin, "COUT": COUT, "KW": KW, "STRIDE": STRIDE, "TIN": tin,
             "TOUT": tout, "N_WORDS": n_words, "WWORDS": max(n_words, 1),
-            "dq_shift": dq_shift, "gold_rows": gold_masked}
+            "gold_rows": gold_masked}
 
 
 def main(argv=None):

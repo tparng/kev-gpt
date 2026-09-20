@@ -36,6 +36,7 @@ def run(sim_dir: str) -> bool:
         os.path.join(STAGE3_RTL, "weight_bank_tdp.sv"),
         os.path.join(STAGE3_RTL, "vec_gelu.sv"),
         os.path.join(STAGE3_RTL, "gelu_lut2.sv"),
+        os.path.join(STAGE3_RTL, "vec_dequant.sv"),
         os.path.join(RTL_DIR, "gelu_wide_vec.sv"),
         os.path.join(RTL_DIR, "conv1d_seq.sv"),
         os.path.join(RTL_DIR, "tanh_lut.sv"),
@@ -46,9 +47,7 @@ def run(sim_dir: str) -> bool:
     ]
     defs = [f"-DTIN1VAL={manifest['TIN1']}", f"-DNWORDS1={manifest['NWORDS1']}",
             f"-DNWORDS2={manifest['NWORDS2']}", f"-DNWORDS3={manifest['NWORDS3']}",
-            f"-DDQ1={manifest['DQ1']}", f"-DGNSHIFT={manifest['GNSHIFT']}",
-            f"-DDQ2={manifest['DQ2']}", f"-DGE1SHIFT={manifest['GE1SHIFT']}",
-            f"-DDQ3={manifest['DQ3']}"]
+            f"-DGNSHIFT={manifest['GNSHIFT']}", f"-DGE1SHIFT={manifest['GE1SHIFT']}"]
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp] + defs + sources,
                          cwd=sim_dir, capture_output=True, text=True)
     if cp.returncode != 0:

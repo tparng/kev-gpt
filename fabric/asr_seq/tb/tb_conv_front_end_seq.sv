@@ -19,20 +19,11 @@
 `ifndef NWORDS3
  `define NWORDS3 5184
 `endif
-`ifndef DQ1
- `define DQ1 0
-`endif
 `ifndef GNSHIFT
  `define GNSHIFT 0
 `endif
-`ifndef DQ2
- `define DQ2 0
-`endif
 `ifndef GE1SHIFT
  `define GE1SHIFT 0
-`endif
-`ifndef DQ3
- `define DQ3 0
 `endif
 
 module tb;
@@ -51,9 +42,11 @@ module tb;
     localparam integer TOUT1 = (TIN1-KW1)/STRIDE1 + 1;
     localparam integer XTROWS1 = TIN1;                    // CGRP1=1 (CIN1=P=8)
     localparam integer CROWS_GN = COUT1/P;
+    localparam integer MROWS1 = COUT1/P;
     localparam integer COUT2=576, KW2=7, STRIDE2=3;
     localparam integer TIN2 = TOUT1;
     localparam integer TOUT2 = (TIN2-KW2)/STRIDE2 + 1;
+    localparam integer MROWS2 = COUT2/P;
     localparam integer COUT3=288, KW3=3, STRIDE3=2;
     localparam integer TIN3 = TOUT2;
     localparam integer TOUT3 = (TIN3-KW3)/STRIDE3 + 1;
@@ -64,21 +57,21 @@ module tb;
     reg rst = 1'b1;
 
     reg c1_gv_ld_rst, c1_gv_ld_we; reg [31:0] c1_gv_ld_data;
+    reg c1_dq_we; reg [P*24-1:0] c1_dq_wmant; reg [P*8-1:0] c1_dq_wexp;
     reg c1_xt_we; reg [P*8-1:0] c1_xt_data;
-    reg signed [7:0] c1_dq_shift;
 
     reg gn_g_we, gn_b_we; reg [P*32-1:0] gn_g_data, gn_b_data;
     reg signed [7:0] gn_ashift;
 
     reg c2_gv_ld_rst, c2_gv_ld_we; reg [31:0] c2_gv_ld_data;
+    reg c2_dq_we; reg [P*24-1:0] c2_dq_wmant; reg [P*8-1:0] c2_dq_wexp;
     reg c2_b_we; reg [P*32-1:0] c2_b_data;
-    reg signed [7:0] c2_dq_shift;
 
     reg signed [7:0] ge1_ashift;
 
     reg c3_gv_ld_rst, c3_gv_ld_we; reg [31:0] c3_gv_ld_data;
+    reg c3_dq_we; reg [P*24-1:0] c3_dq_wmant; reg [P*8-1:0] c3_dq_wexp;
     reg c3_b_we; reg [P*32-1:0] c3_b_data;
-    reg signed [7:0] c3_dq_shift;
 
     reg go; wire done;
     wire yv; wire [P*32-1:0] ydata;
@@ -86,14 +79,17 @@ module tb;
     conv_front_end_seq #(.P(P), .LANES(LANES), .WBW(WBW), .TIN1(TIN1)) dut (
         .clk(clk), .rst(rst),
         .c1_gv_ld_rst(c1_gv_ld_rst), .c1_gv_ld_we(c1_gv_ld_we), .c1_gv_ld_data(c1_gv_ld_data),
-        .c1_xt_we(c1_xt_we), .c1_xt_data(c1_xt_data), .c1_dq_shift(c1_dq_shift),
+        .c1_dq_we(c1_dq_we), .c1_dq_wmant(c1_dq_wmant), .c1_dq_wexp(c1_dq_wexp),
+        .c1_xt_we(c1_xt_we), .c1_xt_data(c1_xt_data),
         .gn_g_we(gn_g_we), .gn_g_data(gn_g_data), .gn_b_we(gn_b_we), .gn_b_data(gn_b_data),
         .gn_ashift(gn_ashift),
         .c2_gv_ld_rst(c2_gv_ld_rst), .c2_gv_ld_we(c2_gv_ld_we), .c2_gv_ld_data(c2_gv_ld_data),
-        .c2_b_we(c2_b_we), .c2_b_data(c2_b_data), .c2_dq_shift(c2_dq_shift),
+        .c2_dq_we(c2_dq_we), .c2_dq_wmant(c2_dq_wmant), .c2_dq_wexp(c2_dq_wexp),
+        .c2_b_we(c2_b_we), .c2_b_data(c2_b_data),
         .ge1_ashift(ge1_ashift),
         .c3_gv_ld_rst(c3_gv_ld_rst), .c3_gv_ld_we(c3_gv_ld_we), .c3_gv_ld_data(c3_gv_ld_data),
-        .c3_b_we(c3_b_we), .c3_b_data(c3_b_data), .c3_dq_shift(c3_dq_shift),
+        .c3_dq_we(c3_dq_we), .c3_dq_wmant(c3_dq_wmant), .c3_dq_wexp(c3_dq_wexp),
+        .c3_b_we(c3_b_we), .c3_b_data(c3_b_data),
         .go(go), .done(done), .y_valid(yv), .y_data(ydata)
     );
 
@@ -105,6 +101,12 @@ module tb;
     reg [P*32-1:0]  bload_gn[0:CROWS_GN-1];
     reg [P*32-1:0]  b2load  [0:COUT2/P-1];
     reg [P*32-1:0]  b3load  [0:COUT3/P-1];
+    reg [P*24-1:0]  dq1mload[0:MROWS1-1];
+    reg [P*8-1:0]   dq1eload[0:MROWS1-1];
+    reg [P*24-1:0]  dq2mload[0:MROWS2-1];
+    reg [P*8-1:0]   dq2eload[0:MROWS2-1];
+    reg [P*24-1:0]  dq3mload[0:MROWS3-1];
+    reg [P*8-1:0]   dq3eload[0:MROWS3-1];
 
     integer i, s, f;
     reg [WBITS-1:0] word_tmp;
@@ -118,15 +120,21 @@ module tb;
         $readmemh("b.mem", bload_gn);
         $readmemh("b2.mem", b2load);
         $readmemh("b3.mem", b3load);
+        $readmemh("dq1_mant.mem", dq1mload);
+        $readmemh("dq1_exp.mem", dq1eload);
+        $readmemh("dq2_mant.mem", dq2mload);
+        $readmemh("dq2_exp.mem", dq2eload);
+        $readmemh("dq3_mant.mem", dq3mload);
+        $readmemh("dq3_exp.mem", dq3eload);
 
-        c1_gv_ld_rst=0; c1_gv_ld_we=0; c1_gv_ld_data=0; c1_xt_we=0; c1_xt_data=0;
-        c1_dq_shift = `DQ1;
+        c1_gv_ld_rst=0; c1_gv_ld_we=0; c1_gv_ld_data=0;
+        c1_dq_we=0; c1_dq_wmant=0; c1_dq_wexp=0; c1_xt_we=0; c1_xt_data=0;
         gn_g_we=0; gn_g_data=0; gn_b_we=0; gn_b_data=0; gn_ashift = `GNSHIFT;
-        c2_gv_ld_rst=0; c2_gv_ld_we=0; c2_gv_ld_data=0; c2_b_we=0; c2_b_data=0;
-        c2_dq_shift = `DQ2;
+        c2_gv_ld_rst=0; c2_gv_ld_we=0; c2_gv_ld_data=0;
+        c2_dq_we=0; c2_dq_wmant=0; c2_dq_wexp=0; c2_b_we=0; c2_b_data=0;
         ge1_ashift = `GE1SHIFT;
-        c3_gv_ld_rst=0; c3_gv_ld_we=0; c3_gv_ld_data=0; c3_b_we=0; c3_b_data=0;
-        c3_dq_shift = `DQ3;
+        c3_gv_ld_rst=0; c3_gv_ld_we=0; c3_gv_ld_data=0;
+        c3_dq_we=0; c3_dq_wmant=0; c3_dq_wexp=0; c3_b_we=0; c3_b_data=0;
         go = 0;
 
         @(posedge clk); #1;
@@ -159,6 +167,21 @@ module tb;
             end
         end
         c3_gv_ld_we = 0;
+
+        for (i = 0; i < MROWS1; i = i + 1) begin
+            c1_dq_we = 1; c1_dq_wmant = dq1mload[i]; c1_dq_wexp = dq1eload[i]; @(posedge clk); #1;
+        end
+        c1_dq_we = 0;
+
+        for (i = 0; i < MROWS2; i = i + 1) begin
+            c2_dq_we = 1; c2_dq_wmant = dq2mload[i]; c2_dq_wexp = dq2eload[i]; @(posedge clk); #1;
+        end
+        c2_dq_we = 0;
+
+        for (i = 0; i < MROWS3; i = i + 1) begin
+            c3_dq_we = 1; c3_dq_wmant = dq3mload[i]; c3_dq_wexp = dq3eload[i]; @(posedge clk); #1;
+        end
+        c3_dq_we = 0;
 
         for (i = 0; i < XTROWS1; i = i + 1) begin
             c1_xt_we = 1; c1_xt_data = xt1load[i]; @(posedge clk); #1;

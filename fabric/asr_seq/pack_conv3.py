@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(GEN2ASR_SW, "model"))
 
 from fabric.asr_seq import conv1d_ref as cr  # noqa: E402
 from fabric.stage3.pack_banked_resident_vec import build_resident  # noqa: E402
+from fabric.stage3.seq_ref import quantize_scale_24  # noqa: E402
 
 P = 8
 COUT = 288
@@ -71,22 +72,31 @@ def main_gen(out_dir: str):
     x_int8 = cr.quantize_act(x_pad, ashift)
 
     w_flat = cr.transpose_weight(w_pad)
-    w_int8, wshift = cr.quantize_weight_per_matrix(w_flat)
+    w_int8, wshift = cr.quantize_weight_per_row(w_flat)   # (COUT,) per-output-channel shift
 
-    dq_shift = ashift + wshift - cr.QX
+    scale = np.exp2((cr.QX - ashift - wshift).astype(np.float64))   # (COUT,)
+    mant, expo = quantize_scale_24(scale)
+    mant = np.asarray(mant, dtype=np.int64)
+    expo = np.asarray(expo, dtype=np.int64)
     bias_q = np.round(b_real * (1 << cr.QX)).astype(np.int64)
-    print(f"ashift={ashift} wshift={wshift} dq_shift={dq_shift}", file=sys.stderr)
+    print(f"ashift={ashift} wshift range=[{wshift.min()},{wshift.max()}]", file=sys.stderr)
 
     gold_tc = cr.conv1d_int_ref(x_int8, w_int8, KW, STRIDE, COUT, cin,
-                                 bias_q=bias_q, dq_shift=dq_shift)
+                                 mant, expo, bias_q=bias_q)
     tout = gold_tc.shape[0]
 
     y_real_from_int = gold_tc.astype(np.float64) / (1 << cr.QX)
     y_real_ref = conv3_out_real.T
     cos = float(np.dot(y_real_from_int.reshape(-1), y_real_ref.reshape(-1)) /
                 (np.linalg.norm(y_real_from_int) * np.linalg.norm(y_real_ref) + 1e-30))
-    print(f"cosine(quantized_int_output, real_float_conv3_output)={cos:.6f} (informational only)",
-          file=sys.stderr)
+    print(f"cosine(quantized_int_output, real_float_conv3_output)={cos:.6f} (informational only -- "
+          "this gate targets Q6.25 (QX=25) directly, and conv3's own raw output can reach real "
+          "magnitude ~1004, which overflows Q6.25's ~+-64 32-bit-storage ceiling for a handful of "
+          "elements (wraps, same class of issue conv_front_end_seq.sv's own final widen step hit -- "
+          "see that file's header); this standalone gate never re-targets a narrower format the way "
+          "the real front-end integration does (Q4.12, ~8192x smaller scale, comfortably in range), "
+          "so a low number here does NOT indicate the per-row dequant itself is wrong -- the RTL-vs-"
+          "Python bit-exact check above is unaffected either way)", file=sys.stderr)
 
     all_words, meta = build_resident([w_int8], LANES, WBW)
     n_words = meta[0]["n_words"]
@@ -106,13 +116,20 @@ def main_gen(out_dir: str):
         nib = (P * 32) // 4
         f.write("\n".join(f"{v & ((1 << (P*32)) - 1):0{nib}x}" for v in b_rows) + "\n")
 
+    mant_rows = cr.pack_rows_pw(mant, P, 24)
+    exp_rows = cr.pack_rows_pw(expo, P, 8)
+    with open(os.path.join(out_dir, "dq_mant.mem"), "w") as f:
+        f.write("\n".join(f"{v & ((1 << (P*24)) - 1):0{(P*24)//4}x}" for v in mant_rows) + "\n")
+    with open(os.path.join(out_dir, "dq_exp.mem"), "w") as f:
+        f.write("\n".join(f"{v & ((1 << (P*8)) - 1):0{(P*8)//4}x}" for v in exp_rows) + "\n")
+
     gold_flat = gold_tc.reshape(-1)
     gold_rows = cr.pack_rows_p32(gold_flat, P)
     gold_masked = [v & 0xFFFFFFFFFFFFFFFF for v in gold_rows]
 
     return {"P": P, "CIN": cin, "COUT": COUT, "KW": KW, "STRIDE": STRIDE, "TIN": tin,
             "TOUT": tout, "N_WORDS": n_words, "WWORDS": max(n_words, 1),
-            "dq_shift": dq_shift, "gold_rows": gold_masked}
+            "gold_rows": gold_masked}
 
 
 def main(argv=None):

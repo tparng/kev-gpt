@@ -34,9 +34,6 @@
 `ifndef WWORDSVAL
  `define WWORDSVAL 1024
 `endif
-`ifndef DQSHIFT
- `define DQSHIFT 0
-`endif
 
 module tb;
     localparam integer P      = `PVAL;
@@ -61,9 +58,9 @@ module tb;
     reg rst = 1'b1;
 
     reg gv_ld_rst, gv_ld_we; reg [31:0] gv_ld_data;
+    reg dq_we; reg [P*24-1:0] dq_wmant; reg [P*8-1:0] dq_wexp;
     reg b_we; reg [P*32-1:0] b_data;
     reg xt_we; reg [P*8-1:0] xt_data;
-    reg signed [7:0] dq_shift;
     reg go; wire done;
     wire yv; wire [P*32-1:0] ydata;
 
@@ -71,26 +68,30 @@ module tb;
                  .TIN(TIN), .HAS_BIAS(HASBIAS), .LANES(LANES), .WWORDS(WWORDS)) dut (
         .clk(clk), .rst(rst),
         .gv_ld_rst(gv_ld_rst), .gv_ld_we(gv_ld_we), .gv_ld_data(gv_ld_data),
+        .dq_we(dq_we), .dq_wmant(dq_wmant), .dq_wexp(dq_wexp),
         .b_we(b_we), .b_data(b_data),
         .xt_we(xt_we), .xt_data(xt_data),
-        .dq_shift(dq_shift),
         .go(go), .done(done), .y_valid(yv), .y_data(ydata)
     );
 
     reg [WBITS-1:0]  wload [0:NWORDS-1];
     reg [P*8-1:0]    xtload [0:XTROWS-1];
     reg [P*32-1:0]   bload [0:(MROWS>0?MROWS-1:0)];
+    reg [P*24-1:0]   dqmload [0:(MROWS>0?MROWS-1:0)];
+    reg [P*8-1:0]    dqeload [0:(MROWS>0?MROWS-1:0)];
     integer i, s, f;
     reg [WBITS-1:0] word_tmp;
 
     initial begin
         $readmemh("w.mem", wload);
         $readmemh("xt.mem", xtload);
+        $readmemh("dq_mant.mem", dqmload);
+        $readmemh("dq_exp.mem", dqeload);
         if (HASBIAS) $readmemh("b.mem", bload);
 
         gv_ld_rst=0; gv_ld_we=0; gv_ld_data=0;
+        dq_we=0; dq_wmant=0; dq_wexp=0;
         b_we=0; b_data=0; xt_we=0; xt_data=0;
-        dq_shift = `DQSHIFT;
         go = 0;
 
         @(posedge clk); #1;
@@ -105,6 +106,11 @@ module tb;
             end
         end
         gv_ld_we = 0;
+
+        for (i = 0; i < MROWS; i = i + 1) begin
+            dq_we = 1; dq_wmant = dqmload[i]; dq_wexp = dqeload[i]; @(posedge clk); #1;
+        end
+        dq_we = 0;
 
         if (HASBIAS) begin
             for (i = 0; i < MROWS; i = i + 1) begin

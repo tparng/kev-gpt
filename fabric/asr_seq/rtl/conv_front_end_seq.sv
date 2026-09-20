@@ -43,28 +43,31 @@
 // registered by the time `done` pulses).
 //
 // ---- Format glue --------------------------------------------------------
-// Every conv1d_seq.sv instance's own dq_shift (runtime port, chosen by the
-// Python packer) is picked so its raw INT32 GEMV accumulator lands DIRECTLY
-// in Q4.12 scale when the next stage is a LUT (conv1->tanh, conv2->gelu1,
-// conv3->gelu2) -- no shift needed at those 3 boundaries. conv1->tanh
-// still uses a plain sat16() clip (int32->int16, the SAME idiom
-// encoder_block_seq.sv's own sat16() uses before its own vec_gelu call) --
-// safe because tanh saturates well inside Q4.12's +-8 range. The two GELU
-// boundaries (conv2->gelu1, conv3->gelu2) go through gelu_wide_vec.sv
-// instead of a plain sat16()+vec_gelu (see the section below for why:
-// GELU does NOT saturate the same way, so a REAL widening fix was needed,
-// not just format bookkeeping). tanh_lut.sv's own Q4.12 output needs an
-// EXPLICIT widening shift (<<<13, exact -- Q4.12 has 12 fractional bits,
-// Q6.25 has 25, the difference is a power of 2 so this loses no precision)
-// wherever the NEXT stage wants Q6.25: tanh->groupnorm1's x_in, and
-// gelu2->this module's own final y_data (which feeds the encoder's own
-// first LayerNorm, itself Q6.25) -- the latter via widen1312_sat (32-bit
-// input, since gelu_wide_vec.sv's own output no longer fits in 16 bits;
-// "_sat" because that boundary needs to SATURATE, not wrap -- see below).
-// Wherever the next stage is another conv1d_seq call (groupnorm1->conv2,
-// gelu1->conv3), an actquant()-style shift+clip to INT8 is unavoidable
-// (GEMV activations are always INT8) -- gn_ashift/ge1_ashift are runtime
-// ports, chosen by the Python packer the same way dq_shift is.
+// Every conv1d_seq.sv instance's own per-row (mant,exp) dequant table
+// (preloaded once via c1_dq_we/c2_dq_we/c3_dq_we -- see conv1d_seq.sv's own
+// header for why per-row, not a single shared shift) is chosen by the
+// Python packer so each raw INT32 GEMV accumulator, per OUTPUT CHANNEL,
+// lands DIRECTLY in Q4.12 scale when the next stage is a LUT (conv1->tanh,
+// conv2->gelu1, conv3->gelu2) -- no further shift needed at those 3
+// boundaries. conv1->tanh still uses a plain sat16() clip (int32->int16,
+// the SAME idiom encoder_block_seq.sv's own sat16() uses before its own
+// vec_gelu call) -- safe because tanh saturates well inside Q4.12's +-8
+// range. The two GELU boundaries (conv2->gelu1, conv3->gelu2) go through
+// gelu_wide_vec.sv instead of a plain sat16()+vec_gelu (see the section
+// below for why: GELU does NOT saturate the same way, so a REAL widening
+// fix was needed, not just format bookkeeping). tanh_lut.sv's own Q4.12
+// output needs an EXPLICIT widening shift (<<<13, exact -- Q4.12 has 12
+// fractional bits, Q6.25 has 25, the difference is a power of 2 so this
+// loses no precision) wherever the NEXT stage wants Q6.25: tanh->
+// groupnorm1's x_in, and gelu2->this module's own final y_data (which
+// feeds the encoder's own first LayerNorm, itself Q6.25) -- the latter via
+// widen1312_sat (32-bit input, since gelu_wide_vec.sv's own output no
+// longer fits in 16 bits; "_sat" because that boundary needs to SATURATE,
+// not wrap -- see below). Wherever the next stage is another conv1d_seq
+// call (groupnorm1->conv2, gelu1->conv3), an actquant()-style shift+clip
+// to INT8 is unavoidable (GEMV activations are always INT8) -- gn_ashift/
+// ge1_ashift are runtime ports, chosen by the Python packer the same way
+// the per-row dequant tables are.
 //
 // ---- Q4.12 GELU precision: found gating this file, then fixed -----------
 // pack_conv_front_end.py's own real-audio run (torch.manual_seed(0),
@@ -148,23 +151,48 @@
 // docstring). Raising both to 127 recovered a real bit of precision at
 // gelu1->conv3 specifically (`ge1_shift` 12->11) and at conv1's own audio
 // quantization (`ashift` 0->1 in the standalone conv3 gate). The same
-// concrete element above improved from 92.97 to **50.75** (still ~2.4x
-// off the true 21.19, better than 4.4x but not fixed) -- and the whole-
-// chain informational cosine rose from **~0.58 to ~0.83**. All of
-// conv1/conv2/conv3's own standalone gates AND this file's own end-to-end
-// gate stay bit-exact throughout (dq_shift/ge1_ashift/etc. are always
-// runtime ports, computed once and fed identically to RTL and Python --
-// changing WHICH shift gets chosen can't affect bit-exactness by
-// construction, only the resulting precision).
+// concrete element above improved from 92.97 to 50.75 (still ~2.4x off
+// the true 21.19, better than 4.4x but not fixed) -- and the whole-chain
+// informational cosine rose from ~0.58 to ~0.83. All of conv1/conv2/
+// conv3's own standalone gates AND this file's own end-to-end gate stayed
+// bit-exact throughout (a runtime shift/scale choice can't affect
+// bit-exactness by construction, only the resulting precision).
 //
-// This closes part of the gap, not all of it: a real ~2.4x error remains
-// on at least this one element, which needs a materially different
-// quantization strategy for the gelu1->conv3 boundary specifically (e.g.
-// per-channel rather than per-matrix weight scales, which would need
-// conv1d_seq.sv's own dequant step widened from a single runtime shift to
-// a per-row scheme like output_head_seq.sv's own vec_dequant.sv -- a real
-// RTL change to an already-proven, shared module, not attempted here) --
-// a bigger, separate investigation than the precision-headroom fix above.
+// ---- Second fix: per-channel (not per-matrix) weight scales -------------
+// The above closed part of the gap, not all of it -- a real ~2.4x error
+// remained on the same element, needing a materially different
+// quantization strategy for the gelu1->conv3 boundary specifically:
+// per-channel rather than per-matrix WEIGHT scales. conv1d_seq.sv's own
+// dequant step is now a per-row (mant,exp) table via vec_dequant.sv
+// (checkpoint C's real, unmodified per-row dequant -- the SAME module
+// output_head_seq.sv's own lm_head GEMV already uses), replacing the
+// single shared runtime dq_shift every conv1d_seq.sv call used before --
+// see that file's own header for the full design (why per-row weight
+// scale needs a matching per-row dequant, the new dq_we preload port,
+// the gi/ro-separated drain FSM vec_dequant.sv's own 3-cycle pipeline
+// needs). conv1d_ref.quantize_weight_per_row (one wshift per OUTPUT
+// channel) replaces quantize_weight_per_matrix at every one of this
+// pipeline's 3 conv weight quantizations.
+//
+// Result: a real, if MODEST, further improvement -- whole-chain cosine
+// rose ~0.83 -> ~0.85 -- but the SAME tracked element barely moved (50.75
+// -> 53.996, no closer to the true 21.19). This is an honest, expected
+// outcome, not a failed fix: per-row WEIGHT scaling only helps output
+// channels whose own weight dynamic range differs from the matrix's own
+// max: it cannot touch ACTIVATION-side quantization noise, and gelu1's
+// own INT8 activation feeding conv3 is STILL a single shared scale
+// (ge1_ashift) across all 576 input channels -- this GEMV architecture
+// (gemv_banked_resident_vec.sv, reused unmodified) has no mechanism for
+// per-channel ACTIVATION scale within one call, unlike weight scale (a
+// pure dequant-side concern, fixable without touching the MAC core at
+// all). If the tracked element's own error is activation-noise-dominated
+// rather than weight-quantization-dominated, per-row weight scale alone
+// was never going to close it -- consistent with what was found. Still
+// bit-exact throughout every one of conv1/conv2/conv3's own standalone
+// gates and this file's own end-to-end gate. A real fix for the
+// remaining gap would need a genuinely different architecture for the
+// activation side (e.g. per-channel activation scale, which this
+// project's shared GEMV core doesn't support today) -- out of scope here.
 
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
@@ -178,13 +206,15 @@ module conv_front_end_seq #(
     input  wire clk,
     input  wire rst,
 
-    // ---- conv1 preload (weight once; input audio once per go) ---------------
+    // ---- conv1 preload (weight + per-row dequant once; input audio once per go) --
     input  wire        c1_gv_ld_rst,
     input  wire        c1_gv_ld_we,
     input  wire [31:0] c1_gv_ld_data,
+    input  wire             c1_dq_we,
+    input  wire [P*24-1:0]  c1_dq_wmant,
+    input  wire [P*8-1:0]   c1_dq_wexp,
     input  wire            c1_xt_we,
     input  wire [P*8-1:0]  c1_xt_data,
-    input  wire signed [7:0] c1_dq_shift,
 
     // ---- groupnorm1 preload (gamma/beta once) --------------------------------
     input  wire            gn_g_we,
@@ -193,23 +223,27 @@ module conv_front_end_seq #(
     input  wire [P*32-1:0] gn_b_data,
     input  wire signed [7:0] gn_ashift,     // groupnorm1 output -> conv2 INT8 actquant
 
-    // ---- conv2 preload (weight + bias once) ----------------------------------
+    // ---- conv2 preload (weight + per-row dequant + bias once) ----------------
     input  wire        c2_gv_ld_rst,
     input  wire        c2_gv_ld_we,
     input  wire [31:0] c2_gv_ld_data,
+    input  wire             c2_dq_we,
+    input  wire [P*24-1:0]  c2_dq_wmant,
+    input  wire [P*8-1:0]   c2_dq_wexp,
     input  wire            c2_b_we,
     input  wire [P*32-1:0] c2_b_data,
-    input  wire signed [7:0] c2_dq_shift,
 
     input  wire signed [7:0] ge1_ashift,    // gelu1 output -> conv3 INT8 actquant
 
-    // ---- conv3 preload (weight + bias once) ----------------------------------
+    // ---- conv3 preload (weight + per-row dequant + bias once) ----------------
     input  wire        c3_gv_ld_rst,
     input  wire        c3_gv_ld_we,
     input  wire [31:0] c3_gv_ld_data,
+    input  wire             c3_dq_we,
+    input  wire [P*24-1:0]  c3_dq_wmant,
+    input  wire [P*8-1:0]   c3_dq_wexp,
     input  wire            c3_b_we,
     input  wire [P*32-1:0] c3_b_data,
-    input  wire signed [7:0] c3_dq_shift,
 
     // ---- run ------------------------------------------------------------------
     input  wire  go,
@@ -316,13 +350,13 @@ module conv_front_end_seq #(
                  .TIN(TIN1), .HAS_BIAS(0), .LANES(LANES), .WWORDS(WWORDS_C1)) u_conv1 (
         .clk(clk), .rst(rst),
         .gv_ld_rst(c1_gv_ld_rst), .gv_ld_we(c1_gv_ld_we), .gv_ld_data(c1_gv_ld_data),
+        .dq_we(c1_dq_we), .dq_wmant(c1_dq_wmant), .dq_wexp(c1_dq_wexp),
         .b_we(1'b0), .b_data({(P*32){1'b0}}),
         .xt_we(c1_xt_we), .xt_data(c1_xt_data),
-        .dq_shift(c1_dq_shift),
         .go(c1_go), .done(c1_done), .y_valid(c1_yv), .y_data(c1_ydata)
     );
 
-    // conv1 -> tanh: direct wire, sat16 only (dq_shift already targets Q4.12)
+    // conv1 -> tanh: direct wire, sat16 only (per-row dequant table already targets Q4.12)
     integer c1p;
     reg signed [16*P-1:0] tanh_x;
     always @(*) begin
@@ -396,9 +430,9 @@ module conv_front_end_seq #(
                  .TIN(TIN2), .HAS_BIAS(1), .LANES(LANES), .WWORDS(WWORDS_C2)) u_conv2 (
         .clk(clk), .rst(rst),
         .gv_ld_rst(c2_gv_ld_rst), .gv_ld_we(c2_gv_ld_we), .gv_ld_data(c2_gv_ld_data),
+        .dq_we(c2_dq_we), .dq_wmant(c2_dq_wmant), .dq_wexp(c2_dq_wexp),
         .b_we(c2_b_we), .b_data(c2_b_data),
         .xt_we(gn_yv), .xt_data(gn_xt_word),
-        .dq_shift(c2_dq_shift),
         .go(c2_go), .done(c2_done), .y_valid(c2_yv), .y_data(c2_ydata)
     );
 
@@ -432,9 +466,9 @@ module conv_front_end_seq #(
                  .TIN(TIN3), .HAS_BIAS(1), .LANES(LANES), .WWORDS(WWORDS_C3)) u_conv3 (
         .clk(clk), .rst(rst),
         .gv_ld_rst(c3_gv_ld_rst), .gv_ld_we(c3_gv_ld_we), .gv_ld_data(c3_gv_ld_data),
+        .dq_we(c3_dq_we), .dq_wmant(c3_dq_wmant), .dq_wexp(c3_dq_wexp),
         .b_we(c3_b_we), .b_data(c3_b_data),
         .xt_we(ge1_ov), .xt_data(ge1_xt_word),
-        .dq_shift(c3_dq_shift),
         .go(c3_go), .done(c3_done), .y_valid(c3_yv), .y_data(c3_ydata)
     );
 

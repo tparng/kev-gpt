@@ -8,8 +8,9 @@ Reconstructs the SAME integer pipeline conv_front_end_seq.sv's own RTL
 computes, stage by stage, reusing every existing block's own reference
 function (conv1d_ref.conv1d_int_ref, pack_groupnorm1.gn_int, run_tanh.tanh_q,
 run_gelu.gelu_q) -- no new arithmetic here either, only the SAME format-glue
-choices (dq_shift targeting Q4.12 instead of the standalone conv gates' own
-Q6.25, sat16, actquant, widen-by-13) the RTL's own header documents.
+choices (per-row (mant,exp) dequant targeting Q4.12 instead of the
+standalone conv gates' own Q6.25, sat16, actquant, widen-by-13) the RTL's
+own header documents.
 
     .venv/bin/python -m fabric.asr_seq.pack_conv_front_end gen --dir <sim_dir>
 """
@@ -34,6 +35,7 @@ from fabric.stage3.run_gelu import gelu_table, gelu_q  # noqa: E402
 from fabric.asr_seq.pack_groupnorm1 import gn_int, BETA_FRAC  # noqa: E402
 from fabric.stage3.run_layernorm import G_FRAC, seed_table  # noqa: E402
 from fabric.stage3.pack_banked_resident_vec import build_resident  # noqa: E402
+from fabric.stage3.seq_ref import quantize_scale_24  # noqa: E402
 
 P = 8
 LANES, WBW = 128, 8
@@ -157,13 +159,16 @@ def main_gen(out_dir: str):
     ashift1 = cr.choose_ashift(audio)
     x1_int8 = cr.quantize_act(x1_pad, ashift1)
     w1_flat = cr.transpose_weight(w1_pad)
-    w1_int8, wshift1 = cr.quantize_weight_per_matrix(w1_flat)
-    dq1 = ashift1 + wshift1 - Q412
+    w1_int8, wshift1 = cr.quantize_weight_per_row(w1_flat)   # (COUT1,) per-output-channel shift
+    scale1 = np.exp2((Q412 - ashift1 - wshift1).astype(np.float64))
+    mant1, expo1 = quantize_scale_24(scale1)
+    mant1 = np.asarray(mant1, dtype=np.int64); expo1 = np.asarray(expo1, dtype=np.int64)
     c1_out = cr.conv1d_int_ref(x1_int8, w1_int8, KW1, STRIDE1, COUT1, cin1,
-                                bias_q=None, dq_shift=dq1)          # (TOUT1,COUT1) Q4.12
+                                mant1, expo1, bias_q=None)          # (TOUT1,COUT1) Q4.12
     c1_sat = sat16(c1_out)
     tout1 = c1_out.shape[0]
-    print(f"conv1: ashift={ashift1} wshift={wshift1} dq1={dq1} TOUT1={tout1}", file=sys.stderr)
+    print(f"conv1: ashift={ashift1} wshift range=[{wshift1.min()},{wshift1.max()}] TOUT1={tout1}",
+          file=sys.stderr)
 
     # ================= tanh =================================================
     lut_tanh = tanh_table()
@@ -191,14 +196,16 @@ def main_gen(out_dir: str):
     cin2 = x2_int8.shape[0]
     w2_pad = cr.pad_cin_weight(d["w2"], P)                 # no-op, 288 already /8
     w2_flat = cr.transpose_weight(w2_pad)
-    w2_int8, wshift2 = cr.quantize_weight_per_matrix(w2_flat)
-    dq2 = ashift2_eff + wshift2 - Q412
+    w2_int8, wshift2 = cr.quantize_weight_per_row(w2_flat)   # (COUT2,) per-output-channel shift
+    scale2 = np.exp2((Q412 - ashift2_eff - wshift2).astype(np.float64))
+    mant2, expo2 = quantize_scale_24(scale2)
+    mant2 = np.asarray(mant2, dtype=np.int64); expo2 = np.asarray(expo2, dtype=np.int64)
     b2_q = np.round(d["b2"] * (1 << Q412)).astype(np.int64)   # bias in Q4.12 (matches conv2's own target)
     c2_out = cr.conv1d_int_ref(x2_int8, w2_int8, KW2, STRIDE2, COUT2, cin2,
-                                bias_q=b2_q, dq_shift=dq2)          # (TOUT2,COUT2) Q4.12, WIDE (not sat16'd)
+                                mant2, expo2, bias_q=b2_q)          # (TOUT2,COUT2) Q4.12, WIDE (not sat16'd)
     tout2 = c2_out.shape[0]
-    print(f"conv2: wshift={wshift2} dq2={dq2} TOUT2={tout2} max|c2_out|={int(np.max(np.abs(c2_out)))}",
-          file=sys.stderr)
+    print(f"conv2: wshift range=[{wshift2.min()},{wshift2.max()}] TOUT2={tout2} "
+          f"max|c2_out|={int(np.max(np.abs(c2_out)))}", file=sys.stderr)
 
     # ================= gelu1 (gelu_wide_q412 -- see that function's own
     # docstring and conv_front_end_seq.sv's own header for the Q4.12
@@ -217,14 +224,16 @@ def main_gen(out_dir: str):
     cin3 = x3_int8.shape[0]
     w3_pad = cr.pad_cin_weight(d["w3"], P)                    # no-op, 576 already /8
     w3_flat = cr.transpose_weight(w3_pad)
-    w3_int8, wshift3 = cr.quantize_weight_per_matrix(w3_flat)
-    dq3 = ashift3_eff + wshift3 - Q412
+    w3_int8, wshift3 = cr.quantize_weight_per_row(w3_flat)    # (COUT3,) per-output-channel shift
+    scale3 = np.exp2((Q412 - ashift3_eff - wshift3).astype(np.float64))
+    mant3, expo3 = quantize_scale_24(scale3)
+    mant3 = np.asarray(mant3, dtype=np.int64); expo3 = np.asarray(expo3, dtype=np.int64)
     b3_q = np.round(d["b3"] * (1 << Q412)).astype(np.int64)
     c3_out = cr.conv1d_int_ref(x3_int8, w3_int8, KW3, STRIDE3, COUT3, cin3,
-                                bias_q=b3_q, dq_shift=dq3)          # (TOUT3,COUT3) Q4.12, WIDE
+                                mant3, expo3, bias_q=b3_q)          # (TOUT3,COUT3) Q4.12, WIDE
     tout3 = c3_out.shape[0]
-    print(f"conv3: wshift={wshift3} dq3={dq3} TOUT3={tout3} max|c3_out|={int(np.max(np.abs(c3_out)))}",
-          file=sys.stderr)
+    print(f"conv3: wshift range=[{wshift3.min()},{wshift3.max()}] TOUT3={tout3} "
+          f"max|c3_out|={int(np.max(np.abs(c3_out)))}", file=sys.stderr)
 
     # ================= gelu2 (gelu_wide_q412, same fix as gelu1) ============
     g2_q412 = gelu_wide_q412(c3_out, lut_gelu)            # (TOUT3,COUT3) Q4.12, WIDE
@@ -256,6 +265,10 @@ def main_gen(out_dir: str):
     xt1_flat = x1_int8.T.reshape(-1)              # (TIN1,CIN1) -> flat, CGRP1=1
     _wmem(os.path.join(out_dir, "xt1.mem"), cr.pack_rows_p8(xt1_flat, P), (P * 8) // 4)
 
+    for tag, mant, expo in [("1", mant1, expo1), ("2", mant2, expo2), ("3", mant3, expo3)]:
+        _wmem(os.path.join(out_dir, f"dq{tag}_mant.mem"), cr.pack_rows_pw(mant, P, 24), (P * 24) // 4)
+        _wmem(os.path.join(out_dir, f"dq{tag}_exp.mem"), cr.pack_rows_pw(expo, P, 8), (P * 8) // 4)
+
     _wmem(os.path.join(out_dir, "g.mem"), cr.pack_rows_p32(g_gn, P), (P * 32) // 4)
     _wmem(os.path.join(out_dir, "b.mem"), cr.pack_rows_p32(b_gn, P), (P * 32) // 4)
     _wmem(os.path.join(out_dir, "b2.mem"), cr.pack_rows_p32(b2_q, P), (P * 32) // 4)
@@ -278,8 +291,8 @@ def main_gen(out_dir: str):
 
     return {
         "TIN1": tin1, "NWORDS1": meta1[0]["n_words"], "NWORDS2": meta2[0]["n_words"],
-        "NWORDS3": meta3[0]["n_words"], "DQ1": dq1, "GNSHIFT": gn_shift, "DQ2": dq2,
-        "GE1SHIFT": ge1_shift, "DQ3": dq3, "TOUT3": tout3, "COUT3": COUT3,
+        "NWORDS3": meta3[0]["n_words"], "GNSHIFT": gn_shift,
+        "GE1SHIFT": ge1_shift, "TOUT3": tout3, "COUT3": COUT3,
         "gold_rows": gold_masked,
     }
 
