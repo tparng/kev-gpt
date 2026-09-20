@@ -8367,6 +8367,22 @@ Result: whole-chain cosine ~0.96 -> ~0.999, matching every other
 block's own 0.99+. Still bit-exact throughout (CONV_FRONT_END_VERDICT
 bitexact=1, mismatches=0/216, all 3 standalone conv gates too).
 
+## Checked for more, found the practical ceiling instead
+
+Tried percentile-based (not max-based) per-channel/per-row calibration
+too (standalone, not committed) -- made cosine slightly WORSE (~0.999 ->
+~0.9987), the expected signature of having already fixed the real
+problem: once every channel/row has its own scale, there's no
+cross-channel tail left for clipping to trade away. Checked the worst
+remaining conv3 element directly: true ~-959, computed ~-935 -- a
+proportional ~2.6% error at large magnitude, not a gross bug. Genuine
+INT8 quantization noise at the practical ceiling for this reduction
+depth, matching every other INT8 block in this project. Going further
+needs wider activations/weights than INT8 in gemv_banked_resident_vec.sv
+-- an already-proven, heavily-reused shared module -- not justified at
+the current precision. No code change from this investigation.
+
 Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "True per-channel
 activation quantization -- this is what actually closed it, and it
-needed no new GEMV hardware" section.
+needed no new GEMV hardware" and "Checked for more, found the practical
+ceiling instead" sections.

@@ -279,6 +279,30 @@
 // bitexact=1, mismatches=0/216, and all 3 standalone conv gates stay
 // bit-exact too. This closes the activation-side gap this file's own
 // history had, until this point, called architecturally out of reach.
+//
+// ---- Checked for more, found the practical ceiling instead -----------
+// With per-channel scaling in place, checked whether the earlier
+// "calibrate against the real percentile, not the absolute max" trick
+// (the third fix, above) still helps when applied PER CHANNEL/PER ROW
+// too (percentile-based quantize_act_per_channel_from_int/quantize_
+// weight_per_row variants, tried standalone, not committed). It does
+// NOT -- cosine got slightly WORSE (~0.999 -> ~0.9987). That's the
+// expected signature of having already fixed the real problem: percentile
+// clipping only helps when a SHARED scale is being dragged down by
+// outliers in channels/rows it doesn't otherwise serve well; once every
+// channel/row has its OWN max-based scale, there's no cross-channel tail
+// left to trade away, so clipping a channel's own genuine outliers just
+// throws away real information for no offsetting gain. Checked the worst
+// remaining conv3 element directly too: true value ~-959, this pipeline
+// computes ~-935 -- a proportional ~2.6% error at large magnitude, not a
+// gross mismatch like the bugs found above. This is genuine, well-
+// distributed INT8 quantization noise, not a further-fixable systematic
+// error -- the practical precision ceiling of INT8 weights/activations
+// at this reduction depth (K up to 2016), matching every other INT8-
+// quantized block in this project. Closing this further would need
+// wider activations/weights than INT8 in gemv_banked_resident_vec.sv --
+// an already-proven, heavily-reused shared module -- a materially
+// bigger, separate undertaking, not justified at the current precision.
 
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
