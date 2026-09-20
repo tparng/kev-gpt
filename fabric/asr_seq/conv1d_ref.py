@@ -114,6 +114,72 @@ def quantize_act(x_real, ashift):
     return np.clip(q, -128, 127).astype(np.int64)
 
 
+def quantize_act_per_channel_from_int(x_int, target_max=127):
+    """PER-INPUT-CHANNEL INT8 activation quantization, operating directly on
+    an ALREADY-INTEGER fixed-point tensor (x_int, CIN x T) via a real
+    ARITHMETIC RIGHT-SHIFT per channel -- floor/truncate-toward-negative-
+    infinity, matching conv_front_end_seq.sv's own actq() EXACTLY (a plain
+    `x >>> shift`). This is NOT round-to-nearest: an earlier version of
+    this function converted x_int to real first and used choose_ashift/
+    quantize_act (round(x_real*2^ashift)) -- compiled and ran fine, scored
+    a near-perfect informational cosine in Python, but was NOT bit-exact
+    against the RTL (roughly half of all activation elements were off by
+    exactly 1 LSB, wherever the true fractional part was >=0.5 and Python
+    rounded up while actq()'s own floor-shift didn't) -- and that 1-LSB
+    activation error, compounded through a 1700+-deep GEMV reduction,
+    was enough to make most OUTPUT elements differ too, even though
+    bit-exactness is all-or-nothing so even a small per-element drift
+    shows up as a large mismatch count. Fixed by matching the RTL's own
+    floor semantics exactly here (Python's native `>>` on a numpy int64
+    array already matches Verilog's `>>>` bit-for-bit, the same fact this
+    project has relied on since decoder_block_seq.sv's own wrap32() work).
+
+    Returns (x_int8 (CIN,T) int8, rshift (CIN,) -- the RIGHT-SHIFT amount
+    itself, fed DIRECTLY to conv_front_end_seq.sv's own per-channel ashift
+    table with NO further inversion needed (that table's own 'shift' port
+    IS a right-shift, not a multiply exponent -- a second, now-fixed bug
+    the first attempt at this also had: it wrote the multiply-exponent
+    ashift directly into a table actq() reads as a right-shift count)."""
+    x_int = np.asarray(x_int, dtype=np.int64)
+    cin = x_int.shape[0]
+    rshift = np.zeros(cin, dtype=np.int64)
+    x_int8 = np.zeros_like(x_int, dtype=np.int64)
+    for c in range(cin):
+        m = int(np.max(np.abs(x_int[c])))
+        s = 0
+        while (m >> s) > target_max:
+            s += 1
+        rshift[c] = s
+        x_int8[c] = np.clip(x_int[c] >> s, -128, 127)
+    return x_int8, rshift
+
+
+def rescale_weight_cols_per_channel(w_flat, ashift_per_channel, cin):
+    """Divides w_flat's own column e by 2^ashift_per_channel[e % cin] --
+    e = k*CIN+ci (transpose_weight's own k-major/ci-minor layout, so e%cin
+    IS the input channel ci) -- BEFORE running quantize_weight_per_row on
+    the result. This is what makes per-channel ACTIVATION quantization
+    exact within a GEMV core that only supports a per-ROW (per-output-
+    channel) weight scale, no RTL change needed: gemvy[row] =
+    sum_k w_int[row,k]*x_int[k] only equals a uniformly-scaled true dot
+    product if the PER-TERM scale (weight-scale * activation-scale) is
+    constant across k -- true by construction here, since dividing
+    w_real[row,k] by exactly the SAME 2^ashift[channel(k)] the matching
+    x_int[k] was multiplied by cancels the channel's own activation scale
+    out of the algebra entirely (verified: gemvy[row] ends up == the true
+    dot product * 2^wshift[row] alone, no ashift term at all needed in
+    the final dequant scale -- see conv_front_end_seq.sv's own header for
+    the full derivation). Trades some weight-quantization headroom (the
+    corrected columns can span a wider range than the raw weight alone)
+    for far better activation precision -- net a big win where activation
+    noise dominates, confirmed empirically at gelu1->conv3."""
+    w_flat = np.asarray(w_flat, dtype=np.float64)
+    kw_cin = w_flat.shape[1]
+    e_idx = np.arange(kw_cin)
+    chan_of_e = e_idx % cin
+    return w_flat / (2.0 ** ashift_per_channel[chan_of_e])[None, :]
+
+
 def conv1d_int_ref(x_int8, w_int8_flat, kw, stride, cout, cin, mant, exp, bias_q=None):
     """Exact-integer conv1d matching conv1d_seq.sv's own per-output-position
     GEMV + per-row vec_dequant.sv dequant scheme bit-for-bit (frac=0, see

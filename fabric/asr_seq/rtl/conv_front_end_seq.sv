@@ -176,65 +176,109 @@
 //
 // Result: a real, if MODEST, further improvement -- whole-chain cosine
 // rose ~0.83 -> ~0.85 -- but the SAME tracked element barely moved (50.75
-// -> 53.996, no closer to the true 21.19). This is an honest, expected
-// outcome, not a failed fix: per-row WEIGHT scaling only helps output
-// channels whose own weight dynamic range differs from the matrix's own
-// max: it cannot touch ACTIVATION-side quantization noise, and gelu1's
-// own INT8 activation feeding conv3 is STILL a single shared scale
-// (ge1_ashift) across all 576 input channels -- this GEMV architecture
-// (gemv_banked_resident_vec.sv, reused unmodified) has no mechanism for
-// per-channel ACTIVATION scale within one call, unlike weight scale (a
-// pure dequant-side concern, fixable without touching the MAC core at
-// all). If the tracked element's own error is activation-noise-dominated
-// rather than weight-quantization-dominated, per-row weight scale alone
-// was never going to close it -- consistent with what was found. Still
-// bit-exact throughout every one of conv1/conv2/conv3's own standalone
-// gates and this file's own end-to-end gate.
+// -> 53.996, no closer to the true 21.19). Honest, but not the whole
+// story: per-row WEIGHT scaling only helps output channels whose own
+// weight dynamic range differs from the matrix's own max, it can't touch
+// ACTIVATION-side quantization noise, and gelu1's own INT8 activation
+// feeding conv3 was STILL a single shared scale (ge1_ashift) across all
+// 576 input channels. Still bit-exact throughout every one of
+// conv1/conv2/conv3's own standalone gates and this file's own
+// end-to-end gate.
 //
-// ---- Third fix: calibrate the activation shift, don't just size it to
-// never clip (pack_conv_front_end.py's own calibrate_int8_shift) -------
-// True per-channel ACTIVATION scale within one GEMV call isn't available
-// without a genuinely different architecture (see above) -- but the
-// SHARED shift itself was still being chosen sub-optimally. Every
-// activation shift in this pipeline (gn_shift, ge1_shift) was sized by
-// `choose_rshift_from_max`: the SMALLEST shift keeping the ABSOLUTE MAX
-// under INT8's ceiling -- i.e., "never clip a single element," the
-// textbook-safe choice. Tried, first, the standard alternative: pick the
-// shift minimizing INPUT round-trip (quantize-then-dequantize) MSE
-// instead -- this picked the EXACT SAME shift as max-based here, because
-// gelu1's own real distribution has a long tail (a handful of elements
-// near its own max ~54.65 real units among a much smaller bulk), and a
-// plain MSE sum over ALL elements is dominated by that tail, so it favors
-// never clipping too. But conv3's own downstream GEMV (KW3=3, a narrow
-// kernel, only 1728 reduction terms) does NOT average that tail's own
-// contribution away the way a wider reduction would -- so round-trip
-// input MSE is not a reliable proxy for the actual OUTPUT error here.
+// ---- Third fix: calibrate the shared shift instead of just sizing it
+// to never clip -- a real, worthwhile gain, but NOT the final answer ----
+// Every activation shift in this pipeline (gn_shift, ge1_shift) was
+// sized by `choose_rshift_from_max`: the SMALLEST shift keeping the
+// ABSOLUTE MAX under INT8's ceiling -- "never clip a single element,"
+// the textbook-safe choice. Tried, first, the standard alternative: pick
+// the shift minimizing INPUT round-trip (quantize-then-dequantize) MSE
+// instead -- picked the EXACT SAME shift as max-based here, because
+// gelu1's own real distribution has a long tail that dominates a plain
+// MSE sum. Fixed by grid-searching the shift directly against THIS
+// STAGE's own real FP32 output instead (re-quantize, re-run the GEMV/
+// dequant chain, compare to the real PyTorch reference, keep the lowest-
+// MSE candidate) -- standard INT8 calibration practice. ge1_shift moved
+// 11->10 (one bit finer, accepting rare hard clipping): whole-chain
+// cosine rose ~0.85 -> ~0.96, still bit-exact throughout.
 //
-// Fixed by grid-searching the shift directly against THIS STAGE's own
-// real FP32 output (calibrate_int8_shift: re-quantize, re-run the GEMV/
-// dequant chain, compare conv3's own output to conv3's own real
-// PyTorch-computed reference, for each of a few candidate shifts near
-// the max-based one, keep the one with lowest MSE) -- standard INT8
-// calibration practice (the same idea real quantization frameworks'
-// own percentile/entropy calibrators use, just scored against this
-// project's own real intermediate references instead of a generic
-// statistic). Found: gn_shift (groupnorm1->conv2) was ALREADY optimal
-// (calibration confirms 17, unchanged) -- that boundary was never the
-// bottleneck. ge1_shift (gelu1->conv3) moves from 11 (max-based) to 10
-// (one bit finer, accepting rare hard clipping) -- and THAT alone
-// recovers most of what per-row weight scaling could not: whole-chain
-// cosine rises ~0.85 -> **~0.96**, finally close to every other block's
-// own 0.99+ (still gated bit-exact throughout: CONV_FRONT_END_VERDICT
-// bitexact=1, mismatches=0/216, and all 3 standalone conv gates too --
-// a shift/scale choice can never affect bit-exactness by construction,
-// only the resulting precision).
+// ---- Fourth fix: TRUE per-channel activation quantization -- this is
+// what actually closed it, and it needed NO new GEMV hardware ----------
+// The earlier "per-channel ACTIVATION scale isn't available without a
+// genuinely different architecture" claim (written at the per-row-WEIGHT
+// stage above) was WRONG -- found while chasing the remaining ~0.04 gap.
+// A GEMV's raw accumulator sum_k w_int[row,k]*x_int[k] only represents a
+// uniformly-rescaled true dot product if EVERY term shares the same
+// combined scale -- true whenever the activation scale is constant across
+// k, which per-channel activation quantization breaks BY DEFINITION
+// (ashift now varies with k's own channel). But the fix doesn't need the
+// GEMV core to know anything about per-channel scale at all: pre-divide
+// each WEIGHT COLUMN by exactly the same 2^ashift[channel(k)] the
+// matching activation column was multiplied by
+// (conv1d_ref.rescale_weight_cols_per_channel), BEFORE the existing
+// per-row weight quantization search -- the per-channel correction
+// cancels out of the algebra completely, leaving gemvy[row] == the true
+// dot product * 2^wshift[row] alone, no ashift term anywhere in the
+// final dequant scale (worked through in full in that function's own
+// docstring). This makes per-channel activation scale a pure WEIGHT-
+// QUANTIZATION-TIME trick, exactly like per-row weight scale was --
+// gemv_banked_resident_vec.sv/vec_dequant.sv stay completely unmodified.
 //
-// The remaining ~0.04 gap is not chased further here -- likely some
-// combination of the SAME narrow-kernel amplification effect at a finer
-// grain than a single shared shift (calibrated or not) can fully correct,
-// and whatever residual the per-row weight fix already captured. Real
-// per-channel activation scale (a genuinely different GEMV architecture)
-// remains the only lever this file hasn't tried.
+// What DID need a real (contained) RTL change: the ACTQUANT step itself
+// (this file's own gn_xt_word/ge1_xt_word logic, which converts
+// groupnorm1's/gelu1's own streamed output to INT8 before feeding
+// conv2/conv3) used a single shared gn_ashift/ge1_ashift scalar port --
+// per-channel precision needs a per-channel TABLE there too, or the
+// activation itself never gets quantized any better regardless of how
+// smart the weight-side correction is. Added: gn_ash_we/gn_ash_data and
+// ge1_ash_we/ge1_ash_data preload tables (CROWS_GN / MROWS2 rows, same
+// auto-incrementing-pointer convention as every other preload table
+// here), plus gn_row/ge1_row -- plain wrapping counters tracking which
+// channel-row is CURRENTLY streaming out of gn_yv/ge1_ov (groupnorm1's
+// and, by pass-through, conv2's own output order is t-major/channel-row-
+// minor, so row-index-modulo-CROWS IS the channel-row). No change to
+// conv1d_seq.sv, groupnorm1_vec.sv, vec_dequant.sv, or gelu_wide_vec.sv
+// at all -- gemv_banked_resident_vec.sv's own K-uniform-scale limitation
+// was real, just irrelevant here, since the correction lives entirely on
+// the weight-quantization side.
+//
+// Two real bugs found getting this bit-exact (both in the NEW code, not
+// in anything reused):
+// 1. The per-channel table's own port ('shift', fed straight to actq())
+//    is a RIGHT-SHIFT applied to the raw Q.22/Q4.12 integer -- the first
+//    attempt wrote the "ashift" MULTIPLY-EXPONENT quantize_act_per_
+//    channel_from_int computes directly into that table instead of the
+//    matching right-shift (target_frac - ashift). Compiled and ran fine;
+//    not remotely bit-exact.
+// 2. Even after fixing (1), still not bit-exact: the per-channel
+//    quantization itself used round-to-nearest-on-real-values (the
+//    natural thing to reach for), but actq() is a plain `x >>> shift` --
+//    floor/truncate-toward-negative-infinity, NOT round-half-*. Ended up
+//    off by exactly 1 LSB for roughly half of all activation elements
+//    (any element whose true fractional part was >=0.5), and that 1-LSB
+//    activation error, compounded through a 1700+-deep GEMV reduction,
+//    was enough to make most OUTPUT elements differ -- bit-exactness is
+//    all-or-nothing, so even a small per-element drift shows up as a
+//    large mismatch count (166/216 mismatched, barely different from
+//    before bug (1) was even fixed -- a strong reminder that a clean
+//    compile and a plausible-looking informational cosine prove nothing
+//    about bit-exactness on their own). Fixed by matching actq()'s own
+//    floor semantics exactly (a real arithmetic right-shift on the
+//    integer, not float round-trip) -- see quantize_act_per_channel_
+//    from_int's own docstring in conv1d_ref.py for the full account.
+//
+// Both bugs were caught the same way every other bug in this project's
+// own history has been: added temporary debug taps (hierarchical
+// references into a scratch copy of the testbench, dumping the RTL's own
+// intermediate per-channel INT8 activations) and compared element-by-
+// element against the Python reference's own intermediate arrays, rather
+// than trying to reason the mismatch pattern out from the final output
+// alone.
+//
+// Result: whole-chain cosine rose ~0.96 -> **~0.999**, matching every
+// other block's own 0.99+ precision -- CONV_FRONT_END_VERDICT
+// bitexact=1, mismatches=0/216, and all 3 standalone conv gates stay
+// bit-exact too. This closes the activation-side gap this file's own
+// history had, until this point, called architecturally out of reach.
 
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps
@@ -263,7 +307,14 @@ module conv_front_end_seq #(
     input  wire [P*32-1:0] gn_g_data,
     input  wire            gn_b_we,
     input  wire [P*32-1:0] gn_b_data,
-    input  wire signed [7:0] gn_ashift,     // groupnorm1 output -> conv2 INT8 actquant
+    // groupnorm1 output -> conv2 INT8 actquant: PER-CHANNEL shift table
+    // (CROWS_GN=C_GN/P rows, P lanes/row, one signed 8-bit shift per real
+    // channel) -- NOT a single shared shift, see this file's own "closing
+    // the activation-side gap" section for why a per-channel table (paired
+    // with a matching per-channel weight-column rescale in the Python
+    // packer, conv1d_ref.rescale_weight_cols_per_channel) was needed.
+    input  wire             gn_ash_we,
+    input  wire [P*8-1:0]   gn_ash_data,
 
     // ---- conv2 preload (weight + per-row dequant + bias once) ----------------
     input  wire        c2_gv_ld_rst,
@@ -275,7 +326,10 @@ module conv_front_end_seq #(
     input  wire            c2_b_we,
     input  wire [P*32-1:0] c2_b_data,
 
-    input  wire signed [7:0] ge1_ashift,    // gelu1 output -> conv3 INT8 actquant
+    // gelu1 output -> conv3 INT8 actquant: PER-CHANNEL shift table
+    // (MROWS2=COUT2/P rows, P lanes/row) -- same reasoning as gn_ash above.
+    input  wire             ge1_ash_we,
+    input  wire [P*8-1:0]   ge1_ash_data,
 
     // ---- conv3 preload (weight + per-row dequant + bias once) ----------------
     input  wire        c3_gv_ld_rst,
@@ -457,13 +511,39 @@ module conv_front_end_seq #(
         .y_valid(gn_yv), .y_out(gn_yout), .done(gn_done)
     );
 
-    // groupnorm1 -> conv2 xt_we: direct wire, actquant (real quantization to INT8)
+    // per-channel ashift table: CROWS_GN rows, loaded once (same
+    // auto-incrementing-pointer convention as every other preload table
+    // in this file).
+    (* ram_style = "distributed" *) reg [P*8-1:0] bank_gn_ash [0:CROWS_GN-1];
+    reg [$clog2(CROWS_GN+1)-1:0] gn_ash_wptr;
+    always @(posedge clk) begin
+        if (rst) gn_ash_wptr <= 0;
+        else if (gn_ash_we) begin bank_gn_ash[gn_ash_wptr] <= gn_ash_data; gn_ash_wptr <= gn_ash_wptr + 1'b1; end
+    end
+    // gn_row: which of the CROWS_GN channel-rows is CURRENTLY streaming
+    // out of gn_yv, wrapping every CROWS_GN rows -- groupnorm1_vec.sv's
+    // own S_OUT emits t-major/channel-row-minor (see that module's header),
+    // so row index modulo CROWS_GN IS the channel-row, tracked here with a
+    // plain wrapping counter (cheaper than a real modulo, CROWS_GN isn't a
+    // power of 2).
+    reg [$clog2(CROWS_GN+1)-1:0] gn_row;
+    reg gn_row_clr;
+    always @(posedge clk) begin
+        if (rst || gn_row_clr) gn_row <= 0;
+        else if (gn_yv) gn_row <= (gn_row == CROWS_GN-1) ? {$clog2(CROWS_GN+1){1'b0}} : gn_row + 1'b1;
+    end
+
+    // groupnorm1 -> conv2 xt_we: direct wire, actquant, PER-CHANNEL shift
+    // (real quantization to INT8, see conv1d_ref.quantize_act_per_channel's
+    // own docstring for why this needed a matching weight-column rescale
+    // in the Python packer -- not just this table).
     integer gnp;
     reg [P*8-1:0] gn_xt_word;
     always @(*) begin
         gn_xt_word = {(P*8){1'b0}};
         for (gnp = 0; gnp < P; gnp = gnp + 1)
-            gn_xt_word[gnp*8 +: 8] = actq($signed(gn_yout[gnp*64 +: 32]), gn_ashift);
+            gn_xt_word[gnp*8 +: 8] = actq($signed(gn_yout[gnp*64 +: 32]),
+                                           $signed(bank_gn_ash[gn_row][gnp*8 +: 8]));
     end
 
     // ---- conv2 ------------------------------------------------------------------
@@ -487,13 +567,32 @@ module conv_front_end_seq #(
         .clk(clk), .in_valid(c2_yv), .x(c2_ydata), .out_valid(ge1_ov), .y(ge1_y)
     );
 
-    // gelu1 -> conv3 xt_we: direct wire, actquant
+    // per-channel ashift table: MROWS2 rows, same convention as gn's own above.
+    (* ram_style = "distributed" *) reg [P*8-1:0] bank_ge1_ash [0:MROWS2-1];
+    reg [$clog2(MROWS2+1)-1:0] ge1_ash_wptr;
+    always @(posedge clk) begin
+        if (rst) ge1_ash_wptr <= 0;
+        else if (ge1_ash_we) begin bank_ge1_ash[ge1_ash_wptr] <= ge1_ash_data; ge1_ash_wptr <= ge1_ash_wptr + 1'b1; end
+    end
+    // ge1_row: which of the MROWS2 channel-rows is CURRENTLY streaming out
+    // of ge1_ov, wrapping every MROWS2 rows -- conv2's own y_data stream
+    // (which gelu_wide_vec.sv passes straight through, just delayed) is
+    // t-major/channel-row-minor, same reasoning as gn_row above.
+    reg [$clog2(MROWS2+1)-1:0] ge1_row;
+    reg ge1_row_clr;
+    always @(posedge clk) begin
+        if (rst || ge1_row_clr) ge1_row <= 0;
+        else if (ge1_ov) ge1_row <= (ge1_row == MROWS2-1) ? {$clog2(MROWS2+1){1'b0}} : ge1_row + 1'b1;
+    end
+
+    // gelu1 -> conv3 xt_we: direct wire, actquant, PER-CHANNEL shift
     integer gep;
     reg [P*8-1:0] ge1_xt_word;
     always @(*) begin
         ge1_xt_word = {(P*8){1'b0}};
         for (gep = 0; gep < P; gep = gep + 1)
-            ge1_xt_word[gep*8 +: 8] = actq($signed(ge1_y[gep*32 +: 32]), ge1_ashift);
+            ge1_xt_word[gep*8 +: 8] = actq($signed(ge1_y[gep*32 +: 32]),
+                                            $signed(bank_ge1_ash[ge1_row][gep*8 +: 8]));
     end
     reg [$clog2(ROWS_C2+1)-1:0] cnt_c3xt;
     reg cnt_c3xt_clr;
@@ -559,15 +658,18 @@ module conv_front_end_seq #(
             c1_go <= 1'b0; c2_go <= 1'b0; c3_go <= 1'b0;
             gn_start <= 1'b0; gn_gvalid <= 1'b0; gn_valid <= 1'b0;
             tanh_wptr_clr <= 1'b0; cnt_c3xt_clr <= 1'b0; cnt_ge2_clr <= 1'b0;
+            gn_row_clr <= 1'b0; ge1_row_clr <= 1'b0;
             gn_gi <= 0; gn_xi <= 0;
         end else begin
             done <= 1'b0;
             c1_go <= 1'b0; c2_go <= 1'b0; c3_go <= 1'b0;
             gn_start <= 1'b0; gn_gvalid <= 1'b0; gn_valid <= 1'b0;
             tanh_wptr_clr <= 1'b0; cnt_c3xt_clr <= 1'b0; cnt_ge2_clr <= 1'b0;
+            gn_row_clr <= 1'b0; ge1_row_clr <= 1'b0;
             case (state)
                 S_IDLE: if (go) begin
                     tanh_wptr_clr <= 1'b1; cnt_c3xt_clr <= 1'b1; cnt_ge2_clr <= 1'b1;
+                    gn_row_clr <= 1'b1; ge1_row_clr <= 1'b1;
                     c1_go <= 1'b1;
                     state <= S_C1_WAIT;
                 end

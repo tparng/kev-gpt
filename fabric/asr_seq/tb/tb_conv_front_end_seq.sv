@@ -1,11 +1,12 @@
 // Testbench for conv_front_end_seq.sv -- preloads all 3 convs' own weight/
-// bias images, groupnorm1's own gamma/beta, and conv1's own real audio
-// input, sets the 5 runtime format-glue shifts, pulses `go` ONCE (the DUT's
-// own internal FSM sequences conv1->tanh->groupnorm1->conv2->gelu->conv3->
-// gelu end to end), and dumps y.out (one P*32-bit hex word per y_valid
-// cycle) for the Python bit-true compare (run_conv_front_end.py against
-// pack_conv_front_end.py's own golden). Weight-load procedure mirrors
-// tb_encoder_block_seq.sv's own (SUBW 32-bit chunks per wide word).
+// per-row-dequant/bias images, groupnorm1's own gamma/beta, the two
+// per-channel activation-shift tables (gn_ash/ge1_ash), and conv1's own
+// real audio input, pulses `go` ONCE (the DUT's own internal FSM sequences
+// conv1->tanh->groupnorm1->conv2->gelu->conv3->gelu end to end), and dumps
+// y.out (one P*32-bit hex word per y_valid cycle) for the Python bit-true
+// compare (run_conv_front_end.py against pack_conv_front_end.py's own
+// golden). Weight-load procedure mirrors tb_encoder_block_seq.sv's own
+// (SUBW 32-bit chunks per wide word).
 `timescale 1ns / 1ps
 `ifndef TIN1VAL
  `define TIN1VAL 3000
@@ -18,12 +19,6 @@
 `endif
 `ifndef NWORDS3
  `define NWORDS3 5184
-`endif
-`ifndef GNSHIFT
- `define GNSHIFT 0
-`endif
-`ifndef GE1SHIFT
- `define GE1SHIFT 0
 `endif
 
 module tb;
@@ -61,13 +56,13 @@ module tb;
     reg c1_xt_we; reg [P*8-1:0] c1_xt_data;
 
     reg gn_g_we, gn_b_we; reg [P*32-1:0] gn_g_data, gn_b_data;
-    reg signed [7:0] gn_ashift;
+    reg gn_ash_we; reg [P*8-1:0] gn_ash_data;
 
     reg c2_gv_ld_rst, c2_gv_ld_we; reg [31:0] c2_gv_ld_data;
     reg c2_dq_we; reg [P*24-1:0] c2_dq_wmant; reg [P*8-1:0] c2_dq_wexp;
     reg c2_b_we; reg [P*32-1:0] c2_b_data;
 
-    reg signed [7:0] ge1_ashift;
+    reg ge1_ash_we; reg [P*8-1:0] ge1_ash_data;
 
     reg c3_gv_ld_rst, c3_gv_ld_we; reg [31:0] c3_gv_ld_data;
     reg c3_dq_we; reg [P*24-1:0] c3_dq_wmant; reg [P*8-1:0] c3_dq_wexp;
@@ -82,11 +77,11 @@ module tb;
         .c1_dq_we(c1_dq_we), .c1_dq_wmant(c1_dq_wmant), .c1_dq_wexp(c1_dq_wexp),
         .c1_xt_we(c1_xt_we), .c1_xt_data(c1_xt_data),
         .gn_g_we(gn_g_we), .gn_g_data(gn_g_data), .gn_b_we(gn_b_we), .gn_b_data(gn_b_data),
-        .gn_ashift(gn_ashift),
+        .gn_ash_we(gn_ash_we), .gn_ash_data(gn_ash_data),
         .c2_gv_ld_rst(c2_gv_ld_rst), .c2_gv_ld_we(c2_gv_ld_we), .c2_gv_ld_data(c2_gv_ld_data),
         .c2_dq_we(c2_dq_we), .c2_dq_wmant(c2_dq_wmant), .c2_dq_wexp(c2_dq_wexp),
         .c2_b_we(c2_b_we), .c2_b_data(c2_b_data),
-        .ge1_ashift(ge1_ashift),
+        .ge1_ash_we(ge1_ash_we), .ge1_ash_data(ge1_ash_data),
         .c3_gv_ld_rst(c3_gv_ld_rst), .c3_gv_ld_we(c3_gv_ld_we), .c3_gv_ld_data(c3_gv_ld_data),
         .c3_dq_we(c3_dq_we), .c3_dq_wmant(c3_dq_wmant), .c3_dq_wexp(c3_dq_wexp),
         .c3_b_we(c3_b_we), .c3_b_data(c3_b_data),
@@ -107,6 +102,8 @@ module tb;
     reg [P*8-1:0]   dq2eload[0:MROWS2-1];
     reg [P*24-1:0]  dq3mload[0:MROWS3-1];
     reg [P*8-1:0]   dq3eload[0:MROWS3-1];
+    reg [P*8-1:0]   gnashload[0:CROWS_GN-1];
+    reg [P*8-1:0]   ge1ashload[0:MROWS2-1];
 
     integer i, s, f;
     reg [WBITS-1:0] word_tmp;
@@ -126,13 +123,15 @@ module tb;
         $readmemh("dq2_exp.mem", dq2eload);
         $readmemh("dq3_mant.mem", dq3mload);
         $readmemh("dq3_exp.mem", dq3eload);
+        $readmemh("gn_ash.mem", gnashload);
+        $readmemh("ge1_ash.mem", ge1ashload);
 
         c1_gv_ld_rst=0; c1_gv_ld_we=0; c1_gv_ld_data=0;
         c1_dq_we=0; c1_dq_wmant=0; c1_dq_wexp=0; c1_xt_we=0; c1_xt_data=0;
-        gn_g_we=0; gn_g_data=0; gn_b_we=0; gn_b_data=0; gn_ashift = `GNSHIFT;
+        gn_g_we=0; gn_g_data=0; gn_b_we=0; gn_b_data=0; gn_ash_we=0; gn_ash_data=0;
         c2_gv_ld_rst=0; c2_gv_ld_we=0; c2_gv_ld_data=0;
         c2_dq_we=0; c2_dq_wmant=0; c2_dq_wexp=0; c2_b_we=0; c2_b_data=0;
-        ge1_ashift = `GE1SHIFT;
+        ge1_ash_we=0; ge1_ash_data=0;
         c3_gv_ld_rst=0; c3_gv_ld_we=0; c3_gv_ld_data=0;
         c3_dq_we=0; c3_dq_wmant=0; c3_dq_wexp=0; c3_b_we=0; c3_b_data=0;
         go = 0;
@@ -193,6 +192,16 @@ module tb;
             @(posedge clk); #1;
         end
         gn_g_we = 0; gn_b_we = 0;
+
+        for (i = 0; i < CROWS_GN; i = i + 1) begin
+            gn_ash_we = 1; gn_ash_data = gnashload[i]; @(posedge clk); #1;
+        end
+        gn_ash_we = 0;
+
+        for (i = 0; i < MROWS2; i = i + 1) begin
+            ge1_ash_we = 1; ge1_ash_data = ge1ashload[i]; @(posedge clk); #1;
+        end
+        ge1_ash_we = 0;
 
         for (i = 0; i < COUT2/P; i = i + 1) begin
             c2_b_we = 1; c2_b_data = b2load[i]; @(posedge clk); #1;

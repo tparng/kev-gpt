@@ -46,8 +46,7 @@ def run(sim_dir: str) -> bool:
         TB,
     ]
     defs = [f"-DTIN1VAL={manifest['TIN1']}", f"-DNWORDS1={manifest['NWORDS1']}",
-            f"-DNWORDS2={manifest['NWORDS2']}", f"-DNWORDS3={manifest['NWORDS3']}",
-            f"-DGNSHIFT={manifest['GNSHIFT']}", f"-DGE1SHIFT={manifest['GE1SHIFT']}"]
+            f"-DNWORDS2={manifest['NWORDS2']}", f"-DNWORDS3={manifest['NWORDS3']}"]
     cp = subprocess.run(["iverilog", "-g2012", "-o", vvp] + defs + sources,
                          cwd=sim_dir, capture_output=True, text=True)
     if cp.returncode != 0:

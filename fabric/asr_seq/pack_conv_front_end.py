@@ -9,8 +9,10 @@ computes, stage by stage, reusing every existing block's own reference
 function (conv1d_ref.conv1d_int_ref, pack_groupnorm1.gn_int, run_tanh.tanh_q,
 run_gelu.gelu_q) -- no new arithmetic here either, only the SAME format-glue
 choices (per-row (mant,exp) dequant targeting Q4.12 instead of the
-standalone conv gates' own Q6.25, sat16, actquant, widen-by-13) the RTL's
-own header documents.
+standalone conv gates' own Q6.25, sat16, actquant, widen-by-13, PER-CHANNEL
+activation quantization at the groupnorm1->conv2 and gelu1->conv3
+boundaries via conv1d_ref.quantize_act_per_channel/
+rescale_weight_cols_per_channel) the RTL's own header documents.
 
     .venv/bin/python -m fabric.asr_seq.pack_conv_front_end gen --dir <sim_dir>
 """
@@ -85,27 +87,10 @@ def gelu_wide_q412(x_wide, lut):
     return np.where(x_wide > 32767, x_wide, lut_out)
 
 
-def choose_rshift_from_max(m: int, target_max: int = 127) -> int:
-    """Smallest non-negative right-shift bringing |m| under target_max --
-    same as pack_output_head.py's own choose_act_rshift_from_max, reused
-    directly as the actq() RTL 'shift' port value for gn_ashift/ge1_ashift
-    (both INT8 activation quantizations, ceiling 127). Was defaulted to
-    100 (~21% of INT8's own range left unused, a real, avoidable precision
-    loss) -- found investigating gelu1->conv3's own quantization noise
-    (ge1_shift alone was landing a full extra bit conservative: gelu1's
-    own real max ~54.65 only needed shift=11 to fit <=127, but target_max
-    =100 pushed it to shift=12, discarding ALL fractional real-unit
-    precision -- see conv_front_end_seq.sv's own header). 127 is safe: the
-    search is a floor-style integer right-shift (`m>>shift`, monotonic,
-    never rounds up), so every OTHER element (<=m in magnitude) also
-    lands <=127 after the same shift -- no new clipping risk from raising
-    this."""
-    if m <= target_max:
-        return 0
-    shift = 0
-    while (m >> shift) > target_max:
-        shift += 1
-    return shift
+def _cos(a, b):
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
 
 
 def load_real():
@@ -136,46 +121,15 @@ def load_real():
         b2=enc.conv2.bias.detach().numpy().astype(np.float64),
         w3=enc.conv3.weight.detach().numpy().astype(np.float64),
         b3=enc.conv3.bias.detach().numpy().astype(np.float64),
-        # real intermediate references for activation-scale CALIBRATION
-        # (see calibrate_int8_shift's own docstring for why these are
-        # needed instead of a cheaper round-trip-MSE proxy)
+        # real intermediate references, used for informational per-stage
+        # cosine prints only (not needed for calibration any more -- the
+        # per-channel activation-quantization fix, conv1d_ref.
+        # quantize_act_per_channel, doesn't need a search against these at
+        # all, unlike the shared-shift calibration attempt that preceded it)
         c2_real=c2[0].detach().numpy().astype(np.float64).T,     # (T2,COUT2) pre-gelu1
         c3_real=c3[0].detach().numpy().astype(np.float64).T,     # (T3,COUT3) pre-gelu2
         front_end_real=front_end_real.detach().numpy().astype(np.float64),
     )
-
-
-def calibrate_int8_shift(x_int, run_fn, true_real_ref, search=4):
-    """Grid-searches the INT8 activation right-shift that minimizes THIS
-    STAGE's own conv output MSE against its real FP32 reference --
-    NOT round-trip input-quantization MSE, which was tried first and
-    found to pick the SAME (uselessly conservative) shift as the plain
-    max-based search here: gelu1's own real distribution has a long tail
-    (a handful of elements near its max ~54.65 real units, the bulk much
-    smaller), so a shift sized to the input's OWN round-trip MSE stays
-    max-based too (the tail dominates a plain MSE sum) -- but the
-    DOWNSTREAM conv3 GEMV (KW3=3, a narrow kernel, only 1728 reduction
-    terms) doesn't average that tail away the way a wider reduction
-    would, so the actual OUTPUT error is minimized by a finer (SMALLER
-    shift, MORE clipping) scale than round-trip input MSE would ever
-    suggest. Confirmed empirically: max-based ge1_shift=11 scores
-    whole-chain cosine ~0.85; grid-searching against conv3's own real
-    output picks ge1_shift=10 (cosine ~0.96) -- see
-    conv_front_end_seq.sv's own header for the full investigation.
-
-    x_int: the pre-shift INT array (to find the max-based upper bound).
-    run_fn(shift) -> this stage's own conv output, REAL units, for that
-    candidate shift (re-quantizes + re-runs the GEMV/dequant chain).
-    true_real_ref: the real FP32 reference to score against.
-    search: how many shifts below the max-based one to also try."""
-    max_shift = choose_rshift_from_max(int(np.max(np.abs(x_int))))
-    best_shift, best_mse = max_shift, None
-    for s in range(max(0, max_shift - search), max_shift + 1):
-        out_real = run_fn(s)
-        mse = float(np.mean((out_real - true_real_ref) ** 2))
-        if best_mse is None or mse < best_mse:
-            best_mse, best_shift = mse, s
-    return best_shift, best_mse
 
 
 def _wmem(path, vals, nib):
@@ -223,43 +177,38 @@ def main_gen(out_dir: str):
     gn_out = np.array([int(v) for v in gn_out_list], dtype=np.int64)   # (T*C,) Q.22
     print(f"groupnorm1: mean={gn_mean} var={gn_var} A={gn_A} Yr={gn_Yr}", file=sys.stderr)
 
-    # ================= actquant groupnorm1 -> conv2 input (CALIBRATED) ======
-    # gn_shift is grid-searched against conv2's own real FP32 output
-    # (calibrate_int8_shift), not just sized to never clip -- see that
-    # function's own docstring for why round-trip-input MSE alone isn't a
-    # reliable proxy for the actual downstream error here.
+    # ================= actquant groupnorm1 -> conv2 input (PER-CHANNEL) =====
+    # True per-channel activation quantization, not a single shared shift
+    # (shift-calibration alone got whole-chain cosine to ~0.96; this closes
+    # nearly all of the rest, see conv_front_end_seq.sv's own header for the
+    # full derivation and history). gn_out (T*C flat, Q.22) -> real -> one
+    # ashift PER CHANNEL (quantize_act_per_channel) -> conv2's own weight
+    # COLUMNS rescaled to compensate (rescale_weight_cols_per_channel), so
+    # the per-row dequant scale below needs NO separate ashift term at all
+    # -- it cancels out algebraically (see that function's own docstring).
     cin2 = COUT1                                          # = CIN2, 288
-    w2_pad = cr.pad_cin_weight(d["w2"], P)                 # no-op, 288 already /8
-    w2_flat = cr.transpose_weight(w2_pad)
-    w2_int8, wshift2 = cr.quantize_weight_per_row(w2_flat)   # (COUT2,) per-output-channel shift
-    b2_q = np.round(d["b2"] * (1 << Q412)).astype(np.int64)   # bias in Q4.12 (matches conv2's own target)
-
-    def _run_conv2(s):
-        gn_i8 = np.clip(gn_out >> s, -128, 127).astype(np.int64)
-        x2_i8 = gn_i8.reshape(t_gn, c_gn).T
-        ae2 = OUT_FRAC_GN - s
-        sc2 = np.exp2((Q412 - ae2 - wshift2).astype(np.float64))
-        m2, e2 = quantize_scale_24(sc2)
-        m2 = np.asarray(m2, dtype=np.int64); e2 = np.asarray(e2, dtype=np.int64)
-        out = cr.conv1d_int_ref(x2_i8, w2_int8, KW2, STRIDE2, COUT2, cin2, m2, e2, bias_q=b2_q)
-        return out.astype(np.float64) / (1 << Q412)
-
-    gn_shift, gn_mse = calibrate_int8_shift(gn_out, _run_conv2, d["c2_real"])
-    gn_int8 = np.clip(gn_out >> gn_shift, -128, 127).astype(np.int64)
-    ashift2_eff = OUT_FRAC_GN - gn_shift
-    print(f"groupnorm1->conv2: gn_shift={gn_shift} ashift2_eff={ashift2_eff} calib_mse={gn_mse:.4f}",
+    x2_int8, gn_rshift = cr.quantize_act_per_channel_from_int(gn_out.reshape(t_gn, c_gn).T)  # (CIN2,T2), (CIN2,)
+    ashift_gn = OUT_FRAC_GN - gn_rshift               # effective multiply-exponent, for weight rescale only
+    print(f"groupnorm1->conv2: per-channel rshift range=[{gn_rshift.min()},{gn_rshift.max()}]",
           file=sys.stderr)
 
-    # ================= conv2 (dq target = Q4.12, feeds gelu1) ===============
-    x2_int8 = gn_int8.reshape(t_gn, c_gn).T              # (CIN2=288, TIN2=t_gn)
-    scale2 = np.exp2((Q412 - ashift2_eff - wshift2).astype(np.float64))
+    w2_pad = cr.pad_cin_weight(d["w2"], P)                 # no-op, 288 already /8
+    w2_flat = cr.transpose_weight(w2_pad)
+    w2_flat_c = cr.rescale_weight_cols_per_channel(w2_flat, ashift_gn, cin2)
+    w2_int8, wshift2 = cr.quantize_weight_per_row(w2_flat_c)   # (COUT2,) per-output-channel shift
+    scale2 = np.exp2((Q412 - wshift2).astype(np.float64))       # no ashift term -- absorbed above
     mant2, expo2 = quantize_scale_24(scale2)
     mant2 = np.asarray(mant2, dtype=np.int64); expo2 = np.asarray(expo2, dtype=np.int64)
+    b2_q = np.round(d["b2"] * (1 << Q412)).astype(np.int64)   # bias in Q4.12 (matches conv2's own target)
+
+    # ================= conv2 (dq target = Q4.12, feeds gelu1) ===============
     c2_out = cr.conv1d_int_ref(x2_int8, w2_int8, KW2, STRIDE2, COUT2, cin2,
                                 mant2, expo2, bias_q=b2_q)          # (TOUT2,COUT2) Q4.12, WIDE (not sat16'd)
     tout2 = c2_out.shape[0]
     print(f"conv2: wshift range=[{wshift2.min()},{wshift2.max()}] TOUT2={tout2} "
-          f"max|c2_out|={int(np.max(np.abs(c2_out)))}", file=sys.stderr)
+          f"max|c2_out|={int(np.max(np.abs(c2_out)))} "
+          f"cos_vs_real={_cos(c2_out.astype(np.float64) / (1 << Q412), d['c2_real']):.6f}",
+          file=sys.stderr)
 
     # ================= gelu1 (gelu_wide_q412 -- see that function's own
     # docstring and conv_front_end_seq.sv's own header for the Q4.12
@@ -267,44 +216,34 @@ def main_gen(out_dir: str):
     lut_gelu = gelu_table()
     g1_q412 = gelu_wide_q412(c2_out, lut_gelu)            # (TOUT2,COUT2) Q4.12, WIDE
 
-    # ================= actquant gelu1 -> conv3 input (CALIBRATED) ===========
-    # ge1_shift is grid-searched against conv3's own real FP32 output --
-    # this is the boundary where max-based sizing was found to genuinely
-    # hurt (see calibrate_int8_shift's own docstring): conv3's narrow
-    # KW3=3 kernel doesn't average away a coarse shared activation scale
-    # the way a wider reduction would.
+    # ================= actquant gelu1 -> conv3 input (PER-CHANNEL) ==========
+    # Same per-channel fix as groupnorm1->conv2 above -- this is the
+    # boundary where it mattered most (conv3's narrow KW3=3 kernel doesn't
+    # average a coarse shared activation scale away the way a wider
+    # reduction would).
     cin3 = COUT2                                              # = CIN3, 576
-    w3_pad = cr.pad_cin_weight(d["w3"], P)                    # no-op, 576 already /8
-    w3_flat = cr.transpose_weight(w3_pad)
-    w3_int8, wshift3 = cr.quantize_weight_per_row(w3_flat)    # (COUT3,) per-output-channel shift
-    b3_q = np.round(d["b3"] * (1 << Q412)).astype(np.int64)
-
-    def _run_conv3(s):
-        ge1_i8 = np.clip(g1_q412 >> s, -128, 127).astype(np.int64)
-        x3_i8 = ge1_i8.T
-        ae3 = Q412 - s
-        sc3 = np.exp2((Q412 - ae3 - wshift3).astype(np.float64))
-        m3, e3 = quantize_scale_24(sc3)
-        m3 = np.asarray(m3, dtype=np.int64); e3 = np.asarray(e3, dtype=np.int64)
-        out = cr.conv1d_int_ref(x3_i8, w3_int8, KW3, STRIDE3, COUT3, cin3, m3, e3, bias_q=b3_q)
-        return out.astype(np.float64) / (1 << Q412)
-
-    ge1_shift, ge1_mse = calibrate_int8_shift(g1_q412, _run_conv3, d["c3_real"])
-    ge1_int8 = np.clip(g1_q412 >> ge1_shift, -128, 127).astype(np.int64)
-    ashift3_eff = Q412 - ge1_shift
-    print(f"gelu1->conv3: ge1_shift={ge1_shift} ashift3_eff={ashift3_eff} calib_mse={ge1_mse:.4f}",
+    x3_int8, ge1_rshift = cr.quantize_act_per_channel_from_int(g1_q412.T)   # (CIN3=576, T2)
+    ashift_ge1 = Q412 - ge1_rshift                    # effective multiply-exponent, for weight rescale only
+    print(f"gelu1->conv3: per-channel rshift range=[{ge1_rshift.min()},{ge1_rshift.max()}]",
           file=sys.stderr)
 
-    # ================= conv3 (dq target = Q4.12, feeds gelu2) ===============
-    x3_int8 = ge1_int8.T                                    # (CIN3=576, TIN3=tout2)
-    scale3 = np.exp2((Q412 - ashift3_eff - wshift3).astype(np.float64))
+    w3_pad = cr.pad_cin_weight(d["w3"], P)                    # no-op, 576 already /8
+    w3_flat = cr.transpose_weight(w3_pad)
+    w3_flat_c = cr.rescale_weight_cols_per_channel(w3_flat, ashift_ge1, cin3)
+    w3_int8, wshift3 = cr.quantize_weight_per_row(w3_flat_c)    # (COUT3,) per-output-channel shift
+    scale3 = np.exp2((Q412 - wshift3).astype(np.float64))        # no ashift term -- absorbed above
     mant3, expo3 = quantize_scale_24(scale3)
     mant3 = np.asarray(mant3, dtype=np.int64); expo3 = np.asarray(expo3, dtype=np.int64)
+    b3_q = np.round(d["b3"] * (1 << Q412)).astype(np.int64)
+
+    # ================= conv3 (dq target = Q4.12, feeds gelu2) ===============
     c3_out = cr.conv1d_int_ref(x3_int8, w3_int8, KW3, STRIDE3, COUT3, cin3,
                                 mant3, expo3, bias_q=b3_q)          # (TOUT3,COUT3) Q4.12, WIDE
     tout3 = c3_out.shape[0]
     print(f"conv3: wshift range=[{wshift3.min()},{wshift3.max()}] TOUT3={tout3} "
-          f"max|c3_out|={int(np.max(np.abs(c3_out)))}", file=sys.stderr)
+          f"max|c3_out|={int(np.max(np.abs(c3_out)))} "
+          f"cos_vs_real={_cos(c3_out.astype(np.float64) / (1 << Q412), d['c3_real']):.6f}",
+          file=sys.stderr)
 
     # ================= gelu2 (gelu_wide_q412, same fix as gelu1) ============
     g2_q412 = gelu_wide_q412(c3_out, lut_gelu)            # (TOUT3,COUT3) Q4.12, WIDE
@@ -356,14 +295,25 @@ def main_gen(out_dir: str):
     with open(os.path.join(out_dir, "gelu_lut_o.mem"), "w") as f:
         f.write("\n".join(f"{int(v) & 0xFFFF:04x}" for v in lut_gelu[1::2]) + "\n")
 
+    # gn_rshift/ge1_rshift are ALREADY the right-shift amount
+    # conv_front_end_seq.sv's own actq() port expects directly (see
+    # quantize_act_per_channel_from_int's own docstring for the two real
+    # bugs found and fixed getting here: (1) an earlier version wrote the
+    # "ashift" multiply-exponent into this table instead of the matching
+    # right-shift (target_frac - ashift); (2) an earlier version of the
+    # quantization itself used round-to-nearest-on-real-values instead of
+    # actq()'s own floor-shift-on-the-integer, a 1-LSB-per-element
+    # mismatch that compounded into a large bit-exact failure).
+    _wmem(os.path.join(out_dir, "gn_ash.mem"), cr.pack_rows_pw(gn_rshift, P, 8), (P * 8) // 4)
+    _wmem(os.path.join(out_dir, "ge1_ash.mem"), cr.pack_rows_pw(ge1_rshift, P, 8), (P * 8) // 4)
+
     gold_flat = final_out.reshape(-1)
     gold_rows = cr.pack_rows_p32(gold_flat, P)
     gold_masked = [v & 0xFFFFFFFFFFFFFFFF for v in gold_rows]
 
     return {
         "TIN1": tin1, "NWORDS1": meta1[0]["n_words"], "NWORDS2": meta2[0]["n_words"],
-        "NWORDS3": meta3[0]["n_words"], "GNSHIFT": gn_shift,
-        "GE1SHIFT": ge1_shift, "TOUT3": tout3, "COUT3": COUT3,
+        "NWORDS3": meta3[0]["n_words"], "TOUT3": tout3, "COUT3": COUT3,
         "gold_rows": gold_masked,
     }
 

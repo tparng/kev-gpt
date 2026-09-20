@@ -8323,10 +8323,50 @@ whole-chain cosine ~0.85 -> ~0.96, close to every other block's own
 0.99+. Still bit-exact throughout (CONV_FRONT_END_VERDICT bitexact=1,
 mismatches=0/216, all 3 standalone conv gates too).
 
-Remaining ~0.04 gap not chased further -- real per-channel activation
-scale would need a genuinely different GEMV architecture, the only
-lever not yet tried.
+Remaining ~0.04 gap initially attributed to needing a genuinely
+different GEMV architecture for real per-channel activation scale.
 
-Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Calibrate the
-activation shift, don't just size it to never clip -- closes most of the
-remaining gap" section.
+## True per-channel activation quantization -- this is what actually closed it, no new GEMV hardware needed
+
+That claim was WRONG. A GEMV's raw sum only represents a uniformly-
+rescaled dot product if every term shares the same scale -- but the fix
+doesn't need the MAC core to know about per-channel scale at all:
+pre-divide each WEIGHT COLUMN by 2^ashift[channel(k)] before the
+existing per-row weight search (conv1d_ref.rescale_weight_cols_per_
+channel) -- the correction cancels out algebraically, leaving gemvy[row]
+== true dot product * 2^wshift[row], no ashift term left anywhere.
+gemv_banked_resident_vec.sv/vec_dequant.sv stay completely unmodified.
+
+What DID need a real RTL change: the actquant step itself
+(conv_front_end_seq.sv's own gn_xt_word/ge1_xt_word) used a single
+shared shift port -- added gn_ash_we/ge1_ash_we per-channel preload
+tables (same auto-incrementing-pointer convention as every other table
+here) plus gn_row/ge1_row wrapping counters tracking which channel-row
+is currently streaming. No change to conv1d_seq.sv/groupnorm1_vec.sv/
+vec_dequant.sv/gelu_wide_vec.sv.
+
+Two real bugs found getting this bit-exact (both in the NEW code):
+1. Wrote the "ashift" multiply-exponent directly into the table instead
+   of the matching right-shift (target_frac - ashift) actq() actually
+   expects -- compiled fine, not remotely bit-exact (168/216 mismatches).
+2. Even after fixing that: still not bit-exact (166/216, barely
+   different) -- the per-channel quantization used round-to-nearest, but
+   actq() is a plain floor right-shift. Off by 1 LSB for ~half of all
+   elements, which compounded through a 1700+-deep reduction into most
+   output elements differing. The Python reference's own informational
+   cosine looked near-perfect throughout both broken attempts (it
+   correctly used round-to-nearest internally), completely masking the
+   RTL-side bugs -- a real reminder that a plausible cosine proves
+   nothing about bit-exactness.
+
+Both found via temporary debug taps (hierarchical references into a
+scratch testbench copy, dumping RTL intermediate values) compared
+element-by-element against the Python reference.
+
+Result: whole-chain cosine ~0.96 -> ~0.999, matching every other
+block's own 0.99+. Still bit-exact throughout (CONV_FRONT_END_VERDICT
+bitexact=1, mismatches=0/216, all 3 standalone conv gates too).
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "True per-channel
+activation quantization -- this is what actually closed it, and it
+needed no new GEMV hardware" section.
