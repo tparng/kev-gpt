@@ -189,10 +189,52 @@
 // rather than weight-quantization-dominated, per-row weight scale alone
 // was never going to close it -- consistent with what was found. Still
 // bit-exact throughout every one of conv1/conv2/conv3's own standalone
-// gates and this file's own end-to-end gate. A real fix for the
-// remaining gap would need a genuinely different architecture for the
-// activation side (e.g. per-channel activation scale, which this
-// project's shared GEMV core doesn't support today) -- out of scope here.
+// gates and this file's own end-to-end gate.
+//
+// ---- Third fix: calibrate the activation shift, don't just size it to
+// never clip (pack_conv_front_end.py's own calibrate_int8_shift) -------
+// True per-channel ACTIVATION scale within one GEMV call isn't available
+// without a genuinely different architecture (see above) -- but the
+// SHARED shift itself was still being chosen sub-optimally. Every
+// activation shift in this pipeline (gn_shift, ge1_shift) was sized by
+// `choose_rshift_from_max`: the SMALLEST shift keeping the ABSOLUTE MAX
+// under INT8's ceiling -- i.e., "never clip a single element," the
+// textbook-safe choice. Tried, first, the standard alternative: pick the
+// shift minimizing INPUT round-trip (quantize-then-dequantize) MSE
+// instead -- this picked the EXACT SAME shift as max-based here, because
+// gelu1's own real distribution has a long tail (a handful of elements
+// near its own max ~54.65 real units among a much smaller bulk), and a
+// plain MSE sum over ALL elements is dominated by that tail, so it favors
+// never clipping too. But conv3's own downstream GEMV (KW3=3, a narrow
+// kernel, only 1728 reduction terms) does NOT average that tail's own
+// contribution away the way a wider reduction would -- so round-trip
+// input MSE is not a reliable proxy for the actual OUTPUT error here.
+//
+// Fixed by grid-searching the shift directly against THIS STAGE's own
+// real FP32 output (calibrate_int8_shift: re-quantize, re-run the GEMV/
+// dequant chain, compare conv3's own output to conv3's own real
+// PyTorch-computed reference, for each of a few candidate shifts near
+// the max-based one, keep the one with lowest MSE) -- standard INT8
+// calibration practice (the same idea real quantization frameworks'
+// own percentile/entropy calibrators use, just scored against this
+// project's own real intermediate references instead of a generic
+// statistic). Found: gn_shift (groupnorm1->conv2) was ALREADY optimal
+// (calibration confirms 17, unchanged) -- that boundary was never the
+// bottleneck. ge1_shift (gelu1->conv3) moves from 11 (max-based) to 10
+// (one bit finer, accepting rare hard clipping) -- and THAT alone
+// recovers most of what per-row weight scaling could not: whole-chain
+// cosine rises ~0.85 -> **~0.96**, finally close to every other block's
+// own 0.99+ (still gated bit-exact throughout: CONV_FRONT_END_VERDICT
+// bitexact=1, mismatches=0/216, and all 3 standalone conv gates too --
+// a shift/scale choice can never affect bit-exactness by construction,
+// only the resulting precision).
+//
+// The remaining ~0.04 gap is not chased further here -- likely some
+// combination of the SAME narrow-kernel amplification effect at a finer
+// grain than a single shared shift (calibrated or not) can fully correct,
+// and whatever residual the per-row weight fix already captured. Real
+// per-channel activation scale (a genuinely different GEMV architecture)
+// remains the only lever this file hasn't tried.
 
 // -----------------------------------------------------------------------------
 `timescale 1ns / 1ps

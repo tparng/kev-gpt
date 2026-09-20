@@ -8303,6 +8303,30 @@ own real hardware truncation) -- documented directly in pack_conv3.py so
 it isn't mistaken for a regression. Doesn't affect the real front-end
 integration (targets Q4.12, far smaller scale, no overflow there).
 
-Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Per-channel
-weight scales: a real RTL change, a real (if modest) further gain, and
-the honest limit of what weight-side fixes alone can do" section.
+## Calibrate the activation shift, don't just size it to never clip -- closes most of the remaining gap
+
+Every activation shift in this pipeline (gn_shift, ge1_shift) was sized
+by "never clip a single element" (max-based). Tried round-trip input MSE
+minimization instead -- picked the SAME shift as max-based (gelu1's own
+long-tailed distribution dominates a plain MSE sum), so that alone
+wasn't the fix. conv3's own narrow kernel (KW3=3) doesn't average the
+tail away the way a wider reduction would, so input MSE isn't a
+reliable proxy for the real output error here.
+
+Fixed via calibrate_int8_shift (pack_conv_front_end.py): grid-search the
+shift against THIS STAGE's own real FP32 output directly (re-run the
+GEMV/dequant chain per candidate, keep lowest MSE vs the real PyTorch
+reference) -- standard INT8 calibration practice. gn_shift was already
+optimal (17, unchanged). ge1_shift moves 11->10 (one bit finer, some
+hard clipping accepted) -- alone recovers most of the remaining gap:
+whole-chain cosine ~0.85 -> ~0.96, close to every other block's own
+0.99+. Still bit-exact throughout (CONV_FRONT_END_VERDICT bitexact=1,
+mismatches=0/216, all 3 standalone conv gates too).
+
+Remaining ~0.04 gap not chased further -- real per-channel activation
+scale would need a genuinely different GEMV architecture, the only
+lever not yet tried.
+
+Full writeup: gen2asr/ASR-ACCELERATOR-OP-SEQUENCE.md's "Calibrate the
+activation shift, don't just size it to never clip -- closes most of the
+remaining gap" section.
